@@ -82,8 +82,21 @@ assumed would be narrowly held.
 *contact* endpoint from a *sync* endpoint. Do the same with keys: publish a
 distinct **contact key** in the rollcall, used only for inbox-tag derivation
 and first contact, rotated on the entry's ~7-day cadence. The correspondence
-key stays unpublished. Inbox tags then rotate with the contact key, and a
-historical count covers one entry period rather than all of history.
+key stays unpublished.
+
+> **Correction.** This proposal does not close the leak, and
+> `RFC-2-blocking-items.md` §2.1 supersedes it. Rollcall entries are
+> `bulletin` objects, so every contact key ever published persists on any
+> archival relay — precisely the adversary RFC 0 §7.6 says exists. Such an
+> adversary holds the whole key sequence and counts everything regardless of
+> rotation. Rotation bounds the retrospective count only for an adversary who
+> starts observing late.
+>
+> The property is structural: an inbox tag must be computable by any stranger,
+> which is what makes open first contact possible, and by nobody else, which
+> is what would stop counting. The real options are to state the leak as
+> unmitigable and scope it to opt-in rollcall participants, or to gate first
+> contact on an introduction token and derive the tag from the token.
 
 This is worth resolving in RFC 3 rather than RFC 1, since RFC 1 is frozen and
 RFC 3 is not — but RFC 1 §6.2's "computable by anyone holding the recipient's

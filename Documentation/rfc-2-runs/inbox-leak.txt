@@ -1,0 +1,19 @@
+Inbox-tag counting leak (RFC 3 review §1) under contact-key rotation
+
+An adversary needs contact_key(epoch) to compute inbox_tag(epoch).
+Rotation only helps if the adversary does NOT already hold the key.
+
+  archival relay (RFC 0 §7.6):
+    holds every contact key ever published -> counts all 1095 days
+    rotation gains: NOTHING
+
+  adversary who starts late:
+    without rotation: one published key -> counts all history
+    with rotation:    only epochs whose key it holds
+                      = from now, plus 45 d of still-live bulletins
+    rotation gains:   bounds retrospective count to 45 days
+
+Conclusion: rotation does not fix the leak against the adversary RFC 0
+§7.6 says exists. The property is structural -- an inbox tag must be
+computable by any stranger (that is what makes first contact work) and
+by nobody else (that is what would stop counting). Those contradict.

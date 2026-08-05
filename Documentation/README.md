@@ -200,6 +200,38 @@ idea in the series. All five of RFC 6's tables reproduce in `krab-sizes`.
 - **Neither SIM-0 nor SIM-1 models fan-out**, so its interaction with
   eviction, holdings analysis and manifest size is unexamined.
 
+## RFC 2
+
+| document | what it is |
+|---|---|
+| [`RFC-2-blocking-items.md`](RFC-2-blocking-items.md) | whether RFC 2 should exist, and what would be in it |
+| [`rfc-2-runs/inbox-leak.txt`](rfc-2-runs/inbox-leak.txt) | why rotating a published contact key does not close the counting leak |
+
+RFC 2 is the odd document in the series: **RFC 1 absorbed five of its seven
+original items** — pairwise and inbox tag derivation, shard extraction, the
+epoch window, prekey selection — leaving only address canonicalisation and the
+namespace-separation invariant. RFC 6 has already dropped its RFC 2 dependency.
+RFC 0 §10's roadmap still lists RFC 2 as freezing a tag scheme RFC 1 froze.
+
+What repopulates it are three findings from reviewing RFC 3, RFC 6 and RFC 7,
+none of which has an addressing home:
+
+- **A correction to this repository's own RFC 3 review.** It proposed a
+  rotating contact key to close the inbox-tag counting leak. That does not
+  work: rollcall entries are bulletins, so an archival relay — the adversary
+  RFC 0 §7.6 says exists — holds every contact key ever published and counts
+  everything regardless. The property is **structural**: an inbox tag must be
+  computable by any stranger and by nobody else, and those contradict. The
+  honest options are to state it as unmitigable and scope it to opt-in
+  rollcall participants, or to gate first contact on an introduction token.
+- **Per-class shard masks**, without which RFC 6 §3.4's channel-interest
+  bucketing cannot be expressed.
+- **The inbox decapsulation cap** RFC 7 §13.3 requires but does not size —
+  now derivable from RFC 7 §5.5's measured decapsulation costs.
+
+The recommendation is to *reduce* RFC 2 to those, not retire it, and to invert
+the plan's dependency: RFC 5 and RFC 6 would require RFC 2, not the reverse.
+
 ## Not yet here
 
 RFC 0 and the RFC series plan are not in this directory.
