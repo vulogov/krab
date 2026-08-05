@@ -70,6 +70,17 @@ one headline conclusion rests on a metric artifact:
 Two of these carried a deadline against RFC 1's frozen routing header. SIM-1
 resolves both — see `SIM-1-results.md` §3 and §6.
 
+## RFC 1
+
+| document | what it is |
+|---|---|
+| [`RFC-1-blocking-items.md`](RFC-1-blocking-items.md) | the gate on RFC 1 reaching Draft: which blocking-item rows are settled, on what evidence, and what would settle the rest |
+
+RFC 1 freezes the object format permanently, so the series plan forbids it
+reaching Draft until B2 and B3 are settled. Four of the seven B3 rows and the
+B2 field set are now settled on measurement; the rest are tracked with what
+each needs.
+
 ## Not yet here
 
 RFC 0 and the RFC series plan are not in this directory.
