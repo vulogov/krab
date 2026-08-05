@@ -11,6 +11,37 @@ convergence, delivery, or storage claim that is not measured here.
 | [`SIM-0-audit.md`](SIM-0-audit.md) | source review and instrumented re-runs; **read before citing any figure** |
 | [`sim-0-runs/sweeps.txt`](sim-0-runs/sweeps.txt) | captured output for every sweep, with audit diagnostics |
 
+## SIM-1 — reconciliation overhead and holdings analysis
+
+| document | what it is |
+|---|---|
+| [`SIM-1-results.md`](SIM-1-results.md) | answers SIM-0's largest omission and the two questions RFC 0 deferred |
+| [`sim-1-runs/sweeps.txt`](sim-1-runs/sweeps.txt) | captured output for every SIM-1 run |
+
+SIM-1 is implemented as flagged extensions to the same simulator, so every
+figure is measured on the same network, seeds, and generators as the SIM-0
+figure it is compared against. With no flags `krab-sim` reproduces SIM-0
+byte-identically, which is the regression check.
+
+Headline findings:
+
+- **LoRa requires RBSR; courier forbids it.** A full manifest starves 98.3% of
+  LoRa reconciliations; RBSR collapses austere delivery from 95.8% to 33.0%
+  because each descent level costs a three-day courier round trip. RFC 5's
+  `sync_mode` has no safe default.
+- **Keep 32-byte identifiers (B3).** Sync-mode choice dominates identifier
+  length by 80× against 3.3×, so there is no bandwidth reason to weaken
+  content addressing.
+- **The holdings leak is under-provisioning, not a coverage threshold.** It
+  beats chance by up to 8× under austere transport below SIM-0's own peer and
+  TTL guidance, and vanishes at degree 12 with a 30-day TTL. **B2 is
+  unblocked**: `expiry` can stay in the frozen header at useful resolution.
+- **Uniform eviction makes the holding set deterministic, not
+  uninformative** — a node's storage cap plus object age determines it
+  exactly, and the age gradient inverts under a cap. RFC 0 §7.4 and SIM-0 §6
+  currently claim the opposite. Eviction also drives a re-fetch loop costing
+  up to 68% extra ingress.
+
 The simulator itself is [`apps/krab-sim`](../apps/krab-sim). It has no
 dependencies, internal or external, so any reviewer can rebuild and re-run it
 offline with nothing to vendor-trust:
@@ -36,10 +67,9 @@ one headline conclusion rests on a metric artifact:
 - **`storeMB` and `rxMB/d` are p99-across-nodes of a peak-over-time**, not
   means.
 
-Two of these carry a deadline: they must be resolved before RFC 1 freezes the
-routing header, because it cannot be revised afterwards.
+Two of these carried a deadline against RFC 1's frozen routing header. SIM-1
+resolves both — see `SIM-1-results.md` §3 and §6.
 
 ## Not yet here
 
-RFC 0 and the RFC series plan are not in this directory. Neither is SIM-1,
-whose revised scope is proposed in audit §7.
+RFC 0 and the RFC series plan are not in this directory.

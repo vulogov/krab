@@ -54,6 +54,10 @@ from the standalone build. Either way the `runs` column reports how many
 seeds actually contributed to a row; a value below `--seeds` means the figures
 were averaged over fewer runs than requested.
 
+Adversary placement draws from its own RNG stream, seeded separately and used
+only after the main loop, so enabling the holdings analysis cannot perturb the
+simulation it observes.
+
 ## Audit flags
 
 Added while auditing the published figures. See `SIM-0-audit.md`.
@@ -68,9 +72,38 @@ Added while auditing the published figures. See `SIM-0-audit.md`.
                                buy, given that the shipped gate admits 0.16%
                                of the traffic distribution
 
-Bare flags cannot be the final argument — the parser reads a value before
-matching the flag name. Put `--diag` and `--quiet` ahead of the last valued
-option.
+## SIM-1
+
+Everything below defaults off, so `krab-sim` with no flags still reproduces
+`SIM-0-results.md` byte-identically. That is the regression check, and it is
+why SIM-1 lives here rather than in a separate program: every SIM-1 figure is
+measured on the same network, with the same seeds and generators, as the SIM-0
+figure it is compared against.
+
+Results in [`Documentation/SIM-1-results.md`](../../Documentation/SIM-1-results.md).
+
+    --manifest                 charge reconciliation overhead against link
+                               capacity. SIM-0 treated it as free
+    --sync <full|rbsr>         reconciliation strategy (default full)
+    --id-len <bytes>           identifier length in manifests (default 32).
+                               Blocking item B3
+    --rbsr-b <int>             RBSR fingerprint tree branching factor (16)
+    --frag                     fragment oversized objects across syncs rather
+                               than dropping them
+    --hol-fix                  skip an object that does not fit the remaining
+                               window instead of abandoning the whole
+                               transfer. SIM-0 abandons, which wedges a link
+                               permanently on its oldest oversized object
+    --sim1                     the three model-fidelity flags together
+    --cap <MB>                 per-node storage cap; eviction is oldest-first
+                               and uniform (I-6). 0 = unlimited
+    --adversary <k>            place k vantage points and run the holdings
+                               analysis
+    --adv-place <random|hub>   vantage placement (default random)
+    --recon                    reconciliation overhead view; implies --manifest
+    --adv                      holdings-leak view; implies --adversary 5
+
+New sweeps: `recon`, `idlen`, `adversary`, `adversary-mix`, `cap`.
 
 ## Layout
 

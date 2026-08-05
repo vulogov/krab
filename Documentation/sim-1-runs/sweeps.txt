@@ -1,0 +1,574 @@
+### recon sweep, shipped LoRa gate (512 B)
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+all-tcp full               5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+all-tcp rbsr               5    100.0%      5.0      8.7     14.1     98.2%     97.7%     449.3     31.27
+mixed full                 5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+mixed rbsr                 5    100.0%      7.4     12.8     18.6     97.2%     96.4%     447.0     31.20
+courier-heavy full         5    100.0%     11.6     20.5     60.5     95.3%     94.3%     442.4     31.06
+courier-heavy rbsr         5     99.4%     11.6     20.3     29.9     94.8%     94.0%     441.0     30.93
+austere full               5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+austere rbsr               5     33.0%    230.6    511.7    681.4      6.7%      0.4%     107.8      8.77
+
+case                   lora ctl% lora ctlKB lora payKB lora strv  cour ctl%   tcp ctl% cour strv
+------------------------------------------------------------------------------------------------
+all-tcp full                NaN%        NaN        NaN      NaN%       NaN%     28.59%      NaN%
+all-tcp rbsr                NaN%        NaN        NaN      NaN%       NaN%      0.34%      NaN%
+mixed full                 94.9%        1.2        0.1      0.0%      18.6%     21.76%      0.0%
+mixed rbsr                 95.0%        1.2        0.1      0.0%       0.2%      0.27%      0.0%
+courier-heavy full         93.5%        1.1        0.1      0.0%      10.0%     16.45%      0.0%
+courier-heavy rbsr         93.7%        1.2        0.1      0.0%       0.2%      0.22%      0.0%
+austere full               89.6%        1.1        0.1      0.0%       0.4%      5.58%      0.0%
+austere rbsr               90.3%        1.2        0.1      0.0%       0.1%      0.48%      0.0%
+
+ctl% is control traffic as a share of all bytes on that link kind.
+strv is the share of reconciliations where control traffic consumed the
+whole window, so no payload moved at all.
+
+### recon sweep, LoRa gate 8000 B (filter widened as fragmentation would)
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+all-tcp full               5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+all-tcp rbsr               5    100.0%      5.0      8.7     14.1     98.2%     97.7%     449.3     31.27
+mixed full                 5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+mixed rbsr                 5    100.0%      7.3     12.7     18.5     97.2%     96.4%     447.0     31.20
+courier-heavy full         5    100.0%     11.6     20.5     60.0     95.3%     94.3%     442.4     31.06
+courier-heavy rbsr         5     99.4%     11.5     20.1     29.1     94.8%     94.0%     441.0     30.93
+austere full               5     96.1%    167.5    294.5    381.1     37.1%     15.2%     273.3     26.83
+austere rbsr               5     34.3%    229.3    501.5    659.9      6.7%      0.4%      95.0      8.49
+
+case                   lora ctl% lora ctlKB lora payKB lora strv  cour ctl%   tcp ctl% cour strv
+------------------------------------------------------------------------------------------------
+all-tcp full                NaN%        NaN        NaN      NaN%       NaN%     28.59%      NaN%
+all-tcp rbsr                NaN%        NaN        NaN      NaN%       NaN%      0.34%      NaN%
+mixed full                 99.0%       18.1        0.2     98.3%      18.6%     21.76%      0.0%
+mixed rbsr                 34.0%        6.8       13.3      0.3%       0.2%      0.27%      0.0%
+courier-heavy full         98.5%       18.1        0.3     97.8%      10.0%     16.45%      0.0%
+courier-heavy rbsr         43.4%        8.4       11.0      3.6%       0.2%      0.22%      0.0%
+austere full               93.0%       17.2        1.3     89.4%       0.4%      5.67%      0.0%
+austere rbsr               60.5%       11.3        7.4     40.3%       0.1%      0.53%      0.0%
+
+ctl% is control traffic as a share of all bytes on that link kind.
+strv is the share of reconciliations where control traffic consumed the
+whole window, so no payload moved at all.
+
+### id length sweep, shipped gate
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+full id=32B                5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+full id=16B                5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+full id=8B                 5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+rbsr id=32B                5    100.0%      7.4     12.8     18.6     97.2%     96.4%     447.0     31.20
+rbsr id=16B                5    100.0%      7.4     12.8     18.6     97.2%     96.4%     447.0     31.20
+rbsr id=8B                 5    100.0%      7.4     12.8     18.6     97.2%     96.4%     447.0     31.20
+
+case                   lora ctl% lora ctlKB lora payKB lora strv  cour ctl%   tcp ctl% cour strv
+------------------------------------------------------------------------------------------------
+full id=32B                94.9%        1.2        0.1      0.0%      18.6%     21.76%      0.0%
+full id=16B                90.4%        0.6        0.1      0.0%      10.2%     12.21%      0.0%
+full id=8B                 82.4%        0.3        0.1      0.0%       5.4%      6.50%      0.0%
+rbsr id=32B                95.0%        1.2        0.1      0.0%       0.2%      0.27%      0.0%
+rbsr id=16B                95.0%        1.2        0.1      0.0%       0.2%      0.22%      0.0%
+rbsr id=8B                 95.0%        1.2        0.1      0.0%       0.2%      0.19%      0.0%
+
+ctl% is control traffic as a share of all bytes on that link kind.
+strv is the share of reconciliations where control traffic consumed the
+whole window, so no payload moved at all.
+
+### id length sweep, LoRa gate 8000 B
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+full id=32B                5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+full id=16B                5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+full id=8B                 5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+rbsr id=32B                5    100.0%      7.3     12.7     18.5     97.2%     96.4%     447.0     31.20
+rbsr id=16B                5    100.0%      7.3     12.7     18.4     97.2%     96.4%     447.0     31.20
+rbsr id=8B                 5    100.0%      7.3     12.7     18.4     97.2%     96.4%     447.0     31.20
+
+case                   lora ctl% lora ctlKB lora payKB lora strv  cour ctl%   tcp ctl% cour strv
+------------------------------------------------------------------------------------------------
+full id=32B                99.0%       18.1        0.2     98.3%      18.6%     21.76%      0.0%
+full id=16B                98.5%       18.1        0.3     97.5%      10.2%     12.21%      0.0%
+full id=8B                 97.6%       17.9        0.4     96.0%       5.4%      6.50%      0.0%
+rbsr id=32B                34.0%        6.8       13.3      0.3%       0.2%      0.27%      0.0%
+rbsr id=16B                26.8%        5.6       15.3      0.0%       0.2%      0.22%      0.0%
+rbsr id=8B                 23.2%        4.9       16.3      0.0%       0.2%      0.19%      0.0%
+
+ctl% is control traffic as a share of all bytes on that link kind.
+strv is the share of reconciliations where control traffic consumed the
+whole window, so no payload moved at all.
+
+### adversary: vantage count, austere 20/30/50
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+vantage=1                  5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=3                  5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=5                  5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=10                 5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=25                 5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=50                 5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+
+vantage=1              origin rank p50   42.8%  (chance 50.0%)   top-10   4.35%  (chance 2.00%)  scored 3013
+  age bucket 0  P(hold | hops):  82%  54%  28%   7%   2%   1%   1%   8%
+  age bucket 1  P(hold | hops):  81%  52%  35%  16%   9%   4%   3%  13%
+  age bucket 2  P(hold | hops):  79%  74%  55%  30%  15%  10%   9%  29%
+  age bucket 3  P(hold | hops):  85%  89%  65%  47%  32%  28%  25%  56%
+  age bucket 4  P(hold | hops):  82%  87%  77%  57%  49%  46%  40%  47%
+  age bucket 5  P(hold | hops):  87%  91%  82%  73%  64%  62%  62%  82%
+  age bucket 6  P(hold | hops):  81%  96%  94%  85%  77%  75%  74%  88%
+  age bucket 7  P(hold | hops):  81%  97%  96%  90%  86%  82%  86%  91%
+
+vantage=3              origin rank p50   42.2%  (chance 50.0%)   top-10   4.95%  (chance 2.00%)  scored 4216
+  age bucket 0  P(hold | hops):  92%  42%  15%   5%   2%   1%   1%   4%
+  age bucket 1  P(hold | hops):  90%  50%  22%  10%   6%   4%   3%  15%
+  age bucket 2  P(hold | hops):  88%  60%  38%  19%  13%  11%  10%  25%
+  age bucket 3  P(hold | hops):  90%  75%  55%  35%  27%  26%  29%  53%
+  age bucket 4  P(hold | hops):  90%  84%  66%  47%  41%  43%  49%  43%
+  age bucket 5  P(hold | hops):  94%  93%  76%  65%  58%  59%  66%  76%
+  age bucket 6  P(hold | hops):  91%  98%  89%  78%  71%  73%  77%  80%
+  age bucket 7  P(hold | hops):  91%  98%  95%  87%  83%  82%  90%  93%
+
+vantage=5              origin rank p50   36.2%  (chance 50.0%)   top-10   6.26%  (chance 2.00%)  scored 4493
+  age bucket 0  P(hold | hops):  95%  42%  14%   4%   2%   1%   0%   2%
+  age bucket 1  P(hold | hops):  94%  47%  20%   8%   5%   3%   2%   6%
+  age bucket 2  P(hold | hops):  93%  62%  37%  17%  11%   8%   7%  10%
+  age bucket 3  P(hold | hops):  94%  81%  54%  34%  25%  23%  22%  41%
+  age bucket 4  P(hold | hops):  95%  89%  68%  47%  40%  39%  39%  46%
+  age bucket 5  P(hold | hops):  95%  96%  78%  64%  57%  56%  56%  62%
+  age bucket 6  P(hold | hops):  95%  99%  90%  77%  70%  71%  72%  73%
+  age bucket 7  P(hold | hops):  94%  99%  95%  87%  82%  82%  84%  86%
+
+vantage=10             origin rank p50   29.8%  (chance 50.0%)   top-10   7.99%  (chance 2.00%)  scored 5047
+  age bucket 0  P(hold | hops):  97%  39%  13%   4%   2%   1%   1%   1%
+  age bucket 1  P(hold | hops):  97%  48%  22%   9%   5%   5%   4%   5%
+  age bucket 2  P(hold | hops):  96%  64%  38%  19%  12%  10%   9%   9%
+  age bucket 3  P(hold | hops):  97%  81%  56%  36%  27%  25%  24%  39%
+  age bucket 4  P(hold | hops):  97%  90%  69%  49%  42%  40%  38%  47%
+  age bucket 5  P(hold | hops):  97%  96%  80%  68%  60%  56%  55%  64%
+  age bucket 6  P(hold | hops):  98%  98%  91%  79%  74%  72%  70%  75%
+  age bucket 7  P(hold | hops):  97%  98%  95%  88%  84%  82%  82%  89%
+
+vantage=25             origin rank p50   20.1%  (chance 50.0%)   top-10  12.45%  (chance 2.00%)  scored 5626
+  age bucket 0  P(hold | hops):  99%  32%  12%   4%   2%   1%   1%   1%   2%
+  age bucket 1  P(hold | hops):  99%  41%  20%   9%   5%   5%   4%   6%   5%
+  age bucket 2  P(hold | hops):  99%  60%  34%  17%  11%   9%   8%   9%  12%
+  age bucket 3  P(hold | hops):  99%  78%  51%  34%  26%  24%  22%  26%   8%
+  age bucket 4  P(hold | hops):  99%  89%  66%  47%  40%  38%  36%  39%  27%
+  age bucket 5  P(hold | hops):  99%  95%  79%  64%  57%  54%  52%  54%  62%
+  age bucket 6  P(hold | hops):  99%  97%  88%  78%  72%  69%  67%  72%  65%
+  age bucket 7  P(hold | hops):  99%  98%  94%  86%  82%  80%  80%  86%  73%
+
+vantage=50             origin rank p50   14.4%  (chance 50.0%)   top-10  16.33%  (chance 2.00%)  scored 5969
+  age bucket 0  P(hold | hops):  99%  34%  12%   4%   2%   1%   1%   1%  13%
+  age bucket 1  P(hold | hops):  99%  41%  19%   9%   5%   4%   4%   5%  10%
+  age bucket 2  P(hold | hops):  99%  57%  31%  16%  11%   9%   7%   7%   7%
+  age bucket 3  P(hold | hops):  99%  78%  51%  34%  27%  23%  21%  19%   4%
+  age bucket 4  P(hold | hops):  99%  89%  65%  48%  41%  37%  34%  34%  19%
+  age bucket 5  P(hold | hops):  99%  95%  78%  64%  58%  54%  50%  49%  36%
+  age bucket 6  P(hold | hops):  99%  98%  88%  78%  73%  70%  68%  69%  66%
+  age bucket 7  P(hold | hops):  99%  98%  93%  87%  84%  82%  80%  83%  59%
+
+A flat P(hold | hops) row means holdings leak nothing about the origin.
+Rank p50 is the true origin's percentile under a maximum-likelihood attack
+calibrated on a disjoint half of the corpus; 50% is chance.
+
+### adversary: vantage count, mixed 70/15/15
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+vantage=1                  5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+vantage=3                  5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+vantage=5                  5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+vantage=10                 5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+vantage=25                 5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+vantage=50                 5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+
+vantage=1              origin rank p50   53.6%  (chance 50.0%)   top-10   0.18%  (chance 2.00%)  scored 6799
+  age bucket 0  P(hold | hops):  82%  87%  88%  79%  76%  74%  73%  64%
+  age bucket 1  P(hold | hops):  81%  97%  99% 100% 100% 100%  99%  91%
+  age bucket 2  P(hold | hops):  79%  97%  99% 100% 100% 100%  99%  95%
+  age bucket 3  P(hold | hops):  85%  96%  99% 100% 100% 100%  99%  95%
+  age bucket 4  P(hold | hops):  82%  97%  99% 100% 100% 100%  99%  93%
+  age bucket 5  P(hold | hops):  87%  97%  99% 100% 100% 100%  99%  92%
+  age bucket 6  P(hold | hops):  81%  96%  99% 100% 100% 100%  99%  90%
+  age bucket 7  P(hold | hops):  81%  97%  99% 100% 100% 100%  99%  91%
+
+vantage=3              origin rank p50   50.3%  (chance 50.0%)   top-10   1.40%  (chance 2.00%)  scored 6846
+  age bucket 0  P(hold | hops):  92%  91%  86%  78%  78%  75%  71%  63%
+  age bucket 1  P(hold | hops):  90%  99% 100% 100% 100% 100% 100%  96%
+  age bucket 2  P(hold | hops):  88%  99% 100% 100% 100% 100% 100%  97%
+  age bucket 3  P(hold | hops):  90%  99% 100% 100% 100% 100% 100%  96%
+  age bucket 4  P(hold | hops):  90%  99% 100% 100% 100% 100% 100%  97%
+  age bucket 5  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  96%
+  age bucket 6  P(hold | hops):  91%  99% 100% 100% 100% 100% 100%  97%
+  age bucket 7  P(hold | hops):  91%  99% 100% 100% 100% 100% 100%  97%
+
+vantage=5              origin rank p50   48.8%  (chance 50.0%)   top-10   1.91%  (chance 2.00%)  scored 6873
+  age bucket 0  P(hold | hops):  95%  92%  85%  80%  77%  76%  72%  61%
+  age bucket 1  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+  age bucket 2  P(hold | hops):  93%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+  age bucket 4  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 5  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 6  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 7  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+
+vantage=10             origin rank p50   49.0%  (chance 50.0%)   top-10   2.27%  (chance 2.00%)  scored 6901
+  age bucket 0  P(hold | hops):  97%  92%  85%  80%  77%  75%  71%  63%
+  age bucket 1  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 2  P(hold | hops):  96% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 4  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 5  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 6  P(hold | hops):  98% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 7  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+
+vantage=25             origin rank p50   48.5%  (chance 50.0%)   top-10   2.33%  (chance 2.00%)  scored 6931
+  age bucket 0  P(hold | hops):  99%  91%  85%  80%  76%  74%  71%  66%  39%
+  age bucket 1  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 2  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  98%
+  age bucket 4  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  98%
+  age bucket 5  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 6  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 7  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+
+vantage=50             origin rank p50   48.6%  (chance 50.0%)   top-10   2.23%  (chance 2.00%)  scored 6951
+  age bucket 0  P(hold | hops):  99%  92%  86%  80%  77%  75%  72%  67%  36%
+  age bucket 1  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  91%
+  age bucket 2  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 4  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  87%
+  age bucket 5  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  87%
+  age bucket 6  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  95%
+  age bucket 7  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+
+A flat P(hold | hops) row means holdings leak nothing about the origin.
+Rank p50 is the true origin's percentile under a maximum-likelihood attack
+calibrated on a disjoint half of the corpus; 50% is chance.
+
+### adversary: vantage count, all-tcp
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+vantage=1                  5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+vantage=3                  5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+vantage=5                  5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+vantage=10                 5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+vantage=25                 5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+vantage=50                 5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+
+vantage=1              origin rank p50   53.7%  (chance 50.0%)   top-10   0.18%  (chance 2.00%)  scored 6882
+  age bucket 0  P(hold | hops):  82%  94%  93%  87%  85%  85%  83%  75%
+  age bucket 1  P(hold | hops):  81%  97%  99% 100% 100% 100%  99%  91%
+  age bucket 2  P(hold | hops):  79%  97%  99% 100% 100% 100%  99%  95%
+  age bucket 3  P(hold | hops):  85%  96%  99% 100% 100% 100%  99%  95%
+  age bucket 4  P(hold | hops):  82%  97%  99% 100% 100% 100%  99%  93%
+  age bucket 5  P(hold | hops):  87%  97%  99% 100% 100% 100%  99%  92%
+  age bucket 6  P(hold | hops):  81%  96%  99% 100% 100% 100%  99%  90%
+  age bucket 7  P(hold | hops):  81%  97%  99% 100% 100% 100%  99%  91%
+
+vantage=3              origin rank p50   50.4%  (chance 50.0%)   top-10   1.40%  (chance 2.00%)  scored 6901
+  age bucket 0  P(hold | hops):  92%  94%  90%  85%  85%  83%  79%  74%
+  age bucket 1  P(hold | hops):  90%  99% 100% 100% 100% 100% 100%  96%
+  age bucket 2  P(hold | hops):  88%  99% 100% 100% 100% 100% 100%  97%
+  age bucket 3  P(hold | hops):  90%  99% 100% 100% 100% 100% 100%  96%
+  age bucket 4  P(hold | hops):  90%  99% 100% 100% 100% 100% 100%  97%
+  age bucket 5  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  96%
+  age bucket 6  P(hold | hops):  91%  99% 100% 100% 100% 100% 100%  97%
+  age bucket 7  P(hold | hops):  91%  99% 100% 100% 100% 100% 100%  97%
+
+vantage=5              origin rank p50   49.0%  (chance 50.0%)   top-10   1.87%  (chance 2.00%)  scored 6913
+  age bucket 0  P(hold | hops):  95%  94%  90%  86%  85%  83%  81%  71%
+  age bucket 1  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+  age bucket 2  P(hold | hops):  93%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+  age bucket 4  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 5  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 6  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 7  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+
+vantage=10             origin rank p50   49.4%  (chance 50.0%)   top-10   2.21%  (chance 2.00%)  scored 6928
+  age bucket 0  P(hold | hops):  97%  94%  90%  86%  84%  83%  80%  73%
+  age bucket 1  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 2  P(hold | hops):  96% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 4  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 5  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 6  P(hold | hops):  98% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 7  P(hold | hops):  97% 100% 100% 100% 100% 100% 100%  99%
+
+vantage=25             origin rank p50   48.9%  (chance 50.0%)   top-10   2.21%  (chance 2.00%)  scored 6948
+  age bucket 0  P(hold | hops):  99%  93%  90%  86%  84%  82%  80%  75%  72%
+  age bucket 1  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 2  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  98%
+  age bucket 4  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  98%
+  age bucket 5  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 6  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 7  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+
+vantage=50             origin rank p50   49.1%  (chance 50.0%)   top-10   2.12%  (chance 2.00%)  scored 6964
+  age bucket 0  P(hold | hops):  99%  94%  90%  86%  84%  83%  81%  76%  49%
+  age bucket 1  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  91%
+  age bucket 2  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+  age bucket 4  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  87%
+  age bucket 5  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  87%
+  age bucket 6  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  95%
+  age bucket 7  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+
+A flat P(hold | hops) row means holdings leak nothing about the origin.
+Rank p50 is the true origin's percentile under a maximum-likelihood attack
+calibrated on a disjoint half of the corpus; 50% is chance.
+
+### adversary: hub placement, austere
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+vantage=1                  5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=3                  5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=5                  5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=10                 5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=25                 5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+vantage=50                 5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+
+vantage=1              origin rank p50   51.3%  (chance 50.0%)   top-10   3.54%  (chance 2.00%)  scored 2882
+  age bucket 0  P(hold | hops):  81%  33%   7%   2%   1%   0%   2%
+  age bucket 1  P(hold | hops):  78%  42%   8%   3%   4%   1%   2%
+  age bucket 2  P(hold | hops):  82%  55%  22%  13%   9%   5%   3%
+  age bucket 3  P(hold | hops):  80%  79%  42%  35%  27%  19%  24%
+  age bucket 4  P(hold | hops):  84%  83%  61%  50%  48%  40%  39%
+  age bucket 5  P(hold | hops):  79%  87%  78%  70%  65%  62%  52%
+  age bucket 6  P(hold | hops):  82%  94%  86%  84%  80%  76%  67%
+  age bucket 7  P(hold | hops):  87%  93%  94%  91%  91%  88%  81%
+
+vantage=3              origin rank p50   41.1%  (chance 50.0%)   top-10   4.95%  (chance 2.00%)  scored 4081
+  age bucket 0  P(hold | hops):  92%  31%   8%   4%   1%   1%   1%  11%
+  age bucket 1  P(hold | hops):  93%  39%  12%   9%   6%   4%   3%  40%
+  age bucket 2  P(hold | hops):  88%  51%  23%  18%  11%   8%   6%  40%
+  age bucket 3  P(hold | hops):  89%  73%  48%  38%  27%  23%  26%  62%
+  age bucket 4  P(hold | hops):  89%  79%  62%  54%  45%  42%  45%  93%
+  age bucket 5  P(hold | hops):  89%  90%  80%  72%  64%  61%  68%  96%
+  age bucket 6  P(hold | hops):  91%  98%  89%  87%  80%  78%  80%  90%
+  age bucket 7  P(hold | hops):  92%  96%  95%  93%  91%  89%  89%  85%
+
+vantage=5              origin rank p50   38.4%  (chance 50.0%)   top-10   5.67%  (chance 2.00%)  scored 4495
+  age bucket 0  P(hold | hops):  95%  26%   7%   3%   2%   1%   1%  11%
+  age bucket 1  P(hold | hops):  95%  36%  10%   8%   6%   4%   4%  33%
+  age bucket 2  P(hold | hops):  94%  51%  26%  17%  12%   8%   6%  28%
+  age bucket 3  P(hold | hops):  94%  73%  50%  35%  26%  22%  22%  31%
+  age bucket 4  P(hold | hops):  92%  80%  60%  50%  44%  40%  40%  43%
+  age bucket 5  P(hold | hops):  94%  90%  78%  70%  62%  60%  61%  62%
+  age bucket 6  P(hold | hops):  95%  97%  88%  83%  78%  74%  71%  66%
+  age bucket 7  P(hold | hops):  95%  97%  93%  92%  88%  87%  83%  75%
+
+vantage=10             origin rank p50   32.4%  (chance 50.0%)   top-10   8.62%  (chance 2.00%)  scored 4852
+  age bucket 0  P(hold | hops):  97%  31%   8%   3%   2%   1%   1%   9%  17%
+  age bucket 1  P(hold | hops):  97%  38%  12%   7%   5%   4%   4%  22%  25%
+  age bucket 2  P(hold | hops):  97%  56%  27%  16%  11%   8%   7%  24%   6%
+  age bucket 3  P(hold | hops):  97%  78%  48%  35%  27%  25%  23%  28%  10%
+  age bucket 4  P(hold | hops):  97%  86%  62%  51%  45%  42%  39%  35%  17%
+  age bucket 5  P(hold | hops):  97%  93%  78%  69%  64%  60%  56%  55%    -
+  age bucket 6  P(hold | hops):  97%  97%  89%  85%  79%  75%  69%  65%   8%
+  age bucket 7  P(hold | hops):  97%  97%  95%  92%  89%  87%  82%  81%  10%
+
+vantage=25             origin rank p50   24.1%  (chance 50.0%)   top-10  11.14%  (chance 2.00%)  scored 5560
+  age bucket 0  P(hold | hops):  99%  33%  10%   4%   2%   1%   1%   7%   8%
+  age bucket 1  P(hold | hops):  99%  39%  14%   9%   7%   6%   5%  24%  12%
+  age bucket 2  P(hold | hops):  99%  58%  28%  17%  13%  10%   9%  30%   4%
+  age bucket 3  P(hold | hops):  99%  78%  49%  36%  30%  27%  23%  35%   5%
+  age bucket 4  P(hold | hops):  99%  87%  63%  52%  46%  42%  39%  51%  10%
+  age bucket 5  P(hold | hops):  99%  94%  77%  68%  63%  59%  55%  64%  12%
+  age bucket 6  P(hold | hops):  99%  97%  87%  82%  78%  74%  68%  79%   6%
+  age bucket 7  P(hold | hops):  99%  98%  93%  90%  87%  85%  80%  87%  25%
+
+vantage=50             origin rank p50   19.4%  (chance 50.0%)   top-10  13.47%  (chance 2.00%)  scored 5865
+  age bucket 0  P(hold | hops):  99%  34%  11%   4%   2%   1%   1%   4%  16%
+  age bucket 1  P(hold | hops):  99%  42%  16%   8%   6%   5%   4%  15%  11%
+  age bucket 2  P(hold | hops):  99%  59%  29%  17%  12%   9%   8%  17%   3%
+  age bucket 3  P(hold | hops):  99%  79%  50%  35%  29%  25%  21%  26%   3%
+  age bucket 4  P(hold | hops):  99%  87%  64%  51%  44%  39%  35%  42%  17%
+  age bucket 5  P(hold | hops):  99%  94%  77%  67%  62%  57%  52%  55%  40%
+  age bucket 6  P(hold | hops):  99%  97%  88%  81%  76%  72%  67%  70%  56%
+  age bucket 7  P(hold | hops):  99%  98%  93%  90%  86%  83%  79%  80%  21%
+
+A flat P(hold | hops) row means holdings leak nothing about the origin.
+Rank p50 is the true origin's percentile under a maximum-likelihood attack
+calibrated on a disjoint half of the corpus; 50% is chance.
+
+### adversary: leak table by transport mix, 5 vantage points
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+all-tcp                    5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+mixed                      5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+austere                    5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+
+all-tcp                origin rank p50   49.0%  (chance 50.0%)   top-10   1.87%  (chance 2.00%)  scored 6913
+  age bucket 0  P(hold | hops):  95%  94%  90%  86%  85%  83%  81%  71%
+  age bucket 1  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+  age bucket 2  P(hold | hops):  93%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+  age bucket 4  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 5  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 6  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 7  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+
+mixed                  origin rank p50   48.8%  (chance 50.0%)   top-10   1.91%  (chance 2.00%)  scored 6873
+  age bucket 0  P(hold | hops):  95%  92%  85%  80%  77%  76%  72%  61%
+  age bucket 1  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+  age bucket 2  P(hold | hops):  93%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 3  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+  age bucket 4  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 5  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 6  P(hold | hops):  95%  99% 100% 100% 100% 100% 100%  99%
+  age bucket 7  P(hold | hops):  94%  99% 100% 100% 100% 100% 100%  98%
+
+austere                origin rank p50   36.2%  (chance 50.0%)   top-10   6.26%  (chance 2.00%)  scored 4493
+  age bucket 0  P(hold | hops):  95%  42%  14%   4%   2%   1%   0%   2%
+  age bucket 1  P(hold | hops):  94%  47%  20%   8%   5%   3%   2%   6%
+  age bucket 2  P(hold | hops):  93%  62%  37%  17%  11%   8%   7%  10%
+  age bucket 3  P(hold | hops):  94%  81%  54%  34%  25%  23%  22%  41%
+  age bucket 4  P(hold | hops):  95%  89%  68%  47%  40%  39%  39%  46%
+  age bucket 5  P(hold | hops):  95%  96%  78%  64%  57%  56%  56%  62%
+  age bucket 6  P(hold | hops):  95%  99%  90%  77%  70%  71%  72%  73%
+  age bucket 7  P(hold | hops):  94%  99%  95%  87%  82%  82%  84%  86%
+
+A flat P(hold | hops) row means holdings leak nothing about the origin.
+Rank p50 is the true origin's percentile under a maximum-likelihood attack
+calibrated on a disjoint half of the corpus; 50% is chance.
+
+### adversary: does SIM-0 provisioning guidance close the leak? austere, 25 vantage points
+--- degree 8, TTL 14d (below guidance)
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+baseline                   5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+
+baseline               origin rank p50   20.1%  (chance 50.0%)   top-10  12.45%  (chance 2.00%)  scored 5626
+  age bucket 0  P(hold | hops):  99%  32%  12%   4%   2%   1%   1%   1%   2%
+  age bucket 1  P(hold | hops):  99%  41%  20%   9%   5%   5%   4%   6%   5%
+  age bucket 2  P(hold | hops):  99%  60%  34%  17%  11%   9%   8%   9%  12%
+  age bucket 3  P(hold | hops):  99%  78%  51%  34%  26%  24%  22%  26%   8%
+  age bucket 4  P(hold | hops):  99%  89%  66%  47%  40%  38%  36%  39%  27%
+  age bucket 5  P(hold | hops):  99%  95%  79%  64%  57%  54%  52%  54%  62%
+  age bucket 6  P(hold | hops):  99%  97%  88%  78%  72%  69%  67%  72%  65%
+  age bucket 7  P(hold | hops):  99%  98%  94%  86%  82%  80%  80%  86%  73%
+
+A flat P(hold | hops) row means holdings leak nothing about the origin.
+Rank p50 is the true origin's percentile under a maximum-likelihood attack
+calibrated on a disjoint half of the corpus; 50% is chance.
+--- degree 12 (minimum peers)
+SIM-0  topo=ws n=500 degree=12 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+baseline                   5    100.0%     30.5    118.5    193.9     85.7%     72.3%     418.8     30.45
+
+baseline               origin rank p50   45.7%  (chance 50.0%)   top-10   3.40%  (chance 2.00%)  scored 6627
+  age bucket 0  P(hold | hops):  99%  58%  36%  29%  26%  23%  30%
+  age bucket 1  P(hold | hops):  99%  81%  78%  77%  76%  74%  72%
+  age bucket 2  P(hold | hops):  99%  90%  85%  83%  82%  81%  88%
+  age bucket 3  P(hold | hops):  99%  98%  95%  95%  95%  94%  90%
+  age bucket 4  P(hold | hops):  99%  99%  99%  99%  99%  99%  91%
+  age bucket 5  P(hold | hops):  99% 100% 100%  99%  99%  99%  95%
+  age bucket 6  P(hold | hops):  99% 100% 100% 100% 100% 100%  93%
+  age bucket 7  P(hold | hops):  99% 100% 100% 100% 100% 100%  94%
+
+A flat P(hold | hops) row means holdings leak nothing about the origin.
+Rank p50 is the true origin's percentile under a maximum-likelihood attack
+calibrated on a disjoint half of the corpus; 50% is chance.
+--- TTL 30d (minimum TTL)
+SIM-0  topo=ws n=500 degree=8 ttl=30d horizon=90d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+baseline                   5    100.0%    175.9    319.7    444.6     69.6%     57.9%     784.8     29.25
+
+baseline               origin rank p50   34.9%  (chance 50.0%)   top-10   6.67%  (chance 2.00%)  scored 13596
+  age bucket 0  P(hold | hops):  99%  37%  17%   7%   4%   3%   3%   4%   1%
+  age bucket 1  P(hold | hops):  99%  76%  46%  29%  22%  19%  17%  18%  24%
+  age bucket 2  P(hold | hops):  99%  94%  78%  63%  55%  51%  48%  52%  54%
+  age bucket 3  P(hold | hops):  99%  98%  94%  87%  83%  81%  78%  80%  59%
+  age bucket 4  P(hold | hops):  99%  99%  98%  97%  95%  95%  94%  93%  70%
+  age bucket 5  P(hold | hops):  99% 100%  99%  99%  99%  98%  98%  99%  86%
+  age bucket 6  P(hold | hops):  99% 100% 100% 100%  99%  99%  99% 100%  94%
+  age bucket 7  P(hold | hops):  99% 100% 100% 100% 100% 100% 100% 100%  99%
+
+A flat P(hold | hops) row means holdings leak nothing about the origin.
+Rank p50 is the true origin's percentile under a maximum-likelihood attack
+calibrated on a disjoint half of the corpus; 50% is chance.
+--- degree 12 + TTL 30d
+SIM-0  topo=ws n=500 degree=12 ttl=30d horizon=90d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+baseline                   5    100.0%     30.2    118.5    196.6     93.4%     87.5%     926.4     30.92
+
+baseline               origin rank p50   48.0%  (chance 50.0%)   top-10   2.50%  (chance 2.00%)  scored 14535
+  age bucket 0  P(hold | hops):  99%  71%  58%  55%  54%  51%  46%
+  age bucket 1  P(hold | hops):  99%  95%  93%  92%  92%  91%  90%
+  age bucket 2  P(hold | hops):  99% 100% 100% 100%  99%  99%  97%
+  age bucket 3  P(hold | hops):  99% 100% 100% 100% 100% 100%  96%
+  age bucket 4  P(hold | hops):  99% 100% 100% 100% 100% 100%  97%
+  age bucket 5  P(hold | hops):  99% 100% 100% 100% 100% 100%  97%
+  age bucket 6  P(hold | hops):  99% 100% 100% 100% 100% 100%  98%
+  age bucket 7  P(hold | hops):  99% 100% 100% 100% 100% 100%  96%
+
+A flat P(hold | hops) row means holdings leak nothing about the origin.
+Rank p50 is the true origin's percentile under a maximum-likelihood attack
+calibrated on a disjoint half of the corpus; 50% is chance.
+
+### capacity-pressure eviction, mixed
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+cap=none                   5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+cap=100MB                  5    100.0%      7.4     12.8     18.6     23.2%     22.9%     100.0     52.38
+cap=200MB                  5    100.0%      7.3     12.8     18.6     46.2%     46.0%     200.0     47.91
+cap=300MB                  5    100.0%      7.3     12.7     18.6     69.4%     69.1%     300.0     42.44
+cap=450MB                  5    100.0%      7.3     12.7     18.6     97.2%     96.4%     445.6     31.21
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+cap=none                  97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+cap=100MB                 23.2%    23.2%    22.9%      0.0%     100.0     100.0     52.38     50.38
+cap=200MB                 46.2%    46.2%    45.7%      0.0%     200.0     200.0     47.91     46.52
+cap=300MB                 69.4%    69.3%    68.6%      0.3%     300.0     300.0     42.44     41.14
+cap=450MB                 97.2%    97.1%    96.9%    100.0%     445.6     443.0     31.21     31.08
+
+cap=none               lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+cap=100MB              lora-eligible   0.16%  cover by age: 76% 100% 10% 0% 0% 0% 0% 0%
+cap=200MB              lora-eligible   0.16%  cover by age: 76% 100% 100% 91% 2% 0% 0% 0%
+cap=300MB              lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 76% 1% 0%
+cap=450MB              lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+
+### full SIM-1 model (--sim1) vs SIM-0, mix sweep
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+all-tcp                    5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+tcp+lora                   5    100.0%      5.9     10.2     15.8     97.8%     97.2%     448.3     31.25
+mixed                      5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+courier-heavy              5    100.0%     11.6     20.5     60.5     95.3%     94.3%     442.4     31.06
+austere                    5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+all-courier                5     52.5%    311.5    390.9    406.3      1.8%      1.3%      18.1      4.07
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+all-tcp                   98.2%    98.0%    98.0%    100.0%     449.4     446.7     31.28     31.19
+tcp+lora                  97.8%    97.6%    97.6%    100.0%     448.3     445.4     31.25     31.14
+mixed                     97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+courier-heavy             95.3%    95.2%    95.1%    100.0%     442.4     435.8     31.06     30.88
+austere                   37.2%    37.0%    37.4%     76.4%     273.3     195.5     26.83     23.26
+all-courier                1.8%     1.8%     1.9%      4.3%      18.1      11.9      4.07      2.35
+
+all-tcp                lora-eligible   0.16%  cover by age: 84% 100% 100% 100% 100% 100% 100% 100%
+tcp+lora               lora-eligible   0.16%  cover by age: 81% 100% 100% 100% 100% 100% 100% 100%
+mixed                  lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+courier-heavy          lora-eligible   0.16%  cover by age: 63% 99% 99% 100% 100% 100% 100% 100%
+austere                lora-eligible   0.16%  cover by age: 3% 6% 12% 26% 41% 56% 71% 82%
+all-courier            lora-eligible   0.16%  cover by age: 0% 0% 1% 1% 2% 3% 4% 5%

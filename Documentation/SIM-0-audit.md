@@ -323,6 +323,14 @@ check: the traffic model and the parameter table disagree.
 
 ## 7. What this implies for SIM-1
 
+> **Resolved.** SIM-1 has since been run against all four priorities below;
+> results are in [`SIM-1-results.md`](SIM-1-results.md). The manifest
+> arithmetic in this section proved pessimistic in one respect — RFC 5 scopes
+> reconciliation to the agreed filter, so the shipped 512 B LoRa gate yields a
+> 1.2 KB manifest rather than 448 KB. Once the filter widens to admit ordinary
+> text, a full manifest starves 98.3% of LoRa reconciliations, which is the
+> failure this section anticipated.
+
 SIM-1's manifest question is now partly answerable by arithmetic, and the
 answer is bad enough to be worth stating before building anything:
 

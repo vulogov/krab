@@ -9,7 +9,7 @@ use crate::graph::Graph;
 use crate::model::*;
 use crate::rng::Rng;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
 enum Ev {
     Inject(u32),
@@ -82,6 +82,50 @@ pub struct RunResult {
     pub rx_mb_day_mean: f64,
     /// Fraction of measured objects small enough to cross a LoRa edge.
     pub lora_eligible: f64,
+
+    // ---- SIM-1 -------------------------------------------------------------
+    /// Control bytes (manifests, fingerprints) per link kind: tcp, lora, courier.
+    pub ctrl_bytes: [u64; 3],
+    /// Payload bytes actually moved, per link kind.
+    pub payload_bytes: [u64; 3],
+    /// Reconciliations attempted, per link kind.
+    pub syncs: [u64; 3],
+    /// Reconciliations in which control traffic consumed the whole window, so
+    /// no payload moved at all. The failure mode SIM-0 could not see.
+    pub starved: [u64; 3],
+    /// P(a vantage point holds an object | hop distance from its origin),
+    /// indexed `[age_bucket][distance]`. A flat row means no leak.
+    pub hold_by_dist: Vec<Vec<f64>>,
+    /// Percentile rank of the true origin under a maximum-likelihood attack
+    /// using `hold_by_dist`. 0.0 is a perfect identification, 0.5 is chance.
+    pub adv_rank_p50: f64,
+    /// Probability the true origin lands in the attack's top 10 candidates.
+    /// Chance is `10/n`.
+    pub adv_top10: f64,
+    /// Objects the attack was scored over.
+    pub adv_scored: usize,
+}
+
+/// Hop distance from `src` to every node. `u16::MAX` where unreachable.
+fn bfs(g: &Graph, src: usize, n: usize) -> Vec<u16> {
+    let mut d = vec![u16::MAX; n];
+    d[src] = 0;
+    let mut frontier = vec![src as u32];
+    let mut depth = 0u16;
+    while !frontier.is_empty() {
+        depth += 1;
+        let mut next = Vec::new();
+        for &u in &frontier {
+            for &v in &g.adj[u as usize] {
+                if d[v as usize] == u16::MAX {
+                    d[v as usize] = depth;
+                    next.push(v);
+                }
+            }
+        }
+        frontier = next;
+    }
+    d
 }
 
 fn pct(sorted: &[f64], p: f64) -> f64 {
@@ -220,6 +264,16 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
     let mut peak_bytes: Vec<u64> = vec![0; cfg.n];
     let mut rx_bytes: Vec<u64> = vec![0; cfg.n];
 
+    // SIM-1 accounting.
+    let mut ctrl_bytes = [0u64; 3];
+    let mut payload_bytes = [0u64; 3];
+    let mut syncs = [0u64; 3];
+    let mut starved = [0u64; 3];
+    // Partially transferred objects, keyed (link, destination, object). Only
+    // read by lookup, never iterated, so it cannot perturb the RNG stream.
+    let mut partial: HashMap<(u32, u32, u32), u64> = HashMap::new();
+    let cap_bytes = cfg.store_cap_mb * 1_000_000;
+
     // ---- event queue -------------------------------------------------------
     let mut q: BinaryHeap<Sched> = BinaryHeap::new();
     let mut seq: u64 = 0;
@@ -294,6 +348,20 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
                             }
                         }
                     }
+                    // SIM-1: capacity-pressure eviction. Oldest-first and
+                    // uniform across shards (I-6) — the holding set must not
+                    // encode anything but age, since under partial coverage
+                    // *which* objects a node holds is the whole question.
+                    if cap_bytes > 0 && b > cap_bytes {
+                        let mut oi = lo;
+                        while b > cap_bytes && oi < hi {
+                            if store[u].get(oi) {
+                                store[u].w[oi >> 6] &= !(1u64 << (oi & 63));
+                                b -= objs[oi].size as u64;
+                            }
+                            oi += 1;
+                        }
+                    }
                     peak_bytes[u] = peak_bytes[u].max(b);
                 }
             }
@@ -321,10 +389,52 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
                 }
                 let lw = lo >> 6;
                 let hw = ((hi + 63) >> 6).min(store[0].w.len());
-                let mask = &size_mask[kidx(l.kind)];
+                let ki = kidx(l.kind);
+                let mask = &size_mask[ki];
                 let cap = l.kind.capacity_bytes();
                 let lat = l.kind.latency_s();
                 let bw = cap as f64 / l.kind.sync_mean().max(1.0);
+
+                // Word mask restricting a word to the live window, so counts
+                // do not spill into the partial words at either boundary.
+                let wmask = |wi: usize| -> u64 {
+                    let mut m = !0u64;
+                    if wi == lo >> 6 {
+                        m &= !0u64 << (lo & 63);
+                    }
+                    if hi & 63 != 0 && wi == hi >> 6 {
+                        m &= (1u64 << (hi & 63)) - 1;
+                    }
+                    m
+                };
+
+                // SIM-1: control traffic is charged against the same window as
+                // payload. SIM-0 treated it as free, which is what hid the
+                // question of whether a constrained link can reconcile at all.
+                let (ctrl, rounds) = if cfg.manifest {
+                    let (mut mine, mut theirs, mut diff) = (0u64, 0u64, 0u64);
+                    for wi in lw..hw {
+                        let w = wmask(wi) & mask.w[wi];
+                        let a_w = store[l.a as usize].w[wi] & w;
+                        let b_w = store[l.b as usize].w[wi] & w;
+                        mine += a_w.count_ones() as u64;
+                        theirs += b_w.count_ones() as u64;
+                        diff += (a_w ^ b_w).count_ones() as u64;
+                    }
+                    recon_cost(cfg, mine, theirs, diff)
+                } else {
+                    (0, 1)
+                };
+                syncs[ki] += 1;
+                let pay_cap = cap.saturating_sub(ctrl);
+                ctrl_bytes[ki] += ctrl.min(cap);
+                if pay_cap == 0 {
+                    starved[ki] += 1;
+                    continue;
+                }
+                // An RBSR descent costs a round trip per level; a full manifest
+                // costs one. On a courier link that is the dominant term.
+                let lat = lat * (2.0 * rounds as f64 - 1.0);
 
                 // Both directions in one reconciliation.
                 for (src, dst) in [(l.a as usize, l.b as usize), (l.b as usize, l.a as usize)] {
@@ -342,13 +452,35 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
                             let sz = objs[oi].size as u64;
                             // Oldest-first within the window, which is also
                             // the eviction order: uniform, leaking nothing.
-                            if bytes + sz > cap {
+                            if cfg.frag {
+                                // Store-and-forward fragmentation: an object
+                                // too large for one window resumes in the next.
+                                let key = (li, dst as u32, oi as u32);
+                                let done = *partial.get(&key).unwrap_or(&0);
+                                let take = (sz - done).min(pay_cap - bytes);
+                                bytes += take;
+                                if done + take == sz {
+                                    partial.remove(&key);
+                                    scratch.push(oi as u32);
+                                } else {
+                                    partial.insert(key, done + take);
+                                    break 'words;
+                                }
+                            } else if bytes + sz > pay_cap {
+                                // SIM-0 abandons the whole transfer here, which
+                                // wedges the link on its oldest oversized
+                                // object forever. `hol_fix` skips instead.
+                                if cfg.hol_fix {
+                                    continue;
+                                }
                                 break 'words;
+                            } else {
+                                bytes += sz;
+                                scratch.push(oi as u32);
                             }
-                            bytes += sz;
-                            scratch.push(oi as u32);
                         }
                     }
+                    payload_bytes[ki] += bytes;
                     if !scratch.is_empty() {
                         let dt = lat + bytes as f64 / bw.max(1.0);
                         push(
@@ -446,6 +578,122 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
     let lora_eligible =
         if measured == 0 { 0.0 } else { (measured - lora_gated) as f64 / measured as f64 };
 
+    // ---- SIM-1: holdings leak and the origin attack ------------------------
+    //
+    // RFC 0 §7.4 defers to SIM-1 the coverage threshold below which
+    // differential holdings analysis becomes practical. The SIM-0 audit
+    // showed the threshold is the wrong question: holding probability is a
+    // steep function of object *age*, and age is readable from the cleartext
+    // `expiry` field that blocking item B2 freezes permanently.
+    //
+    // So the quantity measured here is not a threshold but a leak: how much
+    // does an adversary holding k vantage points sharpen its posterior over a
+    // message's injection point, given only what it holds and each object's
+    // age? No arrival timestamps, no decryption.
+    let mut hold_by_dist: Vec<Vec<f64>> = Vec::new();
+    let mut adv_rank_p50 = f64::NAN;
+    let mut adv_top10 = f64::NAN;
+    let mut adv_scored = 0usize;
+    if cfg.adversary > 0 && hi > lo {
+        // Placement draws from its own stream, after the main loop, so an
+        // adversary can never perturb the simulation it is observing.
+        let mut arng = Rng::new(seed ^ 0x00AD_0E12_5A17_9C3B);
+        let vantage: Vec<usize> = match cfg.adv_place {
+            AdvPlacement::HighDegree => {
+                let mut idx: Vec<usize> = (0..cfg.n).collect();
+                idx.sort_by_key(|&u| (core::cmp::Reverse(g.adj[u].len()), u));
+                idx.truncate(cfg.adversary);
+                idx
+            }
+            AdvPlacement::Random => {
+                let mut idx: Vec<usize> = (0..cfg.n).collect();
+                for i in 0..cfg.adversary.min(cfg.n) {
+                    let j = i + arng.below((cfg.n - i) as u64) as usize;
+                    idx.swap(i, j);
+                }
+                idx.truncate(cfg.adversary);
+                idx
+            }
+        };
+        let dists: Vec<Vec<u16>> = vantage.iter().map(|&v| bfs(&g, v, cfg.n)).collect();
+        let maxd = dists.iter().flatten().copied().filter(|&d| d != u16::MAX).max().unwrap_or(0)
+            as usize;
+
+        // Train the leak table on even-indexed objects and attack the odd ones,
+        // so the attack is never scored against the data that calibrated it.
+        let mut hit = vec![vec![0u64; maxd + 1]; NB];
+        let mut tot = vec![vec![0u64; maxd + 1]; NB];
+        for oi in (lo..hi).step_by(2) {
+            let age = cfg.horizon.saturating_sub(created[oi]);
+            let b = (((age as f64 / cfg.ttl as f64) * NB as f64) as usize).min(NB - 1);
+            let origin = objs[oi].origin as usize;
+            for (vi, &v) in vantage.iter().enumerate() {
+                let d = dists[vi][origin];
+                if d == u16::MAX {
+                    continue;
+                }
+                tot[b][d as usize] += 1;
+                if store[v].get(oi) {
+                    hit[b][d as usize] += 1;
+                }
+            }
+        }
+        // Laplace-smoothed, so an unobserved (bucket, distance) cell cannot
+        // hand the attack an infinite log-likelihood.
+        let rate = |b: usize, d: usize| -> f64 {
+            (hit[b][d] as f64 + 0.5) / (tot[b][d] as f64 + 1.0)
+        };
+        hold_by_dist = (0..NB)
+            .map(|b| (0..=maxd).map(|d| if tot[b][d] == 0 { f64::NAN } else { rate(b, d) }).collect())
+            .collect();
+
+        let mut ranks: Vec<f64> = Vec::new();
+        let mut top10 = 0usize;
+        for oi in (lo + 1..hi).step_by(2) {
+            let age = cfg.horizon.saturating_sub(created[oi]);
+            let b = (((age as f64 / cfg.ttl as f64) * NB as f64) as usize).min(NB - 1);
+            let obs: Vec<bool> = vantage.iter().map(|&v| store[v].get(oi)).collect();
+            // An adversary that holds none of an object learns nothing useful
+            // about it beyond "not near us"; score only what it can act on.
+            if !obs.iter().any(|&x| x) {
+                continue;
+            }
+            let mut best = 0usize;
+            let mut ll: Vec<f64> = Vec::with_capacity(cfg.n);
+            for c in 0..cfg.n {
+                let mut s = 0.0f64;
+                for (vi, &o) in obs.iter().enumerate() {
+                    let d = dists[vi][c];
+                    if d == u16::MAX {
+                        continue;
+                    }
+                    let p = rate(b, d as usize);
+                    s += if o { p.ln() } else { (1.0 - p).ln() };
+                }
+                ll.push(s);
+                if s > ll[best] {
+                    best = c;
+                }
+            }
+            let truth = ll[objs[oi].origin as usize];
+            // Mid-rank, because ties are the common case rather than an edge
+            // case: where the leak is weak, most candidates share a likelihood
+            // and counting only strict betters would report a confident
+            // identification that the adversary cannot actually make.
+            let better = ll.iter().filter(|&&s| s > truth).count();
+            let tied = ll.iter().filter(|&&s| s == truth).count().saturating_sub(1);
+            let rank = better as f64 + tied as f64 / 2.0;
+            ranks.push(rank / cfg.n as f64);
+            if rank < 10.0 {
+                top10 += 1;
+            }
+            adv_scored += 1;
+        }
+        ranks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        adv_rank_p50 = pct(&ranks, 0.50);
+        adv_top10 = if adv_scored == 0 { f64::NAN } else { top10 as f64 / adv_scored as f64 };
+    }
+
     let mut smb: Vec<f64> = peak_bytes.iter().map(|&b| b as f64 / 1e6).collect();
     smb.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let days = cfg.horizon as f64 / DAY as f64;
@@ -472,5 +720,13 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
         store_mb_mean: smb.iter().sum::<f64>() / smb.len().max(1) as f64,
         rx_mb_day_mean: rmb.iter().sum::<f64>() / rmb.len().max(1) as f64,
         lora_eligible,
+        ctrl_bytes,
+        payload_bytes,
+        syncs,
+        starved,
+        hold_by_dist,
+        adv_rank_p50,
+        adv_top10,
+        adv_scored,
     })
 }

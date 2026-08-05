@@ -91,6 +91,66 @@ pub struct Object {
     pub dest: u32,
 }
 
+/// Reconciliation strategy (SIM-1, RFC 5).
+///
+/// The tension this exists to measure: `Full` costs bytes proportional to the
+/// corpus but exactly one round trip; `Rbsr` costs bytes proportional to the
+/// *difference* but several round trips. On LoRa, bytes are the scarce
+/// resource. On a courier link a round trip is three days each way, so the
+/// ranking inverts. RFC 5 must pick per `LinkProfile`, and this is the
+/// measurement that tells it where the crossover sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncMode {
+    /// Full manifest, one round trip. Every identifier in the live window.
+    Full,
+    /// Range-based set reconciliation over `(expiry, id)` with additive
+    /// fingerprints. Descends a `b`-ary tree, so `ceil(log_b m)` round trips.
+    Rbsr,
+}
+
+impl SyncMode {
+    pub fn parse(s: &str) -> Option<SyncMode> {
+        match s {
+            "full" => Some(SyncMode::Full),
+            "rbsr" => Some(SyncMode::Rbsr),
+            _ => None,
+        }
+    }
+    pub fn name(&self) -> &'static str {
+        match self {
+            SyncMode::Full => "full",
+            SyncMode::Rbsr => "rbsr",
+        }
+    }
+}
+
+/// Where an adversary's vantage points sit in the peer graph (SIM-1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdvPlacement {
+    /// Uniformly at random. The realistic case: peering is a human act, so an
+    /// adversary takes the relationships it can get.
+    Random,
+    /// The highest-degree nodes. The strong case: an adversary who can choose,
+    /// and who understands that hubs see more.
+    HighDegree,
+}
+
+impl AdvPlacement {
+    pub fn parse(s: &str) -> Option<AdvPlacement> {
+        match s {
+            "random" => Some(AdvPlacement::Random),
+            "hub" | "high-degree" => Some(AdvPlacement::HighDegree),
+            _ => None,
+        }
+    }
+    pub fn name(&self) -> &'static str {
+        match self {
+            AdvPlacement::Random => "random",
+            AdvPlacement::HighDegree => "hub",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DestModel {
     /// Recipient uniform over the whole network. Pessimistic: real traffic
@@ -128,6 +188,38 @@ pub struct Config {
 
     pub seeds: u64,
     pub quiet: bool,
+
+    // ---- SIM-1 ------------------------------------------------------------
+    // All default to the SIM-0 behaviour, so the published SIM-0 figures
+    // reproduce byte-identically with no flags. `--sim1` turns on the model
+    // fidelity items together; the measurement knobs stay independent.
+    /// Charge reconciliation overhead against link capacity. SIM-0 treated
+    /// manifest exchange as free, which SIM-0 §9 names its most significant
+    /// omission.
+    pub manifest: bool,
+    /// Bytes per object identifier in a manifest. Blocking item B3: 32 B full
+    /// versus 16 B truncated within ranges. Drives manifest size directly.
+    pub id_len: u64,
+    /// Reconciliation strategy.
+    pub sync_mode: SyncMode,
+    /// Branching factor of the RBSR fingerprint tree.
+    pub rbsr_b: u64,
+    /// Split objects larger than a link's gate instead of dropping them.
+    pub frag: bool,
+    /// Skip an object that does not fit the remaining capacity instead of
+    /// abandoning the whole transfer.
+    ///
+    /// SIM-0 abandons (`break`), which wedges a link permanently on its oldest
+    /// oversized object. Off by default only because turning it on changes the
+    /// published SIM-0 figures; RFC 5 MUST specify skip-and-continue.
+    pub hol_fix: bool,
+    /// Per-node storage cap in MB. `0` means unlimited, which is SIM-0's
+    /// assumption. Under a cap, eviction is oldest-first and uniform (I-6).
+    pub store_cap_mb: u64,
+    /// Number of adversary vantage points. `0` disables the holdings analysis.
+    pub adversary: usize,
+    /// How those vantage points are placed.
+    pub adv_place: AdvPlacement,
 }
 
 impl Default for Config {
@@ -149,6 +241,48 @@ impl Default for Config {
             mean_session_up: (12 * HOUR) as f64,
             seeds: 5,
             quiet: false,
+
+            manifest: false,
+            id_len: 32,
+            sync_mode: SyncMode::Full,
+            rbsr_b: 16,
+            frag: false,
+            hol_fix: false,
+            store_cap_mb: 0,
+            adversary: 0,
+            adv_place: AdvPlacement::Random,
+        }
+    }
+}
+
+/// Cost of one reconciliation's control traffic, in bytes and round trips.
+///
+/// `mine` and `theirs` are the two sides' object counts within the filter;
+/// `diff` is the size of the symmetric difference.
+pub fn recon_cost(cfg: &Config, mine: u64, theirs: u64, diff: u64) -> (u64, u64) {
+    if !cfg.manifest {
+        return (0, 1);
+    }
+    match cfg.sync_mode {
+        // Each side names everything it holds. One round trip.
+        SyncMode::Full => ((mine + theirs) * cfg.id_len, 1),
+        SyncMode::Rbsr => {
+            // Descend a b-ary tree over (expiry, id). Each round exchanges a
+            // fingerprint and a count per live range; ranges that agree are
+            // pruned, so the descent is bounded by the difference. Identifiers
+            // are only sent for ranges that actually differ.
+            let m = mine.max(theirs).max(1);
+            let b = cfg.rbsr_b.max(2);
+            let mut depth = 0u64;
+            let mut span = m;
+            while span > 1 && depth < 32 {
+                span = span.div_ceil(b);
+                depth += 1;
+            }
+            let depth = depth.max(1);
+            // 32 B fingerprint + 4 B count per range probed, both directions.
+            let ranges = b * depth.min(diff.max(1));
+            (2 * ranges * 36 + diff * cfg.id_len, depth)
         }
     }
 }

@@ -21,6 +21,8 @@ struct Args {
     json: Option<String>,
     sweep: Option<String>,
     diag: bool,
+    recon: bool,
+    adv: bool,
 }
 
 fn usage() -> ! {
@@ -67,16 +69,69 @@ fn parse() -> Args {
     let mut json = None;
     let mut sweep = None;
     let mut diag = false;
+    let mut recon = false;
+    let mut adv = false;
     let a: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
-    let need = |i: usize, a: &Vec<String>| -> String {
+    // Bare flags are matched before any value is read. Reading first (as this
+    // did) makes a trailing `--quiet` fail with usage text.
+    while i < a.len() {
+        match a[i].as_str() {
+            "--quiet" => {
+                cfg.quiet = true;
+                i += 1;
+                continue;
+            }
+            "--diag" => {
+                diag = true;
+                i += 1;
+                continue;
+            }
+            "--recon" => {
+                recon = true;
+                cfg.manifest = true;
+                i += 1;
+                continue;
+            }
+            "--adv" => {
+                adv = true;
+                if cfg.adversary == 0 {
+                    cfg.adversary = 5;
+                }
+                i += 1;
+                continue;
+            }
+            "--manifest" => {
+                cfg.manifest = true;
+                i += 1;
+                continue;
+            }
+            "--frag" => {
+                cfg.frag = true;
+                i += 1;
+                continue;
+            }
+            "--hol-fix" => {
+                cfg.hol_fix = true;
+                i += 1;
+                continue;
+            }
+            // SIM-1 model fidelity as a set: charge reconciliation overhead,
+            // fragment oversized objects, and stop wedging a link on one.
+            "--sim1" => {
+                cfg.manifest = true;
+                cfg.frag = true;
+                cfg.hol_fix = true;
+                i += 1;
+                continue;
+            }
+            "-h" | "--help" => usage(),
+            _ => {}
+        }
         if i + 1 >= a.len() {
             usage();
         }
-        a[i + 1].clone()
-    };
-    while i < a.len() {
-        let v = need(i, &a);
+        let v = a[i + 1].clone();
         match a[i].as_str() {
             "--topo" => cfg.topo = Topology::parse(&v).unwrap_or_else(|| usage()),
             "--n" => cfg.n = v.parse().unwrap_or_else(|_| usage()),
@@ -103,22 +158,17 @@ fn parse() -> Args {
             "--seeds" => cfg.seeds = v.parse().unwrap_or_else(|_| usage()),
             "--sweep" => sweep = Some(v),
             "--json" => json = Some(v),
-            "--quiet" => {
-                cfg.quiet = true;
-                i += 1;
-                continue;
-            }
-            "--diag" => {
-                diag = true;
-                i += 1;
-                continue;
-            }
-            "-h" | "--help" => usage(),
+            "--id-len" => cfg.id_len = v.parse().unwrap_or_else(|_| usage()),
+            "--sync" => cfg.sync_mode = SyncMode::parse(&v).unwrap_or_else(|| usage()),
+            "--rbsr-b" => cfg.rbsr_b = v.parse().unwrap_or_else(|_| usage()),
+            "--cap" => cfg.store_cap_mb = v.parse().unwrap_or_else(|_| usage()),
+            "--adversary" => cfg.adversary = v.parse().unwrap_or_else(|_| usage()),
+            "--adv-place" => cfg.adv_place = AdvPlacement::parse(&v).unwrap_or_else(|| usage()),
             _ => usage(),
         }
         i += 2;
     }
-    Args { cfg, json, sweep, diag }
+    Args { cfg, json, sweep, diag, recon, adv }
 }
 
 #[derive(Clone)]
@@ -142,6 +192,14 @@ struct Agg {
     store_mean: f64,
     rx_mean: f64,
     lora_eligible: f64,
+    ctrl_bytes: [f64; 3],
+    payload_bytes: [f64; 3],
+    syncs: [f64; 3],
+    starved: [f64; 3],
+    hold_by_dist: Vec<Vec<f64>>,
+    adv_rank_p50: f64,
+    adv_top10: f64,
+    adv_scored: f64,
 }
 
 fn aggregate(label: &str, cfg: &Config) -> Agg {
@@ -191,7 +249,108 @@ fn aggregate(label: &str, cfg: &Config) -> Agg {
         store_mean: mean(&|r| r.store_mb_mean),
         rx_mean: mean(&|r| r.rx_mb_day_mean),
         lora_eligible: mean(&|r| r.lora_eligible),
+        ctrl_bytes: [0, 1, 2].map(|k| mean(&|r| r.ctrl_bytes[k] as f64)),
+        payload_bytes: [0, 1, 2].map(|k| mean(&|r| r.payload_bytes[k] as f64)),
+        syncs: [0, 1, 2].map(|k| mean(&|r| r.syncs[k] as f64)),
+        starved: [0, 1, 2].map(|k| mean(&|r| r.starved[k] as f64)),
+        hold_by_dist: {
+            // Elementwise mean across seeds, skipping cells no seed observed.
+            let nb = results.iter().map(|r| r.hold_by_dist.len()).max().unwrap_or(0);
+            let nd = results.iter().flat_map(|r| r.hold_by_dist.iter()).map(|r| r.len()).max();
+            match nd {
+                None => Vec::new(),
+                Some(nd) => (0..nb)
+                    .map(|b| {
+                        (0..nd)
+                            .map(|d| {
+                                let v: Vec<f64> = results
+                                    .iter()
+                                    .filter_map(|r| r.hold_by_dist.get(b).and_then(|x| x.get(d)))
+                                    .copied()
+                                    .filter(|x| !x.is_nan())
+                                    .collect();
+                                if v.is_empty() {
+                                    f64::NAN
+                                } else {
+                                    v.iter().sum::<f64>() / v.len() as f64
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            }
+        },
+        adv_rank_p50: mean(&|r| r.adv_rank_p50),
+        adv_top10: mean(&|r| r.adv_top10),
+        adv_scored: mean(&|r| r.adv_scored as f64),
     }
+}
+
+/// Reconciliation overhead view (SIM-1 priority 1, blocking item B3).
+fn recon_header() -> String {
+    format!(
+        "{:<22} {:>9} {:>10} {:>10} {:>9} {:>10} {:>10} {:>9}",
+        "case", "lora ctl%", "lora ctlKB", "lora payKB", "lora strv", "cour ctl%", "tcp ctl%",
+        "cour strv"
+    )
+}
+
+fn recon_row(a: &Agg) -> String {
+    let share = |k: usize| -> f64 {
+        let t = a.ctrl_bytes[k] + a.payload_bytes[k];
+        if t <= 0.0 {
+            f64::NAN
+        } else {
+            100.0 * a.ctrl_bytes[k] / t
+        }
+    };
+    let strv = |k: usize| -> f64 {
+        if a.syncs[k] <= 0.0 {
+            f64::NAN
+        } else {
+            100.0 * a.starved[k] / a.syncs[k]
+        }
+    };
+    let per = |v: f64, k: usize| -> f64 {
+        if a.syncs[k] <= 0.0 {
+            f64::NAN
+        } else {
+            v / a.syncs[k] / 1000.0
+        }
+    };
+    format!(
+        "{:<22} {:>8.1}% {:>10.1} {:>10.1} {:>8.1}% {:>9.1}% {:>9.2}% {:>8.1}%",
+        a.label,
+        share(1),
+        per(a.ctrl_bytes[1], 1),
+        per(a.payload_bytes[1], 1),
+        strv(1),
+        share(2),
+        share(0),
+        strv(2)
+    )
+}
+
+/// Holdings-leak view (SIM-1 priority 2, blocking item B2).
+fn adv_rows(a: &Agg, n: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(format!(
+        "{:<22} origin rank p50 {:>6.1}%  (chance 50.0%)   top-10 {:>6.2}%  (chance {:.2}%)  \
+         scored {:.0}",
+        a.label,
+        a.adv_rank_p50 * 100.0,
+        a.adv_top10 * 100.0,
+        1000.0 / n as f64,
+        a.adv_scored
+    ));
+    for (b, row) in a.hold_by_dist.iter().enumerate() {
+        let cells: Vec<String> = row
+            .iter()
+            .map(|&p| if p.is_nan() { "   -".into() } else { format!("{:>3.0}%", p * 100.0) })
+            .collect();
+        out.push(format!("  age bucket {}  P(hold | hops): {}", b, cells.join(" ")));
+    }
+    out
 }
 
 /// Audit view: separates the quantities the standard table conflates.
@@ -311,6 +470,82 @@ fn sweep_cases(name: &str, base: &Config) -> Vec<(String, Config)> {
                 out.push((n.to_string(), c));
             }
         }
+        // ---- SIM-1 ---------------------------------------------------------
+        // Blocking item B3's identifier-length row, measured rather than
+        // argued. Manifest cost is linear in id_len under Full and linear in
+        // the difference under RBSR, so the two react very differently.
+        "idlen" => {
+            for (mode, len) in [
+                (SyncMode::Full, 32u64),
+                (SyncMode::Full, 16),
+                (SyncMode::Full, 8),
+                (SyncMode::Rbsr, 32),
+                (SyncMode::Rbsr, 16),
+                (SyncMode::Rbsr, 8),
+            ] {
+                let mut c = base.clone();
+                c.manifest = true;
+                c.sync_mode = mode;
+                c.id_len = len;
+                out.push((format!("{} id={}B", mode.name(), len), c));
+            }
+        }
+        // Does charging reconciliation overhead change the SIM-0 conclusions?
+        "recon" => {
+            for (t, l, k, n) in [
+                (1.00, 0.00, 0.00, "all-tcp"),
+                (0.70, 0.15, 0.15, "mixed"),
+                (0.50, 0.20, 0.30, "courier-heavy"),
+                (0.20, 0.30, 0.50, "austere"),
+            ] {
+                for (mode, tag) in [(SyncMode::Full, "full"), (SyncMode::Rbsr, "rbsr")] {
+                    let mut c = base.clone();
+                    c.mix_tcp = t;
+                    c.mix_lora = l;
+                    c.mix_courier = k;
+                    c.manifest = true;
+                    c.sync_mode = mode;
+                    out.push((format!("{} {}", n, tag), c));
+                }
+            }
+        }
+        // How much does an adversary's posterior over the injection point
+        // sharpen with vantage count? RFC 0 §7.4's deferred question.
+        "adversary" => {
+            for k in [1usize, 3, 5, 10, 25, 50] {
+                let mut c = base.clone();
+                c.adversary = k;
+                out.push((format!("vantage={}", k), c));
+            }
+        }
+        // The same, under the transport regimes that produce different
+        // coverage ramps. This is where the age gradient should bite hardest.
+        "adversary-mix" => {
+            for (t, l, k, n) in [
+                (1.00, 0.00, 0.00, "all-tcp"),
+                (0.70, 0.15, 0.15, "mixed"),
+                (0.20, 0.30, 0.50, "austere"),
+            ] {
+                let mut c = base.clone();
+                c.mix_tcp = t;
+                c.mix_lora = l;
+                c.mix_courier = k;
+                c.adversary = 5;
+                out.push((n.to_string(), c));
+            }
+        }
+        // Capacity-pressure eviction, which SIM-0 §9 notes will reduce
+        // coverage further and which interacts directly with I-6.
+        "cap" => {
+            for mb in [0u64, 100, 200, 300, 450] {
+                let mut c = base.clone();
+                c.store_cap_mb = mb;
+                out.push((
+                    if mb == 0 { "cap=none".into() } else { format!("cap={}MB", mb) },
+                    c,
+                ));
+            }
+        }
         _ => usage(),
     }
     out
@@ -412,6 +647,30 @@ fn main() {
         for a in &aggs {
             println!("{}", age_row(a));
         }
+    }
+
+    if args.recon && !cfg.quiet {
+        println!("\n{}", recon_header());
+        println!("{}", "-".repeat(recon_header().len()));
+        for a in &aggs {
+            println!("{}", recon_row(a));
+        }
+        println!("\nctl% is control traffic as a share of all bytes on that link kind.");
+        println!("strv is the share of reconciliations where control traffic consumed the");
+        println!("whole window, so no payload moved at all.");
+    }
+
+    if args.adv && !cfg.quiet {
+        println!();
+        for a in &aggs {
+            for line in adv_rows(a, cfg.n) {
+                println!("{}", line);
+            }
+            println!();
+        }
+        println!("A flat P(hold | hops) row means holdings leak nothing about the origin.");
+        println!("Rank p50 is the true origin's percentile under a maximum-likelihood attack");
+        println!("calibrated on a disjoint half of the corpus; 50% is chance.");
     }
 
     if let Some(p) = args.json {
