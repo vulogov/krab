@@ -204,33 +204,34 @@ idea in the series. All five of RFC 6's tables reproduce in `krab-sizes`.
 
 | document | what it is |
 |---|---|
-| [`RFC-2-blocking-items.md`](RFC-2-blocking-items.md) | whether RFC 2 should exist, and what would be in it |
+| [`RFC-2.md`](RFC-2.md) | addressing and tag derivation, Status: Draft |
+| [`RFC-2-review.md`](RFC-2-review.md) | cross-check against RFC 0/1/3/6/7, SIM-0 and `krab-sizes` |
+| [`RFC-2-blocking-items.md`](RFC-2-blocking-items.md) | the gate document; asked whether RFC 2 should exist |
 | [`rfc-2-runs/inbox-leak.txt`](rfc-2-runs/inbox-leak.txt) | why rotating a published contact key does not close the counting leak |
 
-RFC 2 is the odd document in the series: **RFC 1 absorbed five of its seven
-original items** — pairwise and inbox tag derivation, shard extraction, the
-epoch window, prekey selection — leaving only address canonicalisation and the
-namespace-separation invariant. RFC 6 has already dropped its RFC 2 dependency.
-RFC 0 §10's roadmap still lists RFC 2 as freezing a tag scheme RFC 1 froze.
+RFC 1 had absorbed five of RFC 2's seven original items, so the gate document
+asked whether RFC 2 should exist at all. The Draft answers by repopulating it —
+and by carrying an erratum that corrects two documents already at Draft.
 
-What repopulates it are three findings from reviewing RFC 3, RFC 6 and RFC 7,
-none of which has an addressing home:
-
-- **A correction to this repository's own RFC 3 review.** It proposed a
-  rotating contact key to close the inbox-tag counting leak. That does not
-  work: rollcall entries are bulletins, so an archival relay — the adversary
-  RFC 0 §7.6 says exists — holds every contact key ever published and counts
-  everything regardless. The property is **structural**: an inbox tag must be
-  computable by any stranger and by nobody else, and those contradict. The
-  honest options are to state it as unmitigable and scope it to opt-in
-  rollcall participants, or to gate first contact on an introduction token.
-- **Per-class shard masks**, without which RFC 6 §3.4's channel-interest
-  bucketing cannot be expressed.
-- **The inbox decapsulation cap** RFC 7 §13.3 requires but does not size —
-  now derivable from RFC 7 §5.5's measured decapsulation costs.
-
-The recommendation is to *reduce* RFC 2 to those, not retire it, and to invert
-the plan's dependency: RFC 5 and RFC 6 would require RFC 2, not the reverse.
+- **§8.1's erratum is right, and it withdraws a finding of ours.** Prekey
+  batches are sized by *distinct correspondents*, not messages received:
+  deterministic indexing (RFC 7 §13) fixes one index per sender per batch, so a
+  sender's message volume is irrelevant. A 50-person group needs 256 keys, not
+  8 192. **The `MAX_OBJECT` ceiling does not exist**, and neither does RFC 6
+  §2.8's "MUST republish weekly" — nor this repository's claim that monthly
+  republication was structurally impossible.
+- **§5 contradicts RFC 1, which is frozen.** RFC 2 sets `W` to ±30 by default
+  and permits ±14; RFC 1 §6.2 requires `W ≥ MAX_TTL / EPOCH` = **±45** and
+  forbids narrowing. §5's table has no `MAX_TTL` column, which is how it
+  happened — the **fourth** occurrence of anchoring a retention parameter to a
+  measured percentile instead of the declared guarantee.
+- **The tag table is key material and is missing from RFC 7's footprint.**
+  RFC 2 §9 says so explicitly; at 50 correspondents and RFC 1's mandatory ±45
+  it is 54.6 KB against the 82.7 KB RFC 7 §2.1 counted, so RFC 7 §9's "under
+  100 KB" `mlock` justification fails.
+- **§5.1 closes a real gap** — it grounds the ±6 h clock skew that RFC 1's
+  review flagged as the one parameter with no basis, using the corpus itself
+  as a clock.
 
 ## Not yet here
 

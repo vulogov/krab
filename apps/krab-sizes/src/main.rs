@@ -13,6 +13,7 @@ mod creds;
 mod groups;
 mod keys;
 mod object;
+mod tags;
 
 use object::*;
 
