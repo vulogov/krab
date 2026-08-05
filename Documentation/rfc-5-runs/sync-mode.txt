@@ -1,0 +1,65 @@
+Live corpus at n=500: 14,000 objects
+
+1. Full manifest against the per-sync window
+
+   a full manifest is 2 x m x 16 B (both sides name what they hold)
+
+   link                 window     manifest    fits?     max m
+   tcp over Tor   1,073,741,824      448,000      yes 33,554,432
+   LoRa SF10            18,000      448,000       NO       562
+   courier        68,719,476,736      448,000      yes 2,147,483,648
+
+   A LoRa link needs shard k >= 5 for a full manifest to fit at n=500.
+   RFC 2 §6: k=5 leaves a 3.12% anonymity set.
+
+2. RBSR against the round-trip budget
+
+   descent depth at b=16, m=14,000: 4 rounds
+
+   link                  RTT   {d} rounds     vs TTL    verdict
+   tcp over Tor           6s          24s      0.0%         ok
+   LoRa SF10             20s          80s      0.0%         ok
+   courier          518,400s        24.0d    171.4%         NO
+
+   RBSR control cost: 2 x 16 x 4 x 36 = 4,608 B + 16 B per difference
+   against a full manifest's 448,000 B -- 97x cheaper
+
+   => the decision procedure, from the two tables above:
+
+        full manifest feasible  iff  2*m*16 <= per-sync window
+        RBSR feasible           iff  depth * 2 * latency << TTL
+        LoRa: manifest infeasible, RBSR feasible  -> RBSR
+        courier: manifest feasible, RBSR infeasible -> manifest
+        TCP: both feasible -> RBSR, on bytes
+
+3. Why Bloom filters fail asymmetrically
+
+   A false positive means the sender believes the receiver already
+   holds an object, so it is never offered -- silent loss, not delay.
+
+     peers         p=1%       p=0.1%
+         1     1.00e-02     1.00e-03
+         2     1.00e-04     1.00e-06
+         4     1.00e-08     1.00e-12
+         8     1.00e-16     1.00e-24
+        12     1.00e-24     1.00e-36
+
+   P(object never delivered) = p^peers, so the loss concentrates
+   entirely on low-degree nodes -- which SIM-0 §5 already identifies
+   as the population where delivery is worst. A leaf node loses 1% of
+   its mail permanently at p=1%.
+
+4. Effective retention under capacity pressure
+
+   ingress 31.0 MB/day at n=500
+
+     cap MB   days held   promise 30d?
+        100         3.2         BROKEN
+        200         6.5         BROKEN
+        300         9.7         BROKEN
+        450        14.5         BROKEN
+       1000        32.3           kept
+
+   effective_retention = min(promised, cap / daily_ingress)
+   A node promising 30 days on a 100 MB cap actually holds 3.2, and
+   SIM-1 §4 measured the resulting re-fetch loop at +68% ingress.

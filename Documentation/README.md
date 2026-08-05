@@ -263,6 +263,38 @@ in `krab-sizes`.
 - **The cap's coverage cost is unstated.** At bucket 1 024 a LoRa peer can
   receive **4.8%** of realistic text traffic; at 4 096 it would be 45.7%.
 
+## RFC 5
+
+| document | what it is |
+|---|---|
+| [`RFC-5-blocking-items.md`](RFC-5-blocking-items.md) | the gate on RFC 5 reaching Draft: synchronisation |
+| [`rfc-5-runs/sync-mode.py`](rfc-5-runs/sync-mode.py) | the `sync_mode` decision procedure, Bloom rejection, retention sizing |
+
+RFC 5 is the last document and carries the most inherited requirements — six
+others have deferred something to it. Its central decision was measured before
+it was written.
+
+- **`sync_mode` is decidable, not configurable.** Two feasibility tests: a full
+  manifest must fit the per-sync window, and RBSR's descent must fit the
+  round-trip budget. A LoRa link can name **562 objects** per window against a
+  14 000-object corpus; a courier RBSR descent takes **24 days** against a
+  14-day TTL. Four cases fall out, including "this link cannot reconcile" —
+  worth specifying, since a narrow *and* slow link has no working strategy and
+  the client should say so at configuration time.
+- **Bloom filters fail on exactly the wrong nodes.** `P(never delivered) =
+  p^peers`, so at p=1% a one-peer leaf loses 1% of its mail permanently while a
+  degree-12 node loses nothing measurable — and SIM-0 §5 already identifies
+  low-degree nodes as the worst-served population.
+- **A node needs ~1 GB to honour a 30-day retention promise at n=500.**
+  `effective_retention = min(promised, cap / daily_ingress)`; at 450 MB a node
+  promising 30 days actually holds 14.5, and SIM-1 §4 measured the resulting
+  re-fetch loop at +68% ingress.
+
+With RFC 5 the series is complete in outline. What remains is global: **RFC 0
+has accumulated eleven corrections**, SIM-2 has four items, and one rule would
+have prevented four separate findings — *acceptance and retention parameters
+MUST be functions of the declared guarantee, never of a measured percentile.*
+
 ## Not yet here
 
 RFC 0 and the RFC series plan are not in this directory.
