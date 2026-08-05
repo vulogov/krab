@@ -1,39 +1,67 @@
 # RFC 1 — Review
 
     Subject:  RFC 1, Object Format and Cryptography, Status: Draft
-    Method:   cross-check against SIM-0, SIM-0-audit, SIM-1, and krab-sizes output
-    Verdict:  one blocking defect, one stale claim, three specification gaps
+    Method:   cross-check against SIM-0, SIM-0-audit, SIM-1, and apps/krab-sizes
+    Verdict:  one blocking defect (FIXED), one stale claim, three gaps
 
 RFC 1 cannot be revised once objects exist. Everything below is therefore
-worth resolving before Draft becomes Final, and item 1 is worth resolving
-before anything ships at all.
+worth resolving before Draft becomes Final.
 
 ## Byte counts verify
 
-Every figure in RFC 1 was checked against the `krab-sizes` output:
+`apps/krab-sizes` derives the size model independently from RFC 1 §4.2, §6
+and §7 — CBOR head widths from the §4.3 deterministic profile, field by field
+— and then checks it against what RFC 1 publishes:
 
-- floor 150 B → 256 B bucket ✓
-- all six bucket rows: 90/856/3 928/16 216/65 368/261 972 and 64.8/16.4/4.1/1.0/0.3/0.1 % ✓
-- PQ floor 1 239 B → 4 096 B, 280-byte message 1 537 B → 4 096 B ✓
-- LoRa airtimes: 6/21/81 frames, 301/1 205/4 819 s ✓
-- manifest at 12 B ids: 0.2 / 1.6 / 8.0 MB ✓
-- §7.2's 90 → 124 B (32 B key + 2 B CBOR) ✓
+```
+$ krab-sizes --check
+54 figures verified, 0 mismatched
+RFC 1's published byte counts are reproduced exactly.
+```
+
+That covers the 16-byte header, the 48-byte empty envelope, all seven rows of
+the realistic-message table (plaintext, ciphertext, on-wire and bucket), all
+six bucket capacities and overheads, the hybrid 280-byte case, the three LoRa
+frame counts, and all twelve manifest cells. The same figures are pinned as
+unit tests, so a later edit to either the model or the RFC breaks the build.
 
 The arithmetic is sound. The findings below are about consistency, not
 computation.
 
+### One number RFC 1 does not fully specify
+
+`krab-sizes` computes a **135-byte** minimum sealed object where RFC 1 §8.1
+cites 150, and **1 224** where §6.5 cites 1 239. The delta is 15 bytes in both
+cases, which localises it exactly: RFC 1's floor assumes 17 bytes of encoded
+address and content type, while a strictly minimal object has both empty.
+
+RFC 1 never states the floor's field composition. Since §8.1 uses the floor to
+justify the 256-byte bucket ("inefficient by construction"), and §6.5 uses it
+for the post-quantum comparison, the composition should be stated. Both values
+land in the same bucket, so neither conclusion changes.
+
+Relatedly, §6.5's headline "**16× corpus inflation**" is the floor-to-floor
+ratio (256 → 4 096). The 280-byte message in the same table inflates 4×
+(1 024 → 4 096). Both are true; only one is labelled.
+
 ---
 
-## 1. Blocking — `EPOCH_WINDOW` is smaller than `MAX_TTL`
+## 1. Blocking — `EPOCH_WINDOW` was smaller than `MAX_TTL` — **FIXED**
+
+> **Resolved.** RFC 1 §2 and §6.2 now set `EPOCH_WINDOW` to ±45 unconditionally,
+> with the bound stated as `EPOCH_WINDOW ≥ MAX_TTL / EPOCH` and a note that a
+> deployment MAY widen it but MUST NOT narrow it. `krab-sizes` prints the
+> check. The original finding is kept below because the reasoning error — not
+> the number — is the part worth not repeating.
 
 `EPOCH` is 86 400 s and `MAX_TTL` is 45 days, so an object may legitimately
-arrive **45 epochs** after its creation. The default `EPOCH_WINDOW` is
+arrive **45 epochs** after its creation. The default `EPOCH_WINDOW` was
 ±30 epochs.
 
 ```
 MAX_TTL 45 d  ->  arrival up to 45 epochs after creation
-  EPOCH_WINDOW +/-30 (default)  ->  epochs 31..45 undecryptable  (15-epoch gap)
-  EPOCH_WINDOW +/-45 (courier)  ->  OK
+  EPOCH_WINDOW +/-30 (was default)  ->  epochs 31..45 undecryptable  (15-epoch gap)
+  EPOCH_WINDOW +/-45 (now)          ->  OK
 ```
 
 An object delivered inside the TTL the protocol itself declared valid, to a
@@ -173,11 +201,9 @@ resynchronised. The second is more robust and belongs in RFC 5.
   sealed/relayed, while §5.3 states cover traffic MUST use class 0 and class 2
   is reserved and unused. The reasoning in §5.3 is right; the table is what
   implementers will read. Mark the row reserved.
-- **`krab-sizes` is not in the repository.** Every byte count verifies against
-  the output, so the grounding is real — but a reader cannot reproduce it,
-  which is the exact gap the SIM-0 audit was written about. RFC 1's own header
-  says "Grounded by: krab-sizes". It should be committed alongside
-  `krab-sim`, as `apps/krab-sizes`.
+- ~~**`krab-sizes` is not in the repository.**~~ **Resolved** — it is now
+  `apps/krab-sizes`, with no dependencies external or internal, and
+  `--check` verifies RFC 1's published figures on demand.
 - **§13's tag-collision note.** "Adversarial collision is cheap (2³²)" — for
   an 8-byte (64-bit) tag the birthday bound is 2³², which is what is meant, but
   a *targeted* second-preimage on a specific tag is 2⁶⁴. Both matter and only

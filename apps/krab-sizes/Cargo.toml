@@ -1,0 +1,20 @@
+[package]
+name = "krab-sizes"
+description = "RFC 1 reference size encoder: computes every byte count the object format implies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# No dependencies, external or internal — the same rule krab-sim follows.
+#
+# RFC 1 cannot be revised, and every byte count in it is cited from this tool.
+# A reader checking those numbers must be able to rebuild and re-run it
+# offline, on any toolchain, with nothing to vendor-trust.
+#
+# It deliberately does NOT depend on krab-core. This computes what the RFC
+# *specifies*; krab-core implements it. Keeping them independent is what makes
+# a disagreement between them a finding rather than a tautology.
+[dependencies]

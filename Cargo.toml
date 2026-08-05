@@ -9,6 +9,7 @@ members = [
     "crates/krab",
     "apps/krab-tui",
     "apps/krab-sim",
+    "apps/krab-sizes",
 ]
 
 [workspace.package]

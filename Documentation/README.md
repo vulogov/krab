@@ -79,13 +79,19 @@ resolves both — see `SIM-1-results.md` §3 and §6.
 | [`RFC-1-blocking-items.md`](RFC-1-blocking-items.md) | the gate document that preceded the Draft; records which rows were settled on what evidence |
 
 RFC 1 freezes the object format permanently — it closes every open B3 row.
-All of its byte counts verify against `krab-sizes`. The review finds one
-blocking defect and four items worth resolving before Final:
+All 54 of its published byte counts are reproduced exactly by
+[`apps/krab-sizes`](../apps/krab-sizes), which derives the size model
+independently from §4.2/§6/§7 and gates on it:
 
-- **`EPOCH_WINDOW` (±30 epochs) is smaller than `MAX_TTL` (45 days).** An
-  object delivered inside its declared TTL can arrive up to 45 epochs after
-  creation, so 15 epochs' worth is undecryptable — silently. `EPOCH_WINDOW`
-  is not inside the identifier hash, so this one is still cheap to fix.
+    cargo run --release -p krab-sizes -- --check
+
+The review finds one blocking defect, now fixed, and four items worth
+resolving before Final:
+
+- ~~**`EPOCH_WINDOW` (±30 epochs) is smaller than `MAX_TTL` (45 days).**~~
+  **Fixed** — an object delivered inside its declared TTL could arrive up to
+  45 epochs after creation, leaving 15 epochs' worth silently undecryptable.
+  §2 and §6.2 now set ±45 with the bound stated as `MAX_TTL / EPOCH`.
 - **§9.3 defers to SIM-1, which is complete and disagrees.** Manifest exchange
   is survivable on LoRa only at a filter width that makes the link useless;
   at the width §8.3 itself assumes, a full manifest starves 98.3% of

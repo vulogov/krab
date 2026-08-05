@@ -65,7 +65,8 @@ crates/
 
 apps/
   krab-tui       the TUI application; builds the `krab` binary
-  krab-sim       SIM-0 convergence simulator; no dependencies at all
+  krab-sim       SIM-0/SIM-1 convergence simulator; no dependencies at all
+  krab-sizes     RFC 1 reference size encoder; likewise none
 ```
 
 ## Build
@@ -74,6 +75,7 @@ apps/
 
     ./target/release/krab                        # TUI (scaffold)
     ./target/release/krab-sim --diag --sweep mix # SIM-0
+    ./target/release/krab-sizes --check          # verify RFC 1's byte counts
 
 ## Documentation
 

@@ -41,7 +41,7 @@ interoperability boundary.
 | identifier | BLAKE3-256, 32 bytes | |
 | truncated identifier | 12 bytes (96 bits) | manifests only, §9.3 |
 | `EPOCH` | 86 400 s (1 day) | §6.2 |
-| `EPOCH_WINDOW` | ±30 epochs (default) | ±45 for courier-dominated |
+| `EPOCH_WINDOW` | ±45 epochs | = `MAX_TTL` / `EPOCH`; §6.2 |
 | `MAX_TTL` | 45 days | RFC 0 §8.2 requires ≥ 30 |
 | `MAX_OBJECT` | 262 144 bytes | |
 | size buckets | 256, 1K, 4K, 16K, 64K, 256K | §8 |
@@ -306,7 +306,7 @@ tag_e  = HKDF-Expand(S, "krab/tag/v1" ‖ u32(epoch), 8)
 
 Unlinkable across epochs and across senders. The recipient precomputes
 `correspondents × EPOCH_WINDOW` tags into a lookup table — for 50
-correspondents and a ±30 window, 3 050 entries.
+correspondents and a ±45 window, 4 550 entries.
 
 **Inbox tag:**
 ```
@@ -319,10 +319,33 @@ cost, accepted because first contact is inherently less private than
 established correspondence, and because hiding the tradeoff would be
 worse than stating it.
 
-`EPOCH` is 86 400 s. `EPOCH_WINDOW` must exceed maximum delivery latency:
-SIM-0 measured p99 of 382 hours (16 days) under austere transport, so ±30
-epochs is the default and ±45 is recommended for courier-dominated
-deployments.
+`EPOCH` is 86 400 s.
+
+**`EPOCH_WINDOW` MUST be at least `MAX_TTL / EPOCH`, and is therefore ±45.**
+
+The bound is `MAX_TTL`, not observed latency. An object may be delivered at
+any point inside the TTL this document declares valid, so it may arrive up to
+45 epochs after the epoch its tag was derived from. A recipient whose window
+is narrower simply never computed that tag: §11 accepts the object, the store
+keeps it, and it is undecryptable. Nothing surfaces this, because RFC 0 §6
+makes delivery failure silent by design.
+
+An earlier draft of this section derived the window from measured delivery
+latency — SIM-0's p99 of 382 hours (16 days) under austere transport — and set
+±30 with ±45 advised for courier-dominated deployments. That was wrong twice
+over. A p99 is not a bound; SIM-0's own 45-day-TTL austere run puts p99 at
+441.9 hours with a tail beyond it. And the deployments that need the widest
+window are precisely the ones whose nodes are offline for the periods it must
+cover, so making the correct value the non-default was the wrong way round.
+
+The cost of the correct value is negligible and is the reason there is no
+tradeoff to weigh: 50 correspondents at ±30 is 3 050 precomputed tags, at ±45
+it is 4 550. One-off HKDF work on a table that is already being built.
+
+`EPOCH_WINDOW` is the one row of §2 that is not inside the identifier hash, so
+unlike the rest of this document it constrains implementations rather than
+identity. A deployment MAY widen it. It MUST NOT narrow it below
+`MAX_TTL / EPOCH`.
 
 ### 6.3 Key selection carries no hint
 
