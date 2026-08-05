@@ -54,6 +54,13 @@ byte-values in the text range clear the gate, so:
 > **0.16% of objects were eligible to cross a LoRa edge**, in every sweep, at
 > every parameter setting.
 
+> **Later correction.** 0.16% describes the *simulator*, which gates on the raw
+> message body. RFC 1 gates the encoded, padded object, and SIM-0's smallest
+> text body of 500 B encodes to 668 B and pads to the 1024 bucket — so under
+> the real format **nothing SIM-0 generates would cross a 512 B gate at all**.
+> The simulator was optimistic about LoRa, and this section's conclusion holds
+> a fortiori. See `RFC-4-blocking-items.md` §1.1.
+
 The simulator already computes this as `RunResult::lora_gated_objects`. It is
 never read — `cargo build` emits `field is never read`, which is why five
 sweeps were published without anyone noticing.

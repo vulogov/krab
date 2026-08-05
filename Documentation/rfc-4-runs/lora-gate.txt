@@ -1,0 +1,46 @@
+1. SIM-0's traffic, encoded per RFC 1
+
+   SIM-0 draws text bodies uniform [500, 8000) and pictures
+   [50 000, 500 000). Encoded and padded, they land in:
+
+      bucket   share of text
+        1024            4.8%
+        4096           41.0%
+       16384           54.3%
+
+   smallest text object: 668 B -> bucket 1024
+   RFC 1 §8.1 floor:     165 B -> bucket 256 (body 0)
+   a 256-bucket object needs body <= 90 B; SIM-0 generates none.
+
+2. What crosses each candidate gate
+
+       gate   buckets admitted   share of SIM-0 text
+        256                256                  0.0%
+        512                256                  0.0%
+       1024           256,1024                  4.8%
+       4096      256,1024,4096                 45.7%
+      16384 256,1024,4096,16384                100.0%
+
+   At 512 B *zero* of SIM-0's traffic crosses -- not 0.16%. The audit
+   measured raw body size; the gate applies to the padded object, and
+   the smallest one SIM-0 produces is 667 B.
+
+3. Throughput per gate against the flood requirement
+
+   LoRa daily budget: 73,440 B/day
+
+      bucket   frames    airtime  objects/day
+         256        6       0.1h        286.9
+        1024       21       0.3h         71.7
+        4096       81       1.3h         17.9
+       16384      322       5.4h          4.5
+       65536     1286      21.4h          1.1
+
+   flood requirement at n=500: 1000 objects/day
+     gate   1024:   71.7 objects/day =  7.17% of flood
+     gate   4096:   17.9 objects/day =  1.79% of flood
+     gate  16384:    4.5 objects/day =  0.45% of flood
+
+   No gate makes LoRa a flooding transport. A 4096 B gate carries ~17
+   objects/day, which is useful only under a narrow shard and class
+   filter -- targeted traffic, not corpus replication.

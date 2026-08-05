@@ -233,6 +233,36 @@ and by carrying an erratum that corrects two documents already at Draft.
   review flagged as the one parameter with no basis, using the corpus itself
   as a clock.
 
+## RFC 4
+
+| document | what it is |
+|---|---|
+| [`RFC-4-blocking-items.md`](RFC-4-blocking-items.md) | the gate on RFC 4 reaching Draft: transport and link profiles |
+| [`rfc-4-runs/lora-gate.py`](rfc-4-runs/lora-gate.py) | settles LoRa's `max_object_size` from RFC 1's encoding |
+
+RFC 4 owns `LinkProfile`, and **four documents assume four different values
+for LoRa's object gate** — SIM-0's model 512 B, RFC 1 §8.3 ≥4 096 B, RFC 6
+§2.4 256 B, RFC 7 §5.4 512 B. Settling it is what the rest of the series has
+been waiting on.
+
+- **Recommendation: 4 096 B**, matching the only value a Draft document
+  already implied. It admits 45.7% of realistic traffic at 1.3 h per object.
+- **A correction to this repository's SIM-0 audit.** It reported LoRa carrying
+  0.16% of objects — true of the *simulator*, which gates on raw body size.
+  RFC 1 gates the padded object, and SIM-0's smallest text body encodes to
+  668 B, so under the real format **nothing crosses a 512 B gate at all**. The
+  simulator was optimistic; the audit's conclusion holds a fortiori.
+- **No gate makes LoRa a flooding transport.** At 4 096 B it carries 17.9
+  objects/day against a 1 000/day flood requirement at n=500 — 1.79%,
+  confirming SIM-1 §1's ~2% from a different direction. A LoRa profile without
+  a narrow shard and class filter is misconfigured by construction.
+- **RFC 6 §2.4's LoRa table understates airtime ~4×** by costing a group
+  message at the 256 bucket, which no message carrying a body occupies. At
+  G=20 it is 6.4 h, not 1.6 h.
+- **`latency_class` must be in RFC 3's signed credential**, or RFC 5 cannot
+  pick `sync_mode` from signed data and a peer can induce the catastrophic
+  strategy by misdeclaring.
+
 ## Not yet here
 
 RFC 0 and the RFC series plan are not in this directory.
