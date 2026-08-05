@@ -1,0 +1,24 @@
+[package]
+name = "krab-sim"
+description = "SIM-0: corpus convergence simulator for the Krab store-and-forward messaging network"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# No external dependencies, by design — and no internal ones either.
+#
+# SIM-0 grounds normative claims in the Krab RFC series; anyone reviewing those
+# claims must be able to rebuild and re-run it offline, on any toolchain, with
+# nothing to vendor-trust. PRNG, argument parsing and JSON output are therefore
+# implemented in-tree.
+#
+# It deliberately does NOT depend on krab-core. The simulator models the
+# architecture rather than exercising the implementation, so a change to
+# krab-core must not silently move a published measurement. Where the two must
+# agree, that agreement belongs in a test that says so.
+[dependencies]
+
+# Release profile is inherited from the workspace root.

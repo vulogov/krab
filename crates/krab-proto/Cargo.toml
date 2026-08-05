@@ -1,0 +1,12 @@
+[package]
+name = "krab-proto"
+description = "Krab control messages and the reconciliation state machine. Pure state machine, property-test target."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+krab-core = { workspace = true }
