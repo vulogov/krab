@@ -10,6 +10,7 @@
 
 mod cbor;
 mod creds;
+mod keys;
 mod object;
 
 use object::*;
