@@ -14,6 +14,7 @@ mod groups;
 mod keys;
 mod object;
 mod tags;
+mod transport;
 
 use object::*;
 
