@@ -10,6 +10,7 @@
 
 mod cbor;
 mod creds;
+mod groups;
 mod keys;
 mod object;
 

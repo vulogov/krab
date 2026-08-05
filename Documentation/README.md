@@ -175,30 +175,30 @@ the 82 732 B footprint line by line.
 
 | document | what it is |
 |---|---|
-| [`RFC-6-blocking-items.md`](RFC-6-blocking-items.md) | the gate on RFC 6 reaching Draft: groups and channels |
+| [`RFC-6.md`](RFC-6.md) | groups and channels, Status: Draft |
+| [`RFC-6-review.md`](RFC-6-review.md) | cross-check against RFC 0/1/3/7, SIM-0 and `krab-sizes` |
+| [`RFC-6-blocking-items.md`](RFC-6-blocking-items.md) | the gate document that preceded the Draft |
 | [`rfc-6-runs/fanout.py`](rfc-6-runs/fanout.py) | fan-out cost: sharding threshold and prekey burn |
 
-Groups are fan-out — N single-recipient sealed objects rather than one object
-under a shared group key. The security argument is sound; the arithmetic is
-where the difficulty is, because **fan-out is the first mechanism in the
-series that multiplies corpus volume.**
+Groups are fan-out, channels are flood: opposite security models *and*
+opposite cost classes, quadratic against constant. §4's crossover table makes
+the choice arithmetic rather than preference, which is the clearest organising
+idea in the series. All five of RFC 6's tables reproduce in `krab-sizes`.
 
-- **It invalidates the sharding threshold.** RFC 0 §8.3 puts sharding
-  "mandatory above approximately n = 5 000" from a measurement that assumed
-  one object per message. A 20-person group produces 19, so a group-heavy
-  network needs sharding from **~260 nodes**. The threshold is a property of
-  traffic composition, not of network size.
-- **Group size bounds prekey republication.** A 50-person group makes monthly
-  republication *structurally impossible* — the batch would exceed
-  `MAX_OBJECT`. Two 20-person groups force weekly republication and a
-  2 048-key batch, which is exactly where RFC 7 §9's `mlock` argument stops
-  holding.
-- **Neither SIM-0 nor SIM-1 models fan-out.** Every corpus, ingress and
-  convergence figure in the series describes a network with no groups. That
-  belongs in SIM-0 §9's limits list, and settling it is SIM-2's second item.
-- **RFC 2 does not exist and RFC 1 has absorbed most of it** — tag derivation,
-  shard extraction, epoch window, prekey selection. RFC 6 is not actually
-  blocked, but the roadmap still lists a phantom dependency.
+- **§3.4's "channels MUST occupy a separate shard space" does not follow from
+  RFC 1.** Shard derives from the tag, and a bulletin's tag is BLAKE3-derived
+  over the same uniformly-distributed space as sealed tags — there is no
+  separate space to occupy. The intent needs a **per-class shard mask**, which
+  is RFC 5's filter design and is specified nowhere.
+- **§2.3 reports one group against the whole baseline (3% at G=20), not a
+  network that uses groups.** Systemically the multiplier is **19×**, which
+  moves RFC 0 §8.3's sharding threshold from ~4 900 nodes to **~260**. RFC 6
+  is the document that invalidates that threshold and does not say so.
+- **§2.7's stagger rests on an asserted 10% detection threshold**, and its
+  latency cost is worst in small networks — 2.5 days for a 50-member group at
+  n=100, before propagation even starts.
+- **Neither SIM-0 nor SIM-1 models fan-out**, so its interaction with
+  eviction, holdings analysis and manifest size is unexamined.
 
 ## Not yet here
 
