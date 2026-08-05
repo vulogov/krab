@@ -171,6 +171,35 @@ the 82 732 B footprint line by line.
 - **Remote reservoir establishment is unspecified.** §6.4 binds it to RFC 3
   §11's in-person ceremony; RFC 3 §11.1's remote path never mentions it.
 
+## RFC 6
+
+| document | what it is |
+|---|---|
+| [`RFC-6-blocking-items.md`](RFC-6-blocking-items.md) | the gate on RFC 6 reaching Draft: groups and channels |
+| [`rfc-6-runs/fanout.py`](rfc-6-runs/fanout.py) | fan-out cost: sharding threshold and prekey burn |
+
+Groups are fan-out — N single-recipient sealed objects rather than one object
+under a shared group key. The security argument is sound; the arithmetic is
+where the difficulty is, because **fan-out is the first mechanism in the
+series that multiplies corpus volume.**
+
+- **It invalidates the sharding threshold.** RFC 0 §8.3 puts sharding
+  "mandatory above approximately n = 5 000" from a measurement that assumed
+  one object per message. A 20-person group produces 19, so a group-heavy
+  network needs sharding from **~260 nodes**. The threshold is a property of
+  traffic composition, not of network size.
+- **Group size bounds prekey republication.** A 50-person group makes monthly
+  republication *structurally impossible* — the batch would exceed
+  `MAX_OBJECT`. Two 20-person groups force weekly republication and a
+  2 048-key batch, which is exactly where RFC 7 §9's `mlock` argument stops
+  holding.
+- **Neither SIM-0 nor SIM-1 models fan-out.** Every corpus, ingress and
+  convergence figure in the series describes a network with no groups. That
+  belongs in SIM-0 §9's limits list, and settling it is SIM-2's second item.
+- **RFC 2 does not exist and RFC 1 has absorbed most of it** — tag derivation,
+  shard extraction, epoch window, prekey selection. RFC 6 is not actually
+  blocked, but the roadmap still lists a phantom dependency.
+
 ## Not yet here
 
 RFC 0 and the RFC series plan are not in this directory.

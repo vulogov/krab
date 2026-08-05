@@ -1,0 +1,34 @@
+Fan-out moves the sharding threshold down by the mean group size
+
+  SIM-0 §7:      ingress = 0.063 MB/day per node, per node
+  RFC 0 §8.3:    sharding mandatory above ~n=5000 (~310 MB/day/node)
+
+ group size  objects/msg  ingress mult  shard threshold n
+----------------------------------------------------------
+          1            1            1x              4,921
+          2            1            1x              4,921
+          5            4            4x              1,230
+         10            9            9x                547
+         20           19           19x                259
+         50           49           49x                100
+
+  A network whose traffic is mostly 20-person groups needs sharding
+  from a few hundred nodes, not from five thousand. RFC 0 §8.3's
+  threshold assumes one object per message, which groups are not.
+
+Group membership drives received-message rate, hence prekey batch size
+
+  each member sends 2/day; a G-member group emits G x 2
+  group-messages/day, each fanning out to G-1 recipients
+
+ group size   recv/day   +2 groups   batch @7d   batch @30d
+------------------------------------------------------------
+          5          8          16         128          512
+         10         18          36         256         1024
+         20         38          76         512         2048
+         50         98         196        2048   IMPOSSIBLE
+
+  RFC 7 §5.3 caps a batch at 2048 keys, because 8192 exceeds MAX_OBJECT.
+  Membership in two 20-person groups puts a node at 76 received/day,
+  which forces weekly republication -- and a 2048-key batch is where
+  RFC 7 §9's 'under 100 KB' mlock argument stops holding.
