@@ -74,12 +74,28 @@ resolves both — see `SIM-1-results.md` §3 and §6.
 
 | document | what it is |
 |---|---|
-| [`RFC-1-blocking-items.md`](RFC-1-blocking-items.md) | the gate on RFC 1 reaching Draft: which blocking-item rows are settled, on what evidence, and what would settle the rest |
+| [`RFC-1.md`](RFC-1.md) | the object format and cryptography, Status: Draft |
+| [`RFC-1-review.md`](RFC-1-review.md) | cross-check against SIM-0, SIM-1 and `krab-sizes`; **read before Draft becomes Final** |
+| [`RFC-1-blocking-items.md`](RFC-1-blocking-items.md) | the gate document that preceded the Draft; records which rows were settled on what evidence |
 
-RFC 1 freezes the object format permanently, so the series plan forbids it
-reaching Draft until B2 and B3 are settled. Four of the seven B3 rows and the
-B2 field set are now settled on measurement; the rest are tracked with what
-each needs.
+RFC 1 freezes the object format permanently — it closes every open B3 row.
+All of its byte counts verify against `krab-sizes`. The review finds one
+blocking defect and four items worth resolving before Final:
+
+- **`EPOCH_WINDOW` (±30 epochs) is smaller than `MAX_TTL` (45 days).** An
+  object delivered inside its declared TTL can arrive up to 45 epochs after
+  creation, so 15 epochs' worth is undecryptable — silently. `EPOCH_WINDOW`
+  is not inside the identifier hash, so this one is still cheap to fix.
+- **§9.3 defers to SIM-1, which is complete and disagrees.** Manifest exchange
+  is survivable on LoRa only at a filter width that makes the link useless;
+  at the width §8.3 itself assumes, a full manifest starves 98.3% of
+  reconciliations.
+- **Key 3 `admission` has ambiguous presence** and sits inside the identifier
+  hash — two conforming implementations could compute different identifiers
+  for identical content.
+- **`MAX_OBJECT` leaves 5.3% of the modelled traffic unrepresentable**, with
+  no object-level chunking specified.
+- **Clock skew ±6 h is the one parameter with no grounding.**
 
 ## Not yet here
 
