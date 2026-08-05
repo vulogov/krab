@@ -1,0 +1,29 @@
+Forward-secrecy window is bounded below by MAX_TTL
+  chunk N decrypts objects whose tag epoch is N
+  such an object may arrive up to MAX_TTL/EPOCH = 45 epochs later
+  => chunk N MUST survive until N+45; live chunks = 45
+  => seizure at T exposes epochs T-45 d .. T, whatever EPOCH is
+  live reservoir state: 45 x 32 B = 1440 B
+
+Reservoir sizing (32 B/epoch, 1-day epochs)
+  one credential term (90 d)      2880 B     1.2 QR codes at EC-M
+  one year                       11680 B     5.0 QR codes at EC-M
+  five years                     58400 B    25.1 QR codes at EC-M
+
+  The ratchet -- reservoir_{n+1} = HKDF(reservoir_n || DH(fresh)) -- means
+  a reservoir need only span the maximum interval between contacts, not a
+  lifetime. A quantum adversary recovers DH(fresh) but not reservoir_n, so
+  PQ security survives provided the ROOT of the chain was PQ-established.
+
+Reservoir against per-message hybrid (280-byte message)
+  per-message hybrid surcharge      3072 B/message (4096 vs 1024 bucket)
+  reservoir setup, one hybrid KEM   4096 B, once per correspondent
+  crossover                         1.33 messages
+  after   10 messages: reservoir   4096 B against hybrid    30720 B  (    8x)
+  after  100 messages: reservoir   4096 B against hybrid   307200 B  (   75x)
+  after 1000 messages: reservoir   4096 B against hybrid  3072000 B  (  750x)
+
+  A hybrid-KEM-established reservoir pays for itself before the second
+  message. RFC 3 §11.1 concedes remote peering is the common case, so the
+  reservoir must be reachable without a physical meeting or Krab has no
+  post-quantum story for most correspondents.

@@ -138,6 +138,35 @@ The review's leading findings:
 - **§13's peer counts contradict RFC 0 §8.2.** RFC 3 is the correct one;
   RFC 0 should be updated.
 
+## RFC 7
+
+| document | what it is |
+|---|---|
+| [`RFC-7-blocking-items.md`](RFC-7-blocking-items.md) | the gate on RFC 7 reaching Draft: key custody and erasure |
+| [`rfc-7-runs/reservoir.py`](rfc-7-runs/reservoir.py) | reservoir sizing, forward-secrecy floor, post-quantum economics |
+
+RFC 7 became load-bearing when RFC 1 reached Draft: **RFC 1 §6.5 names the
+epoch-chunked reservoir Krab's *primary* post-quantum strategy**, and RFC 1 is
+frozen. RFC 7 now owes a mechanism another unrevisable document depends on.
+
+- **Forward-secrecy granularity is bounded below by `MAX_TTL`, not by
+  `EPOCH`.** Chunk *N* must survive 45 epochs because RFC 1 §6.2 accepts
+  objects that late, so a seizure exposes 45 days whatever the epoch length
+  is. This decouples two periods RFC 0 §11 binds together, and it is the same
+  defect class as the `EPOCH_WINDOW` bug — a retention parameter derived from
+  expected behaviour rather than the protocol's declared guarantee.
+- **The reservoir should be established by hybrid KEM, not physical
+  exchange.** Setup costs one 4 096-byte object; per-message hybrid costs
+  3 072 B every message. Crossover is **1.33 messages**; at 100 messages it is
+  75×. Since RFC 3 §11.1 concedes remote peering is the common case, physical
+  exchange cannot be the primary path or most correspondents get no
+  post-quantum protection at all.
+- **The ratchet preserves post-quantum security if and only if the chain root
+  was PQ-established** — which is what keeps reservoirs small enough
+  (2 880 B for a credential term) to fit RFC 3 §11's QR ceremony.
+- **Prekey burn rate is still uncomputed**, and RFC 3 §14 and RFC 6 fan-out
+  both multiply it after the tier design was fixed.
+
 ## Not yet here
 
 RFC 0 and the RFC series plan are not in this directory.
