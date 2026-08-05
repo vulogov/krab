@@ -103,6 +103,30 @@ resolving before Final:
   no object-level chunking specified.
 - **Clock skew ±6 h is the one parameter with no grounding.**
 
+## RFC 3
+
+| document | what it is |
+|---|---|
+| [`RFC-3-blocking-items.md`](RFC-3-blocking-items.md) | the gate on RFC 3 reaching Draft: peering, credentials, accountability |
+| [`rfc-3-runs/peering-latency.py`](rfc-3-runs/peering-latency.py) | negotiation-triple latency over courier, from SIM-0's transport model |
+
+RFC 3 is revisable — the credential format is not inside the identifier hash —
+so the stakes differ from RFC 1. What it carries instead are three claims
+other documents already depend on.
+
+- **Credential expiry should be 90 days, not 60.** The negotiation triple is
+  three one-way legs, which over SIM-0's courier model takes 30 days on
+  average and 46 at p90. At a 60-day term, 2.44% of courier peering attempts
+  cannot complete at all — the negotiation outlives the credential it is
+  negotiating — and a link that does form spends 77% of its life renewing.
+  At 90 days that becomes 0.07%.
+- **The retention floor has to carry an eviction watermark.** SIM-1 §4's
+  re-fetch loop costs up to 68% extra ingress, and the fix must be derivable
+  from signed data so both sides provably agree.
+- **Graduated quota is asserted as the defence against vantage acquisition
+  and has never been measured** — SIM-1 explicitly did not model quota while
+  measuring the very attack quota is meant to blunt. This is the SIM-2 item.
+
 ## Not yet here
 
 RFC 0 and the RFC series plan are not in this directory.

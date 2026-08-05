@@ -1,0 +1,18 @@
+Negotiation triple over courier-only links
+  3 one-way legs; per leg E[wait] 7 d + transit 3 d = 10 d
+
+  mean   30.0 d
+  p50   27.7 d
+  p90   46.2 d
+  p99   68.3 d
+
+  credential expiry 60 d:
+    establishment consumes 50.0% of lifetime (mean), 77.0% at p90
+    renewal must begin >= 46 d before expiry to complete at p90, leaving 14 d settled
+    P(negotiation outlives a full credential term) = 2.44%
+
+  credential expiry 90 d:
+    establishment consumes 33.3% of lifetime (mean), 51.4% at p90
+    renewal must begin >= 46 d before expiry to complete at p90, leaving 44 d settled
+    P(negotiation outlives a full credential term) = 0.07%
+
