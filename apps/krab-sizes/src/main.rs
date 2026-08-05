@@ -9,6 +9,7 @@
 //! is exactly the property that lets a parameter table be frozen.
 
 mod cbor;
+mod creds;
 mod object;
 
 use object::*;
@@ -146,6 +147,28 @@ fn main() {
         println!();
     }
 
+    println!("\n--- RFC 3 nodelist fragments (peer-link with 1 endpoint = {} B) ---", creds::PEER_LINK_1EP);
+    println!(
+        "{:>7} {:>10} {:>12} {:>10} {:>10} {:>12}",
+        "peers", "fragment", "all copies", "LoRa rec", "LoRa days", "delta(1 link)"
+    );
+    for p in [5usize, 8, 12, 20, 25, 50] {
+        let f = creds::fragment(p, creds::PEER_LINK_1EP);
+        let c = creds::all_copies(p, creds::PEER_LINK_1EP);
+        println!(
+            "{:>7} {:>9.1}K {:>11.1}K {:>10.1} {:>10.1} {:>11.1}K",
+            p,
+            f as f64 / 1000.0,
+            c as f64 / 1000.0,
+            creds::lora_reconciliations(c),
+            creds::lora_days(c),
+            creds::delta_all_copies(p, 1, creds::PEER_LINK_1EP) as f64 / 1000.0
+        );
+    }
+    println!("\n  Cost is O(P^2): the fragment is encrypted individually to each peer.");
+    println!("  A weekly publication fits inside a week of LoRa airtime up to 25 peers");
+    println!("  and not beyond, which is what RFC 3 §13's upper bound is made of.");
+
     println!("\n--- EPOCH_WINDOW vs MAX_TTL (RFC 1 §2, §6.2) ---");
     const EPOCH_S: u64 = 86_400;
     const MAX_TTL_D: u64 = 45;
@@ -216,6 +239,32 @@ fn check(m: Magnitudes) -> i32 {
 
     for (b, frames) in [(256usize, 6usize), (1_024, 21), (4_096, 81)] {
         cmp(&format!("§8.3 LoRa bucket {b} frames"), b.div_ceil(LORA_PAYLOAD), frames);
+    }
+
+    // RFC 3 §8.1 and §8.2 — derivable from a credential size, and checked.
+    for (peers, frag, copies, recons) in
+        [(5usize, 2_300usize, 11_000usize, 6usize), (8, 3_548, 28_000, 16), (12, 5_212, 62_000, 35),
+         (20, 8_540, 170_000, 95), (50, 21_020, 1_051_000, 584)]
+    {
+        cmp(&format!("RFC3 §8.1 fragment, {peers} peers"), creds::fragment(peers, creds::PEER_LINK_1EP), frag);
+        // RFC 3 truncates to two significant figures rather than rounding.
+        cmp(
+            &format!("RFC3 §8.1 all copies, {peers} peers"),
+            (creds::all_copies(peers, creds::PEER_LINK_1EP) / 1000) * 1000,
+            copies,
+        );
+        cmp(
+            &format!("RFC3 §8.1 LoRa reconciliations, {peers} peers"),
+            (creds::lora_reconciliations(creds::all_copies(peers, creds::PEER_LINK_1EP)) * 10.0).round() as usize,
+            recons,
+        );
+    }
+    for (peers, delta_tenths) in [(12usize, 74usize), (20, 123), (50, 308)] {
+        cmp(
+            &format!("RFC3 §8.2 delta, {peers} peers"),
+            (creds::delta_all_copies(peers, 1, creds::PEER_LINK_1EP) as f64 / 100.0).round() as usize,
+            delta_tenths,
+        );
     }
 
     // §9.3 manifest table, in units of 0.1 MB to keep the comparison integral.

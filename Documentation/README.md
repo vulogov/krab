@@ -107,25 +107,36 @@ resolving before Final:
 
 | document | what it is |
 |---|---|
-| [`RFC-3-blocking-items.md`](RFC-3-blocking-items.md) | the gate on RFC 3 reaching Draft: peering, credentials, accountability |
-| [`rfc-3-runs/peering-latency.py`](rfc-3-runs/peering-latency.py) | negotiation-triple latency over courier, from SIM-0's transport model |
+| [`RFC-3.md`](RFC-3.md) | peering, credentials, and accountability, Status: Draft |
+| [`RFC-3-review.md`](RFC-3-review.md) | cross-check against SIM-0, SIM-1, RFC 0/1 and `krab-sizes` |
+| [`RFC-3-blocking-items.md`](RFC-3-blocking-items.md) | the gate document that preceded the Draft |
+| [`rfc-3-runs/peering-latency.py`](rfc-3-runs/peering-latency.py) | negotiation completion over the corpus |
 
 RFC 3 is revisable — the credential format is not inside the identifier hash —
-so the stakes differ from RFC 1. What it carries instead are three claims
-other documents already depend on.
+so nothing in it is irreversible the way RFC 1's findings were. §8.1 and §8.2
+reproduce exactly in `krab-sizes` from `fragment(P) = 220 + 416·P`, and the
+§13 cap of 25 peers is confirmed load-bearing: a weekly fragment publication
+fits in a week of LoRa airtime at 25 peers (3.7 d) and not at 50 (14.6 d).
 
-- **Credential expiry should be 90 days, not 60.** The negotiation triple is
-  three one-way legs, which over SIM-0's courier model takes 30 days on
-  average and 46 at p90. At a 60-day term, 2.44% of courier peering attempts
-  cannot complete at all — the negotiation outlives the credential it is
-  negotiating — and a link that does form spends 77% of its life renewing.
-  At 90 days that becomes 0.07%.
-- **The retention floor has to carry an eviction watermark.** SIM-1 §4's
-  re-fetch loop costs up to 68% extra ingress, and the fix must be derivable
-  from signed data so both sides provably agree.
-- **Graduated quota is asserted as the defence against vantage acquisition
-  and has never been measured** — SIM-1 explicitly did not model quota while
-  measuring the very attack quota is meant to blunt. This is the SIM-2 item.
+The review's leading findings:
+
+- **Composition defect.** RFC 1 §6.2 derives the inbox tag from the
+  recipient's public key; RFC 3 §5.1 sends peer-requests there as flooded
+  corpus objects; RFC 3 §9.1 publishes that key in the rollcall. So anyone can
+  compute a listed node's inbox tag and **count its inbound peering attempts,
+  per epoch, permanently** — RFC 0 §7.6 means archival relays never forget.
+  Neither document is wrong alone. A separate rotating contact key fixes it.
+- **12.1% of austere peering negotiations are silently lost.** Each of the
+  three legs is a corpus delivery, and delivery rates compound: 0.958³ = 87.9%.
+  RFC 3 specifies no retry, though a `peer-request` is idempotent and three
+  attempts would take the loss to 0.18%.
+- **Retention is a promise, not a capacity**, so SIM-1 §4's +68% re-fetch loop
+  survives §7.3's otherwise-correct filter mechanism.
+- **`transports` carries endpoints but not latency class**, so RFC 5 cannot
+  pick `sync_mode` from signed data — and picking wrong costs 98.3% starved
+  LoRa reconciliations or 33% austere delivery.
+- **§13's peer counts contradict RFC 0 §8.2.** RFC 3 is the correct one;
+  RFC 0 should be updated.
 
 ## Not yet here
 
