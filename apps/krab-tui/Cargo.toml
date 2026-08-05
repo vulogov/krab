@@ -1,0 +1,18 @@
+[package]
+name = "krab-tui"
+description = "Krab TUI application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The crate is `krab-tui` per RFC 0 §4.3, but the binary operators invoke is
+# `krab`. The library facade owns the `krab` crate name, so the two coexist.
+[[bin]]
+name = "krab"
+path = "src/main.rs"
+
+[dependencies]
+krab = { workspace = true }

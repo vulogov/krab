@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/krab-core",
+    "crates/krab-store",
+    "crates/krab-proto",
+    "crates/krab-fabric",
+    "crates/krab-node",
+    "crates/krab",
+    "apps/krab-tui",
+    "apps/krab-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/vulogov/krab"
+authors = ["Vladimir Ulogov"]
+
+[workspace.dependencies]
+krab-core = { path = "crates/krab-core" }
+krab-store = { path = "crates/krab-store" }
+krab-proto = { path = "crates/krab-proto" }
+krab-fabric = { path = "crates/krab-fabric" }
+krab-node = { path = "crates/krab-node" }
+krab = { path = "crates/krab" }
+
+[profile.release]
+opt-level = 3
+lto = true
+# RFC 0 §4.3 / RFC 7: no core dumps carrying key material.
+panic = "abort"

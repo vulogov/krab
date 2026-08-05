@@ -1,0 +1,19 @@
+[package]
+name = "krab-core"
+description = "Krab object format, cryptography, tag derivation, and filters. Pure functions over bytes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# RFC 0 §4.3: krab-core MUST NOT perform I/O, read a clock, or source
+# randomness. Time and entropy are arguments.
+#
+# That invariant is enforced mechanically rather than by review: the crate is
+# `no_std`, so `std::time`, `std::fs`, `std::io` and ambient RNG are not
+# reachable. Adding a dependency that pulls in `std` breaks the build, which
+# is the point. This is what lets the same code run in production, under the
+# deterministic simulator, and under a fuzzer with no conditional compilation.
+[dependencies]

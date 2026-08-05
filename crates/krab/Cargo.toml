@@ -1,0 +1,17 @@
+[package]
+name = "krab"
+description = "Krab: friend-to-friend, store-and-forward messaging over any transport. Public library facade."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+krab-core = { workspace = true }
+krab-fabric = { workspace = true }
+krab-node = { workspace = true }
+krab-proto = { workspace = true }
+krab-store = { workspace = true }
