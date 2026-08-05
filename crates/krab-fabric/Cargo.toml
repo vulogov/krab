@@ -1,0 +1,21 @@
+[package]
+name = "krab-fabric"
+description = "Krab transport abstraction and backends: tcp, socks(tor), serial, courier, sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+krab-core = { workspace = true }
+krab-proto = { workspace = true }
+
+[features]
+default = ["tcp", "courier", "sim"]
+tcp = []
+socks = ["tcp"]
+serial = []
+courier = []
+sim = []

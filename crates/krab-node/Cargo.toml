@@ -1,0 +1,15 @@
+[package]
+name = "krab-node"
+description = "Krab scheduler, sync loop, key management, and peering"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+krab-core = { workspace = true }
+krab-fabric = { workspace = true }
+krab-proto = { workspace = true }
+krab-store = { workspace = true }

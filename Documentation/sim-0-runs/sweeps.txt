@@ -1,0 +1,232 @@
+### baseline
+SIM-0 -- Krab corpus convergence simulator
+
+USAGE: krab-sim [OPTIONS]
+
+TOPOLOGY
+  --topo <ws|ba|rr>      peer graph model            (default ws)
+  --n <int>              nodes                       (default 500)
+  --degree <int>         mean peers per node         (default 8)
+  --rewire <float>       WS long-range edge prob     (default 0.10)
+
+TRANSPORT MIX (fractions of edges, must sum to 1.0)
+  --tcp <float>                                      (default 0.70)
+  --lora <float>                                     (default 0.15)
+  --courier <float>                                  (default 0.15)
+
+TRAFFIC
+  --ttl <days>           object lifetime             (default 14)
+  --horizon <days>       simulated span              (default 42)
+  --rate <float>         messages/node/day           (default 2.0)
+  --dest <social|uniform>                            (default social)
+  --hops <int>           social destination radius   (default 3)
+
+AVAILABILITY
+  --uptime <float>       fraction of time online     (default 0.85)
+  --session <hours>      mean online session         (default 12)
+
+RUN
+  --seeds <int>          independent runs            (default 5)
+  --sweep <name>         run a predefined sweep
+                         (ttl|degree|mix|topo|scale|dest)
+  --json <path>          write results as JSON
+  --quiet
+
+
+### sweep mix
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+all-tcp                    5    100.0%      4.9      8.7     14.1     98.2%     97.7%     449.4     31.28
+tcp+lora                   5    100.0%      5.9     10.2     15.8     97.8%     97.2%     448.3     31.25
+mixed                      5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+courier-heavy              5    100.0%     11.6     20.5     60.5     95.3%     94.3%     442.4     31.06
+austere                    5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+all-courier                5     52.5%    311.5    390.9    406.3      1.8%      1.3%      18.1      4.07
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+all-tcp                   98.2%    98.0%    98.0%    100.0%     449.4     446.7     31.28     31.19
+tcp+lora                  97.8%    97.6%    97.6%    100.0%     448.3     445.4     31.25     31.14
+mixed                     97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+courier-heavy             95.3%    95.2%    95.1%    100.0%     442.4     435.8     31.06     30.88
+austere                   37.2%    37.0%    37.4%     76.4%     273.3     195.5     26.83     23.26
+all-courier                1.8%     1.8%     1.9%      4.3%      18.1      11.9      4.07      2.35
+
+all-tcp                lora-eligible   0.16%  cover by age: 84% 100% 100% 100% 100% 100% 100% 100%
+tcp+lora               lora-eligible   0.16%  cover by age: 81% 100% 100% 100% 100% 100% 100% 100%
+mixed                  lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+courier-heavy          lora-eligible   0.16%  cover by age: 63% 99% 99% 100% 100% 100% 100% 100%
+austere                lora-eligible   0.16%  cover by age: 3% 6% 12% 26% 41% 56% 71% 82%
+all-courier            lora-eligible   0.16%  cover by age: 0% 0% 1% 1% 2% 3% 4% 5%
+
+### sweep ttl (mixed 70/15/15)
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+ttl=3d                     5    100.0%      7.4     12.8     18.8     87.3%     83.9%      93.8     31.31
+ttl=7d                     5    100.0%      7.4     12.9     18.8     94.6%     93.1%     225.2     31.31
+ttl=14d                    5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+ttl=21d                    5    100.0%      7.3     12.8     18.6     98.1%     97.6%     672.5     31.27
+ttl=30d                    5    100.0%      7.3     12.8     18.7     98.7%     98.4%     953.8     31.18
+ttl=45d                    5    100.0%      7.3     12.7     18.6     99.1%     98.9%    1419.2     31.07
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+ttl=3d                    87.3%    86.4%    86.3%    100.0%      93.8      90.2     31.31     31.14
+ttl=7d                    94.6%    94.2%    94.3%    100.0%     225.2     221.7     31.31     31.14
+ttl=14d                   97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+ttl=21d                   98.1%    98.0%    97.9%    100.0%     672.5     668.8     31.27     31.19
+ttl=30d                   98.7%    98.6%    98.6%    100.0%     953.8     949.7     31.18     31.13
+ttl=45d                   99.1%    99.1%    99.0%    100.0%    1419.2    1415.6     31.07     31.02
+
+ttl=3d                 lora-eligible   0.16%  cover by age: 11% 79% 99% 100% 100% 100% 100% 100%
+ttl=7d                 lora-eligible   0.15%  cover by age: 53% 100% 100% 100% 100% 100% 100% 100%
+ttl=14d                lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+ttl=21d                lora-eligible   0.15%  cover by age: 84% 100% 100% 100% 100% 100% 100% 100%
+ttl=30d                lora-eligible   0.15%  cover by age: 89% 100% 100% 100% 100% 100% 100% 100%
+ttl=45d                lora-eligible   0.16%  cover by age: 93% 100% 100% 100% 100% 100% 100% 100%
+
+### sweep ttl (austere 20/30/50)
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+ttl=3d                     5     21.3%     24.7    124.6    142.0      4.3%      0.4%      16.1      6.80
+ttl=7d                     5     57.7%    117.6    202.4    236.5     11.9%      1.3%      73.2     18.15
+ttl=14d                    5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+ttl=21d                    5     99.9%    175.6    316.3    436.5     56.8%     40.6%     501.6     28.55
+ttl=30d                    5    100.0%    175.9    319.7    444.6     69.6%     57.9%     784.8     29.25
+ttl=45d                    5    100.0%    175.3    318.0    441.9     79.8%     72.1%    1247.7     29.77
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+ttl=3d                     4.3%     4.2%     4.1%      6.6%      16.1       5.7      6.80      2.80
+ttl=7d                    11.9%    11.7%    11.4%     26.4%      73.2      34.9     18.15     10.77
+ttl=14d                   37.2%    37.0%    37.4%     76.4%     273.3     195.5     26.83     23.26
+ttl=21d                   56.8%    56.8%    56.6%     97.4%     501.6     416.8     28.55     26.84
+ttl=30d                   69.6%    69.6%    69.3%     99.9%     784.8     700.5     29.25     28.09
+ttl=45d                   79.8%    79.8%    79.6%    100.0%    1247.7    1167.4     29.77     29.01
+
+ttl=3d                 lora-eligible   0.16%  cover by age: 1% 2% 3% 4% 5% 6% 6% 7%
+ttl=7d                 lora-eligible   0.15%  cover by age: 1% 4% 6% 7% 9% 14% 23% 30%
+ttl=14d                lora-eligible   0.16%  cover by age: 3% 6% 12% 26% 41% 56% 71% 82%
+ttl=21d                lora-eligible   0.15%  cover by age: 4% 10% 30% 52% 74% 88% 96% 99%
+ttl=30d                lora-eligible   0.15%  cover by age: 5% 22% 54% 82% 95% 99% 100% 100%
+ttl=45d                lora-eligible   0.16%  cover by age: 8% 47% 86% 98% 100% 100% 100% 100%
+
+### sweep degree (mixed)
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+degree=4                   5     99.6%      9.7     39.8    159.7     89.4%     87.4%     431.3     30.85
+degree=6                   5    100.0%      8.3     17.5     26.3     95.7%     94.6%     449.7     31.29
+degree=8                   5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+degree=12                  5    100.0%      5.4      8.8     14.3     98.4%     97.9%     453.3     31.22
+degree=16                  5    100.0%      4.1      7.0     12.5     98.9%     98.6%     454.9     31.22
+degree=20                  5    100.0%      3.3      5.9     11.5     99.2%     98.9%     456.1     31.23
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+degree=4                  89.4%    89.1%    89.3%     99.5%     431.3     416.9     30.85     30.39
+degree=6                  95.7%    95.5%    95.7%    100.0%     449.7     443.3     31.29     31.12
+degree=8                  97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+degree=12                 98.4%    98.2%    98.2%    100.0%     453.3     450.3     31.22     31.14
+degree=16                 98.9%    98.7%    98.7%    100.0%     454.9     453.1     31.22     31.14
+degree=20                 99.2%    98.9%    98.9%    100.0%     456.1     454.6     31.23     31.16
+
+degree=4               lora-eligible   0.15%  cover by age: 27% 93% 97% 98% 99% 99% 99% 100%
+degree=6               lora-eligible   0.15%  cover by age: 64% 100% 100% 100% 100% 100% 100% 100%
+degree=8               lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+degree=12              lora-eligible   0.16%  cover by age: 85% 100% 100% 100% 100% 100% 100% 100%
+degree=16              lora-eligible   0.16%  cover by age: 89% 100% 100% 100% 100% 100% 100% 100%
+degree=20              lora-eligible   0.16%  cover by age: 91% 100% 100% 100% 100% 100% 100% 100%
+
+### sweep degree (austere)
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+degree=4                   5     56.7%    192.2    340.5    400.8      1.8%      0.6%      31.3      3.22
+degree=6                   5     72.4%    198.6    334.5    400.0      8.5%      2.3%     115.2     14.97
+degree=8                   5     95.8%    170.6    296.8    382.5     37.2%     15.4%     273.3     26.83
+degree=12                  5    100.0%     30.5    118.5    193.9     85.7%     72.3%     418.8     30.45
+degree=16                  5    100.0%     16.6     28.8    119.8     93.5%     92.7%     439.7     30.82
+degree=20                  5    100.0%     11.8     18.6     83.2     96.2%     95.4%     446.4     31.00
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+degree=4                   1.8%     1.8%     1.7%      3.4%      31.3      11.2      3.22      1.15
+degree=6                   8.5%     8.4%     8.3%     19.4%     115.2      51.9     14.97      7.76
+degree=8                  37.2%    37.0%    37.4%     76.4%     273.3     195.5     26.83     23.26
+degree=12                 85.7%    85.5%    85.3%    100.0%     418.8     396.4     30.45     29.80
+degree=16                 93.5%    93.4%    93.2%    100.0%     439.7     430.1     30.82     30.57
+degree=20                 96.2%    95.9%    95.7%    100.0%     446.4     440.2     31.00     30.83
+
+degree=4               lora-eligible   0.15%  cover by age: 1% 1% 1% 1% 2% 2% 3% 4%
+degree=6               lora-eligible   0.15%  cover by age: 1% 2% 3% 5% 7% 11% 16% 23%
+degree=8               lora-eligible   0.16%  cover by age: 3% 6% 12% 26% 41% 56% 71% 82%
+degree=12              lora-eligible   0.16%  cover by age: 28% 77% 84% 96% 99% 100% 100% 100%
+degree=16              lora-eligible   0.16%  cover by age: 56% 94% 97% 100% 100% 100% 100% 100%
+degree=20              lora-eligible   0.16%  cover by age: 70% 98% 100% 100% 100% 100% 100% 100%
+
+### sweep topo
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+topo=ws                    5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+topo=ba                    5    100.0%      5.3      9.8     18.5     98.3%     97.7%     453.9     31.30
+topo=rr                    5    100.0%      6.3     10.5     18.3     98.0%     97.5%     449.0     30.95
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+topo=ws                   97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+topo=ba                   98.3%    98.1%    98.0%    100.0%     453.9     450.6     31.30     31.19
+topo=rr                   98.0%    97.8%    97.5%    100.0%     449.0     445.7     30.95     30.85
+
+topo=ws                lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+topo=ba                lora-eligible   0.16%  cover by age: 86% 100% 100% 100% 100% 100% 100% 100%
+topo=rr                lora-eligible   0.16%  cover by age: 83% 100% 100% 100% 100% 100% 100% 100%
+
+### sweep dest
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=5
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+social h=2                 5    100.0%      4.6     10.8     17.0     97.2%     96.4%     447.0     31.20
+social h=3                 5    100.0%      7.3     12.7     18.6     97.2%     96.4%     447.0     31.20
+social h=5                 5    100.0%      9.6     14.2     20.1     97.2%     96.4%     447.0     31.20
+uniform                    5    100.0%      9.9     14.5     20.3     97.2%     96.4%     447.0     31.20
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+social h=2                97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+social h=3                97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+social h=5                97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+uniform                   97.2%    97.1%    96.9%    100.0%     447.0     443.3     31.20     31.08
+
+social h=2             lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+social h=3             lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+social h=5             lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+uniform                lora-eligible   0.16%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+
+### sweep scale (3 seeds)
+SIM-0  topo=ws n=500 degree=8 ttl=14d horizon=42d rate=2/day uptime=0.85 seeds=3
+case                    runs  delivery   lat50h   lat90h   lat99h     cover   cover10   storeMB    rxMB/d
+---------------------------------------------------------------------------------------------------------
+n=100                      3    100.0%      5.5     10.0     15.8     98.8%     98.2%      95.3      6.20
+n=250                      3    100.0%      6.8     12.2     18.5     97.9%     97.1%     231.7     16.12
+n=500                      3    100.0%      7.4     12.9     18.8     97.1%     96.4%     446.5     31.34
+n=1000                     3    100.0%      7.9     14.1     19.9     96.6%     95.9%     893.4     62.97
+n=2000                     3    100.0%      8.3     15.4     21.5     96.1%     95.4%    1748.9    125.21
+
+case                   coverPUB  coverEX  coverBY  coverSET  storeP99 storeMEAN     rxP99    rxMEAN
+---------------------------------------------------------------------------------------------------
+n=100                     98.8%    97.8%    98.1%    100.0%      95.3      94.8      6.20      6.15
+n=250                     97.9%    97.4%    97.4%    100.0%     231.7     229.6     16.12     16.04
+n=500                     97.1%    97.0%    96.8%    100.0%     446.5     442.9     31.34     31.22
+n=1000                    96.6%    96.5%    96.1%    100.0%     893.4     884.5     62.97     62.75
+n=2000                    96.1%    96.0%    96.1%    100.0%    1748.9    1733.6    125.21    124.79
+
+n=100                  lora-eligible   0.17%  cover by age: 82% 100% 100% 100% 100% 100% 100% 100%
+n=250                  lora-eligible   0.16%  cover by age: 79% 100% 100% 100% 100% 100% 100% 100%
+n=500                  lora-eligible   0.18%  cover by age: 76% 100% 100% 100% 100% 100% 100% 100%
+n=1000                 lora-eligible   0.16%  cover by age: 71% 100% 100% 100% 100% 100% 100% 100%
+n=2000                 lora-eligible   0.16%  cover by age: 68% 100% 100% 100% 100% 100% 100% 100%
