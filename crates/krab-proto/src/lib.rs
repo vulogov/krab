@@ -10,8 +10,11 @@
 //! For any two stores and any filter, reconciliation converges to the filtered
 //! union in bounded rounds under reordering and duplication.
 
+#![no_std]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+extern crate alloc;
 
 pub mod control;
 pub mod recon;
