@@ -9,6 +9,22 @@
     Grounded by: krab-sizes/keys (all figures computed)
     Errata:      RFC 1 §6.3 — see §13
 
+> ## ⚠ CRITICAL DEFECT — §6 MUST NOT BE IMPLEMENTED AS WRITTEN
+>
+> `msg_key = HKDF(chunk_N, "krab/msg/v1" ‖ tag)` derives **one key per
+> (pair, epoch)**, not one per message. §6.1's justification — that the tag is
+> "already unique per message" — is false. The tag is derived from a
+> static-static secret and the epoch alone (RFC 1 §6.2), which RFC 2 §4.3
+> confirms from the receiving side.
+>
+> As written this is keystream reuse and Poly1305 one-time-key recovery:
+> confidentiality **and** integrity lost for all reservoir-protected traffic
+> between a pair within an epoch.
+>
+> **Status: open, awaiting fix.** Recommended construction is HPKE
+> `mode_auth_psk` with `chunk_N` as PSK — no format change required.
+> See `CRYPTO-REVIEW.md` §1. Marked in place at §6 and §6.1.
+
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be
 interpreted as described in RFC 2119.
 
@@ -255,8 +271,24 @@ message keys derive symmetrically.
 
 ```
 reservoir → chunk_N  (32 bytes, one per epoch)
-            msg_key = HKDF(chunk_N, "krab/msg/v1" ‖ tag)
+            msg_key = HKDF(chunk_N, "krab/msg/v1" ‖ tag)      ⚠ DEFECTIVE
 ```
+
+> **⚠ CRITICAL — this derivation MUST NOT be implemented.** `tag` is constant
+> for a pair across an epoch (RFC 1 §6.2, RFC 2 §4.3), and `chunk_N` is
+> constant by definition, so `msg_key` is constant for every message that pair
+> exchanges that day. Nothing per-message enters the derivation.
+>
+> **Fix, awaiting adoption:** supply `chunk_N` as an HPKE PSK under
+> `mode_auth_psk` (RFC 9180 §5.1.4) with the epoch as `psk_id`. The ephemeral
+> `skE` then makes the key schedule per-message while the PSK carries the
+> post-quantum property, forward secrecy stays at epoch granularity via §4's
+> shredding, and deniability is preserved. RFC 1 §6.1's suite space
+> accommodates it, so RFC 1 remains frozen.
+>
+> If the reservoir is instead meant to stand alone, a per-message random nonce
+> is mandatory and RFC 1 §4.2 key 4 can carry it — but that discards the
+> ephemeral DH and is strictly weaker. `CRYPTO-REVIEW.md` §1.2.
 
 At the close of epoch N plus a grace window, **`chunk_N` is destroyed**
 (§4). Every message of that epoch becomes permanently undecryptable — by
@@ -271,9 +303,13 @@ loses. Reuse of an offset is catastrophic.
 
 Deriving instead of consuming removes all of it:
 
-- **No offsets, no counters, no consumption state.** The tag is already in
-  the envelope, already unlinkable, already unique per message.
-- **Two-time-pad reuse is structurally impossible**, not merely prevented.
+- ~~**No offsets, no counters, no consumption state.** The tag is already in
+  the envelope, already unlinkable, already unique per message.~~
+  **⚠ FALSE — the tag is unique per (pair, epoch), not per message.** This
+  sentence is the origin of the defect marked at §6 and MUST be deleted.
+- ~~**Two-time-pad reuse is structurally impossible**, not merely prevented.~~
+  **⚠ FALSE — as specified, reuse is guaranteed** for every pair of messages
+  a pair exchanges within one epoch.
 - **Out-of-order delivery is free** within an epoch and grace window.
 - **The epoch number is the same one used for tag derivation and key
   erasure.** One clock, one counter, three mechanisms.

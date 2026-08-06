@@ -2,7 +2,8 @@
 
     Subject:  RFC 7, Key Custody and Erasure, Status: Draft
     Method:   cross-check against RFC 0, RFC 1, RFC 3, SIM-0, SIM-1, apps/krab-sizes
-    Verdict:  one recurring defect, one cross-document contradiction, three gaps
+    Verdict:  ONE OPEN CRITICAL DEFECT (§6, see CRYPTO-REVIEW.md §1),
+              plus one recurring defect, one contradiction, three gaps
 
 RFC 7 is revisable — nothing in it is inside the object identifier hash. Its
 §13 erratum to RFC 1 is the strongest piece of work in the series so far and

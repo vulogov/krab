@@ -397,7 +397,15 @@ This is not "+1.1 KB per message". For short traffic it is a **16× corpus
 inflation** and it makes LoRa links effectively unusable.
 
 **Therefore the epoch-chunked key reservoir (RFC 7) is Krab's primary
-post-quantum strategy, not a secondary one.** A reservoir established
+post-quantum strategy, not a secondary one.**
+
+> **⚠ Dependency notice.** RFC 7 §6's reservoir key derivation carries an open
+> critical defect — it derives one message key per (pair, epoch) rather than
+> per message. This section's post-quantum claim depends on that mechanism, so
+> the claim is **contingent until RFC 7 §6 is fixed.** The recommended fix
+> (HPKE `mode_auth_psk` with the chunk as PSK) requires no change to this
+> document: RFC 1 §6.1's suite space accommodates it and RFC 1 remains frozen.
+> See `CRYPTO-REVIEW.md` §1. A reservoir established
 once — by physical exchange or by a single hybrid KEM — yields
 post-quantum security at *zero* per-message overhead, because message keys
 derive symmetrically from reservoir material.

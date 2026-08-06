@@ -1,5 +1,14 @@
 # Documentation
 
+> ## ⚠ Open critical defect
+>
+> **RFC 7 §6's reservoir key derivation MUST NOT be implemented as written.**
+> It derives one message key per (pair, epoch) rather than per message, which
+> is keystream reuse and Poly1305 one-time-key recovery. Marked in place in
+> `RFC-7.md` §6 and §6.1, with the dependency noted in `RFC-1.md` §6.5.
+> Recommended fix — HPKE `mode_auth_psk` with the chunk as PSK — needs no
+> format change. Full analysis in [`CRYPTO-REVIEW.md`](CRYPTO-REVIEW.md) §1.
+
 Grounding documents for the Krab RFC series. No RFC may assert a
 convergence, delivery, or storage claim that is not measured here.
 
