@@ -267,33 +267,50 @@ in `krab-sizes`.
 
 | document | what it is |
 |---|---|
-| [`RFC-5-blocking-items.md`](RFC-5-blocking-items.md) | the gate on RFC 5 reaching Draft: synchronisation |
-| [`rfc-5-runs/sync-mode.py`](rfc-5-runs/sync-mode.py) | the `sync_mode` decision procedure, Bloom rejection, retention sizing |
+| [`RFC-5.md`](RFC-5.md) | synchronisation, Status: Draft |
+| [`RFC-5-review.md`](RFC-5-review.md) | cross-check; **RFC 5's grounding is not in this repository** |
+| [`RFC-5-blocking-items.md`](RFC-5-blocking-items.md) | the gate document that preceded the Draft |
+| [`rfc-5-runs/sync-mode.py`](rfc-5-runs/sync-mode.py) | the `sync_mode` decision procedure |
 
-RFC 5 is the last document and carries the most inherited requirements — six
-others have deferred something to it. Its central decision was measured before
-it was written.
+RFC 5 completes the series. §4.2 is its strongest section: RBSR is the wrong
+algorithm exactly where it was expected to win, because §2's filter already
+made `n` small, so RBSR's fixed costs dominate. The two modes are complements.
 
-- **`sync_mode` is decidable, not configurable.** Two feasibility tests: a full
-  manifest must fit the per-sync window, and RBSR's descent must fit the
-  round-trip budget. A LoRa link can name **562 objects** per window against a
-  14 000-object corpus; a courier RBSR descent takes **24 days** against a
-  14-day TTL. Four cases fall out, including "this link cannot reconcile" —
-  worth specifying, since a narrow *and* slow link has no working strategy and
-  the client should say so at configuration time.
-- **Bloom filters fail on exactly the wrong nodes.** `P(never delivered) =
-  p^peers`, so at p=1% a one-peer leaf loses 1% of its mail permanently while a
-  degree-12 node loses nothing measurable — and SIM-0 §5 already identifies
-  low-degree nodes as the worst-served population.
-- **A node needs ~1 GB to honour a 30-day retention promise at n=500.**
-  `effective_retention = min(promised, cap / daily_ingress)`; at 450 MB a node
-  promising 30 days actually holds 14.5, and SIM-1 §4 measured the resulting
-  re-fetch loop at +68% ingress.
+Its figures cite `ovhd%`/`waste%` columns and a `PushOnly` mode that do not
+exist in `apps/krab-sim`, and where the two overlap they disagree — this
+repository's SIM-1 measures austere all-RBSR delivery at **33.0%** against
+RFC 5's 64.8%. The conclusion survives either number; the figure should not be
+cited until the extension is committed.
 
-With RFC 5 the series is complete in outline. What remains is global: **RFC 0
-has accumulated eleven corrections**, SIM-2 has four items, and one rule would
-have prevented four separate findings — *acceptance and retention parameters
-MUST be functions of the declared guarantee, never of a measured percentile.*
+## Cryptographic review
+
+| document | what it is |
+|---|---|
+| [`CRYPTO-REVIEW.md`](CRYPTO-REVIEW.md) | composition review of RFC 1, 2, 4 and 7 — **not a substitute for external review** |
+
+RFC 0 §9 requires external cryptographic review and that requirement stands.
+This is one reviewer reading for composition errors, with no formal analysis
+and no tooling. Four findings warrant fixing regardless of what external
+review later concludes:
+
+- **CRITICAL — the reservoir derives one message key per epoch, not per
+  message.** RFC 7 §6.1 justifies having no counter on the grounds that the tag
+  is "already unique per message." It is not: RFC 1 §6.2 derives it from a
+  static-static secret and the epoch, and RFC 2 §4.3's precomputation table
+  confirms one tag per correspondent per epoch. So `msg_key` is constant for a
+  pair for a day. Recommended fix is HPKE `mode_auth_psk` with the chunk as
+  PSK — per-message keys, post-quantum, epoch-granular forward secrecy, and no
+  format change.
+- **HIGH — Ed25519 malleability defeats duplicate suppression.** Malleating a
+  bulletin's signature yields a byte-different object with a different
+  identifier that still verifies, so one valid signature amplifies into
+  unbounded distinct objects every node stores. Strict verification fixes it.
+- **HIGH — raw X25519 output is used as an HKDF PRK without Extract**, and
+  low-order points are not rejected. A peer publishing a low-order `kx_pk`
+  makes every sender derive the same publicly computable tag.
+- **HIGH — padding content is unspecified and sits inside the identifier**,
+  so two conforming implementations produce different identifiers for
+  identical plaintext.
 
 ## Not yet here
 
