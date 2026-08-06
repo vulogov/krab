@@ -321,6 +321,33 @@ review later concludes:
   so two conforming implementations produce different identifiers for
   identical plaintext.
 
+## RFC 8
+
+| document | what it is |
+|---|---|
+| [`RFC-8.md`](RFC-8.md) | client behaviour, Status: Draft |
+| [`RFC-8-review.md`](RFC-8-review.md) | cross-check against RFC 0–7, SIM-0 and SIM-1 |
+
+RFC 8 completes the series. **§1.1 is a genuine contribution**: it marks every
+requirement *derived* or *judgement*, and states that a "MUST" on a judgement
+requirement means the author believes the failure mode warrants it *despite the
+absence of evidence*. That discipline would benefit the other seven documents
+retroactively.
+
+- **§9.2 declines to state a result that was measured.** It says no simulation
+  has measured an origin attack against degree; SIM-1 §3 measured exactly that,
+  and found degree 8 at 6.2× chance against degree 12 at 1.7×. The caution is
+  admirable but costly — the warning text will cite delivery problems where the
+  measured position is that under-provisioning is *measurably deanonymising*.
+  This is the series' first **under**-claim.
+- **Peer-count guidance is now three-way split** — RFC 0 §8.2, RFC 3 §13 and
+  RFC 8 §9.2 all differ, and RFC 8 is the one that renders a number to an
+  operator.
+- **§5.3 lists coverage without requiring the age profile** SIM-1 §2 found
+  necessary; a 37% scalar concealed a 3–82% ramp.
+- **§6's re-encoding is what makes RFC 1's `MAX_OBJECT` enforceable** — an
+  upward dependency neither document states.
+
 ## Not yet here
 
 RFC 0 and the RFC series plan are not in this directory.
