@@ -9,11 +9,24 @@
 //! Every dependency here supports `no_std`, so nothing downstream of
 //! `krab-core` undermines its posture.
 //!
+//! # Randomness is an argument
+//!
+//! Nothing here reaches for an entropy source; a caller passes one in via
+//! [`rng::Rng`]. That keeps `krab-core`'s no-ambient-randomness posture intact
+//! one level up, makes every keygen path reproducible under test, and means
+//! this crate needs no `getrandom` and therefore no platform. The OS generator
+//! lives in the application crate, which is the only part of the system that
+//! has an OS.
+//!
 //! # Status
 //!
-//! Hashing and content addressing are implemented. Sealing, tag derivation and
-//! signatures are not — see `Documentation/MILESTONE-0.1.md` §2 phase B, and
-//! `Documentation/CRYPTO-REVIEW.md` for the three findings that shape them:
+//! Implemented: hashing and content addressing, Ed25519 identity ([`sign`]),
+//! X25519 agreement ([`dh`]), tag derivation ([`kdf`]), and the Argon2id key
+//! hierarchy ([`kek`]).
+//!
+//! Not implemented: HPKE sealing and the reservoir, both blocked on
+//! `CRYPTO-REVIEW.md` §1 below. See `Documentation/MILESTONE-0.1.md` §2 phase
+//! B. The three findings that shape this crate:
 //!
 //! - **§1, critical and open.** RFC 7 §6's reservoir derives one message key
 //!   per (pair, epoch) rather than per message. Not implemented; the
@@ -23,10 +36,11 @@
 //!   encodings, small-order `A` rejected — or malleability defeats RFC 0 I-1's
 //!   duplicate suppression and one signature amplifies without bound.
 //! - **§3.** RFC 1 §6.2 feeds the raw X25519 output to `HKDF-Expand` as a PRK,
-//!   skipping Extract, against RFC 5869 §3.3. That will be implemented **as
-//!   frozen**, with the deviation marked: doing it the safer way would fork
-//!   the tag space from the specification. Low-order rejection is additive and
-//!   will be applied.
+//!   skipping Extract, against RFC 5869 §3.3. Implemented **as frozen** in
+//!   [`kdf`], with the deviation marked: doing it the safer way would fork the
+//!   tag space and fail silently, since RFC 0 §6 makes delivery failure silent
+//!   by design. Low-order rejection is additive and **is** applied, in
+//!   [`dh::agree`].
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -34,8 +48,20 @@
 
 extern crate alloc;
 
+pub mod dh;
 pub mod hash;
+pub mod kdf;
+pub mod kek;
+pub mod rng;
 pub mod secret;
+pub mod sign;
+pub mod words;
 
+pub use dh::{agree, PublicKey, SecretKey, Shared};
 pub use hash::{channel_id, channel_tag, node_id, object_id, Fingerprint};
+pub use kdf::{inbox_tag, pairwise_tag, pairwise_window};
+pub use kek::{Hierarchy, Kek, KekParams};
+pub use rng::Rng;
+pub use sign::{Sig, SigningKey, VerifyingKey};
+pub use words::phrase;
 pub use secret::{Key, Secret};

@@ -20,5 +20,18 @@ krab-core = { workspace = true }
 blake3 = { version = "1", default-features = false }
 zeroize = { version = "1", default-features = false, features = ["zeroize_derive"] }
 
+# RFC 1 §6.1 names the suite: DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 /
+# ChaCha20-Poly1305. These are those primitives and nothing else.
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+
+# Note the absence of `getrandom`. Randomness is an argument here, never
+# ambient -- see `rng::Rng`. The OS entropy source lives in the application
+# crate, which is the only place that has an OS.
+
 [features]
 default = []

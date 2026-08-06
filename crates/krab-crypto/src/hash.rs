@@ -122,6 +122,14 @@ impl Fingerprint {
     }
 
     /// Add a range's fingerprint to this one, mod 2²⁵⁶.
+    ///
+    /// Not `std::ops::Add`: that trait's contract carries no notion of the
+    /// modulus, and a fingerprint that silently participated in generic
+    /// numeric code would be a worse bug than the naming collision.
+    #[allow(clippy::should_implement_trait)]
+    // The index walks two limb arrays and a carry in lockstep; an iterator
+    // rewrite would obscure the carry chain, which is the whole function.
+    #[allow(clippy::needless_range_loop)]
     pub fn add(self, other: Fingerprint) -> Fingerprint {
         let mut out = [0u64; 4];
         let mut carry = 0u64;
@@ -138,6 +146,8 @@ impl Fingerprint {
     ///
     /// The inverse of [`Fingerprint::add`], which is what makes a prefix-sum
     /// index answer an arbitrary range in constant time.
+    #[allow(clippy::should_implement_trait)]
+    #[allow(clippy::needless_range_loop)]
     pub fn sub(self, other: Fingerprint) -> Fingerprint {
         let mut out = [0u64; 4];
         let mut borrow = 0u64;
