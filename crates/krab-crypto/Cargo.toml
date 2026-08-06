@@ -1,0 +1,23 @@
+[package]
+name = "krab-crypto"
+description = "Krab cryptographic primitives. The only crate with third-party dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# This is the one crate permitted third-party dependencies, so that the audit
+# surface and RFC 0 §9's reproducible-builds argument are both localised to a
+# single boundary. krab-core stays literally zero-dependency, which is what
+# keeps its no-I/O, no-clock, no-ambient-randomness invariant compiler-enforced.
+#
+# Every dependency here MUST support no_std, so krab-core's posture is not
+# undermined by anything downstream of it.
+[dependencies]
+krab-core = { workspace = true }
+blake3 = { version = "1", default-features = false }
+
+[features]
+default = []

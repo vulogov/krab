@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/krab-core",
+    "crates/krab-crypto",
     "crates/krab-store",
     "crates/krab-proto",
     "crates/krab-fabric",
@@ -22,6 +23,7 @@ authors = ["Vladimir Ulogov"]
 
 [workspace.dependencies]
 krab-core = { path = "crates/krab-core" }
+krab-crypto = { path = "crates/krab-crypto" }
 krab-store = { path = "crates/krab-store" }
 krab-proto = { path = "crates/krab-proto" }
 krab-fabric = { path = "crates/krab-fabric" }

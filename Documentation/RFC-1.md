@@ -137,6 +137,23 @@ friend-to-friend peering — but it is inside the identifier hash, so a rate
 token could never be added later. Deployments accepting traffic from
 low-trust peers may want one.
 
+```
+A v1 encoder MUST NOT emit key 3.
+A v1 decoder MUST reject an object in which key 3 is present.
+```
+
+Reserved means absent, not present-and-empty. Emitting it would spend two
+bytes in every object forever — material only in the 256-byte bucket, where
+just 90 are usable (§8.1) — and leaving the choice open would fracture the
+corpus, since the two readings produce different identifiers for identical
+content. A version that defines `admission` emits it under a new `ver`,
+which §10 already accommodates.
+
+This resolution postdates the byte counts first published in §6.5 and §8.1,
+which assumed key 3 was emitted. Those tables have been recomputed: every
+on-wire figure is 2 bytes smaller and every bucket capacity 2 bytes larger.
+**No object changes bucket**, so nothing downstream of §8.1 is affected.
+
 **The HPKE suite is public and this is unavoidable.** A recipient cannot
 decapsulate without knowing the suite. Suite diversity is therefore a
 fingerprint, and deployments SHOULD converge on a single suite.
@@ -388,9 +405,9 @@ The naive answer — hybrid KEM per message — costs more than expected:
 
 | | classical `0x0001` | hybrid `0x0002` |
 |---|---|---|
-| floor for a sealed object | 150 B | **1 239 B** |
+| floor for a sealed object | 148 B | **1 237 B** |
 | padded bucket | 256 B | **4 096 B** |
-| a 280-byte message | 448 B → 1 KB bucket | 1 537 B → **4 KB bucket** |
+| a 280-byte message | 446 B → 1 KB bucket | 1 535 B → **4 KB bucket** |
 | LoRa airtime, one small message | ~5 min | **~1.3 h** |
 
 This is not "+1.1 KB per message". For short traffic it is a **16× corpus
@@ -451,7 +468,7 @@ agreement — a considerably lower bar than an envelope field would face.
 In pairwise mode the recipient derived the tag from a specific
 correspondent's key and therefore already holds key 2. Senders MAY omit
 it, saving 34 bytes — which matters only in the 256-byte bucket, where it
-raises usable body from 90 to 124 bytes (§8.1).
+raises usable body from 92 to 126 bytes (§8.1).
 
 ---
 
@@ -463,16 +480,28 @@ Objects are padded to the next bucket. Without this, size alone
 fingerprints content type — a 180-byte object is a beacon, a 40 KB one a
 picture.
 
+```
+Padding MUST be zero bytes.
+A receiver MUST reject an object whose padding is not zero.
+```
+
+The identifier covers the padding (§3, §4), so an unspecified fill would let
+two conforming encoders compute different identifiers for identical
+plaintext and fracture the corpus permanently. Zero is chosen over random
+because padding sits outside the AEAD's AAD (§6.1) and is protected only by
+the identifier: a fixed value makes the invariant checkable on ingest, where
+a random one is indistinguishable from corruption.
+
 | bucket | max body | padding overhead |
 |---|---|---|
-| 256 | 90 B | 64.8 % |
-| 1 024 | 856 B | 16.4 % |
-| 4 096 | 3 928 B | 4.1 % |
-| 16 384 | 16 216 B | 1.0 % |
-| 65 536 | 65 368 B | 0.3 % |
-| 262 144 | 261 972 B | 0.1 % |
+| 256 | 92 B | 64.1 % |
+| 1 024 | 858 B | 16.2 % |
+| 4 096 | 3 930 B | 4.1 % |
+| 16 384 | 16 218 B | 1.0 % |
+| 65 536 | 65 370 B | 0.3 % |
+| 262 144 | 261 974 B | 0.1 % |
 
-The floor for a sealed object is **150 bytes**, so the 256-byte bucket is
+The floor for a sealed object is **148 bytes**, so the 256-byte bucket is
 inefficient by construction. This is accepted: the alternative is a
 smaller bucket that no object can occupy.
 

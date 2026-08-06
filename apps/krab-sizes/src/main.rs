@@ -203,17 +203,17 @@ fn check(m: Magnitudes) -> i32 {
     };
 
     cmp("§4.1 routing header", ROUTING_HEADER, 16);
-    cmp("envelope, empty ciphertext", envelope(X25519, 0, m), 48);
+    cmp("envelope, empty ciphertext", envelope(X25519, 0, m), 46);
     cmp("HPKE enc, suite 0x0001", X25519, 32);
 
     for (body, pt, ct, wire, bucket) in [
-        (0usize, 84usize, 100usize, 165usize, 256usize),
-        (64, 149, 165, 230, 256),
-        (280, 366, 382, 448, 1_024),
-        (1_200, 1_286, 1_302, 1_368, 4_096),
-        (4_000, 4_086, 4_102, 4_168, 16_384),
-        (20_000, 20_086, 20_102, 20_168, 65_536),
-        (120_000, 120_088, 120_104, 120_172, 262_144),
+        (0usize, 84usize, 100usize, 163usize, 256usize),
+        (64, 149, 165, 228, 256),
+        (280, 366, 382, 446, 1_024),
+        (1_200, 1_286, 1_302, 1_366, 4_096),
+        (4_000, 4_086, 4_102, 4_166, 16_384),
+        (20_000, 20_086, 20_102, 20_166, 65_536),
+        (120_000, 120_088, 120_104, 120_170, 262_144),
     ] {
         let s = sealed(body, ADDR, CTYPE, Suite::Classical, m);
         cmp(&format!("body {body} plaintext"), s.plaintext, pt);
@@ -223,12 +223,12 @@ fn check(m: Magnitudes) -> i32 {
     }
 
     for (b, mb) in [
-        (256usize, 90usize),
-        (1_024, 856),
-        (4_096, 3_928),
-        (16_384, 16_216),
-        (65_536, 65_368),
-        (262_144, 261_972),
+        (256usize, 92usize),
+        (1_024, 858),
+        (4_096, 3_930),
+        (16_384, 16_218),
+        (65_536, 65_370),
+        (262_144, 261_974),
     ] {
         cmp(
             &format!("§8.1 bucket {b} max body"),
@@ -238,7 +238,7 @@ fn check(m: Magnitudes) -> i32 {
     }
 
     let pq = sealed(280, ADDR, CTYPE, Suite::Hybrid, m);
-    cmp("§6.5 hybrid 280-byte message", pq.on_wire, 1_537);
+    cmp("§6.5 hybrid 280-byte message", pq.on_wire, 1_535);
     cmp("§6.5 hybrid 280-byte bucket", pq.bucket.unwrap_or(0), 4_096);
 
     for (b, frames) in [(256usize, 6usize), (1_024, 21), (4_096, 81)] {

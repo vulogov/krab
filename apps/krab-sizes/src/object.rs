@@ -94,16 +94,19 @@ pub fn inner_plaintext_base(addr: usize, ctype: usize, body: usize, m: Magnitude
 
 /// RFC 1 §4.2. Envelope body for `sealed`, keys 0..5.
 ///
-/// `admission` (key 3) is emitted as a zero-length byte string. RFC 1 does not
-/// state whether a v1 encoder must emit it empty or omit it, and the choice
-/// changes the identifier — see Documentation/RFC-1-review.md §3. Emitting it
-/// is the reading that matches RFC 1's own published byte counts.
+/// **Five keys, not six.** RFC 1 §4.2 now requires a v1 encoder not to emit
+/// `admission` (key 3), and a v1 decoder to reject it if present — reserved
+/// means absent, not present-and-empty.
+///
+/// That resolution postdates RFC 1's first published byte counts, which were
+/// computed with key 3 emitted. Every on-wire figure is therefore 2 bytes
+/// smaller and every bucket capacity 2 bytes larger than the first draft's.
+/// No object changes bucket.
 pub fn envelope(enc: usize, ct: usize, m: Magnitudes) -> usize {
-    cbor::map(6)
+    cbor::map(5)
         + 1 + cbor::uint(m.epoch)  // 0: tag epoch
         + 1 + cbor::uint(1)        // 1: tag mode
         + 1 + cbor::uint(1)        // 2: HPKE suite
-        + 1 + cbor::bstr(0)        // 3: admission, reserved
         + 1 + cbor::bstr(enc)      // 4: HPKE encapsulated key
         + 1 + cbor::bstr(ct)       // 5: ciphertext ‖ AEAD tag
 }
@@ -172,7 +175,7 @@ mod tests {
 
     #[test]
     fn envelope_with_empty_ciphertext_is_48() {
-        assert_eq!(envelope(X25519, 0, M), 48);
+        assert_eq!(envelope(X25519, 0, M), 46);
     }
 
     #[test]
@@ -185,13 +188,13 @@ mod tests {
     fn realistic_messages_match_rfc1() {
         // (body, plaintext, ciphertext, on_wire, bucket)
         let want = [
-            (0usize, 84usize, 100usize, 165usize, 256usize),
-            (64, 149, 165, 230, 256),
-            (280, 366, 382, 448, 1_024),
-            (1_200, 1_286, 1_302, 1_368, 4_096),
-            (4_000, 4_086, 4_102, 4_168, 16_384),
-            (20_000, 20_086, 20_102, 20_168, 65_536),
-            (120_000, 120_088, 120_104, 120_172, 262_144),
+            (0usize, 84usize, 100usize, 163usize, 256usize),
+            (64, 149, 165, 228, 256),
+            (280, 366, 382, 446, 1_024),
+            (1_200, 1_286, 1_302, 1_366, 4_096),
+            (4_000, 4_086, 4_102, 4_166, 16_384),
+            (20_000, 20_086, 20_102, 20_166, 65_536),
+            (120_000, 120_088, 120_104, 120_170, 262_144),
         ];
         for (body, pt, ct, wire, bucket) in want {
             let s = sealed(body, ADDR, CTYPE, Suite::Classical, M);
@@ -206,12 +209,12 @@ mod tests {
     #[test]
     fn bucket_capacities_match_rfc1() {
         let want = [
-            (256usize, 90usize),
-            (1_024, 856),
-            (4_096, 3_928),
-            (16_384, 16_216),
-            (65_536, 65_368),
-            (262_144, 261_972),
+            (256usize, 92usize),
+            (1_024, 858),
+            (4_096, 3_930),
+            (16_384, 16_218),
+            (65_536, 65_370),
+            (262_144, 261_974),
         ];
         for (bucket, max_body) in want {
             assert_eq!(
@@ -232,7 +235,7 @@ mod tests {
     #[test]
     fn hybrid_suite_matches_rfc1() {
         let s = sealed(280, ADDR, CTYPE, Suite::Hybrid, M);
-        assert_eq!(s.on_wire, 1_537);
+        assert_eq!(s.on_wire, 1_535);
         assert_eq!(s.bucket, Some(4_096));
     }
 
