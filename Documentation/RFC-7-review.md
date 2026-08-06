@@ -219,3 +219,135 @@ belong to other documents:
   received-message rate, and correctly identifies group membership as the
   driver — but RFC 3 §14's per-device multiplier is not folded in. A
   three-device operator in a 20-person group receives 3× the fan-out.
+
+---
+
+## 8. Addendum — §4's single KEK cannot support a locked node
+
+This finding came out of implementing RFC 8's screen lock. It is a defect in
+§4's hierarchy rather than in the lock design, and it already exists today for
+relays, independently of lock.
+
+### 8.1 The contradiction
+
+`RFC-8-review.md` §8.4 makes a locked TUI a relay: it drops the KEK and keeps
+reconciling. Reconciliation requires three things — the Noise static key to
+answer a handshake, the **peer credential** to verify the initiator's static
+key and derive the filter (RFC 5 §2), and the object index.
+
+But RFC 3 §15 requires:
+
+> "The credential store MUST be encrypted under the RFC 7 key hierarchy."
+
+And §7 of this document gives a relay no passphrase, therefore no KEK. And §4
+has exactly one KEK, wrapping everything.
+
+Three consequences, only the third of which is new:
+
+1. A locked node whose credentials died with the KEK **cannot reconcile** —
+   it cannot verify a peer or compute a filter.
+2. A locked node whose credentials survived the KEK has a lock that **does not
+   protect the peer list**, which is the social graph.
+3. **This is already broken for relays, with no lock involved.** A relay has
+   no passphrase, so under §4 its credentials are either unencrypted or
+   unreadable. Neither is what RFC 3 §15 asks for.
+
+### 8.2 RFC 0 §4.4 overstates the relay case
+
+> "Relay. … Holds a link key and ciphertext it cannot read. **Seizure yields
+> nothing not already replicated across the network.**"
+
+The corpus is replicated. **The peer list is not** — it is precisely the
+information RFC 0 §6 non-goal 2 refuses to publish, and RFC 3 §15 calls
+"worse than an address book" because the mutual signatures make it
+non-repudiable.
+
+So a seized relay yields something the network does not contain. That sentence
+needs qualifying regardless of what §4 does.
+
+### 8.3 The fix: two roots, which is the relay/mailbox boundary made concrete
+
+§4's hierarchy needs a second root rather than a second mechanism:
+
+```
+device secret ─────────▶ LINK KEK        survives lock, dies on process exit
+   (OS keychain/TPM)      ├─ peer credentials
+                          ├─ Noise static key
+                          └─ corpus and object index
+
+passphrase ──Argon2id──▶ CONTENT KEK     dies on lock
+                          ├─ tag precomputation table
+                          ├─ prekey privates
+                          ├─ reservoir chunks
+                          ├─ epoch wrapper keys
+                          └─ read and pin state
+```
+
+**A relay holds only the link tier** — which is exactly what §7's table already
+says it holds, so this is the existing role boundary given a key hierarchy that
+can express it. A mailbox holds both. Lock drops the content tier and nothing
+else. §4's shredding argument is unchanged; it now has two roots.
+
+Putting the **corpus under the link tier** rather than leaving it unencrypted
+is worth doing on its own account: it means a powered-off seizure cannot
+enumerate which objects a node holds, which is the input to SIM-1 §2 and §3's
+differential-holdings analysis. §4's diagram currently lists "message store"
+under the single KEK, which cannot be right — §8 requires the store to *be*
+ciphertext, and a relay serves it with no passphrase at all.
+
+### 8.4 What this buys: the exposure ladder matches RFC 0 §5.1
+
+| state | adversary gets |
+|---|---|
+| powered off | nothing — both roots are sealed |
+| running, locked | corpus and peer list; no tag table, no keys |
+| running, unlocked | everything, as RFC 0 §5.1 already concedes |
+
+RFC 0 §5.1 lists "endpoint seizure, powered on" as undefended. With lock, that
+becomes two rows instead of one, and the middle row is new defence rather than
+restated concession.
+
+### 8.5 A locked node cannot recognise its own mail, and that is the point
+
+The tag precomputation table maps tags to correspondents. §9 of RFC 2 calls it
+"the single most valuable artifact on a seized running node." It sits in the
+content tier and dies on lock.
+
+So a locked node **accepts, stores and relays traffic it is genuinely unable to
+identify as its own.** RFC 0 §4.4 asserts that a relay holds no message
+decryption keys; a locked TUI *demonstrates* it, in the same process that was a
+mailbox a moment earlier.
+
+Unlock re-derives the table and rescans what arrived meanwhile. RFC 2 §4.3
+sizes the rebuild at 4 550 entries and 6.8 ms for 50 correspondents at ±45;
+scanning a few thousand objects against it is milliseconds more.
+
+### 8.6 The cost, stated rather than hidden
+
+**The device secret needs somewhere to live.** It cannot be the passphrase, or
+it would not survive lock. On a laptop that is an OS keychain or a TPM — which
+is the C dependency §4.2 contemplates reluctantly for unattended mailboxes.
+
+The irony is worth recording: refusing headless operation removed the need for
+TPM in one place, and lock reintroduces it in another. The stakes are lower —
+the link tier protects a peer list and a corpus rather than message content,
+and losing the device secret costs a re-peering rather than the archive — but
+an implementation without a keychain has to either keep the link tier
+unencrypted at rest or prompt on every start, and it should say which.
+
+**The link tier is not protected against a running-locked seizure.** That is
+the middle row of §8.4's ladder and it is the honest boundary: lock protects
+message content and the correspondent mapping, not the fact of who you peer
+with.
+
+### 8.7 Changes this implies
+
+| document | change |
+|---|---|
+| RFC 7 §4 | two roots: link KEK from a device secret, content KEK from the passphrase |
+| RFC 7 §4 | corpus and index move under the link tier; "message store" as listed is wrong |
+| RFC 7 §7 | state that a relay holds the link tier only, and that lock is the runtime transition into it |
+| RFC 7 §4.2 | the TPM discussion now applies to the link tier, at lower stakes |
+| RFC 0 §4.4 | qualify "seizure yields nothing" — the peer list is not replicated |
+| RFC 0 §5.1 | split "powered on" into locked and unlocked |
+| RFC 3 §15 | say which tier the credential store sits in |
