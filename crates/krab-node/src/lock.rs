@@ -306,6 +306,43 @@ mod tests {
         assert_eq!(r3, Role::Relay);
     }
 
+    /// **The UI cannot halt delivery.**
+    ///
+    /// A composer left open, a pane zoomed, a menu sitting on screen — none of
+    /// it touches the schedule, because the node reconciles on a background
+    /// thread and `Scheduler` has no input describing what the interface is
+    /// doing. The same structural argument as `locking_does_not_alter_the_schedule`,
+    /// stated separately because it is the question an operator will actually
+    /// ask: *if I forget to close the compose pane, does mail stop?*
+    ///
+    /// It does not, and it cannot.
+    #[test]
+    fn an_open_composer_does_not_halt_delivery() {
+        let run = |leave_composer_open: bool| {
+            let mut sched = Scheduler::new(600);
+            let mut sess = session();
+            for n in 1..=4u8 {
+                sched.add([n; 32], 0, 0xFEED ^ n as u64);
+            }
+            let mut fired = Vec::new();
+            for t in (0..20_000u64).step_by(60) {
+                if leave_composer_open && t == 600 {
+                    // Opened, typed into, and never closed.
+                    sess.compose("a long message the user wandered away from").unwrap();
+                }
+                fired.extend(sched.due(t, 0xBEEF ^ t));
+            }
+            (fired, sess.composer().len())
+        };
+
+        let (closed, _) = run(false);
+        let (open, len) = run(true);
+
+        assert!(len > 0, "the composer really is still open with content in it");
+        assert_eq!(closed, open, "an open composer must not change the schedule");
+        assert!(!closed.is_empty(), "and reconciliation must actually be happening");
+    }
+
     /// Locking twice is safe — the panic-wipe path may fire on an already
     /// locked node, and RFC 7 §10 makes it a command a user can press.
     #[test]

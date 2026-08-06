@@ -18,21 +18,51 @@
 //! expressible, which is the same discipline `Scheduler::due` uses for I-5 and
 //! `Store::evict_to` uses for I-6.
 //!
-//! # Non-intrusive, for a reason beyond taste
+//! # A spinner is fine; a countdown is not
 //!
-//! RFC 8 §5.1 also warns that "a precise countdown invites waiting for it, and
-//! a user who learns the exact schedule will correlate their own behaviour
-//! with it." An indicator that draws the eye trains the attention the design
-//! is trying not to create. So the schedule is shown as a **coarsened window**
-//! and never as a live countdown, and nothing animates.
+//! RFC 8 §5.1 permits showing progress "for a reconciliation **while one is in
+//! fact running**", and says outright that "a spinner emits nothing and leaks
+//! nothing; the objection is to the causal claim the interface makes."
 //!
-//! There is a plain cost reason too: a spinner redrawing at 10 Hz over a
-//! serial console or a poor SSH link is real bandwidth on exactly the
-//! transports Krab exists to serve.
+//! Those are two different things and only one is restricted:
+//!
+//! | indicator | shows | verdict |
+//! |---|---|---|
+//! | spinner while reconciling | *that* something is happening, now | fine — it is a fact |
+//! | countdown to next sync | *when* something will happen | coarsened — predictive, and §5.1 says a precise one "invites waiting for it" |
+//! | spinner starting on a keypress | that the user caused it | forbidden — the claim is false |
+//!
+//! Because the node reconciles on a background thread, a running spinner is
+//! **decorrelated from user activity by construction**. A user watching it
+//! learns "sync happens sometimes", not "my keypress causes sync" — and since
+//! the schedule is Poisson and therefore memoryless, watching it does not
+//! help predict it. That is what the distribution was chosen for.
 
 use core::fmt;
 
 /// What the node is doing, derived from its state.
+///
+/// # Almost nothing here is foreground work
+///
+/// The node sends and receives on a background thread regardless of what the
+/// interface is doing. Only a short list of operations are genuinely
+/// *frontend* activities — things the user drives, that block on them, and
+/// that would look broken without feedback:
+///
+/// | activity | foreground? | why |
+/// |---|---|---|
+/// | initial key exchange (RFC 3 §11) | **yes** | a ceremony: the user is reading a word list aloud and moving a USB stick |
+/// | transport establishment | **yes** | the user pressed `connect`, and RFC 4 §5.2 notes Tor bootstrap takes tens of seconds |
+/// | unlock (Argon2id) | **yes** | RFC 7 §4.1 calibrates it at ~500 ms, and the interface is stopped for it |
+/// | reconciliation | no | Poisson-scheduled, RFC 5 §6.1 |
+/// | sending | no | the object queues for the next scheduled exchange |
+/// | receiving | no | it arrives when it arrives |
+///
+/// The distinction is not cosmetic. A foreground activity may be shown as
+/// *the user's operation in progress*, because it is one. A background
+/// activity may only be reported as a fact — RFC 8 §5.1 forbids implying the
+/// user's action caused it, and for reconciliation that implication would be
+/// false.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
     /// Nothing in flight. The common case, and it is not a failure.
@@ -48,13 +78,59 @@ pub enum Activity {
     },
     /// A scheduled reconciliation is running **now**.
     ///
-    /// Permitted by RFC 8 §5.1 only because it reports a fact rather than a
-    /// consequence. It can begin while the user is doing nothing at all, which
-    /// is exactly what makes it safe to show.
+    /// Background. Permitted by RFC 8 §5.1 only because it reports a fact
+    /// rather than a consequence — it can begin while the user is doing
+    /// nothing at all, which is exactly what makes it safe to show.
     Reconciling {
         /// Short peer label.
         peer: &'static str,
     },
+    /// A peering ceremony is in progress, RFC 3 §11.
+    ///
+    /// **Foreground.** The user is comparing a fingerprint word list aloud and
+    /// carrying a USB stick between two machines; the interface is genuinely
+    /// waiting on them, and each step needs to say which step it is or the
+    /// ceremony cannot be followed.
+    ///
+    /// `RFC-8-review.md` §9.1 settles the mechanism: `pack`/`import` over
+    /// physical media, three passes, with `verify` read aloud between them.
+    /// RFC 3 §11 assumes a QR path a terminal cannot complete, since a
+    /// terminal can render a QR and cannot read one.
+    Ceremony {
+        /// Which of the three passes.
+        step: CeremonyStep,
+    },
+    /// Deriving the KEK on unlock, RFC 7 §4.1.
+    ///
+    /// **Foreground**, and deliberately slow: Argon2id is calibrated to about
+    /// 500 ms, so the interface must say why it has stopped.
+    Unlocking,
+}
+
+/// Where a peering ceremony has reached, RFC 3 §11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeremonyStep {
+    /// Writing this node's `peer-request` to removable media.
+    PackRequest,
+    /// Reading the counterparty's archive.
+    Import,
+    /// Comparing fingerprint word lists aloud — **the actual security step**,
+    /// and the only one no software can perform.
+    Verify,
+    /// Countersigning, and exchanging reservoir contributions.
+    Sign,
+}
+
+impl CeremonyStep {
+    /// What to tell the operator to do next.
+    pub fn prompt(&self) -> &'static str {
+        match self {
+            CeremonyStep::PackRequest => "written to media -- hand it over",
+            CeremonyStep::Import => "reading their archive",
+            CeremonyStep::Verify => "compare the word list aloud, both of you",
+            CeremonyStep::Sign => "signing, and exchanging pad contributions",
+        }
+    }
 }
 
 /// Node state the indicator is derived from.
@@ -71,13 +147,27 @@ pub struct NodeState {
     pub next_sync_in_s: Option<u64>,
     /// Objects created locally and awaiting the next scheduled exchange.
     pub queued: usize,
+    /// A peering ceremony in progress. **Foreground** — the user is driving it.
+    pub ceremony: Option<CeremonyStep>,
+    /// Deriving the KEK. **Foreground** — the interface is stopped for it.
+    pub unlocking: bool,
 }
 
 impl Activity {
     /// Derive what to show. The only way to construct one.
     pub fn of(state: &NodeState) -> Activity {
-        // Establishment first: it is the one the user actually caused, and the
-        // one RFC 4 §5.2 says will otherwise look like a hang.
+        // Precedence is "what is the user waiting on", most-blocking first.
+        // Unlock stops the interface outright (RFC 7 §4.1's ~500 ms), so it
+        // outranks work the user can ignore.
+        if state.unlocking {
+            return Activity::Unlocking;
+        }
+        // A ceremony is the operation the user is executing with their hands.
+        if let Some(step) = state.ceremony {
+            return Activity::Ceremony { step };
+        }
+        // Establishment is foreground but not blocking; RFC 4 §5.2 warns it
+        // will look like a hang if nothing is shown.
         if let Some(t) = state.establishing {
             return Activity::Establishing { transport: t };
         }
@@ -91,6 +181,42 @@ impl Activity {
     pub fn is_visible(&self) -> bool {
         !matches!(self, Activity::Idle)
     }
+
+    /// Whether this activity animates.
+    ///
+    /// True whenever something is genuinely in flight, so the operator gets
+    /// the "yes, it is alive" signal a background process otherwise never
+    /// gives. False when idle, because idle is the common case and a
+    /// perpetually spinning interface says nothing.
+    pub fn animates(&self) -> bool {
+        self.is_visible()
+    }
+}
+
+/// A spinner, advanced by the render tick.
+///
+/// Deliberately has **no** `start`, `stop`, `begin` or `finish`. It cannot be
+/// driven by an event, only sampled — so the forbidden shape from RFC 8 §5.1,
+/// an indicator that begins on a keypress and resolves on object arrival, has
+/// no method to express it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Spinner {
+    frame: usize,
+}
+
+/// Braille frames: one cell wide, so the status line never reflows.
+const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠇'];
+
+impl Spinner {
+    /// Advance one render tick.
+    pub fn tick(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// The glyph to draw for `activity`, or `None` when nothing is in flight.
+    pub fn glyph(&self, activity: &Activity) -> Option<char> {
+        activity.animates().then(|| FRAMES[self.frame % FRAMES.len()])
+    }
 }
 
 impl fmt::Display for Activity {
@@ -101,6 +227,8 @@ impl fmt::Display for Activity {
             // Note the wording: never "syncing now", which RFC 8 §5.1 forbids
             // because it implies the user's action caused a transfer.
             Activity::Reconciling { peer } => write!(f, "reconciling with {peer}"),
+            Activity::Ceremony { step } => write!(f, "peering: {}", step.prompt()),
+            Activity::Unlocking => f.write_str("unlocking"),
         }
     }
 }
@@ -146,10 +274,22 @@ pub fn schedule_window(secs_until: u64) -> &'static str {
 /// show activity on compose, which RFC 8 §5.1 forbids. All three cannot hold.
 /// This implements scheduled-only emission.
 pub fn status_line(state: &NodeState) -> String {
+    status_line_with(state, &Spinner::default())
+}
+
+/// As [`status_line`], with a spinner glyph when something is in flight.
+///
+/// RFC 8 §3 gives the command pane two lines and requires structured output to
+/// render elsewhere, so this stays to one short line and the same spinner
+/// serves link status.
+pub fn status_line_with(state: &NodeState, spinner: &Spinner) -> String {
     let mut parts: Vec<String> = Vec::new();
     let activity = Activity::of(state);
     if activity.is_visible() {
-        parts.push(activity.to_string());
+        match spinner.glyph(&activity) {
+            Some(g) => parts.push(format!("{g} {activity}")),
+            None => parts.push(activity.to_string()),
+        }
     }
     if state.queued > 0 {
         parts.push(format!("{} queued", state.queued));
@@ -197,6 +337,96 @@ mod tests {
         let s = NodeState { reconciling: Some("m4k2"), ..Default::default() };
         assert!(status_line(&s).contains("reconciling with m4k2"));
         assert!(!status_line(&s).to_lowercase().contains("syncing now"));
+    }
+
+    /// The operator needs "yes, it is alive" from a background process.
+    #[test]
+    fn a_spinner_animates_while_something_is_in_flight() {
+        let mut sp = Spinner::default();
+        let busy = Activity::Reconciling { peer: "m4k2" };
+        let a = sp.glyph(&busy).unwrap();
+        sp.tick();
+        let b = sp.glyph(&busy).unwrap();
+        assert_ne!(a, b, "it must actually move");
+
+        // And it stops when nothing is happening -- a perpetually spinning
+        // interface says nothing.
+        assert_eq!(sp.glyph(&Activity::Idle), None);
+    }
+
+    /// The spinner has no way to be started by an event: sampling it is the
+    /// only thing a caller can do. This is the test that fails if someone adds
+    /// `Spinner::start()`.
+    #[test]
+    fn the_spinner_is_sampled_never_triggered() {
+        let mut sp = Spinner::default();
+        // Ticking with nothing in flight still draws nothing, so a keypress
+        // that ticked the spinner could not make one appear.
+        for _ in 0..100 {
+            sp.tick();
+            assert_eq!(sp.glyph(&Activity::Idle), None);
+        }
+        // It appears only because the node state says so.
+        let s = NodeState { reconciling: Some("p1"), ..Default::default() };
+        assert!(sp.glyph(&Activity::of(&s)).is_some());
+    }
+
+    /// Sending must not make the spinner appear, however many objects queue.
+    #[test]
+    fn queueing_a_message_does_not_start_the_spinner() {
+        let sp = Spinner::default();
+        for queued in [1usize, 5, 999] {
+            let s = NodeState { queued, next_sync_in_s: Some(7_800), ..Default::default() };
+            assert_eq!(sp.glyph(&Activity::of(&s)), None, "{queued} queued must not animate");
+        }
+    }
+
+    /// Foreground work is the user's operation and is shown as one.
+    #[test]
+    fn the_ceremony_is_foreground_and_names_its_step() {
+        let s = NodeState { ceremony: Some(CeremonyStep::Verify), ..Default::default() };
+        let line = status_line(&s);
+        assert!(line.contains("compare the word list aloud"), "{line}");
+        // It outranks a background reconciliation, because the user is waiting
+        // on it and the reconciliation is nobody's concern right now.
+        let both = NodeState {
+            ceremony: Some(CeremonyStep::Sign),
+            reconciling: Some("m4k2"),
+            ..Default::default()
+        };
+        assert!(matches!(Activity::of(&both), Activity::Ceremony { .. }));
+    }
+
+    /// RFC 7 §4.1 puts Argon2id at ~500 ms, so the interface must say why it
+    /// has stopped rather than appearing to hang.
+    #[test]
+    fn unlocking_is_foreground_and_outranks_everything() {
+        let s = NodeState {
+            unlocking: true,
+            ceremony: Some(CeremonyStep::Verify),
+            reconciling: Some("p"),
+            establishing: Some("tor"),
+            ..Default::default()
+        };
+        assert_eq!(Activity::of(&s), Activity::Unlocking);
+    }
+
+    /// The whole point of the foreground/background split: only a handful of
+    /// activities are the user's, and sending is not one of them.
+    #[test]
+    fn only_a_handful_of_activities_are_foreground() {
+        let background = NodeState {
+            reconciling: Some("p"),
+            queued: 12,
+            next_sync_in_s: Some(7_000),
+            ..Default::default()
+        };
+        // Reported as a fact, never as the user's operation.
+        let line = status_line(&background);
+        assert!(line.contains("reconciling with p"));
+        for forbidden in ["syncing", "sending", "uploading", "please wait"] {
+            assert!(!line.to_lowercase().contains(forbidden), "{line:?}");
+        }
     }
 
     /// RFC 8 §5.1 — a window, never a countdown.
