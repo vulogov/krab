@@ -457,3 +457,94 @@ Replacing §8.7:
 | RFC 0 §5.1 | split "powered on" into locked and unlocked |
 
 §8.3, §8.6's TPM note, and §8.7 are superseded by this section.
+
+---
+
+## 10. Addendum — the reservoir needs a channel rule, not only an XOR
+
+Raised while building the `peer` command. §6.2 states one rationale for
+`reservoir = R_A ⊕ R_B`:
+
+> "Neither party's generator alone determines the result, so a backdoored or
+> broken RNG on one end does not compromise it."
+
+That is correct and it is not sufficient. **The XOR protects against a bad
+generator; nothing in RFC 7 protects against a bad channel.**
+
+### 10.1 The gap
+
+§6's own fix note establishes what the reservoir is *for*: supplied as an HPKE
+PSK, "the ephemeral `skE` then makes the key schedule per-message while **the
+PSK carries the post-quantum property**." The reservoir is the component that
+survives X25519 being broken.
+
+Now consider how `R_A` and `R_B` reach their destinations. RFC 3 §11.1 says
+that where an in-person ceremony is impossible, "the same documents flow
+through the corpus", and qualifies this **only** with respect to fingerprint
+comparison. Read literally, that covers step 3 as well as step 1.
+
+If it does, then an adversary recording the exchange and breaking X25519 later
+recovers both contributions, hence the reservoir root, hence every chunk
+derived from it, for the life of the peering. The reservoir's entire reason for
+existing is void — and no party observes anything wrong, because the link
+functions perfectly. This is a **store-now-decrypt-later** exposure of exactly
+the traffic the reservoir was added to protect.
+
+Note this is strictly worse than the epoch-chunk compromise §6.1 already
+accepts as a tradeoff. That one costs a single epoch with a single peer. This
+costs every epoch with that peer, retroactively, from a passive recording.
+
+### 10.2 Why it is easy to get wrong
+
+The mistake is not careless. Encrypting a secret before sending it is the
+correct instinct everywhere else in the system, and an implementer who wraps
+`R_A` in the peer's X25519 static has done something that looks like diligence.
+The failure is invisible: same bytes, same ceremony, same successful link. Only
+the threat model changed, and threat models do not raise exceptions.
+
+§6.2 calls physical exchange "the gold standard", which reads as a
+recommendation among workable options. For the RNG property it is. For the
+post-quantum property it is the **only** option, and the RFC does not say so.
+
+### 10.3 Proposed text for §6.2
+
+> A contribution MUST reach its destination over a channel whose
+> confidentiality does not depend on the asymmetric cryptography the reservoir
+> is intended to outlive. In-person exchange and physically transported
+> removable media satisfy this; the corpus and any live link do not.
+>
+> Where no such channel is available, a peering MAY still be completed, and the
+> implementation MUST record that the reservoir on that link provides no
+> post-quantum property and MUST surface this wherever the link is displayed.
+> Such a reservoir retains its RNG-independence property and its forward
+> secrecy under §4 shredding; it loses only the store-now-decrypt-later
+> resistance.
+
+And RFC 3 §11.1 should distinguish its two artifacts: step 1 through the corpus
+is fine, step 3 through the corpus is the downgrade above.
+
+### 10.4 What the implementation does
+
+`apps/krab-tui/src/peering.rs`. `peer offer` emits **two** files rather than one
+combined credential — a public `Card` and a secret `Contribution` — so that the
+publishable half and the unforwardable half cannot be confused for each other
+or attached to the same message. `peer seal` takes the arrival `Channel` from
+the operator, since the node cannot observe it, and records
+`Caveat::ReservoirNotPostQuantum` when `Channel::independent_of_dh` is false.
+
+The caveat is kept on the `PeerLink` permanently rather than warned about once,
+which follows §11.1's existing rule that implementations "MUST NOT present
+remote peering as equivalent" — a warning at ceremony time is not a
+presentation, it is a moment.
+
+Two further checks fell out of writing it: a reflected contribution (`R_B =
+R_A`) yields an all-zero reservoir and is caught, and `Contribution`'s `Debug`
+prints nothing, per §9.
+
+### 10.5 Status
+
+Not a defect in a deployed system — nothing implements the reservoir yet, and
+§6's derivation is already blocked on the §1 critical finding. It is a gap in
+the specification that an implementer would fall into by doing the reasonable
+thing. **Recommend §6.2 gain the channel rule before RFC 7 leaves Draft**,
+alongside the §1 fix.

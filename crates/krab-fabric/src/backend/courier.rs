@@ -25,7 +25,7 @@
 use crate::{frame, Error, Fabric, LinkProfile, Session};
 use krab_proto::control::Control;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// A courier session: an archive open for append, read, or both.
