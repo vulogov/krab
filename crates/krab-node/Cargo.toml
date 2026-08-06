@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 krab-core = { workspace = true }
+krab-crypto = { workspace = true }
 krab-fabric = { workspace = true }
 krab-proto = { workspace = true }
 krab-store = { workspace = true }
