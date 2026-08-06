@@ -25,6 +25,7 @@
 
 mod activity;
 mod command;
+mod entropy;
 mod keys;
 mod layout;
 mod peering;

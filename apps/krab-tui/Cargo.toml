@@ -16,5 +16,10 @@ path = "src/main.rs"
 
 [dependencies]
 krab = { workspace = true }
+krab-crypto = { workspace = true }
+# The OS entropy source. `krab-crypto` takes randomness as an argument and has
+# no platform dependency, so this is the one place in the workspace that names
+# an operating system as the root of key material.
+getrandom = "0.2"
 ratatui = "0.29"
 crossterm = "0.28"
