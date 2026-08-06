@@ -13,9 +13,12 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod lock;
+pub mod metrics;
 pub mod peering;
 pub mod scheduler;
 pub mod sync;
+pub mod warnings;
 
 /// Node role (RFC 0 §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

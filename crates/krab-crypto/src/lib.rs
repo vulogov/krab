@@ -35,5 +35,7 @@
 extern crate alloc;
 
 pub mod hash;
+pub mod secret;
 
 pub use hash::{channel_id, channel_tag, node_id, object_id, Fingerprint};
+pub use secret::{Key, Secret};
