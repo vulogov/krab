@@ -348,6 +348,16 @@ retroactively.
 - **§6's re-encoding is what makes RFC 1's `MAX_OBJECT` enforceable** — an
   upward dependency neither document states.
 
+**Addendum (§8):** the TUI *is* the node and there is no headless mode, which
+withdraws the justification RFC 0 §4.3 and RFC 8 §11 both lead with. The seam
+survives on testability — RFC 3 §11.3's courier-only gate cannot be exercised
+through a terminal. Screen lock then becomes the interesting problem, and it
+resolves to a **runtime role transition**: a locked TUI is a relay, an unlocked
+one is a mailbox, and locking drops the KEK while retaining the Noise static
+key. **Reconciliation MUST continue while locked** — pausing it would publish
+the operator's daily presence schedule, which is a worse I-5 violation than
+mail-driven sync because it leaks a rhythm rather than events.
+
 ## Not yet here
 
 RFC 0 and the RFC series plan are not in this directory.

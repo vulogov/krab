@@ -180,3 +180,166 @@ All nine documents exist. Outstanding, in order of cost to fix:
    including §9.2's peer-count table and the SIM-1 §3 citation.
 6. **RFC 1 §12's test vectors do not exist**, and two implementations agreeing
    on them gates every Final.
+
+---
+
+## 8. Addendum — the TUI is the node, and there is no headless mode
+
+Three corrections from the author, received after the review above:
+
+> "TUI is an editor and node. Both."
+> "No headless operations, TUI is always on."
+> "Headless mode IMO leads to compromise. krab is user-focused tool, not a
+> headless mailer."
+
+The third is the load-bearing one, and it is stronger than a scoping decision.
+
+### 8.1 No headless mode is a security position, not a simplification
+
+RFC 0 §4.3 and RFC 8 §11 both justify the channel seam by headless operation:
+
+> "the same interface over a Unix socket yields headless operation with no
+> code change on either side"
+
+Read as a *feature*, that is a convenience. Read against RFC 7 §7 it is a
+liability, and the author's objection is the correct reading:
+
+**A headless node is an unattended process holding decryption keys.** RFC 7 §7
+already establishes that the machine which must run without a human present is
+the one that should have nothing to protect — that is the entire relay/mailbox
+split. A headless *mailbox* inverts it: full key hierarchy, no operator, no
+lock, indefinitely. RFC 7 §4.2 concedes as much when it says a node requiring a
+passphrase cannot run unattended, and resolves it by removing the requirement
+rather than weakening it.
+
+Shipping a headless mode would have made the weak configuration the convenient
+one. Declining it means the only unattended configuration is a relay, which
+holds a Noise static key and ciphertext it cannot read.
+
+**Fix.** RFC 0 §4.3 and RFC 8 §11 should not merely drop the Unix-socket
+sentence; RFC 0 §6 should gain a non-goal — *no headless operation* — with this
+reasoning, so it is refused on the record rather than left as an unbuilt
+feature someone later supplies.
+
+### 8.2 The seam survives on testability
+
+Withdrawing headless does not withdraw the seam. RFC 8 §11 already gives the
+second reason: it makes the core drivable from tests without a TTY, which is
+what makes RFC 3 §11.3's courier-only release gate testable at all. A gate
+requiring "all network interfaces down, file import and export only" cannot be
+exercised through a terminal.
+
+RFC 0 §4.3's other argument is untouched: the crate split is by dependency
+direction, and that is what makes deterministic simulation and fuzzing
+possible. Lead both documents with those.
+
+### 8.3 "While the TUI is closed" no longer denotes a state
+
+RFC 8 §11 requires:
+
+> "The node MUST continue reconciling while the TUI is closed, backgrounded,
+> or crashed."
+
+If the TUI *is* the node, closing it stops the node, and the requirement
+describes nothing. What it was protecting is still real — reconciliation must
+not be tied to user attention — and §8.5 is the replacement.
+
+Consequence for RFC 0 §4.4: with no headless mode a *relay* is an unattended
+TUI rather than a daemon. That works, precisely because RFC 7 §7 gives it no
+decryption keys and therefore no passphrase, but RFC 0 §4.4 should say so
+rather than leaving the reader to assume a service.
+
+### 8.4 Screen lock is a role transition, not a screensaver
+
+An always-on TUI holding decryption keys is RFC 0 §5.1's "endpoint seizure,
+powered on" case standing by default. Lock is the control that bridges it, and
+RFC 7 §7 already contains the shape:
+
+| role | keys held | passphrase |
+|---|---|---|
+| relay | Noise static only | no |
+| mailbox | full hierarchy | on unlock |
+
+> **A locked TUI is a relay. An unlocked TUI is a mailbox.** Locking is a
+> runtime role transition inside one process, not a display state.
+
+This is also what makes §8.1 coherent. Krab refuses the unattended-with-keys
+configuration as a *product*, and then has to handle the same configuration
+arising *by accident* every time an operator walks away. Lock is that handler,
+and it resolves to the role the design already permits unattended.
+
+Locking should:
+
+```
+zeroize all displayed plaintext and the composer buffer
+destroy the KEK (RFC 7 §4 -- a 32-byte overwrite of an in-memory value)
+retain the Noise static key
+continue reconciling
+```
+
+Everything beneath the KEK becomes unreadable through RFC 7 §4's existing
+crypto-shredding hierarchy, so no new mechanism is required. Unlock re-derives
+it through Argon2id at RFC 7 §4.1's ~500 ms.
+
+### 8.5 Reconciliation MUST continue while locked — this is I-5, not convenience
+
+The tempting implementation pauses sync while locked: no user is present, and
+it reads as a battery optimisation.
+
+**It would be an I-5 violation of the purest kind.** Locking is user activity.
+A node whose reconciliation stops when its operator walks away has published
+that operator's presence schedule to every peer, in exactly the form RFC 0
+§5.3's intersection attack consumes — and it is worse than mail-driven sync,
+because it leaks a *daily rhythm* rather than sporadic events.
+
+```
+Locking MUST NOT alter reconciliation scheduling in any way.
+The Poisson schedule MUST be identical locked and unlocked.
+```
+
+RFC 5 §6.1 asks for a test asserting inter-sync intervals are uncorrelated with
+message events. **It should assert independence from lock state too**, and that
+is the cheaper of the two to get wrong.
+
+### 8.6 What locking costs the user, and the one open question
+
+Locking zeroizes the composer buffer, so a draft is lost. RFC 7 §8 forbids
+storing plaintext, so there is no unproblematic place to put it.
+
+| option | cost |
+|---|---|
+| discard the draft | the user loses work on every idle timeout |
+| seal it to self and store it | a real corpus object, with an identifier and a TTL, for an unsent message |
+| hold it under a separate short-lived key | a second key hierarchy for one purpose |
+
+Sealing to self is closest to the design's grain and needs no new mechanism,
+but it puts unsent text into the corpus where it replicates. **This is the one
+genuinely open question in the lock design**, and it is a judgement call in
+§1.1's sense rather than a derived one.
+
+### 8.7 Interaction with the dead-man timer
+
+RFC 7 §10's dead-man timer now has a natural ladder to sit on:
+
+```
+idle timeout        ->  lock: drop the KEK, keep relaying
+prolonged absence   ->  dead-man: destroy the stored KEK wrapper
+```
+
+The two are the same operation at different scales, and the second is what
+RFC 7 §10 already describes as a 32-byte overwrite. Worth stating explicitly,
+because an implementer who builds lock without the ladder will build a second,
+weaker wipe path beside it.
+
+### 8.8 Changes this implies
+
+| document | change |
+|---|---|
+| RFC 0 §6 | new non-goal: no headless operation, with §8.1's reasoning |
+| RFC 0 §4.3 | strike the Unix-socket sentence; lead with testability |
+| RFC 0 §4.4 | say a relay is an unattended TUI, not a daemon |
+| RFC 8 §11 | same; replace "while the TUI is closed" with §8.5 |
+| RFC 8 | new section: screen lock as a relay/mailbox role transition |
+| RFC 7 §7 | note the distinction is also a runtime state |
+| RFC 7 §10 | state the lock → dead-man ladder |
+| RFC 5 §6.1 | extend the correlation test to lock state |
