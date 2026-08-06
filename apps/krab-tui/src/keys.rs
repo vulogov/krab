@@ -105,6 +105,11 @@ impl Binding {
                 Key::Tab if key.shift => Binding::CycleFocusBack,
                 Key::Tab => Binding::CycleFocus,
                 Key::Esc => Binding::Cancel,
+                // Enter means "commit what is being entered", and what that
+                // commits depends on where the text is going: a newline in a
+                // composer, a submitted verb on the command line. The caller
+                // knows which pane has focus; this layer does not.
+                Key::Enter => Binding::Activate,
                 Key::Char('r') if key.ctrl => Binding::Redraw,
                 Key::Char(c) if !key.ctrl => Binding::Input(c),
                 _ => Binding::Ignored,

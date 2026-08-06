@@ -156,6 +156,14 @@ impl Ui {
         self.tab
     }
     /// Focused pane.
+    /// Focus the command pane directly.
+    ///
+    /// The command pane is the one destination worth reaching without cycling
+    /// — it is where every verb in RFC 8 §5 is typed.
+    pub fn focus_command(&mut self) {
+        self.focus = Pane::Command;
+    }
+
     pub fn focus(&self) -> Pane {
         self.focus
     }
