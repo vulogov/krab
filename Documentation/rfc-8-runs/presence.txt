@@ -1,0 +1,56 @@
+Delivery against APP UPTIME -- krab-sim --uptime, 4h mean sessions
+
+The variable is how long the krab TUI is RUNNING, not how long the operator
+is looking at it. A minimized window is running; a locked TUI is running (and
+is a relay, per RFC-8-review.md §8.4). The question "is the user at the
+keyboard" does not enter -- reconciliation is Poisson-scheduled and
+independent of attention by I-5.
+SIM-0's baseline was uptime 0.85 with 12h sessions; these use 4h sessions,
+which is closer to a person opening a laptop than leaving one on.
+
+mixed transport (70 TCP / 15 LoRa / 15 courier)
+  presence              delivery    lat50h  coverage
+  0.99  (23.8h/day)       100.0%       5.3     98.0%
+  0.85  (20.4h/day)       100.0%       7.3     97.2%
+  0.50  (12.0h/day)       100.0%      23.2     91.6%
+  0.25  ( 6.0h/day)       100.0%     102.8     59.9%
+  0.10  ( 2.4h/day)        26.7%     238.7      2.0%
+  0.04  ( 1.0h/day)         5.4%     235.0      0.5%
+
+courier-heavy (50/20/30)
+  0.85  (20.4h/day)       100.0%      11.6     95.2%
+  0.25  ( 6.0h/day)        98.3%     162.4     36.4%
+  0.10  ( 2.4h/day)        28.2%     259.1      1.6%
+  0.04  ( 1.0h/day)        11.6%     272.8      0.7%
+
+Reproduce: krab-sim --uptime <u> --session 4
+
+LIMIT: krab-sim gives every node the same uptime. The realistic case --
+a low-presence operator peered with high-presence relays -- cannot be
+modelled without per-node uptime. That is the SIM-2 item this raises.
+
+
+READING
+
+  A krab TUI left minimized for a working day is 0.5-0.85 -- 100% delivery,
+  23h to 7h median latency. A laptop that stays on is 0.85+.
+
+  The cliff sits between 0.25 and 0.10: 6h/day still delivers 100%, and
+  2.4h/day collapses to 26.7%. So the failure mode is "opened for an hour
+  and quit", not "minimized".
+
+  Coverage degrades long before delivery does -- 59.9% at 0.25 against 100%
+  delivery. Under SIM-1 §2 that is a privacy consequence, not an
+  availability one, and it is the reason a low-uptime node wants a
+  well-connected peer rather than merely a reachable one.
+
+CONSEQUENCE FOR THE NO-DAEMON POSITION
+
+  None, at realistic app uptime. Below ~3h/day the answer is already in
+  RFC 0 §4.4: a relay is always-on and holds no decryption keys. With no
+  headless mode a relay is an unattended, locked TUI -- which is exactly
+  what RFC-8-review.md §8.4 makes the lock state.
+
+  So lock, no-headless, and the relay role are one mechanism, and the
+  low-uptime case is covered by the configuration the design already
+  permits to run unattended, because it is the one with nothing to protect.
