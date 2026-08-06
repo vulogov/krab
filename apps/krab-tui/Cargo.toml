@@ -16,3 +16,5 @@ path = "src/main.rs"
 
 [dependencies]
 krab = { workspace = true }
+ratatui = "0.29"
+crossterm = "0.28"
