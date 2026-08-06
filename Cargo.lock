@@ -111,6 +111,7 @@ name = "krab-proto"
 version = "0.1.0"
 dependencies = [
  "krab-core",
+ "krab-crypto",
 ]
 
 [[package]]
