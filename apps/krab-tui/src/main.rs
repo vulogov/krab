@@ -20,6 +20,8 @@
 //! Status: scaffold. Renders nothing yet; ratatui is not wired in because
 //! RFC 8 depends on RFC 6 and RFC 7, neither of which is at Draft.
 
+mod activity;
+
 /// Commands the application will expose (RFC 8).
 ///
 /// Enumerated ahead of implementation so the RFC 8 command surface is visible
