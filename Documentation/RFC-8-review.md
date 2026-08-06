@@ -343,3 +343,164 @@ weaker wipe path beside it.
 | RFC 7 §7 | note the distinction is also a runtime state |
 | RFC 7 §10 | state the lock → dead-man ladder |
 | RFC 5 §6.1 | extend the correlation test to lock state |
+
+---
+
+## 9. Addendum — pad exchange, and the folders that must not exist
+
+Three further positions from the author:
+
+> "TUI must handle initial pad exchange between trusted parties. How A and B
+> will exchange keys?"
+> "This key exchange must be done as result of user-controlled manual
+> operation, no automatic initial exchange. All consecutive exchanges can be
+> automatic."
+> "I also did not define 'Sent' or 'Trash' folder for private encrypted mail.
+> I consider those as security issues."
+
+The third is correct and sharper than it first appears. The second overrides a
+recommendation this repository made against RFC 7, and the cost should be
+stated.
+
+### 9.1 How A and B actually exchange, in a terminal
+
+RFC 3 §11 lists the ceremony but assumes a QR path that a TUI cannot complete:
+a terminal can *render* a QR with block characters, and cannot *read* one. If
+both parties run krab in terminals, QR is a one-way channel into a device
+neither of them is using.
+
+The reservoir makes it moot anyway. RFC 7 §6 is 32 bytes per epoch, so a
+credential term is **2 880 bytes** — 1.2 QR codes at EC-M before the credential
+and the negotiation chain are counted. Multi-code sequences scanned by hand are
+not a ceremony anyone completes.
+
+**The mechanism already exists and is `pack` / `import`** (RFC 8 §5). The
+courier archive is a flat framed byte stream, hash-verified on ingest, with
+filenames ignored (RFC 4 §5.5) — which is exactly what an in-person exchange
+over a USB stick needs. No new transport, no new container, no new command.
+
+```
+in person, one stick, three passes
+
+  A: pack --peer-request  ->  stick  ->  B: import
+  B: pack --peer-counter  ->  stick  ->  A: import        (+ B's R_B)
+  A: pack --peer-link     ->  stick  ->  B: import        (+ A's R_A)
+
+  aloud, between passes:  verify   -- compare word lists
+```
+
+The reservoir contributions ride the same archive. `RFC-3-review.md` §2
+measured the negotiation as three legs; in person all three happen in one
+sitting and the courier latency that makes it 30 days remotely collapses to
+minutes.
+
+**Recommendation for RFC 8:** specify the ceremony as `pack`/`import` over
+physical media, and keep QR as a display-only convenience for the credential
+alone (343–416 B, one code) where the counterparty has a phone-based tool. Do
+not specify a QR path for the reservoir.
+
+### 9.2 No automatic initial exchange — and what it costs
+
+The author's position is that first contact is manual, and only subsequent
+exchanges automate. Mechanically that maps cleanly onto RFC 7:
+
+| stage | mechanism | automatic? |
+|---|---|---|
+| initial reservoir | physical, `R_A ⊕ R_B` (RFC 7 §6.2) | **no** |
+| subsequent | ratchet, `reservoir_{n+1} = HKDF(reservoir_n ‖ DH(fresh))` (§6.3) | yes |
+
+The ratchet is exactly the right shape for this: it preserves the
+post-quantum property provided the chain's *root* was PQ-established, and a
+physical exchange is PQ-established by construction. `RFC-7-blocking-items.md`
+§2 established that, and it is why reservoirs need only span the interval
+between contacts rather than a lifetime.
+
+**But this removes a path RFC 7 §6.2 currently permits**, and this repository
+recommended making it the default:
+
+> RFC 7 §6.2: "**Network establishment MUST use a hybrid post-quantum KEM.**"
+> `RFC-7-blocking-items.md` §2: hybrid-KEM establishment pays for itself after
+> **1.33 messages** and is 75× cheaper at a hundred, so it should be the
+> default path with physical exchange as the higher-assurance option.
+
+That recommendation is overridden, and the consequence is specific:
+
+> **A correspondent you have never met in person cannot have a reservoir.**
+
+Which means, for remote correspondents:
+
+- no post-quantum protection, or
+- per-message hybrid via suite `0x0002` — which RFC 1 §6.5 measures at a **16×
+  corpus inflation** for short traffic and forbids as a deployment-wide default
+
+And RFC 1 §6.5 is **frozen** while asserting the reservoir is "Krab's primary
+post-quantum strategy." Under this position that claim holds only for
+physically-met correspondents, and RFC 3 §11.1 already concedes remote peering
+is the common case.
+
+This is a defensible trade — it is the Briar model, and it makes the security
+property legible to the user rather than automatic and invisible — but it
+should be stated where RFC 1 §6.5's claim is made, not left as an inference.
+**RFC 7 §6.2 should say that network establishment is not offered**, rather
+than specifying a mechanism the client will not expose.
+
+### 9.3 "Sent" and "Trash" are security defects, and the reasons differ
+
+The author is right about both, and they are wrong in different ways.
+
+**A Sent folder cannot be built without breaking RFC 7 §8.** An outgoing
+message is sealed to the recipient, so the sender cannot decrypt its own
+object. To show it back, a client must either:
+
+| approach | what it breaks |
+|---|---|
+| store the plaintext | RFC 7 §8 directly — "MUST store ciphertext and derive on display" |
+| store a second copy sealed to self | doubles corpus contribution, and creates two objects an observer can link by emission timing — RFC 6 §2.7 spends a stagger window preventing exactly that correlation |
+| keep it under the epoch chunk | works, and the folder empties itself every epoch, which is a feature presented as a bug |
+
+The third is the only sound one and it is indistinguishable from not having the
+folder. So a Sent folder is either a violation or a no-op.
+
+**A Trash folder is worse, because it inverts what deletion means here.**
+RFC 7 §4 establishes that erasure is key destruction and never overwriting.
+"Trash" means *recoverable*, which means the key still exists. A trash folder
+is a place where things the user believes deleted remain decryptable — the
+exact opposite of what RFC 7 §3 says the mechanism is.
+
+It is also cosmetic in a way users will not expect: the object is
+content-addressed and replicated to every peer in the shard. Deleting locally
+removes it from one view and from nowhere else, and RFC 0 §6 non-goal 5
+forbids any recall mechanism, permanently. A folder implying otherwise trains
+the user in a false model of what their delete key does.
+
+```
+Neither a Sent nor a Trash folder MAY be implemented for sealed traffic.
+Delete removes an object from the local view only.
+The client MUST state that the object persists at peers until its TTL.
+```
+
+*(Judgement, in §1.1's sense — but the RFC 7 §8 conflict for Sent is derived.)*
+
+**What replaces them.** Nothing needs to. RFC 8 §13 already rejects forwarding
+because a `mode_auth` message carries no verifiable provenance, and quote-in-
+reply is the supported form — a user who wants a record of what they said
+quotes it. The *fact* of having sent is visible in the corpus as an object the
+node originated; the *content* is gone by design, which RFC 7 §8 calls "the
+only real form of message expiry."
+
+Bulletins are the exception and should be stated as one: a channel post is
+signed, unencrypted, and permanent (RFC 6 §3.3), so a channel author's own
+posts are readable back indefinitely. That asymmetry is worth surfacing in the
+interface, because it is precisely the case where a user's intuition about
+"my sent items" happens to be correct.
+
+### 9.4 Changes this implies
+
+| document | change |
+|---|---|
+| RFC 8 §5 | specify the ceremony as `pack`/`import` over physical media; QR for the credential only |
+| RFC 8 | new section: no Sent, no Trash, with §9.3's reasoning; delete is local-view-only |
+| RFC 8 §13 | add both to rejected alternatives |
+| RFC 7 §6.2 | state that network establishment of a reservoir is not offered |
+| RFC 1 §6.5 | note that the primary-PQ-strategy claim holds for physically-met correspondents |
+| RFC 3 §11 | reservoir exchange rides the courier archive; drop the QR path for it |
