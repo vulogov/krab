@@ -20,6 +20,7 @@
 #![deny(missing_docs)]
 
 pub mod index;
+pub use index::{Reject, Store};
 pub mod keys;
 pub mod segment;
 

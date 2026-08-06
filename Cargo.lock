@@ -126,6 +126,7 @@ name = "krab-store"
 version = "0.1.0"
 dependencies = [
  "krab-core",
+ "krab-crypto",
 ]
 
 [[package]]
