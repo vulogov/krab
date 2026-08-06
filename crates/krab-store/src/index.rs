@@ -128,6 +128,37 @@ impl Store {
         self.segments.values().find_map(|s| s.get(id))
     }
 
+    /// `(expiry, id)` pairs within `[lo, hi)`, in order.
+    ///
+    /// The ordering RBSR descends, and it needs no decryption key — which is
+    /// what lets a locked node serve reconciliation (RFC 7 §7).
+    pub fn entries_in_range(&self, lo_min: u32, hi_min: u32) -> Vec<(u32, ObjectId)> {
+        self.index
+            .keys()
+            .filter(|(e, _)| *e >= lo_min && *e < hi_min)
+            .map(|(e, id)| (*e, *id))
+            .collect()
+    }
+
+    /// Objects within `[lo, hi)`.
+    pub fn count_in_range(&self, lo_min: u32, hi_min: u32) -> u32 {
+        self.index.keys().filter(|(e, _)| *e >= lo_min && *e < hi_min).count() as u32
+    }
+
+    /// Fetch by a 12-byte truncated identifier (RFC 1 §9.3).
+    ///
+    /// Valid only inside an agreed reconciliation scope, which the caller has
+    /// already established.
+    pub fn get_truncated(&self, trunc: &[u8; 12]) -> Option<&[u8]> {
+        let id = self.index.keys().find(|(_, i)| &i.truncated() == trunc).map(|(_, i)| *i)?;
+        self.get(&id)
+    }
+
+    /// Whether a truncated identifier is held.
+    pub fn has_truncated(&self, trunc: &[u8; 12]) -> bool {
+        self.index.keys().any(|(_, i)| &i.truncated() == trunc)
+    }
+
     /// Identifiers in `(expiry, id)` order — the ordering RBSR descends
     /// (RFC 5 §4.4), identical on both sides with no coordination because
     /// expiry is absolute and inside the identifier hash.

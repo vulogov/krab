@@ -15,6 +15,7 @@
 
 pub mod lock;
 pub mod metrics;
+pub mod node;
 pub mod peering;
 pub mod scheduler;
 pub mod sync;
