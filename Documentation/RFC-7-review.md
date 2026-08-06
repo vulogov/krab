@@ -351,3 +351,109 @@ with.
 | RFC 0 §4.4 | qualify "seizure yields nothing" — the peer list is not replicated |
 | RFC 0 §5.1 | split "powered on" into locked and unlocked |
 | RFC 3 §15 | say which tier the credential store sits in |
+
+---
+
+## 9. Correction to §8.3 — lock is a memory operation, not a disk-hierarchy split
+
+The author's formulation, which supersedes §8.3:
+
+> "when node unlocked, user decrypt message keypad. When node is locked,
+> keypad is gone, only session keys required for session authentication are in
+> memory, allowing send/receive to be active."
+
+That is simpler than the two-root hierarchy §8.3 proposed, and it is correct.
+§8.3 solved a problem that does not exist.
+
+### 9.1 The mistake in §8.3
+
+§8.3 assumed a locked node must *re-read* its credentials from disk, and
+therefore needed a second on-disk root with its own device secret. It does not.
+The credentials were already unwrapped at startup and are **already in
+memory**. Lock does not need to read anything; it needs to *not wipe* part of
+what it already holds.
+
+So the disk hierarchy is unchanged — one root, the passphrase, exactly as §4
+draws it. What splits is **residency in memory**, not custody on disk:
+
+```
+at startup   passphrase ─Argon2id─▶ KEK ─▶ unwrap everything into memory
+
+on lock      zeroize:  tag precomputation table
+                       prekey privates
+                       reservoir chunks
+                       decrypted plaintext, composer buffer
+                       the KEK itself
+             retain:   Noise static key
+                       peer credentials
+                       corpus/index working key
+                       live Noise session state
+
+on unlock    passphrase ─Argon2id─▶ KEK ─▶ re-read the zeroized set
+on exit      everything gone
+```
+
+### 9.2 What this removes
+
+**The device secret, the OS keychain, and the TPM dependency all disappear.**
+§8.6 recorded as a cost the irony that refusing headless removed TPM in one
+place and lock reintroduced it in another. It does not: there is one root and
+it is the passphrase. §4.2's TPM discussion stays confined to the case it was
+written for.
+
+**§8.7's table shrinks.** No second root, no change to where the credential
+store sits, no new custody question for RFC 3 §15 to answer.
+
+### 9.3 What it fixes that §8.3 did not
+
+§7 says a relay holds a Noise static key and takes **no passphrase**, which is
+what left a relay's disk unencrypted and made RFC 0 §4.4's "seizure yields
+nothing" false for the peer list.
+
+Under the author's model that is repairable without changing anything else:
+
+> **A relay is a TUI that was unlocked once at startup and locked
+> immediately.**
+
+The operator starts it, enters the passphrase once, locks, and walks away. The
+process then runs indefinitely in the locked state — session keys live,
+reconciling, unable to read mail. And because a passphrase *was* entered once,
+**the relay's disk is encrypted under §4's hierarchy like any other node's.**
+
+That is strictly better than §7's current position and it costs one prompt at
+start. It also fits the no-headless posture exactly: a relay is not a daemon
+with a special key configuration, it is the same application in the state lock
+already defines.
+
+### 9.4 The residual, stated precisely
+
+A **running** locked node holds credentials and the Noise static key in memory.
+An adversary seizing it powered-on and locked gets the peer list.
+
+That is unavoidable — a node cannot answer a handshake without the material
+that answers a handshake — and it is the honest boundary. What lock buys is
+everything else: no tag table, so no mapping from tags to correspondents; no
+prekey privates; no reservoir chunks; no plaintext.
+
+The ladder from §8.4 survives intact and now needs no device secret:
+
+| state | adversary gets |
+|---|---|
+| powered off | nothing — one hierarchy, one passphrase |
+| running, locked | corpus and peer list |
+| running, unlocked | everything, as RFC 0 §5.1 concedes |
+
+### 9.5 Revised changes
+
+Replacing §8.7:
+
+| document | change |
+|---|---|
+| RFC 7 §4 | unchanged on disk; add the memory-residency split — what lock zeroizes and what it retains |
+| RFC 7 §7 | a relay takes a passphrase **once at startup**, then runs locked. Not "no passphrase" |
+| RFC 7 §7 | note that relay and mailbox are runtime states of one process, not two deployments |
+| RFC 7 §9 | retained material stays `mlock`ed across lock |
+| RFC 0 §4.4 | qualify "seizure yields nothing": true powered-off, false for the peer list while running |
+| RFC 0 §5.1 | split "powered on" into locked and unlocked |
+
+§8.3, §8.6's TPM note, and §8.7 are superseded by this section.
