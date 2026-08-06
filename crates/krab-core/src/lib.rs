@@ -24,6 +24,7 @@
 
 extern crate alloc;
 
+pub mod cbor;
 pub mod filter;
 pub mod object;
 pub mod tag;
