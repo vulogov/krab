@@ -282,6 +282,35 @@ mod key {
 }
 
 impl Envelope<'_> {
+    /// The AAD prefix — RFC 1 §6.1's "deterministic CBOR of the body with key
+    /// 5 omitted".
+    ///
+    /// A four-key map: epoch, tag mode, suite, and the encapsulated key. This
+    /// is what makes §6.1's claim true that the AAD "binds expiry, tag, class,
+    /// **epoch, and suite**" — the header alone binds only the first three.
+    ///
+    /// Note key 4 is included, so this cannot be built before encapsulation.
+    /// RFC 9180's `Encap` does not take the AAD, so the two-phase HPKE API
+    /// resolves the ordering; a single-shot call cannot.
+    pub fn aad_prefix(epoch: u64, tag_mode: u64, suite: u64, enc: &[u8]) -> Vec<u8> {
+        let mut w = cbor::Writer::new();
+        w.map(4)
+            .uint(key::EPOCH)
+            .uint(epoch)
+            .uint(key::TAG_MODE)
+            .uint(tag_mode)
+            .uint(key::SUITE)
+            .uint(suite)
+            .uint(key::ENC)
+            .bstr(enc);
+        w.finish()
+    }
+
+    /// This envelope's AAD prefix.
+    pub fn aad(&self) -> Vec<u8> {
+        Envelope::aad_prefix(self.epoch, self.tag_mode, self.suite, self.enc)
+    }
+
     /// Encode to deterministic CBOR. Five keys, ascending, key 3 omitted.
     pub fn write(&self) -> Vec<u8> {
         let mut w = cbor::Writer::new();

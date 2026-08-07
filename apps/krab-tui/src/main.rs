@@ -36,6 +36,7 @@ mod links;
 mod peering;
 mod peers;
 mod reach;
+mod receive;
 mod render;
 mod sync;
 
@@ -70,7 +71,13 @@ use std::time::{Duration, Instant};
 const TICK: Duration = Duration::from_millis(250);
 
 fn main() -> io::Result<()> {
-    let mut app = App::default();
+    let mut app = match App::from_args(std::env::args().skip(1)) {
+        Ok(app) => app,
+        Err(usage) => {
+            eprintln!("{usage}");
+            return Ok(());
+        }
+    };
     install_panic_hook();
     let mut term = setup()?;
     let result = app.run(&mut term);
@@ -106,6 +113,20 @@ struct App {
     links: LinkTable,
     /// The corpus.
     store: krab_store::index::Store,
+    /// The reconciliation schedule. Poisson, and blind to everything the user
+    /// does — RFC 5 §6.1.
+    scheduler: krab_node::scheduler::Scheduler,
+    /// Decrypted mail. **Plaintext, so it dies with the lock** (RFC 7 §8).
+    messages: Vec<receive::Message>,
+    /// Which message the list pane has selected.
+    selected: usize,
+    /// The recognition table, rebuilt on epoch rollover.
+    ///
+    /// Cached because it is 4 550 HKDF passes at 50 correspondents (RFC 2
+    /// §4.3) and the corpus is rescanned far more often than the epoch turns.
+    /// Dropped on lock: it is derived from static-static shared secrets, so it
+    /// is content-key material and a relay must not hold it.
+    tag_table: Option<receive::TagTable>,
     /// Set by the confirmation prompt, consumed by the next command.
     confirmed: bool,
     /// Where the first-run ceremony has got to, if it is running.
@@ -127,11 +148,15 @@ impl Default for App {
             identity: None,
             passphrase: String::new(),
             epoch_key: None,
-            home: std::env::var_os("KRAB_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".")),
+            home: PathBuf::from("."),
             links: LinkTable::new(),
             store: krab_store::index::Store::new(),
+            // Four hours. RFC 5 §6.1 fixes the shape, not the mean; this is a
+            // starting point a deployment tunes.
+            scheduler: krab_node::scheduler::Scheduler::new(4 * 3_600),
+            messages: Vec::new(),
+            selected: 0,
+            tag_table: None,
             confirmed: false,
             init_step: None,
         }
@@ -139,6 +164,45 @@ impl Default for App {
 }
 
 impl App {
+    /// Parse command-line arguments.
+    ///
+    /// **Krab reads no configuration file** — see `Documentation/NO-CONFIG.md`.
+    /// Startup options arrive here and nowhere else, and an environment
+    /// variable is deliberately not accepted: environment is inherited, so a
+    /// parent process would be choosing on the operator's behalf without the
+    /// operator seeing it.
+    fn from_args(args: impl Iterator<Item = String>) -> Result<App, String> {
+        const USAGE: &str = "krab [--home <dir>] [--sync-interval <seconds>]\n\n\
+             krab reads no configuration file. Everything else is set by a \
+             command-pane verb during the session.";
+
+        let mut app = App::default();
+        let mut args = args.peekable();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--home" => {
+                    app.home = PathBuf::from(args.next().ok_or(USAGE)?);
+                }
+                "--sync-interval" => {
+                    let secs: u64 = args
+                        .next()
+                        .ok_or(USAGE)?
+                        .parse()
+                        .map_err(|_| USAGE.to_string())?;
+                    if secs < 60 {
+                        return Err("a sync interval under a minute correlates this node with \
+                             its own activity (RFC 5 §6.1)"
+                            .into());
+                    }
+                    app.scheduler = krab_node::scheduler::Scheduler::new(secs);
+                }
+                "-h" | "--help" => return Err(USAGE.into()),
+                other => return Err(format!("unknown argument {other:?}\n\n{USAGE}")),
+            }
+        }
+        Ok(app)
+    }
+
     fn run(&mut self, term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         let mut last = Instant::now();
         while !self.quit {
@@ -172,6 +236,7 @@ impl App {
             }
             if last.elapsed() >= TICK {
                 self.spinner.tick();
+                self.tick_schedule();
                 last = Instant::now();
             }
         }
@@ -253,6 +318,173 @@ impl App {
         }
     }
 
+    /// Advance the reconciliation schedule.
+    ///
+    /// Called from the render loop, on a timer, with no reference to anything
+    /// the user did. `sync::Tick::run` takes no event parameter and this is
+    /// the only caller — so there is no place for one to be threaded through
+    /// later without the change being visible (RFC 5 §6.1, RFC 0 I-5).
+    fn tick_schedule(&mut self) {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut entropy = [0u8; 8];
+        OsRng.fill(&mut entropy);
+        let due = sync::Tick::run(
+            &mut self.scheduler,
+            &mut self.links,
+            now_s,
+            u64::from_le_bytes(entropy),
+        )
+        .due;
+        if !due.is_empty() {
+            // Reconciliation itself needs a live session, which arrives with
+            // the transport work. The schedule fires regardless, so that when
+            // it is connected, nothing about *when* changes — the timing is
+            // already fixed by the scheduler and not by what gets wired to it.
+            self.node.reconciling = Some("peer");
+        } else {
+            self.node.reconciling = None;
+        }
+        // The status line shows a window, never a countdown (RFC 8 §5.1).
+        self.node.next_sync_in_s = self
+            .links
+            .iter()
+            .filter_map(|l| l.next_sync_min)
+            .min()
+            .map(|m| m * 60);
+    }
+
+    /// Rebuild the tag table and open what this node can read.
+    ///
+    /// Called after anything that changes the corpus or the correspondent set.
+    /// Returns plaintext into `self.messages`, which `lock` destroys.
+    fn refresh_inbox(&mut self) {
+        self.messages.clear();
+        self.selected = 0;
+        let (Some(id), Some(w)) = (&self.identity, self.epoch_key) else {
+            self.list = vec!["(locked)".into()];
+            return;
+        };
+
+        // Correspondents come from the peer-links on disk, so the set is
+        // exactly who a ceremony was completed with.
+        let mut peers = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.home) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("link") {
+                    continue;
+                }
+                let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(card) = peering::Card::decode(&bytes) else {
+                    continue;
+                };
+                if !card.verify() {
+                    continue;
+                }
+                let their_pk = krab_crypto::dh::PublicKey(card.correspondence_pk);
+                let Some(shared) = id.agree_with(&their_pk) else {
+                    continue;
+                };
+
+                let reservoir = std::fs::read(self.path(&format!("{name}.reservoir")))
+                    .ok()
+                    .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/reservoir", &s).ok())
+                    .and_then(|r| <[u8; 32]>::try_from(r.as_slice()).ok())
+                    .map(|root| {
+                        krab_crypto::reservoir::Reservoir::new(root, krab_core::tag::Epoch(0))
+                    });
+
+                // A completed peering is a peer worth reconciling with. Adding
+                // is not triggering: the first interval is drawn from entropy.
+                let sched_id = sync::peer_id_from_node(&card.node_id());
+                if self.scheduler.next_due(&sched_id).is_none() {
+                    let mut e = [0u8; 8];
+                    OsRng.fill(&mut e);
+                    self.scheduler.add(sched_id, 0, u64::from_le_bytes(e));
+                }
+                peers.push(receive::Correspondent {
+                    name: name.to_string(),
+                    correspondence: their_pk,
+                    shared,
+                    reservoir,
+                });
+            }
+        }
+
+        let epoch = now_epoch();
+        // Rebuild only on rollover. A stale table loses the newest epoch,
+        // which would present as "mail from today is undecryptable".
+        if !self.tag_table.as_ref().is_some_and(|t| t.is_current(epoch)) {
+            self.tag_table = Some(receive::TagTable::build(&peers, epoch));
+        }
+        let table = self.tag_table.as_ref().expect("just built");
+        let scan = receive::Inbox::scan(
+            &self.store,
+            table,
+            &peers,
+            id.correspondence(),
+            (0, u32::MAX),
+        );
+
+        self.list = if scan.messages.is_empty() {
+            vec![format!(
+                "(no messages — {} objects examined)",
+                scan.examined
+            )]
+        } else {
+            scan.messages
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{}  {}{}",
+                        m.from,
+                        m.body
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(48)
+                            .collect::<String>(),
+                        if m.post_quantum {
+                            ""
+                        } else {
+                            "  (no reservoir)"
+                        }
+                    )
+                })
+                .collect()
+        };
+        if scan.tag_match_decrypt_fail > 0 {
+            // RFC 3 §12's ratio. A high rate usually means objects are arriving
+            // outside the acceptance window, which is otherwise invisible.
+            self.list.push(format!(
+                "! {} matched a tag and did not open",
+                scan.tag_match_decrypt_fail
+            ));
+        }
+        self.messages = scan.messages;
+        self.show_selected();
+    }
+
+    /// Put the selected message in the view pane.
+    fn show_selected(&mut self) {
+        overwrite(&mut self.body);
+        match self.messages.get(self.selected) {
+            Some(m) => {
+                self.body = format!("from {}\n\n{}", m.from, m.body);
+            }
+            None => self.body.push_str("no message selected"),
+        }
+    }
+
     /// Run whatever is on the command line.
     fn submit(&mut self) {
         let line = core::mem::take(&mut self.command);
@@ -331,6 +563,19 @@ impl App {
                     return;
                 };
                 self.links.connect(peer, profile);
+                // Register with the schedule. This is the *only* coupling
+                // between a user action and the scheduler, and it adds a peer
+                // rather than triggering anything: the first interval is drawn
+                // from entropy, not from now (RFC 5 §6.1).
+                if let Some(id) = sync::peer_id_of(peer) {
+                    let now_s = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let mut e = [0u8; 8];
+                    OsRng.fill(&mut e);
+                    self.scheduler.add(id, now_s, u64::from_le_bytes(e));
+                }
                 // Establishment is synchronous here; a real transport would
                 // leave it `Establishing` and animate that, which RFC 4 §5.2
                 // requires and RFC 8 §5.1 explicitly permits.
@@ -347,6 +592,9 @@ impl App {
                     self.body = "usage: disconnect <peer>".into();
                     return;
                 };
+                if let Some(id) = sync::peer_id_of(peer) {
+                    self.scheduler.remove(&id);
+                }
                 self.body = if self.links.disconnect(peer) {
                     // RFC 3 §6.2's quota reduction is deliberately not bundled:
                     // making disconnect a punishment discourages using it, and
@@ -525,6 +773,11 @@ impl App {
             return format!("could not store the peer-link: {e}");
         }
         let _ = std::fs::remove_file(self.path("ceremony.cbor"));
+        // `peer.pad` is this node's own contribution, written in the clear
+        // because it has to be handed over. Once the reservoir exists it has
+        // no further use and is half a live shared secret sitting unwrapped on
+        // disk — the one file in the layout that is neither signed nor sealed.
+        let _ = std::fs::remove_file(self.path("peer.pad"));
 
         // RFC 3 §4: the peer-link is a contract, so the terms both ends agreed
         // to belong on it. `negotiate` takes the lower bucket ceiling, since a
@@ -723,14 +976,18 @@ impl App {
         }
         match courier::import(&mut self.store, &path, now) {
             Err(e) => format!("could not read {}: {e}", path.display()),
-            Ok(got) => format!(
-                "{} new, {} already held, {} refused ({} records).\n\nNothing was \
+            Ok(got) => {
+                let msg = format!(
+                    "{} new, {} already held, {} refused ({} records).\n\nNothing was \
                  trusted: every object was re-hashed before it entered the corpus.",
-                got.accepted,
-                got.duplicate,
-                got.refused,
-                got.total()
-            ),
+                    got.accepted,
+                    got.duplicate,
+                    got.refused,
+                    got.total()
+                );
+                self.refresh_inbox();
+                msg
+            }
         }
     }
 
@@ -785,15 +1042,31 @@ impl App {
     }
 
     /// RFC 8 §5's `keys`.
+    ///
+    /// Reports the recognition table's size too: RFC 2 §4.3 makes it
+    /// `correspondents × 91`, and an operator whose table is unexpectedly
+    /// small has correspondents whose peer-link failed to load — which is
+    /// otherwise invisible, since unrecognised mail looks like no mail.
     fn keys_report(&self) -> String {
         let Some(id) = &self.identity else {
             return "no identity — run `init` first".into();
         };
         let epochs = id.hierarchy.epochs().count();
+        // RFC 2 §4.3 makes the table `correspondents × 91`. An operator whose
+        // table is unexpectedly small has a peer-link that failed to load —
+        // otherwise invisible, since unrecognised mail looks like no mail.
+        let table = match &self.tag_table {
+            Some(t) if !t.is_empty() => format!("{} entries", t.len()),
+            _ => "not built — no correspondents, or locked".into(),
+        };
         format!(
-            "identity   {}\nepochs     {epochs} wrapper{} ({} bytes)\nbackup                  shown once at init and never again (RFC 7 §11)\nreservoir  none \
-             established\n\nmessage history is not recoverable from the identity \
-             backup, and that is intentional.",
+            "identity   {}\n\
+             epochs     {epochs} wrapper{} ({} bytes)\n\
+             tags       {table}\n\
+             backup     shown once at init and never again (RFC 7 §11)\n\
+             \n\
+             message history is not recoverable from the identity backup, and \
+             that is intentional.",
             id.short_id(),
             if epochs == 1 { "" } else { "s" },
             id.hierarchy.stored_bytes(),
@@ -936,6 +1209,16 @@ impl App {
             use zeroize::Zeroize;
             w.zeroize();
         }
+        // RFC 7 §8 — plaintext exists only while displayed, and a locked node
+        // is displaying nothing.
+        for m in &mut self.messages {
+            overwrite(&mut m.body);
+        }
+        self.messages.clear();
+        // The table derives from static-static shared secrets, so it is
+        // content-key material. A locked node is a relay and must not hold it.
+        self.tag_table = None;
+        self.list = vec!["(locked)".into()];
         overwrite(&mut self.passphrase);
         overwrite(&mut self.composer);
         overwrite(&mut self.body);
@@ -1729,7 +2012,7 @@ mod tests {
                 ct: env.ciphertext.to_vec(),
             },
             &krab_crypto::seal::info_for(header.class),
-            &header.write(),
+            &compose::aad_for(&header, &env),
         )
         .expect("the recipient opens it");
         assert_eq!(opened, b"meet me at the usual place");
@@ -1859,7 +2142,7 @@ mod tests {
                 ct: env.ciphertext.to_vec(),
             },
             &krab_crypto::seal::info_for(header.class),
-            &header.write(),
+            &compose::aad_for(&header, &env),
         )
         .expect("B opens it");
         assert_eq!(opened, b"the usual place, thursday");
@@ -1936,6 +2219,193 @@ mod tests {
             a.body.contains("not self-consistent") || a.body.contains("could not read"),
             "{}",
             a.body
+        );
+    }
+
+    /// **The loop closes at the interface.** A message imported from a stick
+    /// appears in the list pane and its body in the view pane.
+    #[test]
+    fn imported_mail_appears_in_the_interface() {
+        let mut a = ready_node("inbox-a");
+        let mut b = ready_node("inbox-b");
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+
+        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+            std::fs::write(to.path(as_name), std::fs::read(from.path(name)).unwrap()).unwrap();
+            to.path(as_name).to_string_lossy().into_owned()
+        };
+        // Each side records the other, so both can recognise the other's tags.
+        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        let a_card = carry(&a, &b, "peer.card", "from-a.card");
+        let b_pad = carry(&b, &a, "peer.pad", "from-b.pad");
+        let a_pad = carry(&a, &b, "peer.pad", "from-a.pad");
+        for (n, card, pad) in [(&mut a, b_card, b_pad), (&mut b, a_card, a_pad)] {
+            type_command(n, &format!("peer accept {card}"));
+            let mut p = n.load_ceremony().unwrap();
+            p.fingerprint_verified = true;
+            n.save_ceremony(&p).unwrap();
+            type_command(n, &format!("peer seal {pad} media"));
+        }
+
+        let b_id = short_id(&b.identity.as_ref().unwrap().node_id());
+        type_command(&mut a, &format!("send {b_id} bring the good coffee"));
+        type_command(&mut a, "pack out.krab");
+
+        let stick = b.path("anything.bin");
+        std::fs::copy(a.path("out.krab"), &stick).unwrap();
+        type_command(&mut b, &format!("import {}", stick.display()));
+
+        // The list pane names the sender; the view pane holds the body.
+        assert_eq!(b.messages.len(), 1, "list: {:?}", b.list);
+        assert_eq!(b.messages[0].body, "bring the good coffee");
+        assert!(b.messages[0].post_quantum, "the reservoir was in play");
+        assert!(b.list[0].contains("bring the good coffee"), "{:?}", b.list);
+
+        // The view pane holds the command's output, which is correct — the
+        // operator just ran `import` and wants its result. Selecting the
+        // message is what puts the body there.
+        assert!(b.body.contains("1 new"), "{}", b.body);
+        b.show_selected();
+        assert!(b.body.starts_with("from "), "{}", b.body);
+        assert!(b.body.contains("bring the good coffee"), "{}", b.body);
+    }
+
+    /// **RFC 7 §8** — locking destroys the plaintext, not just the view.
+    #[test]
+    fn locking_destroys_decrypted_mail() {
+        let mut a = ready_node("inbox-lock");
+        a.messages.push(receive::Message {
+            id: krab_core::object::ObjectId([1; 32]),
+            from: "alice".into(),
+            epoch: now_epoch(),
+            body: "something private".into(),
+            post_quantum: true,
+        });
+        a.list = vec!["alice  something private".into()];
+        a.show_selected();
+        assert!(a.body.contains("something private"));
+
+        a.lock();
+        assert!(a.messages.is_empty(), "plaintext is gone, not hidden");
+        assert!(!a.body.contains("something private"), "{}", a.body);
+        assert_eq!(a.list, vec!["(locked)".to_string()]);
+    }
+
+    /// A locked node's inbox refresh produces nothing rather than failing.
+    #[test]
+    fn a_locked_node_has_no_inbox() {
+        let mut a = ready_node("inbox-locked");
+        a.lock();
+        a.refresh_inbox();
+        assert!(a.messages.is_empty());
+        assert_eq!(a.list, vec!["(locked)".to_string()]);
+    }
+
+    /// **RFC 5 §6.1 at the loop.** Ticking the schedule never depends on what
+    /// the user did — `tick_schedule` takes nothing and reads no user state.
+    #[test]
+    fn ticking_the_schedule_touches_no_user_state() {
+        let mut a = ready_node("tick");
+        // Peer names are short node identifiers, so they are hex.
+        type_command(&mut a, "connect a1b2c3d4 tcp");
+        a.composer.push_str("a draft in progress");
+        a.command.push_str("half-typed");
+        let before = (a.composer.clone(), a.command.clone(), a.store.len());
+
+        for _ in 0..20 {
+            a.tick_schedule();
+        }
+        assert_eq!(
+            (a.composer.clone(), a.command.clone(), a.store.len()),
+            before
+        );
+        // And it publishes a window rather than a countdown.
+        let l = a.links.get("a1b2c3d4").expect("connected");
+        assert!(
+            l.schedule_hint().contains("(scheduled)"),
+            "the scheduler never published a window: {}",
+            l.schedule_hint()
+        );
+    }
+
+    /// **No configuration file, ever.** Startup options come from argv and
+    /// nothing else — see `Documentation/NO-CONFIG.md`.
+    #[test]
+    fn startup_options_come_from_argv_only() {
+        let a = App::from_args(
+            ["--home", "/tmp/krab-x", "--sync-interval", "7200"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert_eq!(a.home, PathBuf::from("/tmp/krab-x"));
+        assert_eq!(a.scheduler.mean_interval_s(), 7_200);
+
+        // An environment variable is deliberately not consulted: environment
+        // is inherited, so a parent process would choose unseen.
+        std::env::set_var("KRAB_HOME", "/tmp/should-be-ignored");
+        let b = App::from_args(std::iter::empty()).unwrap();
+        assert_eq!(
+            b.home,
+            PathBuf::from("."),
+            "the environment must not decide"
+        );
+        std::env::remove_var("KRAB_HOME");
+    }
+
+    /// A sync interval short enough to correlate the node with its own
+    /// activity is refused at the boundary rather than accepted quietly.
+    #[test]
+    fn an_absurd_sync_interval_is_refused() {
+        assert!(App::from_args(["--sync-interval", "5"].iter().map(|s| s.to_string())).is_err());
+        assert!(App::from_args(["--sync-interval", "x"].iter().map(|s| s.to_string())).is_err());
+        assert!(App::from_args(["--nonsense"].iter().map(|s| s.to_string())).is_err());
+        assert!(App::from_args(["--home"].iter().map(|s| s.to_string())).is_err());
+    }
+
+    /// **The outgoing pad does not outlive the ceremony.** It is the one file
+    /// in the layout that is neither signed nor sealed, and after sealing it
+    /// is half a live shared secret with no further use.
+    #[test]
+    fn the_outgoing_pad_is_destroyed_once_the_reservoir_exists() {
+        let mut a = ready_node("pad-life");
+        let b = ready_node("pad-life-b");
+        {
+            let mut b2 = App {
+                home: b.home.clone(),
+                ..App::default()
+            };
+            b2.identity = Some(Identity::generate(&mut OsRng));
+            b2.epoch_key = b.epoch_key;
+            type_command(&mut b2, "peer offer");
+        }
+        type_command(&mut a, "peer offer");
+        assert!(a.path("peer.pad").exists(), "written for the handover");
+
+        std::fs::copy(b.path("peer.card"), a.path("b.card")).unwrap();
+        std::fs::copy(b.path("peer.pad"), a.path("b.pad")).unwrap();
+        let card = a.path("b.card").display().to_string();
+        let pad = a.path("b.pad").display().to_string();
+        type_command(&mut a, &format!("peer accept {card}"));
+        type_command(&mut a, &format!("peer seal {pad} media"));
+        assert!(a.body.starts_with("peer-link signed"), "{}", a.body);
+
+        assert!(
+            !a.path("peer.pad").exists(),
+            "the contribution must not linger"
+        );
+        assert!(!a.path("ceremony.cbor").exists());
+        // What remains is signed or sealed.
+        let peer = short_id(
+            &peering::Card::decode(&std::fs::read(a.path("b.card")).unwrap())
+                .unwrap()
+                .node_id(),
+        );
+        assert!(a.path(&format!("{peer}.link")).exists(), "signed");
+        assert!(
+            a.path(&format!("{peer}.reservoir")).exists(),
+            "sealed under W_N"
         );
     }
 }

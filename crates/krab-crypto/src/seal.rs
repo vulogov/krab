@@ -54,7 +54,7 @@ use crate::dh::{PublicKey, SecretKey};
 use crate::reservoir::Chunk;
 use crate::rng::Rng;
 use alloc::vec::Vec;
-use hpke::aead::ChaCha20Poly1305;
+use hpke::aead::{AeadCtxR, AeadCtxS, ChaCha20Poly1305};
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
 use hpke::{Deserializable, Kem, OpModeR, OpModeS, PskBundle, Serializable};
@@ -153,6 +153,109 @@ impl<R: Rng> rand_core::TryRng for RngBridge<'_, R> {
 }
 
 impl<R: Rng> rand_core::TryCryptoRng for RngBridge<'_, R> {}
+
+/// A sender's context, after encapsulation and before sealing.
+///
+/// Exists because **RFC 1 §6.1's AAD contains the encapsulated key**:
+/// `aad = ROUTING_HEADER ‖ deterministic_cbor(body with key 5 omitted)`, and
+/// key 4 is `enc`. A single-shot API cannot construct that AAD — it produces
+/// `enc` and consumes the AAD in one call, so the value is not available when
+/// it is needed.
+///
+/// RFC 9180's `Encap` does not take the AAD, so the two-phase form resolves it:
+/// encapsulate, build the AAD from the resulting `enc`, then seal. Worth
+/// stating in RFC 1 §6.1, because an implementer reaching for the obvious
+/// single-shot call will silently drop keys 0, 1, 2 and 4 from the AAD — which
+/// is exactly the epoch and suite binding §6.1 says it provides.
+pub struct SealCtx(AeadCtxS<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>);
+
+impl SealCtx {
+    /// Seal under an AAD built from the encapsulated key.
+    pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
+        self.0.seal(plaintext, aad).map_err(|_| Error::Open)
+    }
+}
+
+/// A recipient's context, after decapsulation and before opening.
+pub struct OpenCtx(AeadCtxR<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>);
+
+impl OpenCtx {
+    /// Open under the same AAD.
+    pub fn open(&mut self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
+        self.0.open(ciphertext, aad).map_err(|_| Error::Open)
+    }
+}
+
+/// Encapsulate, returning the key the AAD must cover.
+pub fn begin_seal(
+    mode: &Mode,
+    sender: &SecretKey,
+    recipient: &PublicKey,
+    info: &[u8],
+    rng: &mut impl Rng,
+) -> Result<([u8; ENC_LEN], SealCtx), Error> {
+    let pk_r = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(&recipient.0)
+        .map_err(|_| Error::BadKey)?;
+    let sk_s = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(&sender.to_bytes())
+        .map_err(|_| Error::BadKey)?;
+    let pk_s = <X25519HkdfSha256 as Kem>::sk_to_pk(&sk_s);
+
+    let psk_id = mode_psk_id(mode);
+    let op = match mode {
+        Mode::Base => OpModeS::Base,
+        Mode::Auth => OpModeS::Auth((sk_s, pk_s)),
+        Mode::AuthPsk { chunk, .. } => {
+            let bundle = PskBundle::new(chunk.expose(), &psk_id).map_err(|_| Error::BadKey)?;
+            OpModeS::AuthPsk((sk_s, pk_s), bundle)
+        }
+    };
+
+    let mut bridge = RngBridge(rng);
+    let (enc, ctx) = hpke::setup_sender_with_rng::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
+        &op,
+        &pk_r,
+        info,
+        &mut bridge,
+    )
+    .map_err(|_| Error::BadKey)?;
+
+    let bytes = Serializable::to_bytes(&enc);
+    let mut out = [0u8; ENC_LEN];
+    out.copy_from_slice(&bytes);
+    Ok((out, SealCtx(ctx)))
+}
+
+/// Decapsulate, ready to open.
+pub fn begin_open(
+    mode: &Mode,
+    recipient: &SecretKey,
+    sender: &PublicKey,
+    enc: &[u8; ENC_LEN],
+    info: &[u8],
+) -> Result<OpenCtx, Error> {
+    let sk_r = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(&recipient.to_bytes())
+        .map_err(|_| Error::BadKey)?;
+    let pk_s =
+        <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(&sender.0).map_err(|_| Error::BadKey)?;
+    let encapped =
+        <X25519HkdfSha256 as Kem>::EncappedKey::from_bytes(enc).map_err(|_| Error::Malformed)?;
+
+    let psk_id = mode_psk_id(mode);
+    let op = match mode {
+        Mode::Base => OpModeR::Base,
+        Mode::Auth => OpModeR::Auth(pk_s),
+        Mode::AuthPsk { chunk, .. } => {
+            let bundle = PskBundle::new(chunk.expose(), &psk_id).map_err(|_| Error::BadKey)?;
+            OpModeR::AuthPsk(pk_s, bundle)
+        }
+    };
+
+    hpke::setup_receiver::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
+        &op, &sk_r, &encapped, info,
+    )
+    .map(OpenCtx)
+    .map_err(|_| Error::Open)
+}
 
 /// Seal `plaintext` to `recipient`.
 ///
@@ -528,6 +631,56 @@ mod tests {
                 "encapsulated key byte {i} was not covered"
             );
         }
+    }
+
+    /// **RFC 1 §6.1's AAD covers the encapsulated key**, which is only
+    /// constructible with the two-phase API — the single-shot form produces
+    /// `enc` and consumes the AAD in the same call.
+    #[test]
+    fn the_two_phase_form_can_bind_the_encapsulated_key() {
+        let (a, b) = (sk(20), sk(21));
+        let info = info_for(0);
+        let mut rng = NotRandom::seeded(30);
+
+        let (enc, mut ctx) = begin_seal(&Mode::Auth, &a, &b.public(), &info, &mut rng).unwrap();
+        // The AAD is built *from* enc, which a single-shot call cannot do.
+        let mut aad = alloc::vec![0xAAu8; 4];
+        aad.extend_from_slice(&enc);
+        let ct = ctx.seal(b"payload", &aad).unwrap();
+
+        let mut rx = begin_open(&Mode::Auth, &b, &a.public(), &enc, &info).unwrap();
+        assert_eq!(rx.open(&ct, &aad).unwrap(), b"payload");
+
+        // And a mismatched AAD fails, so the binding is real.
+        let mut rx2 = begin_open(&Mode::Auth, &b, &a.public(), &enc, &info).unwrap();
+        assert_eq!(rx2.open(&ct, b"different"), Err(Error::Open));
+    }
+
+    /// The two-phase and single-shot forms agree when the AAD is the same, so
+    /// nothing is lost by using the one that can bind more.
+    #[test]
+    fn two_phase_matches_single_shot_under_the_same_aad() {
+        let (a, b) = (sk(22), sk(23));
+        let info = info_for(0);
+        let aad = b"same aad";
+
+        let mut r1 = NotRandom::seeded(31);
+        let (enc, mut ctx) = begin_seal(&Mode::Auth, &a, &b.public(), &info, &mut r1).unwrap();
+        let ct = ctx.seal(b"m", aad).unwrap();
+
+        // Opened by the single-shot receiver.
+        assert_eq!(
+            open(
+                &Mode::Auth,
+                &b,
+                &a.public(),
+                &Sealed { enc, ct },
+                &info,
+                aad
+            )
+            .unwrap(),
+            b"m"
+        );
     }
 
     /// A malformed key is refused rather than panicking.
