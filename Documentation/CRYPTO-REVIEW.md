@@ -407,3 +407,139 @@ test vectors. A reviewer given executable vectors for tag derivation, the AAD
 construction, both HPKE modes, and the reservoir path will find in an afternoon
 what prose review does not surface at all — and §9's five undetermined items
 would all have been answered by a vector.
+
+---
+
+## 11. Review of the adopted §6 construction
+
+Requested after RFC 7 §6 was replaced with `mode_auth_psk`. This reviews what
+was adopted, not what it replaced.
+
+**One finding, and it is more serious than the one it was written to check.**
+
+### 11.1 The hybrid is genuine — verified, not assumed
+
+The claim is that breaking X25519 is insufficient because the PSK carries the
+post-quantum property. That depends entirely on *where* HPKE puts the PSK in
+its key schedule, so it was checked rather than believed. RFC 9180 §5.1:
+
+```
+secret = LabeledExtract(shared_secret, "secret", psk)
+```
+
+`LabeledExtract(salt, label, ikm)` is `Extract(salt, "HPKE-v1"‖suite‖label‖ikm)`,
+and `Extract(salt, ikm)` is `HMAC(key=salt, msg=ikm)`. So:
+
+```
+secret = HMAC-SHA256(key = shared_secret, msg = …‖ psk)
+```
+
+- An adversary who breaks X25519 holds the **HMAC key** and needs the **message**,
+  which contains 32 secret bytes. Not computable.
+- An adversary who obtains the reservoir holds the **message** and needs the
+  **key**, which is the DH output. Not computable.
+
+Both must fail. This is a proper hybrid, not a PSK bolted alongside one.
+
+Three secondary checks pass: the PSK is 32 bytes, meeting RFC 9180 §9.5's
+minimum exactly; `psk_id` is unique per PSK, since the epoch identifies the
+chunk; and deniability is preserved, because both parties hold the PSK so
+either could have produced the message.
+
+### 11.2 **FINDING — chunk destruction was illusory**
+
+RFC 7 §6, as adopted, says:
+
+> "At the close of epoch N plus a grace window, **`chunk_N` is destroyed**.
+> Every message of that epoch becomes permanently undecryptable — by anyone,
+> including the participants."
+
+With the chunk derivation §6 now specifies:
+
+```
+chunk_N = HKDF(reservoir, "krab/chunk/v1" ‖ u32_le(N), 32)
+```
+
+**that sentence was false.** The derivation is a pure function of a value the
+node must retain, because epoch N+1 needs it. Destroying `chunk_N` while
+keeping `reservoir` destroys nothing — anyone holding the reservoir recomputes
+any chunk they like, in microseconds, forever.
+
+This is worse than the defect §6 was amended to fix. That one reused a key
+within an epoch; this one silently voids the forward secrecy of *every* epoch,
+and it is the property RFC 7 §4's entire hierarchy exists to provide.
+
+The implementation had the same bug in a more damaging form: the root was
+sealed under `W_N`, so shredding an epoch would have destroyed the peering
+outright while the surviving root still recomputed everything.
+
+**A static root cannot deliver §6's claim.** The two failure modes are
+exclusive: keep the root and destruction is illusory; shred it with the epoch
+key and the correspondent is lost.
+
+### 11.3 The fix, implemented
+
+A one-way ratchet, in `crates/krab-crypto/src/reservoir.rs`:
+
+```
+chunk_N   = HKDF(root_N, "krab/chunk/v1"   ‖ u32_le(N),   32)
+root_{N+1} = HKDF(root_N, "krab/ratchet/v1" ‖ u32_le(N+1), 32)
+```
+
+`root_N` is destroyed once `root_{N+1}` exists. The peering survives; `chunk_N`
+becomes underivable, because inverting HKDF is the assumption everything else
+already rests on.
+
+Chunks inside RFC 1 §6.2's acceptance window are **retained** rather than
+re-derived — an object may arrive up to `MAX_TTL` after its epoch, and the
+ratchet has already passed it. 46 chunks at 32 bytes is 1 472 bytes, alongside
+§4.1's 2 700 bytes of epoch wrappers.
+
+`a_shredded_chunk_cannot_be_recomputed_from_what_remains` is the test: it
+shreds a chunk, then tries to regenerate it from the surviving root and fails.
+
+### 11.4 Proposed text for §6
+
+Add after the chunk derivation:
+
+> The reservoir is a **ratchet, not a constant**:
+>
+> ```
+> root_{N+1} = HKDF(root_N, "krab/ratchet/v1" ‖ u32_le(N+1), 32)
+> ```
+>
+> An implementation MUST destroy `root_N` once `root_{N+1}` is derived, and
+> MUST NOT retain any value from which a destroyed chunk can be recomputed.
+> Chunks within the acceptance window of RFC 1 §6.2 are retained directly; a
+> chunk outside it MUST be unrecoverable.
+>
+> §6's destruction guarantee depends on this. A reservoir stored as a constant
+> root satisfies every other requirement in this section and provides none of
+> the forward secrecy it claims.
+
+RFC 7 §6.3's "ratchet on contact" is a **different mechanism and does not
+substitute**: it mixes fresh DH on contact, which strengthens the root against
+compromise but happens at contact rather than per epoch. Between contacts the
+root is static, and that is where the destruction claim lives.
+
+### 11.5 Still to wire
+
+The stored root has no epoch beside it, so a restart adopts it at the current
+epoch and the ratchet's position is inferred rather than recorded. That is
+correct while a node runs continuously and wrong after a gap: a node offline
+for a week resumes with a root labelled the wrong epoch and derives chunks its
+peer will not recognise.
+
+**The peer-link must record the ratchet epoch alongside the wrapped root.**
+RFC 7 §6.4 already says the `peer-link` "records the reservoir identifier and
+current epoch" — so the RFC anticipated this and the implementation has not
+caught up. Tracked, not fixed.
+
+### 11.6 Standing caveat
+
+This is the fourth finding I have raised against my own reading of these
+documents, and the third that survived to a code change. It is not a substitute
+for the external review RFC 0 §9 requires. The finding in §11.2 was found by
+asking "what does *destroyed* mean here, concretely?" — a question an external
+reviewer would ask on their first pass, and one I did not ask when I wrote
+§11.1's construction.

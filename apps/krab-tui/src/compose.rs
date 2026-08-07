@@ -263,7 +263,7 @@ mod tests {
     }
 
     fn chunk(seed: u8) -> Chunk {
-        Reservoir::new([seed; 32], Epoch(0)).chunk(EPOCH).unwrap()
+        Reservoir::new([seed; 32], EPOCH).chunk(EPOCH).unwrap()
     }
 
     /// **The whole pipeline, end to end.** Compose, then take the object apart

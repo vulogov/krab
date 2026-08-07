@@ -373,7 +373,9 @@ mod tests {
     }
 
     fn chunk() -> Chunk {
-        Reservoir::new([0x77; 32], Epoch(0)).chunk(NOW).unwrap()
+        // Adopted at NOW, so the ratchet is already there — a chunk exists only
+        // once the ratchet reaches its epoch.
+        Reservoir::new([0x77; 32], NOW).chunk(NOW).unwrap()
     }
 
     /// RFC 1 §6.1 — `info = "krab/v1/" ‖ class`.
@@ -474,7 +476,7 @@ mod tests {
             "breaking X25519 must not be sufficient"
         );
         // And with a different chunk.
-        let wrong = Reservoir::new([0x11; 32], Epoch(0)).chunk(NOW).unwrap();
+        let wrong = Reservoir::new([0x11; 32], NOW).chunk(NOW).unwrap();
         assert_eq!(
             open(
                 &Mode::AuthPsk {

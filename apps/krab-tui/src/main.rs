@@ -412,13 +412,15 @@ impl App {
                     continue;
                 };
 
+                // The stored root is `root_N` for the epoch it was last
+                // ratcheted to, so it is adopted at the current epoch. A real
+                // deployment stores the epoch alongside it; see
+                // `CRYPTO-REVIEW.md` §11.3 on what still needs wiring.
                 let reservoir = std::fs::read(self.path(&format!("{name}.reservoir")))
                     .ok()
                     .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/reservoir", &s).ok())
                     .and_then(|r| <[u8; 32]>::try_from(r.as_slice()).ok())
-                    .map(|root| {
-                        krab_crypto::reservoir::Reservoir::new(root, krab_core::tag::Epoch(0))
-                    });
+                    .map(|root| krab_crypto::reservoir::Reservoir::new(root, now_epoch()));
 
                 // A completed peering is a peer worth reconciling with. Adding
                 // is not triggering: the first interval is drawn from entropy.
@@ -2402,7 +2404,7 @@ mod tests {
         .unwrap();
         let mut r = [0u8; 32];
         r.copy_from_slice(&root);
-        let chunk = krab_crypto::reservoir::Reservoir::new(r, krab_core::tag::Epoch(0))
+        let chunk = krab_crypto::reservoir::Reservoir::new(r, now_epoch())
             .chunk(now_epoch())
             .unwrap();
 
@@ -2533,7 +2535,7 @@ mod tests {
         .unwrap();
         let mut r = [0u8; 32];
         r.copy_from_slice(&root);
-        let chunk = krab_crypto::reservoir::Reservoir::new(r, krab_core::tag::Epoch(0))
+        let chunk = krab_crypto::reservoir::Reservoir::new(r, now_epoch())
             .chunk(now_epoch())
             .unwrap();
         let mut enc = [0u8; krab_crypto::seal::ENC_LEN];

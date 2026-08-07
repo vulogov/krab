@@ -5,11 +5,11 @@ out of implementing the thing the paragraph describes.
 
 | # | target | finding | text |
 |---|---|---|---|
-| 1 | RFC 7 §6 | `msg_key` reuses one key per (pair, epoch) — **critical** | `RFC-7-section-6-proposed.md` |
-| 2 | RFC 7 §6.2 | no channel rule; the post-quantum property can be silently void | ” |
-| 3 | RFC 7 §6 | chunk derivation is drawn as an arrow, never defined | ” |
+| 1 | RFC 7 §6 | `msg_key` reuses one key per (pair, epoch) — **critical** | **ADOPTED** 2026-08-07 |
+| 2 | RFC 7 §6.2 | no channel rule; the post-quantum property can be silently void | **ADOPTED** 2026-08-07 |
+| 3 | RFC 7 §6 | chunk derivation is drawn as an arrow, never defined | **ADOPTED** 2026-08-07 |
 | 4 | RFC 3 §2.1 | the credential is the one signed document with no signature domain | §A below |
-| 5 | RFC 4 §5.5 | nothing says an archive must be a window rather than a diff | §B below |
+| 5 | RFC 4 §5.5 | nothing says an archive must be a window rather than a diff | **ADOPTED** 2026-08-07 |
 | 6 | RFC 1 §11 | the checks are prose; two of six were never implemented | §C below |
 
 Findings 1–3 land in one section, so `RFC-7-section-6-proposed.md` closes all

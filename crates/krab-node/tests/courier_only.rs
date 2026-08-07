@@ -229,8 +229,8 @@ fn a_sealed_message_crosses_by_courier() {
     let recipient = SecretKey::generate(&mut NotRandom::seeded(2));
     let epoch = Epoch(20_671);
     let root = [0x5A; 32];
-    let chunk_s = Reservoir::new(root, Epoch(0)).chunk(epoch).unwrap();
-    let chunk_r = Reservoir::new(root, Epoch(0)).chunk(epoch).unwrap();
+    let chunk_s = Reservoir::new(root, epoch).chunk(epoch).unwrap();
+    let chunk_r = Reservoir::new(root, epoch).chunk(epoch).unwrap();
 
     let plaintext = b"the message that must not be readable in transit";
     let header = RoutingHeader {
