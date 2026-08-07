@@ -476,6 +476,40 @@ impl App {
                 })
                 .collect()
         };
+        // First-contact requests, on our own inbox tag. Shown at the top: a
+        // request needs a human decision (RFC 3 §11's ceremony is a deliberate
+        // act), and burying it under mail would mean it is never made.
+        let requests = receive::scan_requests(
+            &self.store,
+            id.correspondence(),
+            &id.node_id(),
+            epoch,
+            (0, u32::MAX),
+        );
+        for inc in &requests {
+            let note = inc.request.note.chars().take(40).collect::<String>();
+            self.list.insert(
+                0,
+                format!(
+                    "REQUEST from {}  {note}",
+                    inc.request
+                        .from
+                        .fingerprint()
+                        .split_whitespace()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            );
+        }
+        if !requests.is_empty() {
+            self.list.push(format!(
+                "! {} first-contact request(s). Compare fingerprints aloud before \
+                 peering — the signature proves who signed it, not who they are.",
+                requests.len()
+            ));
+        }
+
         if scan.tag_match_decrypt_fail > 0 {
             // RFC 3 §12's ratio. A high rate usually means objects are arriving
             // outside the acceptance window, which is otherwise invisible.
@@ -654,6 +688,7 @@ impl App {
                 };
             }
             Command::Send => self.body = self.send(line),
+            Command::Request => self.body = self.peer_request(line),
             Command::Pack => self.body = self.pack(line),
             Command::Import => self.body = self.import(line),
         }
@@ -974,6 +1009,83 @@ impl App {
                     "composed {n} bytes in bucket {bucket}{note}.\n\nIt is in your \
                      corpus and will leave on a scheduled reconciliation — not now, \
                      and not because you pressed send (RFC 5 §6.1)."
+                )
+            }
+            Err(e) => format!("the store refused it: {e:?}"),
+        }
+    }
+
+    /// RFC 3 §5.1's `peer-request` — reach someone this node has never met.
+    ///
+    /// Addressed to their **inbox tag**, which needs only their public key.
+    /// That is what makes first contact possible at all, and RFC 2 §4.2 states
+    /// its cost plainly: messages to an inbox tag are linkable within an epoch.
+    /// It rotates out; that is the whole mitigation.
+    fn peer_request(&mut self, line: &str) -> String {
+        let Some(card_path) = arg(line, 1) else {
+            return "usage: request <their.card> [note]\n\n\
+                    Sends a first-contact request to the inbox tag their card \
+                    implies. Requests to one person in one day are linkable to \
+                    each other (RFC 2 §4.2)."
+                .into();
+        };
+        let note = line
+            .splitn(3, char::is_whitespace)
+            .nth(2)
+            .unwrap_or("")
+            .trim();
+        let (Some(id), Some(_)) = (&self.identity, self.epoch_key) else {
+            return "locked — unlock to compose".into();
+        };
+
+        let Ok(bytes) = std::fs::read(card_path) else {
+            return format!("could not read {card_path}");
+        };
+        let card = match peering::Card::decode(&bytes) {
+            Ok(c) if c.verify() => c,
+            Ok(_) => return "that card's signature does not verify".into(),
+            Err(e) => return format!("not a card: {e:?}"),
+        };
+
+        let epoch = now_epoch();
+        let their_pk = krab_crypto::dh::PublicKey(card.correspondence_pk);
+        let tag = krab_crypto::inbox_tag(&their_pk, epoch);
+        let req = request::PeerRequest::create(
+            id.signing_key(),
+            id.card(Policy::default()),
+            card.node_id(),
+            Policy::default(),
+            note,
+        );
+
+        let composed = match compose::seal_to(
+            id.correspondence(),
+            &compose::Recipient::FirstContact {
+                correspondence: &their_pk,
+                tag,
+            },
+            epoch,
+            0,
+            expiry_for(epoch),
+            &req.encode(),
+            &mut OsRng,
+        ) {
+            Ok(c) => c,
+            Err(e) => return format!("could not seal: {e:?}"),
+        };
+
+        match self
+            .store
+            .ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX)
+        {
+            Ok(()) => {
+                self.save_corpus();
+                format!(
+                    "request composed for {}.\n\nIt carries your card and an inner \
+                     signature, because first contact cannot be deniable — the \
+                     recipient can prove you sent it, which RFC 3 §5.1 considers \
+                     the right trade for this one message.",
+                    card.fingerprint()
                 )
             }
             Err(e) => format!("the store refused it: {e:?}"),
@@ -3043,5 +3155,103 @@ mod tests {
             report.contains("interrupted wipe is still a complete one"),
             "{report}"
         );
+    }
+
+    /// **First contact, end to end.** A node reaches someone it has never met,
+    /// using only their card — no shared secret, no prior exchange.
+    #[test]
+    fn a_peer_request_reaches_a_stranger_and_proves_who_sent_it() {
+        let mut a = ready_node("req-a");
+        let mut b = ready_node("req-b");
+        type_command(&mut b, "peer offer");
+
+        // A has only B's card. That is the entire precondition.
+        std::fs::copy(b.path("peer.card"), a.path("stranger.card")).unwrap();
+        let card = a.path("stranger.card").display().to_string();
+        type_command(&mut a, &format!("request {card} we met at the thing"));
+        assert!(a.body.contains("request composed"), "{}", a.body);
+        assert_eq!(a.store.len(), 1);
+
+        // It travels as an ordinary object, so a stick carries it.
+        type_command(&mut a, "pack out.krab");
+        let stick = b.path("unremarkable.bin");
+        std::fs::copy(a.path("out.krab"), &stick).unwrap();
+        type_command(&mut b, &format!("import {}", stick.display()));
+        assert_eq!(b.store.len(), 1);
+
+        // B recognises it on its own inbox tag, which needs only B's own key.
+        let incoming = receive::scan_requests(
+            &b.store,
+            b.identity.as_ref().unwrap().correspondence(),
+            &b.identity.as_ref().unwrap().node_id(),
+            now_epoch(),
+            (0, u32::MAX),
+        );
+        assert_eq!(incoming.len(), 1, "the request was not recognised");
+
+        // And it is visible in the interface, at the top, with the caution
+        // that a signature proves who signed and not who they are.
+        assert!(b.list[0].starts_with("REQUEST from"), "{:?}", b.list);
+        assert!(
+            b.list
+                .iter()
+                .any(|l| l.contains("Compare fingerprints aloud")),
+            "{:?}",
+            b.list
+        );
+        let req = &incoming[0].request;
+        assert_eq!(req.note, "we met at the thing");
+        assert!(req.verify(), "the inner signature stands");
+        assert!(req.is_for(&b.identity.as_ref().unwrap().node_id()));
+
+        // And it carries A's identity provably — mode_base binds no sender, so
+        // the signature is the only thing that says who, and it says A.
+        assert_eq!(req.from.node_id(), a.identity.as_ref().unwrap().node_id());
+        assert_eq!(
+            req.from.fingerprint(),
+            a.identity.as_ref().unwrap().fingerprint()
+        );
+    }
+
+    /// A request addressed to someone else does not become ours by arriving.
+    #[test]
+    fn a_request_for_another_node_is_not_accepted() {
+        let mut a = ready_node("req-wrong-a");
+        let mut b = ready_node("req-wrong-b");
+        let c = ready_node("req-wrong-c");
+        type_command(&mut b, "peer offer");
+
+        // A addresses B, but C imports the object.
+        std::fs::copy(b.path("peer.card"), a.path("b.card")).unwrap();
+        let card = a.path("b.card").display().to_string();
+        type_command(&mut a, &format!("request {card} for B only"));
+        type_command(&mut a, "pack out.krab");
+
+        let mut c = c;
+        let stick = c.path("in.krab");
+        std::fs::copy(a.path("out.krab"), &stick).unwrap();
+        type_command(&mut c, &format!("import {}", stick.display()));
+
+        let incoming = receive::scan_requests(
+            &c.store,
+            c.identity.as_ref().unwrap().correspondence(),
+            &c.identity.as_ref().unwrap().node_id(),
+            now_epoch(),
+            (0, u32::MAX),
+        );
+        assert!(
+            incoming.is_empty(),
+            "C must not adopt a request addressed to B"
+        );
+        assert_eq!(c.store.len(), 1, "but it is stored and relayed regardless");
+    }
+
+    /// A locked node composes nothing.
+    #[test]
+    fn a_locked_node_cannot_send_a_request() {
+        let mut a = ready_node("req-locked");
+        a.lock();
+        type_command(&mut a, "request anything.card note");
+        assert!(a.body.contains("locked"), "{}", a.body);
     }
 }

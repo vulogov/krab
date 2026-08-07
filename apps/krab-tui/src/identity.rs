@@ -148,6 +148,12 @@ impl Identity {
         self.correspondence.to_bytes()
     }
 
+    /// This node's signing key, for the inner signature a `peer-request`
+    /// carries (RFC 3 §5.1).
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing
+    }
+
     /// This node's correspondence key, for sealing.
     pub fn correspondence(&self) -> &SecretKey {
         &self.correspondence
