@@ -35,9 +35,11 @@ mod layout;
 mod links;
 mod peering;
 mod peers;
+mod persist;
 mod reach;
 mod receive;
 mod render;
+mod shred;
 mod sync;
 
 use activity::{NodeState, Spinner};
@@ -77,6 +79,14 @@ fn main() -> io::Result<()> {
             eprintln!("{usage}");
             return Ok(());
         }
+    };
+    // Which verb this run needs. A node that has been restarted has a store it
+    // cannot read until a passphrase arrives, and saying so is the difference
+    // between "empty" and "locked" — which look identical otherwise.
+    app.body = if app.has_stored_identity() {
+        "a store is here. `unlock` to open it.".into()
+    } else {
+        "no identity. `init` to create one.".into()
     };
     install_panic_hook();
     let mut term = setup()?;
@@ -131,6 +141,8 @@ struct App {
     confirmed: bool,
     /// Where the first-run ceremony has got to, if it is running.
     init_step: Option<InitStep>,
+    /// Whether the passphrase prompt is unlocking rather than initialising.
+    unlocking: bool,
 }
 
 impl Default for App {
@@ -159,6 +171,7 @@ impl Default for App {
             tag_table: None,
             confirmed: false,
             init_step: None,
+            unlocking: false,
         }
     }
 }
@@ -521,15 +534,35 @@ impl App {
                 self.body = InitStep::Passphrase.prompt().into();
             }
             Command::Lock => self.lock(),
-            Command::Wipe => {
-                self.lock();
-                // Dropping the identity runs every key's `Drop`, which
-                // zeroizes. RFC 7 §4: erasure is destroying a key, and nothing
-                // here touches a file.
-                self.identity = None;
-                overwrite(&mut self.passphrase);
-                self.body = "key hierarchy destroyed".into();
+            Command::Duress => {
+                // RFC 7 §10: "Neither MUST be enabled by default. Both MUST be
+                // discoverable." So it is a verb, and it says what it does.
+                let Some(phrase) = line.split_once(char::is_whitespace).map(|x| x.1) else {
+                    self.body = "usage: duress <passphrase>\n\n\
+                                 Sets a second passphrase that destroys this node \
+                                 and then behaves like a fresh install. There is no \
+                                 confirmation and no warning when it is used — that \
+                                 is the point (RFC 7 §10)."
+                        .into();
+                    return;
+                };
+                self.body = match self.set_duress(phrase.trim().as_bytes()) {
+                    Ok(()) => "duress passphrase set. Entering it at the unlock \
+                               prompt destroys this node and shows an empty one. \
+                               Nothing will warn you, including this node."
+                        .into(),
+                    Err(e) => e,
+                };
             }
+            Command::Unlock => {
+                // The passphrase is typed at the prompt, not on the command
+                // line -- a command line is echoed and may be scrolled back.
+                self.init_step = Some(InitStep::Passphrase);
+                self.unlocking = true;
+                self.node.unlocking = true;
+                self.body = "passphrase:".into();
+            }
+            Command::Wipe => self.body = self.panic_wipe(),
             Command::Peer => {
                 let rest = line.trim().strip_prefix("peer").unwrap_or("");
                 self.body = match Peering::parse(rest) {
@@ -537,6 +570,7 @@ impl App {
                     Some(Peering::Offer) => self.peer_offer(),
                     Some(Peering::Accept) => self.peer_accept(arg(rest, 1)),
                     Some(Peering::Seal) => self.peer_seal(arg(rest, 1), arg(rest, 2)),
+                    Some(Peering::Pad) => self.peer_pad(arg(rest, 1)),
                     Some(Peering::Status) => self.peer_status(),
                     None => format!("unknown: peer{rest}"),
                 };
@@ -669,6 +703,38 @@ impl App {
             .map_err(|e| format!("could not write ceremony state: {e}"))
     }
 
+    /// Write this node's reservoir contribution to a named destination.
+    ///
+    /// **Not to the node's own storage by default**, and never automatically.
+    /// `R_A` is the one piece of key material that must exist in plaintext,
+    /// because a person carries it — and RFC 7 §4 forbids relying on deletion
+    /// to remove plaintext from a disk. It lives wrapped under `W_N` in the
+    /// ceremony; this materialises it exactly once, where the operator says.
+    fn peer_pad(&self, dest: Option<&str>) -> String {
+        let Some(dest) = dest else {
+            return "usage: peer pad <destination>\n\n\
+                    Give the path on the medium you are carrying. This writes \
+                    the one file Krab cannot protect once it exists — see \
+                    Documentation/SECURE-DELETE.md."
+                .into();
+        };
+        let pending = match self.load_ceremony() {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let bytes = ceremony::encode_contribution(&pending.my_contribution);
+        match std::fs::write(dest, bytes) {
+            Err(e) => format!("could not write {dest}: {e}"),
+            Ok(()) => format!(
+                "wrote your contribution to {dest}.\n\n\
+                 This is half a shared secret in plaintext. It is the only \
+                 unprotected artifact Krab produces, and once it is on a medium \
+                 no software can retract it — carry it, hand it over, and do not \
+                 leave a copy behind."
+            ),
+        }
+    }
+
     /// Record the counterparty's card — RFC 3 §11 step 1.
     fn peer_accept(&mut self, path: Option<&str>) -> String {
         let Some(path) = path else {
@@ -772,12 +838,13 @@ impl App {
         if let Err(e) = std::fs::write(self.path(&format!("{short}.link")), their_card.encode()) {
             return format!("could not store the peer-link: {e}");
         }
-        let _ = std::fs::remove_file(self.path("ceremony.cbor"));
+        shred::remove(&self.path("ceremony.cbor"), &mut OsRng);
         // `peer.pad` is this node's own contribution, written in the clear
-        // because it has to be handed over. Once the reservoir exists it has
-        // no further use and is half a live shared secret sitting unwrapped on
-        // disk — the one file in the layout that is neither signed nor sealed.
-        let _ = std::fs::remove_file(self.path("peer.pad"));
+        // because it has to be handed over. Once the reservoir exists it has no
+        // further use and is half a live shared secret sitting unwrapped on
+        // disk — the one file in the layout that is neither signed nor sealed,
+        // and therefore the one where overwriting is the only tool available.
+        shred::remove(&self.path("peer.pad"), &mut OsRng);
 
         // RFC 3 §4: the peer-link is a contract, so the terms both ends agreed
         // to belong on it. `negotiate` takes the lower bucket ceiling, since a
@@ -893,18 +960,21 @@ impl App {
             .store
             .ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX)
         {
-            Ok(()) => format!(
-                "composed {} bytes in bucket {}{}.\n\nIt is in your corpus and will \
-                 leave on a scheduled reconciliation — not now, and not because you \
-                 pressed send (RFC 5 §6.1).",
-                n,
-                composed.bucket,
-                if chunk.is_some() {
+            Ok(()) => {
+                let note = if chunk.is_some() {
                     ", post-quantum"
                 } else {
                     ", no reservoir"
-                }
-            ),
+                };
+                let bucket = composed.bucket;
+                self.save_corpus();
+                self.refresh_inbox();
+                format!(
+                    "composed {n} bytes in bucket {bucket}{note}.\n\nIt is in your \
+                     corpus and will leave on a scheduled reconciliation — not now, \
+                     and not because you pressed send (RFC 5 §6.1)."
+                )
+            }
             Err(e) => format!("the store refused it: {e:?}"),
         }
     }
@@ -985,6 +1055,7 @@ impl App {
                     got.refused,
                     got.total()
                 );
+                self.save_corpus();
                 self.refresh_inbox();
                 msg
             }
@@ -1087,6 +1158,185 @@ impl App {
         }
     }
 
+    /// RFC 7 §10's panic wipe.
+    ///
+    /// > "A command, and a duress passphrase that appears to unlock normally,
+    /// > either of which destroys the KEK. The store becomes unrecoverable **in
+    /// > milliseconds**. This is the control that matters at the moment of
+    /// > seizure."
+    ///
+    /// # The ordering is the design
+    ///
+    /// Key destruction happens **first**, before a single byte of disk is
+    /// touched. Everything wrapped beneath the KEK is unreadable the instant
+    /// that line runs, and overwriting a corpus is not a millisecond
+    /// operation — it is seconds to minutes on a large store.
+    ///
+    /// So if this is interrupted halfway — the process killed, the machine
+    /// unplugged, the laptop taken mid-sentence — **the guarantee already
+    /// holds** and only the hedge is incomplete. Doing it the other way round
+    /// would mean an interrupted wipe leaves a live key beside partially
+    /// overwritten files, which is the worst of both.
+    fn panic_wipe(&mut self) -> String {
+        // ---- The erasure. Milliseconds, and irreversible. ----
+        self.identity = None; // Drop runs Zeroize on every private key
+        self.epoch_key = None;
+        self.tag_table = None;
+        self.store = krab_store::index::Store::new();
+        for m in &mut self.messages {
+            overwrite(&mut m.body);
+        }
+        self.messages.clear();
+        overwrite(&mut self.passphrase);
+        overwrite(&mut self.composer);
+        overwrite(&mut self.body);
+        self.locked = true;
+        self.list = vec!["(wiped)".into()];
+
+        // ---- The hedge. Slower, best effort, and claims nothing. ----
+        //
+        // Applied to ciphertext as well as anything else: key destruction
+        // defeats an adversary who never gets the key, and overwriting is the
+        // only thing that touches one who obtains it later — coercion, a
+        // keylogger, a passphrase brute-forced at leisure. RFC 7 §10 exists
+        // because coercion is in the threat model.
+        let n = shred::remove_matching(
+            &self.home,
+            |name| {
+                name.ends_with(".link")
+                    || name.ends_with(".reservoir")
+                    || name.ends_with(".krab")
+                    || matches!(
+                        name,
+                        "identity.wrapped"
+                            | "kek.params"
+                            | "ceremony.cbor"
+                            | "peer.card"
+                            | "peer.pad"
+                    )
+            },
+            &mut OsRng,
+        );
+        format!(
+            "destroyed. {n} files overwritten and removed.\n\n\
+             The key went first and the store was unreadable before any file was \
+             touched — an interrupted wipe is still a complete one. The overwrite \
+             is a hedge against a passphrase obtained later, not the erasure \
+             itself (RFC 7 §4, §10)."
+        )
+    }
+
+    /// Write everything that survives a restart.
+    ///
+    /// Called after anything that changes the corpus or the key hierarchy.
+    /// Only wrapped or self-authenticating data — see `persist`'s module docs
+    /// and `Documentation/NO-CONFIG.md`.
+    fn save(&self, kek: &krab_crypto::kek::Kek) {
+        let _ = persist::write_params(&self.path("kek.params"), &self.identity_params());
+        if let Some(id) = &self.identity {
+            let _ = persist::write_identity(&self.path("identity.wrapped"), id, kek, &mut OsRng);
+        }
+        let _ = persist::write_corpus(&self.path("corpus.krab"), &self.store);
+    }
+
+    /// Persist just the corpus. Cheap, and needs no key.
+    fn save_corpus(&self) {
+        let _ = persist::write_corpus(&self.path("corpus.krab"), &self.store);
+    }
+
+    fn identity_params(&self) -> krab_crypto::kek::KekParams {
+        self.identity
+            .as_ref()
+            .map(|i| i.kek_params)
+            .unwrap_or_else(|| krab_crypto::kek::KekParams::new(&mut OsRng))
+    }
+
+    /// Whether a store already exists here.
+    fn has_stored_identity(&self) -> bool {
+        self.path("identity.wrapped").exists()
+    }
+
+    /// Whether `passphrase` is the duress passphrase — RFC 7 §10.
+    ///
+    /// A separate sealed record whose only content is a marker. It is
+    /// indistinguishable on disk from any other wrapped file: same size class,
+    /// same ciphertext, no name that gives it away beyond one an adversary
+    /// would have to already suspect. Its absence is also indistinguishable
+    /// from its presence without the passphrase, which is what makes "I do not
+    /// have one" a survivable answer.
+    fn is_duress(&self, passphrase: &[u8]) -> bool {
+        let Ok(params) = persist::read_params(&self.path("kek.params")) else {
+            return false;
+        };
+        let Ok(kek) = persist::kek_for(passphrase, &params) else {
+            return false;
+        };
+        std::fs::read(self.path("duress.wrapped"))
+            .ok()
+            .and_then(|sealed| kek.open(persist::CONTEXT_DURESS, &sealed).ok())
+            .is_some()
+    }
+
+    /// Record a duress passphrase — RFC 7 §10.
+    ///
+    /// Not enabled by default (§10 requires that), and set by an explicit
+    /// command so the operator knows it exists.
+    fn set_duress(&self, passphrase: &[u8]) -> Result<(), String> {
+        let params = persist::read_params(&self.path("kek.params"))
+            .map_err(|_| "no store here".to_string())?;
+        let kek = persist::kek_for(passphrase, &params).map_err(|e| format!("{e:?}"))?;
+        let sealed = kek
+            .seal(persist::CONTEXT_DURESS, b"duress", &mut OsRng)
+            .map_err(|e| format!("{e:?}"))?;
+        std::fs::write(self.path("duress.wrapped"), sealed)
+            .map_err(|e| format!("could not store it: {e}"))
+    }
+
+    /// Unlock an existing store: derive the KEK, recover the identity, reload
+    /// the corpus — RFC 7 §4.
+    ///
+    /// This is the *only* path that turns a passphrase into a working node,
+    /// and it is deliberately the same shape as `init`'s final step: derive,
+    /// open the epoch, then read. A second path would be a second place to get
+    /// the ordering wrong.
+    fn unlock(&mut self, passphrase: &[u8]) -> Result<(), String> {
+        // **RFC 7 §10.** Checked before anything else, and the response is
+        // silent: the node destroys itself and then presents exactly what a
+        // freshly initialised node presents. No warning, no distinct message,
+        // nothing an observer over the operator's shoulder can read.
+        if self.is_duress(passphrase) {
+            self.panic_wipe();
+            // What a first run looks like. The lie has to be complete or it is
+            // not a duress passphrase, it is a tell.
+            self.body = "no messages".into();
+            self.list = vec!["(no messages)".into()];
+            self.locked = false;
+            return Ok(());
+        }
+
+        let params = persist::read_params(&self.path("kek.params"))
+            .map_err(|_| "no store here — run `init`".to_string())?;
+        let kek = persist::kek_for(passphrase, &params)
+            .map_err(|_| "that passphrase does not open this store".to_string())?;
+        let mut id = persist::read_identity(&self.path("identity.wrapped"), &kek, params)
+            .map_err(|_| "that passphrase does not open this store".to_string())?;
+
+        let epoch = now_epoch();
+        let w = id
+            .hierarchy
+            .open_epoch(&kek, epoch, &mut OsRng)
+            .map_err(|e| format!("{e:?}"))?;
+        self.identity = Some(id);
+        self.epoch_key = Some(w);
+        self.locked = false;
+
+        // The corpus goes through the same verification a stranger's archive
+        // does. The disk is not trusted (RFC 7 §4).
+        let _ = persist::read_corpus(&self.path("corpus.krab"), &mut self.store, epoch.0 * 1440);
+        self.refresh_inbox();
+        Ok(())
+    }
+
     /// Derive the KEK and open the current epoch, RFC 7 §4.
     fn open_store(&mut self) -> Result<(), krab_crypto::kek::Error> {
         let Some(id) = &mut self.identity else {
@@ -1094,6 +1344,7 @@ impl App {
         };
         let kek = id.kek(self.passphrase.as_bytes())?;
         self.epoch_key = Some(id.hierarchy.open_epoch(&kek, now_epoch(), &mut OsRng)?);
+        self.save(&kek);
         // `kek` drops here. RFC 7 §4: it is memory-only and never written, and
         // the shorter it lives the better — it is re-derived on unlock.
         Ok(())
@@ -1107,17 +1358,16 @@ impl App {
         let mine = peering::offer(id.card(Policy::default()), OsRng.next_32());
         let pending = ceremony::Pending::open(mine.card.clone(), mine.contribution.r);
 
-        // Two files, never one. See `peering`'s module documentation: a single
-        // blob holding both halves would look routine and be catastrophic to
-        // forward.
+        // Only the card. It is public and signed, so writing it costs nothing.
+        //
+        // The contribution is deliberately **not** written here: it is the one
+        // artifact that would be plaintext on this node's own disk, and RFC 7
+        // §4 forbids relying on deletion to remove it. It is already held
+        // wrapped under W_N in the ceremony, so a plaintext copy would be a
+        // redundant one — see Documentation/SECURE-DELETE.md. `peer pad
+        // <destination>` materialises it onto the medium being carried.
         if let Err(e) = std::fs::write(self.path("peer.card"), mine.card.encode()) {
             return format!("could not write peer.card: {e}");
-        }
-        if let Err(e) = std::fs::write(
-            self.path("peer.pad"),
-            ceremony::encode_contribution(&mine.contribution),
-        ) {
-            return format!("could not write peer.pad: {e}");
         }
         if let Err(e) = self.save_ceremony(&pending) {
             return e;
@@ -1143,6 +1393,31 @@ impl App {
     /// only edge available.
     fn advance_init(&mut self) {
         let Some(step) = self.init_step else { return };
+
+        // An unlock is a single step: derive and open, or refuse.
+        if self.unlocking && step == InitStep::Passphrase {
+            if self.passphrase.is_empty() {
+                self.body = "a passphrase is required".into();
+                return;
+            }
+            let passphrase = core::mem::take(&mut self.passphrase);
+            self.body = match self.unlock(passphrase.as_bytes()) {
+                Ok(()) => format!(
+                    "unlocked {}",
+                    self.identity
+                        .as_ref()
+                        .map(|i| i.short_id())
+                        .unwrap_or_default()
+                ),
+                Err(e) => e,
+            };
+            let mut p = passphrase;
+            overwrite(&mut p);
+            self.init_step = None;
+            self.unlocking = false;
+            self.node.unlocking = false;
+            return;
+        }
 
         // Refuse to leave the passphrase step with nothing. The KEK is the
         // only root (RFC 7 §4), so an empty passphrase is a store anyone who
@@ -1360,6 +1635,14 @@ mod tests {
         a.passphrase.push_str("a passphrase");
         a.open_store().expect("store opens");
         a
+    }
+
+    /// Materialise a node's contribution onto a "medium" — the new `peer pad`
+    /// verb, which writes where told and never to the node's own storage.
+    fn pad_onto(from: &mut App, dest: &std::path::Path) -> String {
+        type_command(from, &format!("peer pad {}", dest.display()));
+        assert!(dest.exists(), "peer pad wrote nothing: {}", from.body);
+        dest.to_string_lossy().into_owned()
     }
 
     fn type_command(a: &mut App, s: &str) {
@@ -1606,8 +1889,8 @@ mod tests {
         }
 
         // Steps 3 and 4: the pads travel on the same media.
-        let a_pad = carry(&a, &b, "peer.pad", "from-a.pad");
-        let b_pad = carry(&b, &a, "peer.pad", "from-b.pad");
+        let a_pad = pad_onto(&mut a, &b.path("from-a.pad"));
+        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
         type_command(&mut a, &format!("peer seal {b_pad} media"));
         type_command(&mut b, &format!("peer seal {a_pad} media"));
         assert!(a.body.starts_with("peer-link signed"), "{}", a.body);
@@ -1649,7 +1932,15 @@ mod tests {
         type_command(&mut a, "peer offer");
         type_command(&mut b, "peer offer");
         std::fs::copy(b.path("peer.card"), a.path("b.card")).unwrap();
-        std::fs::copy(b.path("peer.pad"), a.path("b.pad")).unwrap();
+        {
+            let mut b2 = App {
+                home: b.home.clone(),
+                ..App::default()
+            };
+            b2.identity = Some(Identity::generate(&mut OsRng));
+            b2.epoch_key = b.epoch_key;
+            type_command(&mut b2, &format!("peer pad {}", a.path("b.pad").display()));
+        }
 
         let card = a.path("b.card").display().to_string();
         let pad = a.path("b.pad").display().to_string();
@@ -1928,7 +2219,7 @@ mod tests {
             to.path(as_name).to_string_lossy().into_owned()
         };
         let b_card = carry(&b, &a, "peer.card", "from-b.card");
-        let b_pad = carry(&b, &a, "peer.pad", "from-b.pad");
+        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
         type_command(&mut a, &format!("peer accept {b_card}"));
         {
             let mut p = a.load_ceremony().unwrap();
@@ -2066,7 +2357,7 @@ mod tests {
             to.path(as_name).to_string_lossy().into_owned()
         };
         let b_card = carry(&b, &a, "peer.card", "from-b.card");
-        let b_pad = carry(&b, &a, "peer.pad", "from-b.pad");
+        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
         type_command(&mut a, &format!("peer accept {b_card}"));
         {
             let mut p = a.load_ceremony().unwrap();
@@ -2238,8 +2529,8 @@ mod tests {
         // Each side records the other, so both can recognise the other's tags.
         let b_card = carry(&b, &a, "peer.card", "from-b.card");
         let a_card = carry(&a, &b, "peer.card", "from-a.card");
-        let b_pad = carry(&b, &a, "peer.pad", "from-b.pad");
-        let a_pad = carry(&a, &b, "peer.pad", "from-a.pad");
+        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
+        let a_pad = pad_onto(&mut a, &b.path("from-a.pad"));
         for (n, card, pad) in [(&mut a, b_card, b_pad), (&mut b, a_card, a_pad)] {
             type_command(n, &format!("peer accept {card}"));
             let mut p = n.load_ceremony().unwrap();
@@ -2364,48 +2655,392 @@ mod tests {
         assert!(App::from_args(["--home"].iter().map(|s| s.to_string())).is_err());
     }
 
-    /// **The outgoing pad does not outlive the ceremony.** It is the one file
-    /// in the layout that is neither signed nor sealed, and after sealing it
-    /// is half a live shared secret with no further use.
+    /// **`peer offer` writes no plaintext to this node's own disk.**
+    ///
+    /// The contribution is the one artifact that must exist unencrypted,
+    /// because a person carries it. RFC 7 §4 forbids relying on deletion to
+    /// remove plaintext from a disk, so it is never written there by default —
+    /// `peer pad <destination>` puts it on the medium and nowhere else. See
+    /// `Documentation/SECURE-DELETE.md`.
     #[test]
-    fn the_outgoing_pad_is_destroyed_once_the_reservoir_exists() {
+    fn offering_writes_no_unencrypted_material_to_local_storage() {
         let mut a = ready_node("pad-life");
-        let b = ready_node("pad-life-b");
-        {
-            let mut b2 = App {
-                home: b.home.clone(),
-                ..App::default()
-            };
-            b2.identity = Some(Identity::generate(&mut OsRng));
-            b2.epoch_key = b.epoch_key;
-            type_command(&mut b2, "peer offer");
-        }
         type_command(&mut a, "peer offer");
-        assert!(a.path("peer.pad").exists(), "written for the handover");
 
-        std::fs::copy(b.path("peer.card"), a.path("b.card")).unwrap();
-        std::fs::copy(b.path("peer.pad"), a.path("b.pad")).unwrap();
-        let card = a.path("b.card").display().to_string();
-        let pad = a.path("b.pad").display().to_string();
-        type_command(&mut a, &format!("peer accept {card}"));
-        type_command(&mut a, &format!("peer seal {pad} media"));
-        assert!(a.body.starts_with("peer-link signed"), "{}", a.body);
-
+        assert!(
+            a.path("peer.card").exists(),
+            "the card is public and signed"
+        );
         assert!(
             !a.path("peer.pad").exists(),
-            "the contribution must not linger"
+            "no plaintext contribution on our own disk"
         );
-        assert!(!a.path("ceremony.cbor").exists());
-        // What remains is signed or sealed.
-        let peer = short_id(
-            &peering::Card::decode(&std::fs::read(a.path("b.card")).unwrap())
-                .unwrap()
-                .node_id(),
-        );
-        assert!(a.path(&format!("{peer}.link")).exists(), "signed");
+
+        // The contribution exists, wrapped, inside the ceremony — so nothing
+        // was lost by not writing it.
+        let r = a.load_ceremony().unwrap().my_contribution.r;
+        assert_ne!(r, [0u8; 32]);
+
+        // And it is not recoverable from anything on disk without W_N.
+        for entry in std::fs::read_dir(&a.home).unwrap().flatten() {
+            let bytes = std::fs::read(entry.path()).unwrap_or_default();
+            assert!(
+                !bytes.windows(32).any(|w| w == r),
+                "the contribution appears in plaintext in {:?}",
+                entry.file_name()
+            );
+        }
+    }
+
+    /// `peer pad` writes where told, once, and says what it just created.
+    #[test]
+    fn the_pad_is_materialised_only_where_the_operator_says() {
+        let mut a = ready_node("pad-dest");
+        type_command(&mut a, "peer offer");
+
+        // No destination: refuses and explains, rather than picking one.
+        type_command(&mut a, "peer pad");
+        assert!(a.body.contains("usage:"), "{}", a.body);
+        assert!(a.body.contains("carrying"), "{}", a.body);
+
+        let medium = a.home.join("removable-medium.pad");
+        type_command(&mut a, &format!("peer pad {}", medium.display()));
+        assert!(medium.exists());
+        assert!(a.body.contains("only unprotected artifact"), "{}", a.body);
+
+        // It is the ceremony's contribution, and it matches.
+        let written = ceremony::decode_contribution(&std::fs::read(&medium).unwrap()).unwrap();
+        assert_eq!(written.r, a.load_ceremony().unwrap().my_contribution.r);
+    }
+
+    /// **`wipe` overwrites everything it removes**, ciphertext included.
+    ///
+    /// The erasure is the key destruction; the overwrite is what a
+    /// later-obtained passphrase cannot undo, and it removes the listing —
+    /// a directory of `*.link` files names who this node peered with even when
+    /// their contents are unreadable.
+    #[test]
+    fn wipe_overwrites_every_artifact_including_encrypted_ones() {
+        let mut a = ready_node("wipe-shred");
+        type_command(&mut a, "peer offer");
+        let card_before = std::fs::read(a.path("peer.card")).unwrap();
+        assert!(a.path("ceremony.cbor").exists());
+
+        type_command(&mut a, "wipe");
+        type_command(&mut a, "wipe");
         assert!(
-            a.path(&format!("{peer}.reservoir")).exists(),
-            "sealed under W_N"
+            a.identity.is_none(),
+            "the key is destroyed — that is the erasure"
+        );
+        assert!(a.body.contains("overwritten and removed"), "{}", a.body);
+        assert!(
+            a.body.contains("not the erasure"),
+            "and it does not overclaim"
+        );
+
+        // Nothing of the layout survives, and the listing is gone with it.
+        for name in [
+            "peer.card",
+            "ceremony.cbor",
+            "identity.wrapped",
+            "corpus.krab",
+        ] {
+            assert!(!a.path(name).exists(), "{name} survived wipe");
+        }
+        assert!(!card_before.is_empty());
+    }
+
+    /// **A node survives being stopped.** Identity, peer-links, corpus, and
+    /// readable mail all come back from a passphrase and a directory.
+    #[test]
+    fn a_node_restarts_from_a_passphrase_and_a_directory() {
+        let home = temp_home("restart");
+        let peer_home = temp_home("restart-peer");
+
+        // A peer to exchange with, and a message from them.
+        let mut them = App {
+            home: peer_home.clone(),
+            ..App::default()
+        };
+        let mut their_id = Identity::generate(&mut OsRng);
+        their_id.kek_params.m_kib = 64;
+        their_id.kek_params.t = 1;
+        their_id.kek_params.p = 1;
+        them.identity = Some(their_id);
+        them.passphrase.push_str("their passphrase");
+        them.open_store().unwrap();
+        type_command(&mut them, "peer offer");
+
+        // The node itself, initialised the long way.
+        let mut a = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        let mut id = Identity::generate(&mut OsRng);
+        id.kek_params.m_kib = 64;
+        id.kek_params.t = 1;
+        id.kek_params.p = 1;
+        a.identity = Some(id);
+        a.passphrase.push_str("open sesame please");
+        a.open_store().unwrap();
+        let node_id = a.identity.as_ref().unwrap().node_id();
+        let fingerprint = a.identity.as_ref().unwrap().fingerprint();
+
+        type_command(&mut a, "peer offer");
+        std::fs::copy(them.path("peer.card"), a.path("t.card")).unwrap();
+        pad_onto(&mut them, &a.path("t.pad"));
+        let card = a.path("t.card").display().to_string();
+        let pad = a.path("t.pad").display().to_string();
+        type_command(&mut a, &format!("peer accept {card}"));
+        type_command(&mut a, &format!("peer seal {pad} media"));
+
+        let peer = short_id(&them.identity.as_ref().unwrap().node_id());
+        type_command(&mut a, &format!("send {peer} kept across a restart"));
+        assert_eq!(a.store.len(), 1);
+
+        // The process ends. Everything in memory is gone.
+        drop(a);
+
+        // A fresh process, given only the directory and the passphrase.
+        let mut b = App::from_args(
+            ["--home", home.to_str().unwrap()]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert!(b.has_stored_identity());
+        assert!(b.identity.is_none(), "nothing is known before unlocking");
+
+        b.unlock(b"open sesame please").expect("unlocks");
+        assert_eq!(
+            b.identity.as_ref().unwrap().node_id(),
+            node_id,
+            "same identity"
+        );
+        assert_eq!(b.identity.as_ref().unwrap().fingerprint(), fingerprint);
+        assert_eq!(b.store.len(), 1, "the corpus came back");
+        assert!(b.epoch_key.is_some());
+        // And the peer-link is still there, so tags still derive.
+        assert!(b.path(&format!("{peer}.link")).exists());
+    }
+
+    /// The wrong passphrase opens nothing, and says nothing about how wrong.
+    #[test]
+    fn a_wrong_passphrase_opens_nothing() {
+        let home = temp_home("restart-wrong");
+        let mut a = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        let mut id = Identity::generate(&mut OsRng);
+        id.kek_params.m_kib = 64;
+        id.kek_params.t = 1;
+        id.kek_params.p = 1;
+        a.identity = Some(id);
+        a.passphrase.push_str("the right one");
+        a.open_store().unwrap();
+        drop(a);
+
+        let mut b = App {
+            home,
+            ..App::default()
+        };
+        let err = b.unlock(b"the right on").unwrap_err();
+        assert!(err.contains("does not open this store"), "{err}");
+        assert!(b.identity.is_none(), "nothing was recovered");
+        assert!(b.epoch_key.is_none());
+    }
+
+    /// A directory with no store says what to do rather than failing opaquely.
+    #[test]
+    fn an_empty_directory_directs_the_operator_to_init() {
+        let mut a = App {
+            home: temp_home("restart-empty"),
+            ..App::default()
+        };
+        assert!(!a.has_stored_identity());
+        assert!(a.unlock(b"anything").unwrap_err().contains("run `init`"));
+    }
+
+    /// **Nothing on disk is configuration.** Every file a run leaves behind is
+    /// signed, wrapped, or content-addressed — `Documentation/NO-CONFIG.md`.
+    #[test]
+    fn the_stored_layout_contains_no_unauthenticated_settings() {
+        let home = temp_home("layout");
+        let mut a = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        let mut id = Identity::generate(&mut OsRng);
+        id.kek_params.m_kib = 64;
+        id.kek_params.t = 1;
+        id.kek_params.p = 1;
+        a.identity = Some(id);
+        a.passphrase.push_str("passphrase");
+        a.open_store().unwrap();
+        type_command(&mut a, "peer offer");
+
+        let allowed = [
+            "identity.wrapped", // sealed under the KEK
+            "kek.params",       // plaintext, self-defeating to tamper with
+            "corpus.krab",      // content-addressed
+            "ceremony.cbor",    // signed cards, wrapped contribution
+            "peer.card",        // signed
+            "peer.pad",         // destroyed at seal; see the pad-life test
+        ];
+        for entry in std::fs::read_dir(&home).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let ok = allowed.contains(&name.as_str())
+                || name.ends_with(".link")
+                || name.ends_with(".reservoir");
+            assert!(ok, "unexpected file on disk: {name}");
+            // Nothing that reads like configuration.
+            for smell in [
+                ".toml", ".conf", ".ini", ".yaml", ".json", "config", "settings",
+            ] {
+                assert!(!name.contains(smell), "{name} looks like configuration");
+            }
+        }
+    }
+
+    /// **RFC 7 §10's duress passphrase.** It destroys the node and then shows
+    /// exactly what a fresh install shows — no warning, no distinct message,
+    /// nothing readable over the operator's shoulder.
+    #[test]
+    fn the_duress_passphrase_destroys_and_then_lies_convincingly() {
+        let home = temp_home("duress");
+        let mut a = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        let mut id = Identity::generate(&mut OsRng);
+        id.kek_params.m_kib = 64;
+        id.kek_params.t = 1;
+        id.kek_params.p = 1;
+        a.identity = Some(id);
+        a.passphrase.push_str("the real one");
+        a.open_store().unwrap();
+        type_command(&mut a, "peer offer");
+        a.set_duress(b"under duress").unwrap();
+        assert!(a.path("identity.wrapped").exists());
+        drop(a);
+
+        // Someone is made to unlock.
+        let mut b = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        b.unlock(b"under duress").expect("it appears to work");
+
+        // What they see is what a first run looks like.
+        assert_eq!(b.list, vec!["(no messages)".to_string()]);
+        assert!(!b.body.to_lowercase().contains("wipe"), "{}", b.body);
+        assert!(!b.body.to_lowercase().contains("destroy"), "{}", b.body);
+        assert!(!b.body.to_lowercase().contains("duress"), "{}", b.body);
+
+        // And the store is gone, irreversibly — the real passphrase now opens
+        // nothing either.
+        assert!(b.identity.is_none());
+        assert!(!home.join("identity.wrapped").exists());
+        let mut c = App {
+            home,
+            ..App::default()
+        };
+        assert!(c.unlock(b"the real one").is_err());
+    }
+
+    /// The real passphrase still works when a duress one is set, and the
+    /// duress record does not open the identity.
+    #[test]
+    fn setting_a_duress_passphrase_does_not_disturb_the_real_one() {
+        let home = temp_home("duress-coexist");
+        let mut a = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        let mut id = Identity::generate(&mut OsRng);
+        id.kek_params.m_kib = 64;
+        id.kek_params.t = 1;
+        id.kek_params.p = 1;
+        a.identity = Some(id);
+        a.passphrase.push_str("the real one");
+        a.open_store().unwrap();
+        let node_id = a.identity.as_ref().unwrap().node_id();
+        a.set_duress(b"under duress").unwrap();
+        drop(a);
+
+        let mut b = App {
+            home,
+            ..App::default()
+        };
+        assert!(!b.is_duress(b"the real one"), "the real one is not duress");
+        assert!(b.is_duress(b"under duress"));
+        b.unlock(b"the real one")
+            .expect("the real passphrase still opens it");
+        assert_eq!(b.identity.as_ref().unwrap().node_id(), node_id);
+    }
+
+    /// A node with no duress passphrase set answers the same way to every
+    /// wrong passphrase — its absence must not be detectable.
+    #[test]
+    fn a_node_without_a_duress_passphrase_reveals_nothing() {
+        let home = temp_home("no-duress");
+        let mut a = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        let mut id = Identity::generate(&mut OsRng);
+        id.kek_params.m_kib = 64;
+        id.kek_params.t = 1;
+        id.kek_params.p = 1;
+        a.identity = Some(id);
+        a.passphrase.push_str("only one");
+        a.open_store().unwrap();
+        drop(a);
+
+        let mut b = App {
+            home,
+            ..App::default()
+        };
+        assert!(!b.is_duress(b"anything at all"));
+        let e1 = b.unlock(b"wrong one").unwrap_err();
+        let e2 = b.unlock(b"wrong two").unwrap_err();
+        assert_eq!(e1, e2, "two wrong guesses must be indistinguishable");
+    }
+
+    /// **The ordering is the design.** The key dies before any file is
+    /// touched, so an interrupted wipe is still a complete one.
+    #[test]
+    fn the_key_is_destroyed_before_the_disk_is_touched() {
+        let home = temp_home("wipe-order");
+        let mut a = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        let mut id = Identity::generate(&mut OsRng);
+        id.kek_params.m_kib = 64;
+        id.kek_params.t = 1;
+        id.kek_params.p = 1;
+        a.identity = Some(id);
+        a.passphrase.push_str("passphrase");
+        a.open_store().unwrap();
+        type_command(&mut a, "peer offer");
+
+        // `panic_wipe` returns its report rather than assigning it, so that
+        // the erasure runs to completion before anything renders.
+        let report = a.panic_wipe();
+
+        // In-memory key material is gone, which is the erasure.
+        assert!(a.identity.is_none());
+        assert!(a.epoch_key.is_none());
+        assert!(a.tag_table.is_none());
+        assert!(a.messages.is_empty());
+        assert_eq!(a.store.len(), 0);
+        // And the message says which part is the guarantee.
+        assert!(report.contains("key went first"), "{report}");
+        assert!(
+            report.contains("interrupted wipe is still a complete one"),
+            "{report}"
         );
     }
 }

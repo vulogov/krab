@@ -56,6 +56,14 @@ pub enum Command {
     Peer,
     /// **Not in RFC 8 §5.** Lock now. The `Ctrl-L` chord's discoverable form.
     Lock,
+    /// **Not in RFC 8 §5.** Set a duress passphrase (RFC 7 §10).
+    Duress,
+    /// **Not in RFC 8 §5.** Re-derive the KEK and reopen the store.
+    ///
+    /// §5 has no way to *create* an identity and no way to *reopen* one, which
+    /// together mean a node that has been restarted has no listed verb that
+    /// makes it usable again.
+    Unlock,
     /// **Not in RFC 8 §5.** RFC 7 §10's panic wipe: destroy the KEK.
     Wipe,
     /// Establish a transport. Does **not** trigger a reconciliation.
@@ -87,6 +95,8 @@ impl Command {
             "init" => Command::Init,
             "peer" => Command::Peer,
             "lock" => Command::Lock,
+            "unlock" => Command::Unlock,
+            "duress" => Command::Duress,
             "wipe" => Command::Wipe,
             "connect" => Command::Connect,
             "disconnect" => Command::Disconnect,
@@ -122,7 +132,12 @@ impl Command {
     pub fn needs_unlocked(&self) -> bool {
         matches!(
             self,
-            Command::Send | Command::Peer | Command::Init | Command::Keys | Command::Verify
+            Command::Send
+                | Command::Peer
+                | Command::Init
+                | Command::Keys
+                | Command::Verify
+                | Command::Duress
         )
     }
 
@@ -143,6 +158,8 @@ impl fmt::Display for Command {
             Command::Init => "init",
             Command::Peer => "peer",
             Command::Lock => "lock",
+            Command::Unlock => "unlock",
+            Command::Duress => "duress",
             Command::Wipe => "wipe",
             Command::Connect => "connect",
             Command::Disconnect => "disconnect",
@@ -167,11 +184,19 @@ impl fmt::Display for Command {
 /// that is what friend-to-friend means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Peering {
-    /// Emit **two** files: a public card and a secret reservoir contribution.
+    /// Emit this node's public card and open a ceremony.
     ///
-    /// Two, not one. See [`crate::peering`] — a single blob containing both
-    /// would look routine and be catastrophic to forward.
+    /// The card only. The reservoir contribution is materialised separately by
+    /// [`Peering::Pad`], because it is the one artifact that would be plaintext
+    /// on this node's own disk and RFC 7 §4 forbids relying on deletion to
+    /// remove it — see `Documentation/SECURE-DELETE.md`.
     Offer,
+    /// Write the reservoir contribution to a destination the operator names.
+    ///
+    /// Separate from [`Peering::Offer`] on purpose: the two artifacts have
+    /// different channel requirements *and* different storage requirements, and
+    /// a single command producing both invites leaving one behind.
+    Pad,
     /// Ingest the peer's card. Displays the fingerprint word list for RFC 3
     /// §11 step 2, which the operator must then read aloud.
     Accept,
@@ -187,6 +212,7 @@ impl Peering {
     pub fn parse(rest: &str) -> Option<Peering> {
         Some(match rest.split_whitespace().next().unwrap_or("status") {
             "offer" => Peering::Offer,
+            "pad" => Peering::Pad,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,
             "status" => Peering::Status,
@@ -290,6 +316,8 @@ mod tests {
             Command::Init,
             Command::Peer,
             Command::Lock,
+            Command::Unlock,
+            Command::Duress,
             Command::Wipe,
             Command::Connect,
             Command::Disconnect,
