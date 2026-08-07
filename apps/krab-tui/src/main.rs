@@ -2013,8 +2013,8 @@ mod tests {
         assert!(a.body.starts_with("peer-link signed"), "{}", a.body);
         assert!(b.body.starts_with("peer-link signed"), "{}", b.body);
         // Both ends report the same agreed terms, from opposite directions.
-        assert!(a.body.contains("agreed: buckets to 7"), "{}", a.body);
-        assert!(b.body.contains("agreed: buckets to 7"), "{}", b.body);
+        assert!(a.body.contains("agreed: buckets to 5"), "{}", a.body);
+        assert!(b.body.contains("agreed: buckets to 5"), "{}", b.body);
 
         // Sneakernet keeps the post-quantum property, so neither is warned.
         assert!(!a.body.contains("does NOT survive"), "{}", a.body);
