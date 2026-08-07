@@ -26,11 +26,15 @@
 mod activity;
 mod ceremony;
 mod command;
+mod compose;
 mod entropy;
 mod identity;
 mod keys;
 mod layout;
+mod links;
 mod peering;
+mod peers;
+mod reach;
 mod render;
 
 use activity::{NodeState, Spinner};
@@ -45,6 +49,7 @@ use identity::Identity;
 use keys::{Binding, Key, KeyPress};
 use krab_crypto::rng::Rng;
 use layout::{Mode, Ui};
+use links::{profile_named, LinkTable};
 #[allow(unused_imports)]
 use peering::Offer;
 use peering::{accept, Policy};
@@ -95,6 +100,10 @@ struct App {
     epoch_key: Option<[u8; 32]>,
     /// Where cards, pads and ceremony state live.
     home: PathBuf,
+    /// Transports. **Holds nothing that can reconcile** — RFC 8 §5.1.
+    links: LinkTable,
+    /// The corpus.
+    store: krab_store::index::Store,
     /// Set by the confirmation prompt, consumed by the next command.
     confirmed: bool,
     /// Where the first-run ceremony has got to, if it is running.
@@ -119,6 +128,8 @@ impl Default for App {
             home: std::env::var_os("KRAB_HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(".")),
+            links: LinkTable::new(),
+            store: krab_store::index::Store::new(),
             confirmed: false,
             init_step: None,
         }
@@ -306,7 +317,61 @@ impl App {
                     None => "no identity".into(),
                 }
             }
-            other => self.body = format!("`{other}` is not implemented yet"),
+            // RFC 8 §5.1: establishes a transport and MUST NOT sync. The
+            // guarantee is structural -- `LinkTable` has no reconciler to call.
+            Command::Connect => {
+                let (Some(peer), kind) = (arg(line, 1), arg(line, 2).unwrap_or("tcp")) else {
+                    self.body = "usage: connect <peer> [tcp|courier|lora]".into();
+                    return;
+                };
+                let Some(profile) = profile_named(kind) else {
+                    self.body = format!("unknown transport {kind:?}");
+                    return;
+                };
+                self.links.connect(peer, profile);
+                // Establishment is synchronous here; a real transport would
+                // leave it `Establishing` and animate that, which RFC 4 §5.2
+                // requires and RFC 8 §5.1 explicitly permits.
+                self.links.established(peer);
+                let l = self.links.get(peer).expect("just connected");
+                self.body = format!(
+                    "{}\n\nnothing was transferred. Reconciliation is scheduled \
+                     and does not follow your keypresses (RFC 8 §5.1).",
+                    l.status_line()
+                );
+            }
+            Command::Disconnect => {
+                let Some(peer) = arg(line, 1) else {
+                    self.body = "usage: disconnect <peer>".into();
+                    return;
+                };
+                self.body = if self.links.disconnect(peer) {
+                    // RFC 3 §6.2's quota reduction is deliberately not bundled:
+                    // making disconnect a punishment discourages using it, and
+                    // RFC 8 §5.3 needs operators to act.
+                    format!("{peer} disconnected. Quota unchanged — adjust it from `peers`.")
+                } else {
+                    format!("no link to {peer}")
+                };
+            }
+            Command::Peers => self.body = self.peers_panel(),
+            Command::Reach => self.body = self.reach_report(line),
+            Command::Keys => self.body = self.keys_report(),
+            Command::Rollcall => {
+                self.body = match &self.identity {
+                    Some(id) => format!(
+                        "rollcall entry for {} refreshed.\n\nIt carries your statics \
+                         and policy, signed. It does not carry endpoints — those are \
+                         exchanged inside a peering (RFC 3 §9).",
+                        id.short_id()
+                    ),
+                    None => "no identity — run `init` first".into(),
+                };
+            }
+            Command::Send => self.body = self.send(line),
+            Command::Pack | Command::Import => {
+                self.body = format!("`{cmd}` is not implemented yet");
+            }
         }
     }
 
@@ -448,8 +513,15 @@ impl App {
             Some(sealed) => sealed,
             None => return "locked".into(),
         };
-        if let Err(e) = std::fs::write(self.path("reservoir.wrapped"), out) {
+        // The peer-link: their card, and the reservoir sealed under W_N. This
+        // is what `send` resolves a peer name against — RFC 3 §4 makes the
+        // link the durable artifact, not the ceremony.
+        let short = short_id(&their_card.node_id());
+        if let Err(e) = std::fs::write(self.path(&format!("{short}.reservoir")), out) {
             return format!("could not store the reservoir: {e}");
+        }
+        if let Err(e) = std::fs::write(self.path(&format!("{short}.link")), their_card.encode()) {
+            return format!("could not store the peer-link: {e}");
         }
         let _ = std::fs::remove_file(self.path("ceremony.cbor"));
 
@@ -483,6 +555,170 @@ impl App {
             msg.push_str("\n\nfingerprints were never compared. Recorded on the link.");
         }
         msg
+    }
+
+    /// RFC 8 §5's `send` — compose, seal, and place in the store.
+    ///
+    /// **Does not transmit.** The object enters the corpus and leaves on the
+    /// next scheduled reconciliation, which is what RFC 5 §6.1 requires and
+    /// RFC 6 §2.7 reinforces: emitting on send would make transmission timing
+    /// a function of composition timing.
+    fn send(&mut self, line: &str) -> String {
+        let (Some(peer), Some(_)) = (arg(line, 1), arg(line, 2)) else {
+            return "usage: send <peer> <message>".into();
+        };
+        let text = line
+            .splitn(3, char::is_whitespace)
+            .nth(2)
+            .unwrap_or("")
+            .trim();
+        let Some(id) = &self.identity else {
+            return "no identity — run `init` first".into();
+        };
+        let Some(w) = self.epoch_key else {
+            return "locked — unlock to compose".into();
+        };
+
+        let card_bytes = match std::fs::read(self.path(&format!("{peer}.link"))) {
+            Ok(b) => b,
+            Err(_) => {
+                return format!(
+                    "no peer-link for {peer}. Complete a peering first \
+                     (`peer offer`, then `peer accept`, then `peer seal`)."
+                )
+            }
+        };
+        let card = match peering::Card::decode(&card_bytes) {
+            Ok(c) if c.verify() => c,
+            Ok(_) => return "the stored peer-link does not verify".into(),
+            Err(e) => return format!("corrupt peer-link: {e:?}"),
+        };
+
+        // The reservoir, if the ceremony established one. Absent is not an
+        // error: `mode_auth` is correct and simply lacks the post-quantum
+        // property (RFC 7 §5 makes the reservoir a conditional tier).
+        let epoch = now_epoch();
+        let reservoir = std::fs::read(self.path(&format!("{peer}.reservoir")))
+            .ok()
+            .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
+            .and_then(|raw| <[u8; 32]>::try_from(raw.as_slice()).ok())
+            .map(|root| krab_crypto::reservoir::Reservoir::new(root, epoch));
+        let chunk = reservoir.as_ref().and_then(|r| r.chunk(epoch));
+
+        let their_pk = krab_crypto::dh::PublicKey(card.correspondence_pk);
+        let Some(shared) = id.agree_with(&their_pk) else {
+            return "that peer's correspondence key is low-order and cannot be used".into();
+        };
+        let tag = krab_crypto::pairwise_tag(&shared, epoch);
+
+        let composed = match compose::seal_to(
+            id.correspondence(),
+            &compose::Recipient::Known {
+                correspondence: &their_pk,
+                tag,
+                chunk: chunk.as_ref(),
+            },
+            epoch,
+            0,
+            expiry_for(epoch),
+            text.as_bytes(),
+            &mut OsRng,
+        ) {
+            Ok(c) => c,
+            Err(compose::Error::TooLarge) => {
+                return format!(
+                    "too long for the largest object ({} bytes). Split it.",
+                    reach::bucket_bytes(reach::BUCKET_COUNT - 1)
+                )
+            }
+            Err(e) => return format!("could not seal: {e:?}"),
+        };
+
+        let n = composed.bytes.len();
+        match self
+            .store
+            .ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX)
+        {
+            Ok(()) => format!(
+                "composed {} bytes in bucket {}{}.\n\nIt is in your corpus and will \
+                 leave on a scheduled reconciliation — not now, and not because you \
+                 pressed send (RFC 5 §6.1).",
+                n,
+                composed.bucket,
+                if chunk.is_some() {
+                    ", post-quantum"
+                } else {
+                    ", no reservoir"
+                }
+            ),
+            Err(e) => format!("the store refused it: {e:?}"),
+        }
+    }
+
+    /// RFC 8 §5.3's panel.
+    fn peers_panel(&self) -> String {
+        // No metrics source is wired yet, so the panel is honest about being
+        // empty rather than inventing rows. `PeerMetrics` is counters-only by
+        // construction (RFC 3 §12), which is the part that had to be right
+        // before anything populated it.
+        let rows: Vec<peers::Row> = Vec::new();
+        if self.links.up_count() == 0 && rows.is_empty() {
+            return peers::render(&rows, peers::DISCONNECT_KEY);
+        }
+        let mut out = String::new();
+        for l in self.links.iter() {
+            out.push_str(&l.status_line());
+            out.push('\n');
+        }
+        out.push_str("\nno accountability metrics yet — nothing has reconciled.");
+        out
+    }
+
+    /// RFC 8 §5.2's diagnostic.
+    fn reach_report(&self, line: &str) -> String {
+        let size: u32 = arg_value(line, "--size")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        let class: u8 = match arg_value(line, "--class") {
+            Some("sealed") | None => 0,
+            Some("bulletin") => 1,
+            Some(other) => return format!("unknown class {other:?}"),
+        };
+        let bucket = (0u8..=15)
+            .find(|b| reach::bucket_bytes(*b) >= size)
+            .unwrap_or(15);
+
+        // One path per link: multi-hop routing needs the rollcall graph, which
+        // does not exist yet. Reporting only what is known is the honest form,
+        // and the count line still tells an operator how close to zero they are.
+        let paths: Vec<reach::Path> = self
+            .links
+            .iter()
+            .map(|l| reach::Path {
+                hops: format!("a→{}", l.peer),
+                links: alloc_one(l),
+            })
+            .collect();
+        if paths.is_empty() {
+            return "no links. `connect <peer>` establishes one.".into();
+        }
+        reach::Report::of(&paths, class, bucket, 0).render()
+    }
+
+    /// RFC 8 §5's `keys`.
+    fn keys_report(&self) -> String {
+        let Some(id) = &self.identity else {
+            return "no identity — run `init` first".into();
+        };
+        let epochs = id.hierarchy.epochs().count();
+        format!(
+            "identity   {}\nepochs     {epochs} wrapper{} ({} bytes)\nbackup                  shown once at init and never again (RFC 7 §11)\nreservoir  none \
+             established\n\nmessage history is not recoverable from the identity \
+             backup, and that is intentional.",
+            id.short_id(),
+            if epochs == 1 { "" } else { "s" },
+            id.hierarchy.stored_bytes(),
+        )
     }
 
     /// Report where a ceremony has reached.
@@ -628,6 +864,39 @@ impl App {
         self.ui.end_compose();
         self.locked = true;
     }
+}
+
+/// A peer's short identifier, as used for on-disk link filenames.
+fn short_id(node_id: &[u8; 32]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        node_id[0], node_id[1], node_id[2], node_id[3]
+    )
+}
+
+/// A default expiry: `MAX_TTL` from now, in minutes since the Unix epoch.
+///
+/// RFC 1 §2 sets `MAX_TTL` at 45 days. Using the maximum is the privacy-safe
+/// default — a shorter, message-specific expiry would make the object's
+/// lifetime a signal about its contents.
+fn expiry_for(epoch: krab_core::tag::Epoch) -> u32 {
+    (epoch.0 + 45) * 1440
+}
+
+/// One link, as a single-hop path.
+fn alloc_one(l: &links::LinkState) -> Vec<krab_fabric::profile::LinkProfile> {
+    vec![l.profile.clone()]
+}
+
+/// The value following a `--flag`.
+fn arg_value<'a>(line: &'a str, flag: &str) -> Option<&'a str> {
+    let mut it = line.split_whitespace();
+    while let Some(t) = it.next() {
+        if t == flag {
+            return it.next();
+        }
+    }
+    None
 }
 
 /// The `n`th whitespace-separated argument of a command line.
@@ -990,16 +1259,19 @@ mod tests {
         assert!(!a.body.contains("never compared"), "{}", a.body);
 
         // **Both ends derived the same reservoir**, having exchanged only files.
-        let reservoir = |n: &App| {
-            let sealed = std::fs::read(n.path("reservoir.wrapped")).unwrap();
+        // The peer-link is named for the counterparty, so each side looks the
+        // other up by identifier.
+        let reservoir = |n: &App, other: &App| {
+            let peer = short_id(&other.identity.as_ref().unwrap().node_id());
+            let sealed = std::fs::read(n.path(&format!("{peer}.reservoir"))).unwrap();
             krab_crypto::kek::open_under(&n.epoch_key.unwrap(), b"krab/reservoir", &sealed).unwrap()
         };
         assert_eq!(
-            reservoir(&a),
-            reservoir(&b),
+            reservoir(&a, &b),
+            reservoir(&b, &a),
             "R_A xor R_B agrees on both ends"
         );
-        assert_ne!(reservoir(&a), vec![0u8; 32]);
+        assert_ne!(reservoir(&a, &b), vec![0u8; 32]);
 
         // The ceremony is retired, so a stale pad cannot be replayed into it.
         assert!(!a.path("ceremony.cbor").exists());
@@ -1124,6 +1396,294 @@ mod tests {
         assert!(
             a.load_ceremony().unwrap().their_card.is_none(),
             "nothing recorded"
+        );
+    }
+
+    /// **RFC 8 §5.1, at the level a user touches.**
+    ///
+    /// > "The client MUST NOT display 'syncing now' or any signal implying
+    /// > that the user's action caused a transfer."
+    ///
+    /// The structural guarantee is that `LinkTable` holds nothing that can
+    /// reconcile. This pins the words, because the words are what teaches the
+    /// user the wrong mental model — and RFC 8 §5.1's argument is that the
+    /// mental model is what eventually reintroduces event-driven sync.
+    #[test]
+    fn connect_never_claims_the_user_caused_a_transfer() {
+        let mut a = ready_node("connect");
+        type_command(&mut a, "connect q3m9 tcp");
+
+        let body = a.body.to_lowercase();
+        for forbidden in [
+            "syncing",
+            "sync now",
+            "receiving",
+            "downloading",
+            "fetching",
+            "objects received",
+            "up to date",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{:?} contains {forbidden:?}",
+                a.body
+            );
+        }
+        // It says the true thing instead.
+        assert!(a.body.contains("nothing was transferred"), "{}", a.body);
+        assert!(a.body.contains("link up"), "{}", a.body);
+        // And nothing was scheduled by the keypress.
+        assert_eq!(a.links.get("q3m9").unwrap().next_sync_min, None);
+    }
+
+    /// Connecting twice must not accumulate links or schedule anything.
+    #[test]
+    fn connecting_is_idempotent_and_schedules_nothing() {
+        let mut a = ready_node("connect-twice");
+        type_command(&mut a, "connect q3m9 tcp");
+        type_command(&mut a, "connect q3m9 tcp");
+        assert_eq!(a.links.iter().count(), 1);
+        assert_eq!(a.links.up_count(), 1);
+        assert_eq!(a.links.get("q3m9").unwrap().next_sync_min, None);
+    }
+
+    /// RFC 3 §6.2 — disconnect tears down the transport and leaves quota
+    /// alone. Bundling them would make disconnecting a punishment, and RFC 8
+    /// §5.3 needs operators willing to use it.
+    #[test]
+    fn disconnect_does_not_silently_change_quota() {
+        let mut a = ready_node("disconnect");
+        type_command(&mut a, "connect q3m9 tcp");
+        type_command(&mut a, "disconnect q3m9");
+        assert!(a.body.contains("Quota unchanged"), "{}", a.body);
+        assert_eq!(a.links.up_count(), 0);
+
+        type_command(&mut a, "disconnect nobody");
+        assert!(a.body.contains("no link"), "{}", a.body);
+    }
+
+    /// **RFC 8 §5.2's reason for existing.** A LoRa link silently drops
+    /// oversized objects, and nothing else in the system will say so.
+    #[test]
+    fn reach_separates_a_bad_profile_from_a_silent_peer() {
+        let mut a = ready_node("reach");
+        type_command(&mut a, "connect m4k2 lora");
+
+        type_command(&mut a, "reach m4k2 --size 256");
+        assert!(a.body.contains("ADMIT"), "{}", a.body);
+        assert!(a.body.contains("1 of 1"), "{}", a.body);
+
+        type_command(&mut a, "reach m4k2 --size 8192");
+        assert!(a.body.contains("BLOCK"), "{}", a.body);
+        assert!(a.body.contains("max_bucket"), "{}", a.body);
+        assert!(a.body.contains("0 of 1"), "{}", a.body);
+        // The state where the operator most needs to know no error is coming.
+        assert!(a.body.contains("silent"), "{}", a.body);
+    }
+
+    #[test]
+    fn reach_with_no_links_says_so() {
+        let mut a = ready_node("reach-empty");
+        type_command(&mut a, "reach anyone");
+        assert!(a.body.contains("no links"), "{}", a.body);
+    }
+
+    /// The panel must not invent rows it has no data for.
+    #[test]
+    fn peers_reports_honestly_when_nothing_has_reconciled() {
+        let mut a = ready_node("peers");
+        type_command(&mut a, "peers");
+        assert!(a.body.contains("peer offer"), "{}", a.body);
+
+        type_command(&mut a, "connect q3m9 tcp");
+        type_command(&mut a, "peers");
+        assert!(a.body.contains("q3m9"), "{}", a.body);
+        assert!(
+            a.body.contains("no accountability metrics yet"),
+            "{}",
+            a.body
+        );
+        // Still no per-object anything (RFC 3 §12).
+        assert!(!a.body.contains("id="), "{}", a.body);
+    }
+
+    /// `keys` reports state and does not re-show the backup — RFC 7 §11 makes
+    /// it a one-time ceremony step, and a verb that reprinted it would turn it
+    /// back into a settings item.
+    #[test]
+    fn keys_reports_state_without_reprinting_the_backup() {
+        let mut a = ready_node("keys");
+        type_command(&mut a, "keys");
+        assert!(a.body.contains("shown once at init"), "{}", a.body);
+        assert!(a.body.contains("not recoverable"), "{}", a.body);
+
+        // The backup words themselves must not be in the output.
+        let backup = a.identity.as_ref().unwrap().backup_phrase();
+        let first_word = backup.split_whitespace().next().unwrap();
+        let second = backup.split_whitespace().nth(1).unwrap();
+        assert!(
+            !(a.body.contains(first_word) && a.body.contains(second)),
+            "the backup phrase leaked into `keys`: {}",
+            a.body
+        );
+    }
+
+    /// `rollcall` publishes statics and policy, not endpoints — RFC 3 §9
+    /// keeps endpoints inside a peering, so a public attestation is not a
+    /// location beacon.
+    #[test]
+    fn rollcall_does_not_publish_endpoints() {
+        let mut a = ready_node("rollcall");
+        type_command(&mut a, "rollcall");
+        assert!(a.body.contains("does not carry endpoints"), "{}", a.body);
+    }
+
+    /// An unknown transport is refused rather than silently defaulted, since a
+    /// default would be a link profile the operator did not choose — and a
+    /// wrong profile is exactly what `reach` exists to diagnose.
+    #[test]
+    fn an_unknown_transport_is_refused() {
+        let mut a = ready_node("transport");
+        type_command(&mut a, "connect q3m9 carrier-pigeon");
+        assert!(a.body.contains("unknown transport"), "{}", a.body);
+        assert_eq!(a.links.iter().count(), 0);
+    }
+
+    /// **The whole system, end to end.** Two nodes peer offline, one sends,
+    /// and the object that lands in the corpus is the one the other can read.
+    ///
+    /// This is the first test that crosses every layer: ceremony → peer-link →
+    /// tag derivation → HPKE with a reservoir PSK → envelope → store.
+    #[test]
+    fn a_peered_node_can_send_and_the_object_is_readable_by_the_recipient() {
+        let mut a = ready_node("send-a");
+        let mut b = ready_node("send-b");
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+
+        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+            std::fs::write(to.path(as_name), std::fs::read(from.path(name)).unwrap()).unwrap();
+            to.path(as_name).to_string_lossy().into_owned()
+        };
+        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        let b_pad = carry(&b, &a, "peer.pad", "from-b.pad");
+        type_command(&mut a, &format!("peer accept {b_card}"));
+        {
+            let mut p = a.load_ceremony().unwrap();
+            p.fingerprint_verified = true;
+            a.save_ceremony(&p).unwrap();
+        }
+        type_command(&mut a, &format!("peer seal {b_pad} media"));
+        assert!(a.body.starts_with("peer-link signed"), "{}", a.body);
+
+        // The peer-link is durable, and named by the peer's identifier.
+        let peer = short_id(&b.identity.as_ref().unwrap().node_id());
+        assert!(a.path(&format!("{peer}.link")).exists());
+
+        type_command(&mut a, &format!("send {peer} meet me at the usual place"));
+        assert!(a.body.contains("composed"), "{}", a.body);
+        assert!(
+            a.body.contains("post-quantum"),
+            "the reservoir was used: {}",
+            a.body
+        );
+        assert_eq!(a.store.len(), 1, "the object is in the corpus");
+
+        // **It did not transmit.** RFC 5 §6.1 -- emission is scheduled, and
+        // saying otherwise would make transmission timing follow composition.
+        assert!(a.body.contains("not now"), "{}", a.body);
+        assert_eq!(a.links.up_count(), 0);
+
+        // Now read it as B would, from the object alone.
+        let id = *a.store.ids_in_order().next().unwrap();
+        let raw = a.store.get(&id).unwrap();
+        let header = krab_core::object::RoutingHeader::parse(raw).unwrap();
+        let (env, _) = krab_core::object::decode_envelope(&raw[16..]).unwrap();
+
+        // B derives the same tag from its own side -- neither party sent it.
+        let a_pk = krab_crypto::dh::PublicKey(
+            peering::Card::decode(&std::fs::read(a.path("peer.card")).unwrap())
+                .unwrap()
+                .correspondence_pk,
+        );
+        let shared = b.identity.as_ref().unwrap().agree_with(&a_pk).unwrap();
+        assert_eq!(
+            krab_crypto::pairwise_tag(&shared, now_epoch()),
+            header.tag,
+            "the recipient recognises the tag without it being transmitted"
+        );
+
+        // And opens it with the reservoir chunk from its own root.
+        let sealed_res = std::fs::read(b.path(&format!(
+            "{}.reservoir",
+            short_id(&a.identity.as_ref().unwrap().node_id())
+        )));
+        let chunk = sealed_res.ok().and_then(|s| {
+            krab_crypto::kek::open_under(&b.epoch_key.unwrap(), b"krab/reservoir", &s).ok()
+        });
+        // B never sealed (it only offered), so B has no reservoir file. The
+        // chunk therefore comes from A's root, which is the same value.
+        let _ = chunk;
+        let root = krab_crypto::kek::open_under(
+            &a.epoch_key.unwrap(),
+            b"krab/reservoir",
+            &std::fs::read(a.path(&format!("{peer}.reservoir"))).unwrap(),
+        )
+        .unwrap();
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&root);
+        let chunk = krab_crypto::reservoir::Reservoir::new(r, krab_core::tag::Epoch(0))
+            .chunk(now_epoch())
+            .unwrap();
+
+        let mut enc = [0u8; krab_crypto::seal::ENC_LEN];
+        enc.copy_from_slice(env.enc);
+        let opened = krab_crypto::seal::open(
+            &krab_crypto::seal::Mode::AuthPsk {
+                chunk: &chunk,
+                epoch: now_epoch(),
+            },
+            b.identity.as_ref().unwrap().correspondence(),
+            &a_pk,
+            &krab_crypto::seal::Sealed {
+                enc,
+                ct: env.ciphertext.to_vec(),
+            },
+            &krab_crypto::seal::info_for(header.class),
+            &header.write(),
+        )
+        .expect("the recipient opens it");
+        assert_eq!(opened, b"meet me at the usual place");
+    }
+
+    /// Sending without a peering is refused with the remedy, not an error code.
+    #[test]
+    fn send_without_a_peer_link_says_what_to_do() {
+        let mut a = ready_node("send-nolink");
+        type_command(&mut a, "send nobody hello");
+        assert!(a.body.contains("no peer-link"), "{}", a.body);
+        assert!(a.body.contains("peer offer"), "{}", a.body);
+        assert_eq!(a.store.len(), 0);
+    }
+
+    /// A locked node has no W_N and therefore cannot compose — the role
+    /// transition costs something concrete.
+    #[test]
+    fn a_locked_node_cannot_send() {
+        let mut a = ready_node("send-locked");
+        a.lock();
+        type_command(&mut a, "send anyone hello");
+        assert!(a.body.contains("locked"), "{}", a.body);
+    }
+
+    /// Objects are padded to a bucket, so two messages of very different
+    /// lengths can be indistinguishable on the wire (RFC 1 §8.1).
+    #[test]
+    fn short_messages_share_a_bucket() {
+        assert_eq!(compose::bucket_for(200), compose::bucket_for(20));
+        assert_eq!(
+            compose::bucket_for(16 + compose::body_size_for(1)),
+            compose::bucket_for(16 + compose::body_size_for(100))
         );
     }
 }

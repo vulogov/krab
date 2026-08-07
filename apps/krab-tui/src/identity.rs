@@ -117,6 +117,22 @@ impl Identity {
         Kek::derive(passphrase, &self.kek_params)
     }
 
+    /// This node's correspondence key, for sealing.
+    pub fn correspondence(&self) -> &SecretKey {
+        &self.correspondence
+    }
+
+    /// Static-static agreement with a correspondent, for tag derivation.
+    ///
+    /// `None` if their key is low-order — `CRYPTO-REVIEW.md` §3. A caller that
+    /// treated that as "use zeros" would derive a tag the attacker also knows.
+    pub fn agree_with(
+        &self,
+        their_correspondence: &krab_crypto::dh::PublicKey,
+    ) -> Option<krab_crypto::dh::Shared> {
+        krab_crypto::dh::agree(&self.correspondence, their_correspondence)
+    }
+
     /// Build this node's signed card — RFC 3 §11 step 1.
     pub fn card(&self, policy: Policy) -> Card {
         Card::create(

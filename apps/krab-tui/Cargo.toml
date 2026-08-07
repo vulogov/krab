@@ -18,6 +18,9 @@ path = "src/main.rs"
 krab = { workspace = true }
 krab-core = { workspace = true }
 krab-crypto = { workspace = true }
+krab-fabric = { workspace = true }
+krab-node = { workspace = true }
+krab-store = { workspace = true }
 # The OS entropy source. `krab-crypto` takes randomness as an argument and has
 # no platform dependency, so this is the one place in the workspace that names
 # an operating system as the root of key material.
