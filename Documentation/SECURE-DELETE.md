@@ -144,9 +144,36 @@ On rotational media and in-place filesystems it works. On flash or
 copy-on-write it may do nothing, and it does not need to — nothing depends on
 it. That is the whole distinction between a hedge and a guarantee.
 
-Random bytes rather than zeros, because a zeroed region is visibly a region
-someone deliberately cleared. Random bytes are indistinguishable from the
-ciphertext around them, and everything else Krab writes is ciphertext.
+### Cost and unpredictability, not just probability
+
+The weaker argument for overwriting is "it may have worked." There is a
+stronger one, and it holds even when the overwrite touched nothing.
+
+**Random bytes rather than zeros makes forensic triage harder.** An analyst
+imaging a device works by prioritising: which regions look like structured
+data, which look like a filesystem, which look like they were cleared. A
+zero-filled region answers all three questions at once — it is visibly a region
+someone deliberately erased, which is both a signpost and a statement about the
+operator's intent.
+
+Random bytes answer none of them. They are indistinguishable from the
+ciphertext that surrounds them, and everything else Krab writes *is*
+ciphertext. So an analyst cannot tell:
+
+- which regions were overwritten and which are live objects,
+- how much was deleted, or when,
+- whether a region is a stale FTL page worth recovering or noise worth skipping.
+
+That converts a targeted search into an undirected one. The adversary's cost
+rises whether or not any particular overwrite reached the medium, and their
+results become unreliable rather than merely incomplete — they cannot know what
+they missed, which is a different and worse position than knowing a file is
+gone.
+
+None of this is a guarantee and none of it should be described as one. It is
+the difference between *"we recovered nothing"* and *"we cannot establish what
+was here"*, and for an adversary who has to act on findings, that difference is
+substantial.
 
 **`shred::remove` returning `true` is never evidence that data is
 unrecoverable**, and the module says so where a caller will read it. The value

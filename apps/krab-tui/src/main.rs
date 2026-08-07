@@ -39,6 +39,7 @@ mod persist;
 mod reach;
 mod receive;
 mod render;
+mod request;
 mod shred;
 mod sync;
 
