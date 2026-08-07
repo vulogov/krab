@@ -394,7 +394,11 @@ mod tests {
         for bucket in 6u8..=255 {
             let mut b = hdr().write();
             b[2] = bucket;
-            assert_eq!(RoutingHeader::parse(&b), Err(Error::Malformed), "bucket {bucket}");
+            assert_eq!(
+                RoutingHeader::parse(&b),
+                Err(Error::Malformed),
+                "bucket {bucket}"
+            );
         }
     }
 
@@ -409,14 +413,26 @@ mod tests {
 
     #[test]
     fn envelope_round_trips_with_admission_absent() {
-        let e = Envelope { epoch: 20_671, tag_mode: 0, suite: 1, enc: &[9; 32], ciphertext: &[1; 40] };
+        let e = Envelope {
+            epoch: 20_671,
+            tag_mode: 0,
+            suite: 1,
+            enc: &[9; 32],
+            ciphertext: &[1; 40],
+        };
         let body = e.write();
         let (back, consumed) = decode_envelope(&body).unwrap();
         assert_eq!(back, e);
         assert_eq!(consumed, body.len());
         // krab-sizes computes 13 + b(enc) + b(ct) for the envelope; check the
         // published constant for an empty ciphertext holds here too.
-        let empty = Envelope { epoch: 20_671, tag_mode: 0, suite: 1, enc: &[0; 32], ciphertext: &[] };
+        let empty = Envelope {
+            epoch: 20_671,
+            tag_mode: 0,
+            suite: 1,
+            enc: &[0; 32],
+            ciphertext: &[],
+        };
         assert_eq!(empty.write().len(), 46, "RFC 1 §4.2 with key 3 absent");
     }
 
@@ -472,12 +488,20 @@ mod tests {
     #[test]
     fn canonical_bytes_pads_with_zeros_and_verifies() {
         let h = hdr();
-        let e = Envelope { epoch: 1, tag_mode: 0, suite: 1, enc: &[0; 32], ciphertext: &[7; 64] };
+        let e = Envelope {
+            epoch: 1,
+            tag_mode: 0,
+            suite: 1,
+            enc: &[0; 32],
+            ciphertext: &[7; 64],
+        };
         let body = e.write();
         let obj = canonical_bytes(&h, &body).unwrap();
 
         assert_eq!(obj.len(), 1_024);
-        assert!(obj[ROUTING_HEADER_LEN + body.len()..].iter().all(|&b| b == 0));
+        assert!(obj[ROUTING_HEADER_LEN + body.len()..]
+            .iter()
+            .all(|&b| b == 0));
         assert_eq!(verify_padding(&obj, body.len()), Ok(()));
 
         // A single non-zero padding byte is rejected.
@@ -499,7 +523,13 @@ mod tests {
     #[test]
     fn a_64_byte_message_lands_in_the_256_bucket() {
         // krab-sizes: body 64 -> ciphertext 165 -> on-wire 228 -> bucket 256.
-        let e = Envelope { epoch: 20_671, tag_mode: 0, suite: 1, enc: &[0; 32], ciphertext: &[0; 165] };
+        let e = Envelope {
+            epoch: 20_671,
+            tag_mode: 0,
+            suite: 1,
+            enc: &[0; 32],
+            ciphertext: &[0; 165],
+        };
         let on_wire = ROUTING_HEADER_LEN + e.write().len();
         assert_eq!(on_wire, 228, "matches RFC 1 §8.1 with key 3 absent");
         assert_eq!(RoutingHeader::bucket_for(on_wire as u32), Some(0));

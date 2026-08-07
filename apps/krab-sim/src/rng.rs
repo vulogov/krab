@@ -22,7 +22,9 @@ impl Rng {
             x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             x ^ (x >> 31)
         };
-        Rng { s: [next(), next(), next(), next()] }
+        Rng {
+            s: [next(), next(), next(), next()],
+        }
     }
 
     #[inline]

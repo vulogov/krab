@@ -168,7 +168,14 @@ fn parse() -> Args {
         }
         i += 2;
     }
-    Args { cfg, json, sweep, diag, recon, adv }
+    Args {
+        cfg,
+        json,
+        sweep,
+        diag,
+        recon,
+        adv,
+    }
 }
 
 #[derive(Clone)]
@@ -211,7 +218,10 @@ fn aggregate(label: &str, cfg: &Config) -> Agg {
                 s.spawn(move || sim::run(&c, k + 1))
             })
             .collect();
-        handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().flatten())
+            .collect()
     });
 
     let n = results.len().max(1) as f64;
@@ -255,8 +265,16 @@ fn aggregate(label: &str, cfg: &Config) -> Agg {
         starved: [0, 1, 2].map(|k| mean(&|r| r.starved[k] as f64)),
         hold_by_dist: {
             // Elementwise mean across seeds, skipping cells no seed observed.
-            let nb = results.iter().map(|r| r.hold_by_dist.len()).max().unwrap_or(0);
-            let nd = results.iter().flat_map(|r| r.hold_by_dist.iter()).map(|r| r.len()).max();
+            let nb = results
+                .iter()
+                .map(|r| r.hold_by_dist.len())
+                .max()
+                .unwrap_or(0);
+            let nd = results
+                .iter()
+                .flat_map(|r| r.hold_by_dist.iter())
+                .map(|r| r.len())
+                .max();
             match nd {
                 None => Vec::new(),
                 Some(nd) => (0..nb)
@@ -290,7 +308,13 @@ fn aggregate(label: &str, cfg: &Config) -> Agg {
 fn recon_header() -> String {
     format!(
         "{:<22} {:>9} {:>10} {:>10} {:>9} {:>10} {:>10} {:>9}",
-        "case", "lora ctl%", "lora ctlKB", "lora payKB", "lora strv", "cour ctl%", "tcp ctl%",
+        "case",
+        "lora ctl%",
+        "lora ctlKB",
+        "lora payKB",
+        "lora strv",
+        "cour ctl%",
+        "tcp ctl%",
         "cour strv"
     )
 }
@@ -346,9 +370,19 @@ fn adv_rows(a: &Agg, n: usize) -> Vec<String> {
     for (b, row) in a.hold_by_dist.iter().enumerate() {
         let cells: Vec<String> = row
             .iter()
-            .map(|&p| if p.is_nan() { "   -".into() } else { format!("{:>3.0}%", p * 100.0) })
+            .map(|&p| {
+                if p.is_nan() {
+                    "   -".into()
+                } else {
+                    format!("{:>3.0}%", p * 100.0)
+                }
+            })
             .collect();
-        out.push(format!("  age bucket {}  P(hold | hops): {}", b, cells.join(" ")));
+        out.push(format!(
+            "  age bucket {}  P(hold | hops): {}",
+            b,
+            cells.join(" ")
+        ));
     }
     out
 }
@@ -357,7 +391,14 @@ fn adv_rows(a: &Agg, n: usize) -> Vec<String> {
 fn diag_header() -> String {
     format!(
         "{:<22} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9}",
-        "case", "coverPUB", "coverEX", "coverBY", "coverSET", "storeP99", "storeMEAN", "rxP99",
+        "case",
+        "coverPUB",
+        "coverEX",
+        "coverBY",
+        "coverSET",
+        "storeP99",
+        "storeMEAN",
+        "rxP99",
         "rxMEAN"
     )
 }
@@ -378,7 +419,11 @@ fn diag_row(a: &Agg) -> String {
 }
 
 fn age_row(a: &Agg) -> String {
-    let mut s = format!("{:<22} lora-eligible {:>6.2}%  cover by age: ", a.label, a.lora_eligible * 100.0);
+    let mut s = format!(
+        "{:<22} lora-eligible {:>6.2}%  cover by age: ",
+        a.label,
+        a.lora_eligible * 100.0
+    );
     for (b, c) in a.cov_by_age.iter().enumerate() {
         let _ = write!(s, "{}{:.0}%", if b == 0 { "" } else { " " }, c * 100.0);
     }
@@ -388,7 +433,15 @@ fn age_row(a: &Agg) -> String {
 fn header() -> String {
     format!(
         "{:<22} {:>5} {:>9} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9}",
-        "case", "runs", "delivery", "lat50h", "lat90h", "lat99h", "cover", "cover10", "storeMB",
+        "case",
+        "runs",
+        "delivery",
+        "lat50h",
+        "lat90h",
+        "lat99h",
+        "cover",
+        "cover10",
+        "storeMB",
         "rxMB/d"
     )
 }
@@ -444,7 +497,11 @@ fn sweep_cases(name: &str, base: &Config) -> Vec<(String, Config)> {
             }
         }
         "topo" => {
-            for t in [Topology::WattsStrogatz, Topology::BarabasiAlbert, Topology::RandomRegular] {
+            for t in [
+                Topology::WattsStrogatz,
+                Topology::BarabasiAlbert,
+                Topology::RandomRegular,
+            ] {
                 let mut c = base.clone();
                 c.topo = t;
                 out.push((format!("topo={}", t.name()), c));
@@ -541,7 +598,11 @@ fn sweep_cases(name: &str, base: &Config) -> Vec<(String, Config)> {
                 let mut c = base.clone();
                 c.store_cap_mb = mb;
                 out.push((
-                    if mb == 0 { "cap=none".into() } else { format!("cap={}MB", mb) },
+                    if mb == 0 {
+                        "cap=none".into()
+                    } else {
+                        format!("cap={}MB", mb)
+                    },
                     c,
                 ));
             }

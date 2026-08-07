@@ -11,6 +11,6 @@ Non-standard cryptography (15 CFR 772.1): none.
   Hashing:          BLAKE3 — published specification; used for content
                     addressing and identity, not confidentiality
   Transport:        Noise Protocol Framework rev 34 — published specification
-  Protocol:         KRAB RFC 0-8, published at <url>
+  Protocol:         KRAB RFC 0-8, published at https://github.com/vulogov/krab
 
 No cryptographic functionality in this project is proprietary or unpublished.

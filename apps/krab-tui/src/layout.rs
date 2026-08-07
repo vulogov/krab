@@ -160,6 +160,7 @@ impl Ui {
     ///
     /// The command pane is the one destination worth reaching without cycling
     /// — it is where every verb in RFC 8 §5 is typed.
+    #[allow(dead_code)] // used by main.rs's tests
     pub fn focus_command(&mut self) {
         self.focus = Pane::Command;
     }
@@ -265,9 +266,33 @@ impl Ui {
         let list_w = (area.w as u32 * 40 / 100) as u16;
         let view_w = area.w.saturating_sub(list_w);
         vec![
-            (Pane::List, Rect { x: area.x, y: area.y, w: list_w, h: body_h }),
-            (Pane::View, Rect { x: area.x + list_w, y: area.y, w: view_w, h: body_h }),
-            (Pane::Command, Rect { x: area.x, y: area.y + body_h, w: area.w, h: cmd_h }),
+            (
+                Pane::List,
+                Rect {
+                    x: area.x,
+                    y: area.y,
+                    w: list_w,
+                    h: body_h,
+                },
+            ),
+            (
+                Pane::View,
+                Rect {
+                    x: area.x + list_w,
+                    y: area.y,
+                    w: view_w,
+                    h: body_h,
+                },
+            ),
+            (
+                Pane::Command,
+                Rect {
+                    x: area.x,
+                    y: area.y + body_h,
+                    w: area.w,
+                    h: cmd_h,
+                },
+            ),
         ]
     }
 }
@@ -276,7 +301,12 @@ impl Ui {
 mod tests {
     use super::*;
 
-    const SCREEN: Rect = Rect { x: 0, y: 0, w: 100, h: 40 };
+    const SCREEN: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 100,
+        h: 40,
+    };
 
     /// RFC 8 §2 — the safe context is the one reached by inattention.
     #[test]
@@ -335,7 +365,11 @@ mod tests {
         assert_eq!(ui.zoomed(), Some(Pane::List));
         ui.cycle_focus();
         assert_eq!(ui.focus(), Pane::View);
-        assert_eq!(ui.zoomed(), Some(Pane::View), "the zoom moved with the focus");
+        assert_eq!(
+            ui.zoomed(),
+            Some(Pane::View),
+            "the zoom moved with the focus"
+        );
     }
 
     /// RFC 8 §2's 40/60 split and two-line command pane.
@@ -359,7 +393,12 @@ mod tests {
     #[test]
     fn the_composer_banner_survives_every_zoom_and_pane_combination() {
         for tab in [Tab::Private, Tab::Channels] {
-            for zoom_target in [None, Some(Pane::List), Some(Pane::View), Some(Pane::Command)] {
+            for zoom_target in [
+                None,
+                Some(Pane::List),
+                Some(Pane::View),
+                Some(Pane::Command),
+            ] {
                 let mut ui = Ui::default();
                 if tab == Tab::Channels {
                     ui.switch_tab();

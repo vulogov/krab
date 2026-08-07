@@ -65,7 +65,10 @@ fn main() {
         ROUTING_HEADER,
         floor.on_wire - ROUTING_HEADER
     );
-    println!("  padded to bucket ............ {} bytes", floor.bucket.unwrap());
+    println!(
+        "  padded to bucket ............ {} bytes",
+        floor.bucket.unwrap()
+    );
     println!();
     println!("  Computed with an empty address and empty content type. RFC 1 §8.1");
     println!("  cites a 150-byte floor, which requires 17 bytes of encoded address");
@@ -73,7 +76,10 @@ fn main() {
     println!("  in the 256-byte bucket, so §8.1's conclusion is unaffected either way.");
 
     println!("\n--- realistic messages (X25519, addr 'dst=<16 hex>', text/plain) ---");
-    println!("{:>10} {:>9} {:>9} {:>10} {:>9}", "body", "plaintxt", "cipher", "on-wire", "bucket");
+    println!(
+        "{:>10} {:>9} {:>9} {:>10} {:>9}",
+        "body", "plaintxt", "cipher", "on-wire", "bucket"
+    );
     for body in [0usize, 64, 280, 1_200, 4_000, 20_000, 120_000] {
         let s = sealed(body, ADDR, CTYPE, Suite::Classical, m);
         println!(
@@ -82,7 +88,9 @@ fn main() {
             s.plaintext,
             s.ciphertext,
             s.on_wire,
-            s.bucket.map(|b| b.to_string()).unwrap_or_else(|| "OVER".into())
+            s.bucket
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "OVER".into())
         );
     }
 
@@ -105,7 +113,10 @@ fn main() {
         "MINIMUM sealed object ......... {} bytes (vs {} classical)",
         pq_floor.on_wire, floor.on_wire
     );
-    println!("  padded to bucket ............ {} bytes", pq_floor.bucket.unwrap());
+    println!(
+        "  padded to bucket ............ {} bytes",
+        pq_floor.bucket.unwrap()
+    );
     let pq = sealed(280, ADDR, CTYPE, Suite::Hybrid, m);
     let cl = sealed(280, ADDR, CTYPE, Suite::Classical, m);
     println!(
@@ -146,12 +157,19 @@ fn main() {
         let entry = 4 + id;
         print!("id {id:>2}B -> {entry:>2} B/entry:");
         for corpus in [10_000usize, 100_000, 500_000] {
-            print!("  {}k={:>6.1} MB", corpus / 1_000, (corpus * entry) as f64 / 1e6);
+            print!(
+                "  {}k={:>6.1} MB",
+                corpus / 1_000,
+                (corpus * entry) as f64 / 1e6
+            );
         }
         println!();
     }
 
-    println!("\n--- RFC 3 nodelist fragments (peer-link with 1 endpoint = {} B) ---", creds::PEER_LINK_1EP);
+    println!(
+        "\n--- RFC 3 nodelist fragments (peer-link with 1 endpoint = {} B) ---",
+        creds::PEER_LINK_1EP
+    );
     println!(
         "{:>7} {:>10} {:>12} {:>10} {:>10} {:>12}",
         "peers", "fragment", "all copies", "LoRa rec", "LoRa days", "delta(1 link)"
@@ -219,7 +237,11 @@ fn check(m: Magnitudes) -> i32 {
         cmp(&format!("body {body} plaintext"), s.plaintext, pt);
         cmp(&format!("body {body} ciphertext"), s.ciphertext, ct);
         cmp(&format!("body {body} on-wire"), s.on_wire, wire);
-        cmp(&format!("body {body} bucket"), s.bucket.unwrap_or(0), bucket);
+        cmp(
+            &format!("body {body} bucket"),
+            s.bucket.unwrap_or(0),
+            bucket,
+        );
     }
 
     for (b, mb) in [
@@ -242,15 +264,26 @@ fn check(m: Magnitudes) -> i32 {
     cmp("§6.5 hybrid 280-byte bucket", pq.bucket.unwrap_or(0), 4_096);
 
     for (b, frames) in [(256usize, 6usize), (1_024, 21), (4_096, 81)] {
-        cmp(&format!("§8.3 LoRa bucket {b} frames"), b.div_ceil(LORA_PAYLOAD), frames);
+        cmp(
+            &format!("§8.3 LoRa bucket {b} frames"),
+            b.div_ceil(LORA_PAYLOAD),
+            frames,
+        );
     }
 
     // RFC 3 §8.1 and §8.2 — derivable from a credential size, and checked.
-    for (peers, frag, copies, recons) in
-        [(5usize, 2_300usize, 11_000usize, 6usize), (8, 3_548, 28_000, 16), (12, 5_212, 62_000, 35),
-         (20, 8_540, 170_000, 95), (50, 21_020, 1_051_000, 584)]
-    {
-        cmp(&format!("RFC3 §8.1 fragment, {peers} peers"), creds::fragment(peers, creds::PEER_LINK_1EP), frag);
+    for (peers, frag, copies, recons) in [
+        (5usize, 2_300usize, 11_000usize, 6usize),
+        (8, 3_548, 28_000, 16),
+        (12, 5_212, 62_000, 35),
+        (20, 8_540, 170_000, 95),
+        (50, 21_020, 1_051_000, 584),
+    ] {
+        cmp(
+            &format!("RFC3 §8.1 fragment, {peers} peers"),
+            creds::fragment(peers, creds::PEER_LINK_1EP),
+            frag,
+        );
         // RFC 3 truncates to two significant figures rather than rounding.
         cmp(
             &format!("RFC3 §8.1 all copies, {peers} peers"),
@@ -259,24 +292,35 @@ fn check(m: Magnitudes) -> i32 {
         );
         cmp(
             &format!("RFC3 §8.1 LoRa reconciliations, {peers} peers"),
-            (creds::lora_reconciliations(creds::all_copies(peers, creds::PEER_LINK_1EP)) * 10.0).round() as usize,
+            (creds::lora_reconciliations(creds::all_copies(peers, creds::PEER_LINK_1EP)) * 10.0)
+                .round() as usize,
             recons,
         );
     }
     for (peers, delta_tenths) in [(12usize, 74usize), (20, 123), (50, 308)] {
         cmp(
             &format!("RFC3 §8.2 delta, {peers} peers"),
-            (creds::delta_all_copies(peers, 1, creds::PEER_LINK_1EP) as f64 / 100.0).round() as usize,
+            (creds::delta_all_copies(peers, 1, creds::PEER_LINK_1EP) as f64 / 100.0).round()
+                as usize,
             delta_tenths,
         );
     }
 
     // §9.3 manifest table, in units of 0.1 MB to keep the comparison integral.
-    for (id, tenths) in [(8usize, [1usize, 12, 60]), (12, [2, 16, 80]), (16, [2, 20, 100]), (32, [4, 36, 180])] {
+    for (id, tenths) in [
+        (8usize, [1usize, 12, 60]),
+        (12, [2, 16, 80]),
+        (16, [2, 20, 100]),
+        (32, [4, 36, 180]),
+    ] {
         let entry = 4 + id;
         for (i, corpus) in [10_000usize, 100_000, 500_000].iter().enumerate() {
             let mb10 = ((corpus * entry) as f64 / 1e5).round() as usize;
-            cmp(&format!("§9.3 manifest id {id}B corpus {corpus}"), mb10, tenths[i]);
+            cmp(
+                &format!("§9.3 manifest id {id}B corpus {corpus}"),
+                mb10,
+                tenths[i],
+            );
         }
     }
 

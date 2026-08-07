@@ -16,10 +16,16 @@ path = "src/main.rs"
 
 [dependencies]
 krab = { workspace = true }
+krab-core = { workspace = true }
 krab-crypto = { workspace = true }
 # The OS entropy source. `krab-crypto` takes randomness as an argument and has
 # no platform dependency, so this is the one place in the workspace that names
 # an operating system as the root of key material.
 getrandom = "0.2"
+# Memory hygiene, not cryptography. `krab-crypto`'s single-boundary rule is
+# about the primitives an auditor must review; `zeroize` is a volatile-write
+# helper already in the tree transitively, and a hand-rolled loop under this
+# crate's `forbid(unsafe_code)` is one the optimiser is free to delete.
+zeroize = "1"
 ratatui = "0.29"
 crossterm = "0.28"

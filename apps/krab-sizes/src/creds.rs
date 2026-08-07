@@ -100,9 +100,18 @@ mod tests {
             let f = fragment(peers, PEER_LINK_1EP) as f64 / 1000.0;
             let c = all_copies(peers, PEER_LINK_1EP) as f64 / 1000.0;
             let r = lora_reconciliations(all_copies(peers, PEER_LINK_1EP));
-            assert!(close(f, frag_kb), "{peers} peers: fragment {f:.2} KB, RFC says {frag_kb}");
-            assert!(close(c, copies_kb), "{peers} peers: copies {c:.1} KB, RFC says {copies_kb}");
-            assert!(close(r, recons), "{peers} peers: {r:.2} reconciliations, RFC says {recons}");
+            assert!(
+                close(f, frag_kb),
+                "{peers} peers: fragment {f:.2} KB, RFC says {frag_kb}"
+            );
+            assert!(
+                close(c, copies_kb),
+                "{peers} peers: copies {c:.1} KB, RFC says {copies_kb}"
+            );
+            assert!(
+                close(r, recons),
+                "{peers} peers: {r:.2} reconciliations, RFC says {recons}"
+            );
         }
     }
 
@@ -110,14 +119,28 @@ mod tests {
     #[test]
     fn nodediff_table_matches_rfc3() {
         // (peers, delta KB, full KB, ratio)
-        let want = [(12usize, 7.4f64, 62.0f64, 8.0f64), (20, 12.0, 170.0, 14.0), (50, 31.0, 1_050.0, 34.0)];
+        let want = [
+            (12usize, 7.4f64, 62.0f64, 8.0f64),
+            (20, 12.0, 170.0, 14.0),
+            (50, 31.0, 1_050.0, 34.0),
+        ];
         let close = two_sig_figs;
         for (peers, delta_kb, full_kb, ratio) in want {
             let d = delta_all_copies(peers, 1, PEER_LINK_1EP) as f64 / 1000.0;
             let f = all_copies(peers, PEER_LINK_1EP) as f64 / 1000.0;
-            assert!(close(d, delta_kb), "{peers} peers: delta {d:.1} KB, RFC says {delta_kb}");
-            assert!(close(f, full_kb), "{peers} peers: full {f:.1} KB, RFC says {full_kb}");
-            assert!(close(f / d, ratio), "{peers} peers: ratio {:.1}x, RFC says {ratio}x", f / d);
+            assert!(
+                close(d, delta_kb),
+                "{peers} peers: delta {d:.1} KB, RFC says {delta_kb}"
+            );
+            assert!(
+                close(f, full_kb),
+                "{peers} peers: full {f:.1} KB, RFC says {full_kb}"
+            );
+            assert!(
+                close(f / d, ratio),
+                "{peers} peers: ratio {:.1}x, RFC says {ratio}x",
+                f / d
+            );
         }
     }
 
@@ -125,7 +148,10 @@ mod tests {
     #[test]
     fn fifty_peers_is_two_weeks_of_lora_airtime() {
         let d = lora_days(all_copies(50, PEER_LINK_1EP));
-        assert!((14.0..15.5).contains(&d), "50 peers: {d:.1} days, RFC says roughly two weeks");
+        assert!(
+            (14.0..15.5).contains(&d),
+            "50 peers: {d:.1} days, RFC says roughly two weeks"
+        );
     }
 
     /// RFC 3 §13 caps constrained links at 25 peers. Check that a weekly

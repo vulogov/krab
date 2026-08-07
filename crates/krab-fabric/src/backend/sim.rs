@@ -62,7 +62,11 @@ impl Session for SimSession {
         if w.partitioned {
             return Ok(None);
         }
-        Ok(if self.is_a { w.b_to_a.pop_front() } else { w.a_to_b.pop_front() })
+        Ok(if self.is_a {
+            w.b_to_a.pop_front()
+        } else {
+            w.a_to_b.pop_front()
+        })
     }
 
     fn close(&mut self) -> Result<(), Error> {
@@ -80,12 +84,18 @@ pub struct SimFabric {
 impl SimFabric {
     /// A link with the given profile.
     pub fn new(profile: LinkProfile) -> SimFabric {
-        SimFabric { profile, wire: Rc::new(RefCell::new(Wire::default())) }
+        SimFabric {
+            profile,
+            wire: Rc::new(RefCell::new(Wire::default())),
+        }
     }
 
     /// The other end of the same wire.
     pub fn counterpart(&self, profile: LinkProfile) -> SimFabric {
-        SimFabric { profile, wire: Rc::clone(&self.wire) }
+        SimFabric {
+            profile,
+            wire: Rc::clone(&self.wire),
+        }
     }
 
     /// Partition the link. Sends are dropped and receives return nothing.
@@ -100,12 +110,20 @@ impl SimFabric {
 
     /// A session as the initiating end.
     pub fn end_a(&self) -> SimSession {
-        SimSession { wire: Rc::clone(&self.wire), is_a: true, closed: false }
+        SimSession {
+            wire: Rc::clone(&self.wire),
+            is_a: true,
+            closed: false,
+        }
     }
 
     /// A session as the responding end.
     pub fn end_b(&self) -> SimSession {
-        SimSession { wire: Rc::clone(&self.wire), is_a: false, closed: false }
+        SimSession {
+            wire: Rc::clone(&self.wire),
+            is_a: false,
+            closed: false,
+        }
     }
 }
 
@@ -161,7 +179,11 @@ mod tests {
 
         f.partition(false);
         a.send(&Control::Done).unwrap();
-        assert_eq!(b.recv().unwrap(), Some(Control::Done), "recovers with no reset");
+        assert_eq!(
+            b.recv().unwrap(),
+            Some(Control::Done),
+            "recovers with no reset"
+        );
     }
 
     #[test]

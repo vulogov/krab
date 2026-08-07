@@ -26,6 +26,7 @@
 mod activity;
 mod command;
 mod entropy;
+mod identity;
 mod keys;
 mod layout;
 mod peering;
@@ -38,8 +39,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
+use entropy::OsRng;
+use identity::Identity;
 use keys::{Binding, Key, KeyPress};
+use krab_crypto::rng::Rng;
 use layout::{Mode, Ui};
+use peering::{offer, Policy};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, Stdout};
@@ -73,8 +78,10 @@ struct App {
     list: Vec<String>,
     locked: bool,
     quit: bool,
-    /// Whether `init` has run. A fresh install can do almost nothing.
-    has_identity: bool,
+    /// This node's keys, once `init` has completed. `None` on a fresh install.
+    identity: Option<Identity>,
+    /// The passphrase being typed. Never echoed — see `View::masked`.
+    passphrase: String,
     /// Set by the confirmation prompt, consumed by the next command.
     confirmed: bool,
     /// Where the first-run ceremony has got to, if it is running.
@@ -93,7 +100,8 @@ impl Default for App {
             list: vec!["(no messages)".into()],
             locked: false,
             quit: false,
-            has_identity: false,
+            identity: None,
+            passphrase: String::new(),
             confirmed: false,
             init_step: None,
         }
@@ -113,9 +121,14 @@ impl App {
                         spinner: &self.spinner,
                         list: &self.list,
                         body: &self.body,
-                        command: &self.command,
+                        command: if self.init_step == Some(InitStep::Passphrase) {
+                            &self.passphrase
+                        } else {
+                            &self.command
+                        },
                         composer: &self.composer,
                         locked: self.locked,
+                        masked: self.init_step == Some(InitStep::Passphrase),
                     },
                 )
             })?;
@@ -154,7 +167,11 @@ impl App {
         // (`Ctrl-L`, `Tab`, `Esc`, `Enter`) resolve the same either way, which
         // is why the lock chord still works while a command is half-typed.
         let typing = self.ui.focus() == layout::Pane::Command;
-        let interp = if typing { Mode::Compose } else { self.ui.mode() };
+        let interp = if typing {
+            Mode::Compose
+        } else {
+            self.ui.mode()
+        };
 
         match Binding::of(press, interp) {
             // Reachable from every mode, dispatched above every mode branch.
@@ -192,7 +209,9 @@ impl App {
                 }
             }
             Binding::Input(c) => {
-                if typing {
+                if self.init_step == Some(InitStep::Passphrase) {
+                    self.passphrase.push(c);
+                } else if typing {
                     self.command.push(c);
                 } else if self.ui.mode() == Mode::Compose {
                     self.composer.push(c);
@@ -211,7 +230,7 @@ impl App {
             self.body = format!("unknown command: {}", line.trim());
             return;
         };
-        match admit(&cmd, self.has_identity, self.locked, self.confirmed) {
+        match admit(&cmd, self.identity.is_some(), self.locked, self.confirmed) {
             Err(Refusal::NoIdentity) => {
                 self.body = "no identity yet — run `init` first".into();
             }
@@ -242,22 +261,73 @@ impl App {
             Command::Lock => self.lock(),
             Command::Wipe => {
                 self.lock();
-                self.has_identity = false;
+                // Dropping the identity runs every key's `Drop`, which
+                // zeroizes. RFC 7 §4: erasure is destroying a key, and nothing
+                // here touches a file.
+                self.identity = None;
+                overwrite(&mut self.passphrase);
                 self.body = "key hierarchy destroyed".into();
             }
             Command::Peer => {
                 let rest = line.trim().strip_prefix("peer").unwrap_or("");
                 self.body = match Peering::parse(rest) {
                     // `offer` writes two files on purpose — see peering.rs.
-                    Some(Peering::Offer) => "wrote peer.card (publishable) and                         peer.pad (SECRET — hand over in person or on media)".into(),
-                    Some(Peering::Accept) => "card accepted — now compare                         fingerprints aloud, then `peer seal`".into(),
+                    // Two artifacts on purpose — see `peering`.
+                    Some(Peering::Offer) => self.peer_offer(),
+                    Some(Peering::Accept) => "card accepted — now compare fingerprints aloud, \
+                         then `peer seal`"
+                        .into(),
                     Some(Peering::Seal) => "peer-link signed".into(),
                     Some(Peering::Status) => "no ceremony in progress".into(),
                     None => format!("unknown: peer{rest}"),
                 };
             }
+            // RFC 3 §11 step 2, and RFC 8 §5's `verify`.
+            Command::Verify => {
+                self.body = match &self.identity {
+                    Some(id) => format!(
+                        "read these eight words aloud and hear the same back:\n\n  {}",
+                        id.fingerprint()
+                    ),
+                    None => "no identity".into(),
+                }
+            }
             other => self.body = format!("`{other}` is not implemented yet"),
         }
+    }
+
+    /// Derive the KEK and open the current epoch, RFC 7 §4.
+    fn open_store(&mut self) -> Result<(), krab_crypto::kek::Error> {
+        let Some(id) = &mut self.identity else {
+            return Err(krab_crypto::kek::Error::Kdf);
+        };
+        let kek = id.kek(self.passphrase.as_bytes())?;
+        id.hierarchy.open_epoch(&kek, now_epoch(), &mut OsRng)?;
+        // `kek` drops here. RFC 7 §4: it is memory-only and never written, and
+        // the shorter it lives the better — it is re-derived on unlock.
+        Ok(())
+    }
+
+    /// Produce this node's half of a peering — RFC 3 §11 steps 1 and 3.
+    fn peer_offer(&self) -> String {
+        let Some(id) = &self.identity else {
+            return "no identity".into();
+        };
+        let mine = offer(id.card(Policy::default()), {
+            let mut r = OsRng;
+            r.next_32()
+        });
+        // The card is publishable; the contribution is half a shared secret,
+        // and the two must not travel together. See `peering`'s module docs
+        // and `RFC-7-review.md` §10 for why the channel matters.
+        format!(
+            "peer.card  — publishable; send it any way you like\n\
+             peer.pad   — SECRET; hand over in person or on media\n\n\
+             your fingerprint, to read aloud:\n\n  {}\n\n\
+             a pad sent through the corpus still works and is not \
+             post-quantum. `peer seal` will record which you used.",
+            mine.card.fingerprint()
+        )
     }
 
     /// Advance the first-run ceremony one step.
@@ -268,15 +338,55 @@ impl App {
     /// only edge available.
     fn advance_init(&mut self) {
         let Some(step) = self.init_step else { return };
+
+        // Refuse to leave the passphrase step with nothing. The KEK is the
+        // only root (RFC 7 §4), so an empty passphrase is a store anyone who
+        // picks up the disk can open.
+        if step == InitStep::Passphrase && self.passphrase.is_empty() {
+            self.body = "a passphrase is required — it is the only root".into();
+            return;
+        }
+
         match step.next() {
             Some(InitStep::Done) | None => {
+                // The last act of the ceremony: derive the KEK and open the
+                // current epoch's wrapper. Argon2id at RFC 7 §4.1's parameters
+                // takes ~500 ms and 64 MiB, which is the whole point — it is
+                // what a seized disk has to get through.
+                self.body = match self.open_store() {
+                    Ok(()) => format!(
+                        "{}\n\nmessage history is NOT recoverable from that backup, \
+                         and that is intentional (RFC 7 §11).",
+                        InitStep::Done.prompt()
+                    ),
+                    Err(e) => {
+                        // Leave the ceremony where it is: an identity without a
+                        // KEK has nothing to wrap its keys under.
+                        return self.body = format!("could not derive the key: {e:?}");
+                    }
+                };
                 self.init_step = None;
-                self.has_identity = true;
-                self.body = InitStep::Done.prompt().into();
+                // The passphrase has done its work and must not linger (§9).
+                overwrite(&mut self.passphrase);
             }
             Some(next) => {
+                if next == InitStep::Generate {
+                    // Every key this node will ever hold originates here.
+                    let id = Identity::generate(&mut OsRng);
+                    self.body = format!("generated {}", id.short_id());
+                    self.identity = Some(id);
+                }
                 self.init_step = Some(next);
-                self.body = next.prompt().into();
+                if next == InitStep::ShowBackup {
+                    let phrase = self
+                        .identity
+                        .as_ref()
+                        .map(|i| i.backup_phrase())
+                        .unwrap_or_default();
+                    self.body = format!("{}\n\n{}", next.prompt(), phrase);
+                } else if next != InitStep::Generate {
+                    self.body = next.prompt().into();
+                }
             }
         }
     }
@@ -288,12 +398,27 @@ impl App {
     /// rhythm rather than sporadic events. Nothing here touches the schedule,
     /// and nothing here can.
     fn lock(&mut self) {
+        overwrite(&mut self.passphrase);
         overwrite(&mut self.composer);
         overwrite(&mut self.body);
         self.body.push_str("locked");
         self.ui.end_compose();
         self.locked = true;
     }
+}
+
+/// The current epoch, RFC 1 §2 — days since the Unix epoch.
+///
+/// The clock lives here rather than in any library crate: `krab-core` is
+/// zero-dependency so that "no clock" is compiler-enforced, and every function
+/// beneath this one takes time as an argument.
+fn now_epoch() -> krab_core::tag::Epoch {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    krab_core::tag::Epoch::at(secs)
 }
 
 /// Overwrite a `String`'s bytes before clearing.
@@ -333,6 +458,9 @@ fn install_panic_hook() {
 }
 
 #[cfg(test)]
+// Tests build an `App` from `Default` and then set the two or three fields
+// under test; listing every field would obscure which ones matter.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -358,7 +486,28 @@ mod tests {
         let mut a = App::default();
         type_command(&mut a, "send");
         assert!(a.body.contains("run `init` first"), "{}", a.body);
-        assert!(!a.has_identity);
+        assert!(a.identity.is_none());
+    }
+
+    /// The store is openable when the ceremony finishes: an identity without
+    /// a wrapper key would have nothing to protect its own keys under.
+    #[test]
+    fn finishing_init_opens_the_current_epoch() {
+        let mut a = App::default();
+        a.identity = Some(Identity::generate(&mut OsRng));
+        a.passphrase.push_str("a passphrase");
+        // Use cheap Argon2id parameters; the specified ones are exercised in
+        // `krab_crypto::kek`.
+        {
+            let id = a.identity.as_mut().unwrap();
+            id.kek_params.m_kib = 64;
+            id.kek_params.t = 1;
+            id.kek_params.p = 1;
+        }
+        a.open_store().unwrap();
+        let id = a.identity.as_ref().unwrap();
+        assert_eq!(id.hierarchy.epochs().count(), 1);
+        assert_eq!(id.hierarchy.stored_bytes(), krab_crypto::kek::WRAPPED_LEN);
     }
 
     /// **RFC 7 §11 end to end**: the ceremony cannot produce an identity
@@ -367,15 +516,37 @@ mod tests {
     fn init_yields_an_identity_only_after_the_backup_step() {
         let mut a = App::default();
         type_command(&mut a, "init");
+        // The ceremony will not leave the first step without one.
+        a.advance_init();
+        assert_eq!(
+            a.init_step,
+            Some(InitStep::Passphrase),
+            "empty passphrase is refused"
+        );
+        for c in "a passphrase".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(
+            a.command.is_empty(),
+            "a passphrase must not land on the command line"
+        );
+
         let mut seen = vec![a.init_step.unwrap()];
-        while a.init_step.is_some() {
+        for _ in 0..10 {
             a.advance_init();
-            if let Some(s) = a.init_step {
-                seen.push(s);
+            match a.init_step {
+                Some(s) => seen.push(s),
+                None => break,
             }
         }
-        assert!(a.has_identity);
+        assert!(a.init_step.is_none(), "the ceremony terminates: {seen:?}");
+        assert!(a.identity.is_some());
         assert!(seen.contains(&InitStep::ConfirmBackup), "{seen:?}");
+        // And the passphrase does not outlive the ceremony (RFC 7 §9).
+        assert!(
+            a.passphrase.is_empty(),
+            "the passphrase is cleared once the KEK exists"
+        );
         // And it will not run twice.
         type_command(&mut a, "init");
         assert!(a.body.contains("runs once"), "{}", a.body);
@@ -385,22 +556,29 @@ mod tests {
     #[test]
     fn wipe_asks_once_then_destroys() {
         let mut a = App::default();
-        a.has_identity = true;
+        a.identity = Some(Identity::generate(&mut entropy::OsRng));
         type_command(&mut a, "wipe");
         assert!(a.body.contains("cannot be undone"), "{}", a.body);
-        assert!(a.has_identity, "first wipe only prompts");
+        assert!(a.identity.is_some(), "first wipe only prompts");
         type_command(&mut a, "wipe");
-        assert!(!a.has_identity, "second wipe destroys");
+        assert!(a.identity.is_none(), "second wipe destroys");
         assert!(a.locked);
     }
 
     #[test]
     fn peer_offer_names_both_files_and_marks_which_is_secret() {
         let mut a = App::default();
-        a.has_identity = true;
+        a.identity = Some(Identity::generate(&mut entropy::OsRng));
         type_command(&mut a, "peer offer");
-        assert!(a.body.contains("peer.card") && a.body.contains("peer.pad"), "{}", a.body);
-        assert!(a.body.contains("SECRET"), "the unforwardable half is marked");
+        assert!(
+            a.body.contains("peer.card") && a.body.contains("peer.pad"),
+            "{}",
+            a.body
+        );
+        assert!(
+            a.body.contains("SECRET"),
+            "the unforwardable half is marked"
+        );
     }
 
     #[test]

@@ -72,7 +72,11 @@ impl NotRandom {
         state[3] = 0x6b20_6574;
         state[4] = seed as u32;
         state[5] = (seed >> 32) as u32;
-        NotRandom { state, buf: [0; 64], used: 64 }
+        NotRandom {
+            state,
+            buf: [0; 64],
+            used: 64,
+        }
     }
 
     // The index is shared between the working state and the original state,
@@ -132,8 +136,14 @@ mod tests {
 
     #[test]
     fn the_test_generator_is_reproducible() {
-        assert_eq!(NotRandom::seeded(7).next_32(), NotRandom::seeded(7).next_32());
-        assert_ne!(NotRandom::seeded(7).next_32(), NotRandom::seeded(8).next_32());
+        assert_eq!(
+            NotRandom::seeded(7).next_32(),
+            NotRandom::seeded(7).next_32()
+        );
+        assert_ne!(
+            NotRandom::seeded(7).next_32(),
+            NotRandom::seeded(8).next_32()
+        );
     }
 
     #[test]

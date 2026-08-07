@@ -47,8 +47,7 @@ impl PeerMetrics {
     /// RFC 0 §5.4's censorship case visible — a relay dropping everything is
     /// possible, and shows up here.
     pub fn novelty_ratio(&self) -> Option<f64> {
-        (self.objects_received > 0)
-            .then(|| self.objects_new as f64 / self.objects_received as f64)
+        (self.objects_received > 0).then(|| self.objects_new as f64 / self.objects_received as f64)
     }
 
     /// Objects that arrived **only** via this peer.
@@ -143,24 +142,43 @@ mod tests {
     /// RFC 5 §10 — high volume at low novelty is misconfiguration or attack.
     #[test]
     fn novelty_ratio_exposes_a_peer_sending_what_we_have() {
-        let m = PeerMetrics { objects_received: 1_000, objects_new: 3, ..Default::default() };
+        let m = PeerMetrics {
+            objects_received: 1_000,
+            objects_new: 3,
+            ..Default::default()
+        };
         assert!(m.novelty_ratio().unwrap() < 0.01);
     }
 
     /// RFC 5 §10's eclipse indicator.
     #[test]
     fn unique_source_ratio_exposes_an_eclipse() {
-        let m = PeerMetrics { objects_received: 500, unique_source: 480, ..Default::default() };
-        assert!(m.unique_source_ratio().unwrap() > 0.9, "cutting this peer partitions us");
+        let m = PeerMetrics {
+            objects_received: 500,
+            unique_source: 480,
+            ..Default::default()
+        };
+        assert!(
+            m.unique_source_ratio().unwrap() > 0.9,
+            "cutting this peer partitions us"
+        );
     }
 
     /// SIM-1 §1 measured 68-83% overhead on a correctly configured LoRa link,
     /// so the 50% threshold is conditioned on the link, not absolute.
     #[test]
     fn overhead_share_is_high_on_lora_by_design() {
-        let lora = PeerMetrics { control_bytes: 17_200, payload_bytes: 1_300, ..Default::default() };
+        let lora = PeerMetrics {
+            control_bytes: 17_200,
+            payload_bytes: 1_300,
+            ..Default::default()
+        };
         assert!(lora.overhead_share().unwrap() > 0.9);
-        let tcp = PeerMetrics { control_bytes: 100, payload_bytes: 100_000, ..Default::default() };
+        let tcp = PeerMetrics {
+            control_bytes: 100,
+            payload_bytes: 100_000,
+            ..Default::default()
+        };
         assert!(tcp.overhead_share().unwrap() < 0.5);
     }
 
@@ -168,13 +186,20 @@ mod tests {
     #[test]
     fn coverage_scalar_is_derived_from_the_profile() {
         // SIM-1 §2's measured austere profile.
-        let austere = Coverage { by_age: [0.03, 0.06, 0.12, 0.26, 0.41, 0.56, 0.71, 0.82] };
+        let austere = Coverage {
+            by_age: [0.03, 0.06, 0.12, 0.26, 0.41, 0.56, 0.71, 0.82],
+        };
         assert!((austere.mean() - 0.37).abs() < 0.02, "the 37% headline");
         assert_eq!(austere.youngest(), 0.03, "and what it conceals");
-        assert!(austere.is_ramped(), "propagation does not complete within TTL");
+        assert!(
+            austere.is_ramped(),
+            "propagation does not complete within TTL"
+        );
 
         // SIM-1 §2's mixed profile: flat after the youngest bucket.
-        let mixed = Coverage { by_age: [0.76, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] };
+        let mixed = Coverage {
+            by_age: [0.76, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        };
         assert!(!mixed.is_ramped(), "possession implies nothing here");
         assert!(mixed.mean() > 0.95);
     }

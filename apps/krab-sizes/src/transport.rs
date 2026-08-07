@@ -36,12 +36,42 @@ pub struct Lora {
 }
 
 pub const LORA: [Lora; 6] = [
-    Lora { sf: 7, payload: 222, toa_ms: 348.4, duty: 0.01 },
-    Lora { sf: 8, payload: 222, toa_ms: 614.9, duty: 0.01 },
-    Lora { sf: 9, payload: 115, toa_ms: 615.4, duty: 0.01 },
-    Lora { sf: 10, payload: 51, toa_ms: 616.4, duty: 0.01 },
-    Lora { sf: 11, payload: 51, toa_ms: 1_314.8, duty: 0.01 },
-    Lora { sf: 12, payload: 51, toa_ms: 2_465.8, duty: 0.01 },
+    Lora {
+        sf: 7,
+        payload: 222,
+        toa_ms: 348.4,
+        duty: 0.01,
+    },
+    Lora {
+        sf: 8,
+        payload: 222,
+        toa_ms: 614.9,
+        duty: 0.01,
+    },
+    Lora {
+        sf: 9,
+        payload: 115,
+        toa_ms: 615.4,
+        duty: 0.01,
+    },
+    Lora {
+        sf: 10,
+        payload: 51,
+        toa_ms: 616.4,
+        duty: 0.01,
+    },
+    Lora {
+        sf: 11,
+        payload: 51,
+        toa_ms: 1_314.8,
+        duty: 0.01,
+    },
+    Lora {
+        sf: 12,
+        payload: 51,
+        toa_ms: 2_465.8,
+        duty: 0.01,
+    },
 ];
 
 impl Lora {
@@ -114,7 +144,10 @@ mod tests {
         ] {
             assert_eq!(frames(bucket), f, "frames for {bucket}");
             assert_eq!(framing_overhead(bucket), over, "overhead for {bucket}");
-            assert!(close(100.0 * over as f64 / bucket as f64, pct, 0.01), "pct for {bucket}");
+            assert!(
+                close(100.0 * over as f64 / bucket as f64, pct, 0.01),
+                "pct for {bucket}"
+            );
         }
     }
 
@@ -134,11 +167,23 @@ mod tests {
         {
             // RFC 4 gives sustained rates to two significant figures, so SF12's
             // 0.2068 prints as "0.21" — 1.5% off on its own.
-            assert!(close(LORA[i].sustained_bps(), *bps, 0.02), "SF{}", LORA[i].sf);
-            assert!(close(LORA[i].mb_day(), *mb, 0.01), "SF{} MB/day", LORA[i].sf);
+            assert!(
+                close(LORA[i].sustained_bps(), *bps, 0.02),
+                "SF{}",
+                LORA[i].sf
+            );
+            assert!(
+                close(LORA[i].mb_day(), *mb, 0.01),
+                "SF{} MB/day",
+                LORA[i].sf
+            );
         }
         // "SF7 is 7.7x faster than SF10".
-        assert!(close(LORA[0].sustained_bps() / LORA[3].sustained_bps(), 7.7, 0.01));
+        assert!(close(
+            LORA[0].sustained_bps() / LORA[3].sustained_bps(),
+            7.7,
+            0.01
+        ));
     }
 
     /// RFC 4 §5.4's fragmentation table — the "airtime" column is elapsed
@@ -158,7 +203,10 @@ mod tests {
             let l = sf(s);
             assert_eq!(l.fragments(bucket), frag, "{bucket}B SF{s} fragments");
             assert_eq!(l.fragments_fec(bucket), fec, "{bucket}B SF{s} with FEC");
-            assert!(close(l.elapsed_s(bucket), secs, 0.01), "{bucket}B SF{s} elapsed");
+            assert!(
+                close(l.elapsed_s(bucket), secs, 0.01),
+                "{bucket}B SF{s} elapsed"
+            );
         }
     }
 
@@ -172,10 +220,17 @@ mod tests {
         let sf10 = LORA[3];
         let transmit = sf10.transmit_s(NOISE_HANDSHAKE);
         let elapsed = sf10.elapsed_s(NOISE_HANDSHAKE);
-        assert!(close(elapsed / transmit, 1.0 / sf10.duty, 1e-9), "duty-cycle ratio");
+        assert!(
+            close(elapsed / transmit, 1.0 / sf10.duty, 1e-9),
+            "duty-cycle ratio"
+        );
         // §4.1's "approximately 3 minutes" is the right order for elapsed;
         // a raw-transmission figure of ~1.5 s is not what the link costs.
-        assert!((1.0..6.0).contains(&(elapsed / 60.0)), "elapsed {:.1} min", elapsed / 60.0);
+        assert!(
+            (1.0..6.0).contains(&(elapsed / 60.0)),
+            "elapsed {:.1} min",
+            elapsed / 60.0
+        );
         assert!(transmit < 5.0, "transmit {transmit:.1} s");
     }
 
@@ -183,9 +238,16 @@ mod tests {
     #[test]
     fn serial_table_matches_rfc4() {
         const CORPUS: usize = 447_000_000; // SIM-0 §2, n=500
-        for (baud, hours) in [(9_600u32, 129.3f64), (19_200, 64.7), (57_600, 21.6), (115_200, 10.8)]
-        {
-            assert!(close(serial_hours(CORPUS, baud), hours, 0.01), "{baud} baud");
+        for (baud, hours) in [
+            (9_600u32, 129.3f64),
+            (19_200, 64.7),
+            (57_600, 21.6),
+            (115_200, 10.8),
+        ] {
+            assert!(
+                close(serial_hours(CORPUS, baud), hours, 0.01),
+                "{baud} baud"
+            );
         }
     }
 

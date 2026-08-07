@@ -48,7 +48,12 @@ mod tests {
 
     fn msgs() -> Vec<Control> {
         vec![
-            Control::Hello { version: 1, node: [1; 32], watermark: 9, filter_digest: [2; 32] },
+            Control::Hello {
+                version: 1,
+                node: [1; 32],
+                watermark: 9,
+                filter_digest: [2; 32],
+            },
             Control::Obj(vec![7; 512]),
             Control::Done,
         ]
@@ -64,7 +69,11 @@ mod tests {
         for want in msgs() {
             assert_eq!(read(&mut cur).unwrap(), Some(want));
         }
-        assert_eq!(read(&mut cur).unwrap(), None, "clean end of input, not an error");
+        assert_eq!(
+            read(&mut cur).unwrap(),
+            None,
+            "clean end of input, not an error"
+        );
     }
 
     /// RFC 4 §9 — validate the length before allocating.

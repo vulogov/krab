@@ -547,8 +547,10 @@ dependencies = [
  "crossterm",
  "getrandom",
  "krab",
+ "krab-core",
  "krab-crypto",
  "ratatui",
+ "zeroize",
 ]
 
 [[package]]

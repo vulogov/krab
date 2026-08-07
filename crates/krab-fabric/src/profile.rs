@@ -180,7 +180,11 @@ mod tests {
     #[test]
     fn max_bucket_is_an_index_so_a_between_buckets_gate_is_unrepresentable() {
         let lora = LinkProfile::lora_sf10();
-        assert_eq!(lora.max_bucket.bytes(), 1_024, "RFC 4 §5.4 caps SF7-SF10 here");
+        assert_eq!(
+            lora.max_bucket.bytes(),
+            1_024,
+            "RFC 4 §5.4 caps SF7-SF10 here"
+        );
         assert!(lora.max_bucket.admits(0), "256-byte objects cross");
         assert!(lora.max_bucket.admits(1), "1024-byte objects cross");
         assert!(!lora.max_bucket.admits(2), "4096-byte objects do not");

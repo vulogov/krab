@@ -68,7 +68,10 @@ impl LinkKind {
             LinkKind::Lora => {
                 static G: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
                 *G.get_or_init(|| {
-                    std::env::var("KRAB_LORA_GATE").ok().and_then(|v| v.parse().ok()).unwrap_or(512)
+                    std::env::var("KRAB_LORA_GATE")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(512)
                 })
             }
             LinkKind::Courier => 512 * 1024,
@@ -297,7 +300,9 @@ pub struct BitSet {
 
 impl BitSet {
     pub fn new(bits: usize) -> BitSet {
-        BitSet { w: vec![0u64; (bits + 63) / 64] }
+        BitSet {
+            w: vec![0u64; (bits + 63) / 64],
+        }
     }
     #[inline]
     pub fn set(&mut self, i: usize) {
@@ -309,6 +314,9 @@ impl BitSet {
     }
     /// Population count over a word range.
     pub fn count_range(&self, lo_word: usize, hi_word: usize) -> u64 {
-        self.w[lo_word..hi_word].iter().map(|x| x.count_ones() as u64).sum()
+        self.w[lo_word..hi_word]
+            .iter()
+            .map(|x| x.count_ones() as u64)
+            .sum()
     }
 }

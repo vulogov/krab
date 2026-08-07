@@ -83,7 +83,7 @@ pub enum Command {
 impl Command {
     /// Parse a verb.
     pub fn parse(s: &str) -> Option<Command> {
-        Some(match s.trim().split_whitespace().next()? {
+        Some(match s.split_whitespace().next()? {
             "init" => Command::Init,
             "peer" => Command::Peer,
             "lock" => Command::Lock,
@@ -108,7 +108,10 @@ impl Command {
     /// everything else needs a key hierarchy that does not exist yet, and
     /// failing at the point of use is worse than refusing up front.
     pub fn needs_identity(&self) -> bool {
-        !matches!(self, Command::Init | Command::Lock | Command::Wipe | Command::Keys)
+        !matches!(
+            self,
+            Command::Init | Command::Lock | Command::Wipe | Command::Keys
+        )
     }
 
     /// Whether this verb needs the node unlocked.
@@ -182,7 +185,7 @@ pub enum Peering {
 impl Peering {
     /// Parse the subverb. Bare `peer` reports status rather than guessing.
     pub fn parse(rest: &str) -> Option<Peering> {
-        Some(match rest.trim().split_whitespace().next().unwrap_or("status") {
+        Some(match rest.split_whitespace().next().unwrap_or("status") {
             "offer" => Peering::Offer,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,
@@ -235,9 +238,7 @@ impl InitStep {
             InitStep::Passphrase => "choose a passphrase — it is the only root",
             InitStep::Generate => "generating identity and first prekeys",
             InitStep::ShowBackup => "write these words down, offline, now",
-            InitStep::ConfirmBackup => {
-                "confirm you recorded them — this cannot be shown again"
-            }
+            InitStep::ConfirmBackup => "confirm you recorded them — this cannot be shown again",
             InitStep::Done => "ready",
         }
     }
@@ -307,7 +308,10 @@ mod tests {
         assert_eq!(Command::parse("nonsense"), None);
         assert_eq!(Command::parse(""), None);
         // Arguments are ignored by the verb parser.
-        assert_eq!(Command::parse("reach q3m9 --size 4096"), Some(Command::Reach));
+        assert_eq!(
+            Command::parse("reach q3m9 --size 4096"),
+            Some(Command::Reach)
+        );
     }
 
     /// **A fresh install can barely do anything, and that is correct.**
@@ -328,7 +332,10 @@ mod tests {
         assert_eq!(admitted, vec![Command::Init, Command::Lock, Command::Keys]);
 
         // And the refusal names the reason rather than failing later.
-        assert_eq!(admit(&Command::Send, false, false, false), Err(Refusal::NoIdentity));
+        assert_eq!(
+            admit(&Command::Send, false, false, false),
+            Err(Refusal::NoIdentity)
+        );
     }
 
     /// **RFC 7 §11's requirement, enforced by the state machine.**
@@ -381,11 +388,20 @@ mod tests {
     /// A locked node is a relay: it keeps its links and loses its content.
     #[test]
     fn a_locked_node_manages_links_but_not_messages() {
-        for c in [Command::Peers, Command::Reach, Command::Connect, Command::Pack] {
+        for c in [
+            Command::Peers,
+            Command::Reach,
+            Command::Connect,
+            Command::Pack,
+        ] {
             assert!(admit(&c, true, true, false).is_ok(), "{c} is link work");
         }
         for c in [Command::Send, Command::Keys, Command::Verify, Command::Peer] {
-            assert_eq!(admit(&c, true, true, false), Err(Refusal::Locked), "{c} needs content");
+            assert_eq!(
+                admit(&c, true, true, false),
+                Err(Refusal::Locked),
+                "{c} needs content"
+            );
         }
     }
 
@@ -396,7 +412,10 @@ mod tests {
     /// nothing, so it is the one place friction is earned.
     #[test]
     fn only_wipe_asks_for_confirmation() {
-        assert!(admit(&Command::Lock, true, false, false).is_ok(), "lock never prompts");
+        assert!(
+            admit(&Command::Lock, true, false, false).is_ok(),
+            "lock never prompts"
+        );
         assert_eq!(
             admit(&Command::Wipe, true, false, false),
             Err(Refusal::NeedsConfirmation)

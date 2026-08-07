@@ -37,13 +37,17 @@ pub struct CourierSession {
 
 impl Session for CourierSession {
     fn send(&mut self, msg: &Control) -> Result<(), Error> {
-        let Some(out) = self.out.as_mut() else { return Err(Error::Closed) };
+        let Some(out) = self.out.as_mut() else {
+            return Err(Error::Closed);
+        };
         self.written += frame::write(out, msg)?;
         Ok(())
     }
 
     fn recv(&mut self) -> Result<Option<Control>, Error> {
-        let Some(inp) = self.inp.as_mut() else { return Ok(None) };
+        let Some(inp) = self.inp.as_mut() else {
+            return Ok(None);
+        };
         frame::read(inp)
     }
 
@@ -90,7 +94,9 @@ impl CourierFabric {
     /// check 5). Returns the count of verified objects, or the index of the
     /// first record that failed.
     pub fn verify(path: impl AsRef<Path>) -> Result<usize, usize> {
-        let Ok(f) = File::open(path) else { return Err(0) };
+        let Ok(f) = File::open(path) else {
+            return Err(0);
+        };
         let mut r = BufReader::new(f);
         let mut n = 0;
         let mut idx = 0;
@@ -124,7 +130,10 @@ impl Fabric for CourierFabric {
     /// write to, and whether anyone carries it is not the protocol's business.
     /// That asymmetry is the whole of I-4 in one method.
     fn connect(&self) -> Result<Box<dyn Session>, Error> {
-        let f = OpenOptions::new().create(true).append(true).open(&self.outbox)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.outbox)?;
         Ok(Box::new(CourierSession {
             out: Some(BufWriter::new(f)),
             inp: File::open(&self.inbox).ok().map(BufReader::new),
@@ -188,8 +197,13 @@ mod tests {
         let f = CourierFabric::new(LinkProfile::courier(), &out, &inp);
 
         let mut s = f.connect().unwrap();
-        s.send(&Control::Hello { version: 1, node: [1; 32], watermark: 0, filter_digest: [0; 32] })
-            .unwrap();
+        s.send(&Control::Hello {
+            version: 1,
+            node: [1; 32],
+            watermark: 0,
+            filter_digest: [0; 32],
+        })
+        .unwrap();
         s.send(&Control::Obj(object(1))).unwrap();
         s.send(&Control::Obj(object(2))).unwrap();
         s.send(&Control::Done).unwrap();

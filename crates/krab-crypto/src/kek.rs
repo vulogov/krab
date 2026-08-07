@@ -77,7 +77,12 @@ impl KekParams {
     pub fn new(rng: &mut impl Rng) -> KekParams {
         let mut salt = [0u8; SALT_LEN];
         rng.fill(&mut salt);
-        KekParams { m_kib: ARGON2_M_KIB, t: ARGON2_T, p: ARGON2_P, salt }
+        KekParams {
+            m_kib: ARGON2_M_KIB,
+            t: ARGON2_T,
+            p: ARGON2_P,
+            salt,
+        }
     }
 }
 
@@ -135,7 +140,10 @@ impl Kek {
         let ct = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
-                Payload { msg: key, aad: &epoch.to_le_bytes() },
+                Payload {
+                    msg: key,
+                    aad: &epoch.to_le_bytes(),
+                },
             )
             .map_err(|_| Error::Unwrap)?;
         let mut out = Vec::with_capacity(WRAPPED_LEN);
@@ -153,7 +161,10 @@ impl Kek {
         let pt = cipher
             .decrypt(
                 Nonce::from_slice(&record[..12]),
-                Payload { msg: &record[12..], aad: &epoch.to_le_bytes() },
+                Payload {
+                    msg: &record[12..],
+                    aad: &epoch.to_le_bytes(),
+                },
             )
             .map_err(|_| Error::Unwrap)?;
         let mut key = [0u8; 32];
@@ -181,7 +192,9 @@ impl fmt::Debug for Hierarchy {
 impl Hierarchy {
     /// An empty hierarchy.
     pub fn new() -> Hierarchy {
-        Hierarchy { records: Vec::new() }
+        Hierarchy {
+            records: Vec::new(),
+        }
     }
 
     /// Create and store `W_N` for `epoch`, returning it for immediate use.
@@ -205,8 +218,11 @@ impl Hierarchy {
 
     /// Recover `W_N`.
     pub fn epoch_key(&self, kek: &Kek, epoch: Epoch) -> Result<[u8; 32], Error> {
-        let (_, record) =
-            self.records.iter().find(|(e, _)| *e == epoch).ok_or(Error::Unwrap)?;
+        let (_, record) = self
+            .records
+            .iter()
+            .find(|(e, _)| *e == epoch)
+            .ok_or(Error::Unwrap)?;
         kek.unwrap(epoch, record)
     }
 
@@ -229,8 +245,12 @@ impl Hierarchy {
 
     /// Shred every epoch older than `keep_from`. RFC 7 §4's retention sweep.
     pub fn shred_before(&mut self, keep_from: Epoch) -> usize {
-        let doomed: Vec<Epoch> =
-            self.records.iter().filter(|(e, _)| *e < keep_from).map(|(e, _)| *e).collect();
+        let doomed: Vec<Epoch> = self
+            .records
+            .iter()
+            .filter(|(e, _)| *e < keep_from)
+            .map(|(e, _)| *e)
+            .collect();
         doomed.iter().filter(|e| self.shred_epoch(**e)).count()
     }
 
@@ -253,13 +273,22 @@ mod tests {
     /// Argon2id at 64 MiB is slow on purpose, so tests use a cheap
     /// configuration. The real parameters are exercised once, below.
     fn cheap(rng: &mut impl Rng) -> KekParams {
-        KekParams { m_kib: 64, t: 1, p: 1, ..KekParams::new(rng) }
+        KekParams {
+            m_kib: 64,
+            t: 1,
+            p: 1,
+            ..KekParams::new(rng)
+        }
     }
 
     fn setup() -> (Kek, KekParams, NotRandom) {
         let mut rng = NotRandom::seeded(1);
         let params = cheap(&mut rng);
-        (Kek::derive(b"correct horse battery staple", &params).unwrap(), params, rng)
+        (
+            Kek::derive(b"correct horse battery staple", &params).unwrap(),
+            params,
+            rng,
+        )
     }
 
     #[test]
@@ -307,7 +336,11 @@ mod tests {
 
         assert!(h.epoch_key(&kek, target).is_ok());
         assert!(h.shred_epoch(target));
-        assert_eq!(h.epoch_key(&kek, target), Err(Error::Unwrap), "gone for good");
+        assert_eq!(
+            h.epoch_key(&kek, target),
+            Err(Error::Unwrap),
+            "gone for good"
+        );
         // And only that epoch.
         assert!(h.epoch_key(&kek, Epoch(20_672)).is_ok());
         assert!(!h.shred_epoch(target), "already gone");

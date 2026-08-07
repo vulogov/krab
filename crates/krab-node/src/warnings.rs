@@ -124,13 +124,20 @@ pub fn evaluate(
     let mut out = Vec::new();
     let want = mix.min_peers();
     if peers < want {
-        out.push(Warning::PeerCountLow { have: peers, want, mix });
+        out.push(Warning::PeerCountLow {
+            have: peers,
+            want,
+            mix,
+        });
     }
     if has_constrained_link && peers > MAX_PEERS_CONSTRAINED {
         out.push(Warning::PeerCountHighForConstrainedLink { have: peers });
     }
     if ttl_days < mix.min_ttl_days() {
-        out.push(Warning::TtlLow { have: ttl_days, want: mix.min_ttl_days() });
+        out.push(Warning::TtlLow {
+            have: ttl_days,
+            want: mix.min_ttl_days(),
+        });
     }
     if coverage.is_ramped() {
         out.push(Warning::CoverageRamped {
@@ -160,7 +167,11 @@ mod tests {
         let w = evaluate(4, TransportMix::IpConnected, 7, flat(), false);
         assert_eq!(
             w,
-            vec![Warning::PeerCountLow { have: 4, want: 8, mix: TransportMix::IpConnected }]
+            vec![Warning::PeerCountLow {
+                have: 4,
+                want: 8,
+                mix: TransportMix::IpConnected
+            }]
         );
         // Austere needs more, so 8 peers is fine on IP and not on austere.
         assert!(evaluate(8, TransportMix::IpConnected, 7, flat(), false).is_empty());
@@ -190,9 +201,14 @@ mod tests {
     /// SIM-1 §2 — the ramp is the warning, not the aggregate.
     #[test]
     fn warns_on_a_ramped_coverage_profile() {
-        let austere = Coverage { by_age: [0.03, 0.06, 0.12, 0.26, 0.41, 0.56, 0.71, 0.82] };
+        let austere = Coverage {
+            by_age: [0.03, 0.06, 0.12, 0.26, 0.41, 0.56, 0.71, 0.82],
+        };
         let w = evaluate(12, TransportMix::Austere, 30, austere, false);
-        match w.iter().find(|w| matches!(w, Warning::CoverageRamped { .. })) {
+        match w
+            .iter()
+            .find(|w| matches!(w, Warning::CoverageRamped { .. }))
+        {
             Some(Warning::CoverageRamped { youngest, mean }) => {
                 assert_eq!(*youngest, 0.03);
                 assert!((mean - 0.37).abs() < 0.02, "the headline the ramp conceals");

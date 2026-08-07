@@ -34,7 +34,12 @@ pub struct Segment {
 impl Segment {
     /// An empty segment for `bucket`.
     pub fn new(bucket: u32) -> Segment {
-        Segment { bucket, entries: Vec::new(), fingerprint: Fingerprint::ZERO, bytes: 0 }
+        Segment {
+            bucket,
+            entries: Vec::new(),
+            fingerprint: Fingerprint::ZERO,
+            bytes: 0,
+        }
     }
 
     /// The expiry bucket this segment covers.
@@ -67,7 +72,10 @@ impl Segment {
 
     /// Fetch by identifier.
     pub fn get(&self, id: &ObjectId) -> Option<&[u8]> {
-        self.entries.iter().find(|e| &e.0 == id).map(|e| e.1.as_slice())
+        self.entries
+            .iter()
+            .find(|e| &e.0 == id)
+            .map(|e| e.1.as_slice())
     }
 
     /// Every identifier held, in append order.

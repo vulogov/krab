@@ -14,7 +14,10 @@ use std::collections::{BinaryHeap, HashMap};
 enum Ev {
     Inject(u32),
     Sync(u32),
-    Deliver { node: u32, objs: Vec<u32> },
+    Deliver {
+        node: u32,
+        objs: Vec<u32>,
+    },
     /// Periodic measurement of live corpus size. Necessary because a node's
     /// bitmap is never cleared -- expiry is handled by masking the live
     /// window, so store size has to be recomputed over that window rather
@@ -163,7 +166,13 @@ fn online_windows(cfg: &Config, rng: &mut Rng) -> Vec<(u64, u64)> {
 
 fn is_online(w: &[(u64, u64)], t: u64) -> bool {
     // Windows are sorted and disjoint.
-    match w.binary_search_by(|&(s, _)| if s <= t { Ordering::Less } else { Ordering::Greater }) {
+    match w.binary_search_by(|&(s, _)| {
+        if s <= t {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    }) {
         Ok(_) => true,
         Err(i) => i > 0 && w[i - 1].1 > t,
     }
@@ -200,7 +209,9 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
     // contiguous word range instead of scanning the whole corpus.
     let mut objs: Vec<Object> = Vec::new();
     let social: Vec<Vec<u32>> = if cfg.dest == DestModel::Social {
-        (0..cfg.n as u32).map(|u| g.within_hops(u, cfg.social_hops)).collect()
+        (0..cfg.n as u32)
+            .map(|u| g.within_hops(u, cfg.social_hops))
+            .collect()
     } else {
         Vec::new()
     };
@@ -231,7 +242,12 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
             } else {
                 rng.range(50_000, 500_000) as u32
             };
-            objs.push(Object { size, created: t as u64, origin: u, dest });
+            objs.push(Object {
+                size,
+                created: t as u64,
+                origin: u,
+                dest,
+            });
             t += rng.exp(mean_gap);
         }
     }
@@ -245,7 +261,10 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
     // Per-transport eligibility masks: object fits under the link's size gate.
     let mut size_mask = [BitSet::new(m), BitSet::new(m), BitSet::new(m)];
     for (i, o) in objs.iter().enumerate() {
-        for (k, kind) in [LinkKind::Tcp, LinkKind::Lora, LinkKind::Courier].iter().enumerate() {
+        for (k, kind) in [LinkKind::Tcp, LinkKind::Lora, LinkKind::Courier]
+            .iter()
+            .enumerate()
+        {
             if o.size <= kind.max_object() {
                 size_mask[k].set(i);
             }
@@ -373,7 +392,8 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
 
                 // A courier does not require either endpoint to be up.
                 if l.kind != LinkKind::Courier {
-                    if !is_online(&windows[l.a as usize], t) || !is_online(&windows[l.b as usize], t)
+                    if !is_online(&windows[l.a as usize], t)
+                        || !is_online(&windows[l.b as usize], t)
                     {
                         continue;
                     }
@@ -487,7 +507,10 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
                             &mut q,
                             &mut seq,
                             t + dt as u64,
-                            Ev::Deliver { node: dst as u32, objs: scratch.clone() },
+                            Ev::Deliver {
+                                node: dst as u32,
+                                objs: scratch.clone(),
+                            },
                         );
                     }
                 }
@@ -568,15 +591,35 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
         }
     }
     let denom = (hi - lo) as u128 * cfg.n as u128;
-    let cov_exact = if denom == 0 { 0.0 } else { held_total as f64 / denom as f64 };
-    let cov_bytes = if bytes_live == 0 { 0.0 } else { bytes_held as f64 / bytes_live as f64 };
-    let cov_settled =
-        if settled_tot == 0 { 0.0 } else { settled_hold as f64 / settled_tot as f64 };
+    let cov_exact = if denom == 0 {
+        0.0
+    } else {
+        held_total as f64 / denom as f64
+    };
+    let cov_bytes = if bytes_live == 0 {
+        0.0
+    } else {
+        bytes_held as f64 / bytes_live as f64
+    };
+    let cov_settled = if settled_tot == 0 {
+        0.0
+    } else {
+        settled_hold as f64 / settled_tot as f64
+    };
     let cov_by_age: Vec<f64> = (0..NB)
-        .map(|b| if age_tot[b] == 0 { 0.0 } else { age_hold[b] as f64 / age_tot[b] as f64 })
+        .map(|b| {
+            if age_tot[b] == 0 {
+                0.0
+            } else {
+                age_hold[b] as f64 / age_tot[b] as f64
+            }
+        })
         .collect();
-    let lora_eligible =
-        if measured == 0 { 0.0 } else { (measured - lora_gated) as f64 / measured as f64 };
+    let lora_eligible = if measured == 0 {
+        0.0
+    } else {
+        (measured - lora_gated) as f64 / measured as f64
+    };
 
     // ---- SIM-1: holdings leak and the origin attack ------------------------
     //
@@ -616,8 +659,13 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
             }
         };
         let dists: Vec<Vec<u16>> = vantage.iter().map(|&v| bfs(&g, v, cfg.n)).collect();
-        let maxd = dists.iter().flatten().copied().filter(|&d| d != u16::MAX).max().unwrap_or(0)
-            as usize;
+        let maxd = dists
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|&d| d != u16::MAX)
+            .max()
+            .unwrap_or(0) as usize;
 
         // Train the leak table on even-indexed objects and attack the odd ones,
         // so the attack is never scored against the data that calibrated it.
@@ -640,11 +688,14 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
         }
         // Laplace-smoothed, so an unobserved (bucket, distance) cell cannot
         // hand the attack an infinite log-likelihood.
-        let rate = |b: usize, d: usize| -> f64 {
-            (hit[b][d] as f64 + 0.5) / (tot[b][d] as f64 + 1.0)
-        };
+        let rate =
+            |b: usize, d: usize| -> f64 { (hit[b][d] as f64 + 0.5) / (tot[b][d] as f64 + 1.0) };
         hold_by_dist = (0..NB)
-            .map(|b| (0..=maxd).map(|d| if tot[b][d] == 0 { f64::NAN } else { rate(b, d) }).collect())
+            .map(|b| {
+                (0..=maxd)
+                    .map(|d| if tot[b][d] == 0 { f64::NAN } else { rate(b, d) })
+                    .collect()
+            })
             .collect();
 
         let mut ranks: Vec<f64> = Vec::new();
@@ -691,7 +742,11 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
         }
         ranks.sort_by(|a, b| a.partial_cmp(b).unwrap());
         adv_rank_p50 = pct(&ranks, 0.50);
-        adv_top10 = if adv_scored == 0 { f64::NAN } else { top10 as f64 / adv_scored as f64 };
+        adv_top10 = if adv_scored == 0 {
+            f64::NAN
+        } else {
+            top10 as f64 / adv_scored as f64
+        };
     }
 
     let mut smb: Vec<f64> = peak_bytes.iter().map(|&b| b as f64 / 1e6).collect();

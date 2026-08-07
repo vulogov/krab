@@ -89,7 +89,12 @@ pub struct Session {
 impl Session {
     /// An unlocked session.
     pub fn unlocked(link: LinkKeys, content: ContentKeys) -> Session {
-        Session { link, content: Some(content), plaintext: Vec::new(), composer: String::new() }
+        Session {
+            link,
+            content: Some(content),
+            plaintext: Vec::new(),
+            composer: String::new(),
+        }
     }
 
     /// Current role.
@@ -204,7 +209,10 @@ mod tests {
 
     fn session() -> Session {
         Session::unlocked(
-            LinkKeys { noise_static: Key::new([1; 32]), credentials: 8 },
+            LinkKeys {
+                noise_static: Key::new([1; 32]),
+                credentials: 8,
+            },
             ContentKeys {
                 kek: Key::new([2; 32]),
                 tag_table_len: 4_550,
@@ -226,7 +234,10 @@ mod tests {
         assert_eq!(s.role(), Role::Relay);
         assert!(!s.can_decrypt());
         assert!(s.plaintext().is_empty(), "displayed plaintext zeroized");
-        assert!(s.composer().is_empty(), "composer zeroized -- the draft is gone");
+        assert!(
+            s.composer().is_empty(),
+            "composer zeroized -- the draft is gone"
+        );
         assert_eq!(destroyed, 1 + 4_550 + 256 + 45);
     }
 
@@ -235,7 +246,10 @@ mod tests {
     fn a_locked_node_still_reconciles() {
         let mut s = session();
         s.lock();
-        assert!(s.can_reconcile(), "session keys retained -- this is the relay role");
+        assert!(
+            s.can_reconcile(),
+            "session keys retained -- this is the relay role"
+        );
         assert!(!s.can_decrypt(), "and it cannot read its own mail");
     }
 
@@ -328,7 +342,8 @@ mod tests {
             for t in (0..20_000u64).step_by(60) {
                 if leave_composer_open && t == 600 {
                     // Opened, typed into, and never closed.
-                    sess.compose("a long message the user wandered away from").unwrap();
+                    sess.compose("a long message the user wandered away from")
+                        .unwrap();
                 }
                 fired.extend(sched.due(t, 0xBEEF ^ t));
             }
@@ -338,9 +353,18 @@ mod tests {
         let (closed, _) = run(false);
         let (open, len) = run(true);
 
-        assert!(len > 0, "the composer really is still open with content in it");
-        assert_eq!(closed, open, "an open composer must not change the schedule");
-        assert!(!closed.is_empty(), "and reconciliation must actually be happening");
+        assert!(
+            len > 0,
+            "the composer really is still open with content in it"
+        );
+        assert_eq!(
+            closed, open,
+            "an open composer must not change the schedule"
+        );
+        assert!(
+            !closed.is_empty(),
+            "and reconciliation must actually be happening"
+        );
     }
 
     /// Locking twice is safe — the panic-wipe path may fire on an already

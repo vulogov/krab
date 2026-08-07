@@ -128,10 +128,18 @@ mod tests {
     /// RFC 6 §2.4's fan-out-versus-shared-key ratios.
     #[test]
     fn shared_key_comparison_matches_rfc6() {
-        for (g, shared, ratio) in
-            [(5usize, 10usize, 4usize), (10, 20, 9), (20, 40, 19), (50, 100, 49), (100, 200, 99)]
-        {
-            assert_eq!(shared_key_objects_per_day(g), shared, "G={g} shared-key objects");
+        for (g, shared, ratio) in [
+            (5usize, 10usize, 4usize),
+            (10, 20, 9),
+            (20, 40, 19),
+            (50, 100, 49),
+            (100, 200, 99),
+        ] {
+            assert_eq!(
+                shared_key_objects_per_day(g),
+                shared,
+                "G={g} shared-key objects"
+            );
             assert_eq!(group_objects_per_day(g) / shared, ratio, "G={g} ratio");
         }
     }
@@ -144,7 +152,10 @@ mod tests {
             (500, 41.7, 2.2, 4.6, 11.8),
             (2_000, 166.7, 0.5, 1.1, 2.9),
         ] {
-            assert!(close(background_per_hour(n), background, 0.1), "n={n} background");
+            assert!(
+                close(background_per_hour(n), background, 0.1),
+                "n={n} background"
+            );
             assert!(close(stagger_hours(10, n, 0.10), w10, 0.1), "n={n} G=10");
             assert!(close(stagger_hours(20, n, 0.10), w20, 0.1), "n={n} G=20");
             assert!(close(stagger_hours(50, n, 0.10), w50, 0.1), "n={n} G=50");
@@ -154,9 +165,12 @@ mod tests {
     /// RFC 6 §2.4's LoRa table, reproduced exactly.
     #[test]
     fn lora_table_matches_rfc6() {
-        for (g, frames, hours) in
-            [(3usize, 12usize, 0.2f64), (5, 24, 0.3), (10, 54, 0.8), (20, 114, 1.6)]
-        {
+        for (g, frames, hours) in [
+            (3usize, 12usize, 0.2f64),
+            (5, 24, 0.3),
+            (10, 54, 0.8),
+            (20, 114, 1.6),
+        ] {
             let (f, secs) = lora_group_message(g);
             assert_eq!(f, frames, "G={g} frames");
             assert!(close(secs / 3600.0, hours, 0.05), "G={g} airtime");
@@ -172,8 +186,14 @@ mod tests {
             (50, 4_096, 0.205, 20.5),
             (10, 65_536, 0.655, 65.5),
         ] {
-            assert!(close(channel_mb_day(posts, size), mb, 0.001), "{posts}/day at {size} B");
-            assert!(close(channel_mb_day(posts, size) * 100.0, hundred, 0.05), "x100 channels");
+            assert!(
+                close(channel_mb_day(posts, size), mb, 0.001),
+                "{posts}/day at {size} B"
+            );
+            assert!(
+                close(channel_mb_day(posts, size) * 100.0, hundred, 0.05),
+                "x100 channels"
+            );
         }
     }
 
@@ -185,7 +205,10 @@ mod tests {
     #[test]
     fn the_380x_claim_is_per_author_not_per_message() {
         assert_eq!(group_objects_per_day(20) / MSGS_PER_MEMBER_DAY, 380);
-        assert_eq!(group_objects_per_day(20) / shared_key_objects_per_day(20), 19);
+        assert_eq!(
+            group_objects_per_day(20) / shared_key_objects_per_day(20),
+            19
+        );
     }
 
     /// The systemic figure RFC 6 §2.3 does not report: when group messaging is
@@ -195,7 +218,10 @@ mod tests {
     fn systemic_fanout_moves_the_sharding_threshold() {
         assert_eq!(systemic_multiplier(20), 19);
         let t = shard_threshold(systemic_multiplier(20));
-        assert!((250.0..270.0).contains(&t), "threshold {t:.0}, expected ~260");
+        assert!(
+            (250.0..270.0).contains(&t),
+            "threshold {t:.0}, expected ~260"
+        );
         // Un-fanned, RFC 0 §8.3's ~5000.
         let base = shard_threshold(1);
         assert!((4_800.0..5_000.0).contains(&base), "baseline {base:.0}");
