@@ -318,6 +318,7 @@ ceremony, in person, with no diagnostic. RFC 3 §11 makes the ceremony a
 deliberate event people travel for.
 
 ### 8.3 Proposed text for §2.1
+<!-- Also in Documentation/AMENDMENTS.md §A, alongside the other open items. -->
 
 > A credential's signature is Ed25519 over `"krab/cred/v1" ‖ body`, where
 > `body` is the deterministic CBOR encoding of the document with the signature
