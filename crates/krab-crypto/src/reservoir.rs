@@ -47,7 +47,7 @@
 use crate::secret::Secret;
 use alloc::collections::BTreeMap;
 use hkdf::Hkdf;
-use krab_core::tag::Epoch;
+use krab_core::tag::{Epoch, EPOCH_WINDOW};
 use sha2::Sha256;
 
 /// Domain label for chunk derivation. **Not specified by RFC 7 §6** — see the
@@ -169,6 +169,19 @@ impl Reservoir {
             self.epoch = next;
             self.derive_current();
         }
+        // Trim to RFC 1 §6.2's acceptance window automatically.
+        //
+        // Not left to the caller: a node resuming after a long gap ratchets
+        // hundreds of steps, and a caller who forgot to trim would retain every
+        // chunk it passed — turning a bounded window into an unbounded archive
+        // of exactly the material §6 promises to destroy. Retaining more than
+        // the window is never useful anyway, since an object older than it is
+        // unrecognisable (RFC 1 §6.2).
+        let floor = Epoch(self.epoch.0.saturating_sub(EPOCH_WINDOW));
+        if floor > self.floor {
+            self.floor = floor;
+        }
+        self.retained.retain(|&e, _| e >= self.floor.0);
     }
 
     /// `chunk_N` for `epoch`, or `None` if it is outside the retained window.
@@ -391,6 +404,51 @@ mod tests {
         );
         assert_eq!(r.retained(), 46, "45 epochs back plus today");
         assert_eq!(46 * 32, 1_472, "under 1.5 KB of chunks");
+    }
+
+    /// **A node returning after a long gap.** The ratchet advances hundreds of
+    /// steps and must not accumulate every chunk it passed — that would turn a
+    /// bounded window into an archive of the material §6 destroys.
+    #[test]
+    fn a_long_gap_does_not_accumulate_chunks() {
+        let mut r = Reservoir::new([3; 32], Epoch(20_000));
+        r.advance_to(Epoch(20_400));
+        assert_eq!(r.epoch(), Epoch(20_400));
+        assert_eq!(
+            r.retained(),
+            EPOCH_WINDOW as usize + 1,
+            "the window must stay bounded across a 400-epoch gap"
+        );
+        assert!(r.chunk(Epoch(20_400)).is_some(), "today");
+        assert!(
+            r.chunk(Epoch(20_400 - EPOCH_WINDOW)).is_some(),
+            "the far edge of MAX_TTL"
+        );
+        assert!(r.chunk(Epoch(20_100)).is_none(), "long past the window");
+    }
+
+    /// Two nodes that were apart for different lengths of time still agree,
+    /// because the ratchet is deterministic in the epoch and not in the path.
+    #[test]
+    fn nodes_that_resume_from_different_gaps_still_agree() {
+        let mut steady = Reservoir::new([9; 32], Epoch(20_000));
+        for e in 20_001..=20_050 {
+            steady.advance_to(Epoch(e));
+        }
+        let mut returning = Reservoir::new([9; 32], Epoch(20_000));
+        returning.advance_to(Epoch(20_050));
+
+        assert_eq!(steady.epoch(), returning.epoch());
+        assert_eq!(steady.root_bytes(), returning.root_bytes());
+        for d in 0..40u32 {
+            let e = Epoch(20_050 - d);
+            assert_eq!(
+                steady.chunk(e).map(|c| *c.expose()),
+                returning.chunk(e).map(|c| *c.expose()),
+                "epoch {} diverged",
+                e.0
+            );
+        }
     }
 
     #[test]
