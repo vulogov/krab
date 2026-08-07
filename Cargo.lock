@@ -622,6 +622,7 @@ dependencies = [
  "krab-crypto",
  "krab-fabric",
  "krab-node",
+ "krab-proto",
  "krab-store",
  "ratatui",
  "zeroize",

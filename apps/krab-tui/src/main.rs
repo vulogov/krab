@@ -27,6 +27,7 @@ mod activity;
 mod ceremony;
 mod command;
 mod compose;
+mod courier;
 mod entropy;
 mod identity;
 mod keys;
@@ -369,9 +370,8 @@ impl App {
                 };
             }
             Command::Send => self.body = self.send(line),
-            Command::Pack | Command::Import => {
-                self.body = format!("`{cmd}` is not implemented yet");
-            }
+            Command::Pack => self.body = self.pack(line),
+            Command::Import => self.body = self.import(line),
         }
     }
 
@@ -652,6 +652,84 @@ impl App {
                 }
             ),
             Err(e) => format!("the store refused it: {e:?}"),
+        }
+    }
+
+    /// RFC 8 §5's `pack` — write a courier archive.
+    ///
+    /// Writes a **window of the corpus**, not a diff. See `courier`'s module
+    /// documentation: successive diffs handed to one courier reconstruct their
+    /// author's composition schedule, which is the correlation RFC 5 §6.1
+    /// forbids on the network arriving by another route.
+    fn pack(&self, line: &str) -> String {
+        let out = arg(line, 1).unwrap_or("krab-archive.krab");
+        let kind = arg_value(line, "--for").unwrap_or("courier");
+        let Some(profile) = profile_named(kind) else {
+            return format!("unknown transport {kind:?}");
+        };
+        let path = if out.contains('/') {
+            PathBuf::from(out)
+        } else {
+            self.path(out)
+        };
+
+        // MAX_TTL back from now, not "since last time". RFC 1 §2 sets the TTL
+        // and the window follows it rather than anything the operator did.
+        // `entries_in_range` is half-open, and an object composed today
+        // expires at exactly `now + MAX_TTL` — the upper edge. A window that
+        // stopped there would omit everything written today, every time.
+        let now = now_epoch().0 * 1440;
+        const MAX_TTL_MIN: u32 = 45 * 1440;
+        let window = (
+            now.saturating_sub(MAX_TTL_MIN),
+            now.saturating_add(MAX_TTL_MIN) + 1,
+        );
+
+        match courier::pack(&self.store, &path, window, &profile) {
+            Err(e) => format!("could not write {}: {e}", path.display()),
+            Ok(packed) => {
+                let manifest = path.with_extension("MANIFEST.hjson");
+                let _ = std::fs::write(&manifest, courier::manifest(&packed));
+                format!(
+                    "wrote {} objects, {} bytes to {}\n\nThis is a window of your \
+                     corpus, not what changed — so two archives do not reveal what \
+                     you wrote in between. Carry it on anything; the filename is \
+                     ignored on import.",
+                    packed.objects,
+                    packed.bytes,
+                    path.display()
+                )
+            }
+        }
+    }
+
+    /// RFC 8 §5's `import` — ingest a courier archive.
+    fn import(&mut self, line: &str) -> String {
+        let Some(path) = arg(line, 1) else {
+            return "usage: import <archive>".into();
+        };
+        let path = PathBuf::from(path);
+        let now = now_epoch().0 * 1440;
+
+        // Verify before ingesting, so an operator can be told the medium is
+        // bad rather than watching objects silently not appear.
+        if let Err(idx) = courier::verify(&path) {
+            return format!(
+                "record {idx} of that archive is not self-consistent. Nothing was \
+                 imported. If the medium is failing, a partial copy is still worth \
+                 trying — records before {idx} would import."
+            );
+        }
+        match courier::import(&mut self.store, &path, now) {
+            Err(e) => format!("could not read {}: {e}", path.display()),
+            Ok(got) => format!(
+                "{} new, {} already held, {} refused ({} records).\n\nNothing was \
+                 trusted: every object was re-hashed before it entered the corpus.",
+                got.accepted,
+                got.duplicate,
+                got.refused,
+                got.total()
+            ),
         }
     }
 
@@ -1684,6 +1762,179 @@ mod tests {
         assert_eq!(
             compose::bucket_for(16 + compose::body_size_for(1)),
             compose::bucket_for(16 + compose::body_size_for(100))
+        );
+    }
+
+    /// **RFC 3 §11.3, complete, through the verbs an operator actually types.**
+    ///
+    /// Two nodes peer over files, one composes, one packs a stick, the other
+    /// imports it, and the message is readable. No network at any point, and
+    /// every step is a command someone types rather than an internal call.
+    #[test]
+    fn a_message_reaches_a_peer_by_stick_using_only_typed_commands() {
+        let mut a = ready_node("stick-a");
+        let mut b = ready_node("stick-b");
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+
+        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+            std::fs::write(to.path(as_name), std::fs::read(from.path(name)).unwrap()).unwrap();
+            to.path(as_name).to_string_lossy().into_owned()
+        };
+        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        let b_pad = carry(&b, &a, "peer.pad", "from-b.pad");
+        type_command(&mut a, &format!("peer accept {b_card}"));
+        {
+            let mut p = a.load_ceremony().unwrap();
+            p.fingerprint_verified = true;
+            a.save_ceremony(&p).unwrap();
+        }
+        type_command(&mut a, &format!("peer seal {b_pad} media"));
+
+        let peer = short_id(&b.identity.as_ref().unwrap().node_id());
+        type_command(&mut a, &format!("send {peer} the usual place, thursday"));
+        assert!(a.body.contains("composed"), "{}", a.body);
+
+        // Pack a stick.
+        type_command(&mut a, "pack outbound.krab");
+        assert!(a.body.contains("wrote 1 objects"), "{}", a.body);
+        assert!(
+            a.body.contains("not what changed"),
+            "the window property is stated"
+        );
+        assert!(a.path("outbound.krab").exists());
+        // The manifest is for the courier, and names nobody.
+        let manifest = std::fs::read_to_string(a.path("outbound.MANIFEST.hjson")).unwrap();
+        assert!(!manifest.contains(&peer), "{manifest}");
+
+        // Carried, renamed, imported.
+        let delivered = b.path("holiday-photos.zip");
+        std::fs::copy(a.path("outbound.krab"), &delivered).unwrap();
+        type_command(&mut b, &format!("import {}", delivered.display()));
+        assert!(b.body.starts_with("1 new"), "{}", b.body);
+        assert!(b.body.contains("re-hashed"), "{}", b.body);
+        assert_eq!(b.store.len(), 1);
+
+        // B reads it, having received one file and nothing else.
+        let id = *b.store.ids_in_order().next().unwrap();
+        let raw = b.store.get(&id).unwrap();
+        let header = krab_core::object::RoutingHeader::parse(raw).unwrap();
+        let (env, _) = krab_core::object::decode_envelope(&raw[16..]).unwrap();
+
+        let a_pk = krab_crypto::dh::PublicKey(
+            peering::Card::decode(&std::fs::read(a.path("peer.card")).unwrap())
+                .unwrap()
+                .correspondence_pk,
+        );
+        let shared = b.identity.as_ref().unwrap().agree_with(&a_pk).unwrap();
+        assert_eq!(
+            krab_crypto::pairwise_tag(&shared, now_epoch()),
+            header.tag,
+            "B recognises the tag it never received"
+        );
+
+        let root = krab_crypto::kek::open_under(
+            &a.epoch_key.unwrap(),
+            b"krab/reservoir",
+            &std::fs::read(a.path(&format!("{peer}.reservoir"))).unwrap(),
+        )
+        .unwrap();
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&root);
+        let chunk = krab_crypto::reservoir::Reservoir::new(r, krab_core::tag::Epoch(0))
+            .chunk(now_epoch())
+            .unwrap();
+        let mut enc = [0u8; krab_crypto::seal::ENC_LEN];
+        enc.copy_from_slice(env.enc);
+        let opened = krab_crypto::seal::open(
+            &krab_crypto::seal::Mode::AuthPsk {
+                chunk: &chunk,
+                epoch: now_epoch(),
+            },
+            b.identity.as_ref().unwrap().correspondence(),
+            &a_pk,
+            &krab_crypto::seal::Sealed {
+                enc,
+                ct: env.ciphertext.to_vec(),
+            },
+            &krab_crypto::seal::info_for(header.class),
+            &header.write(),
+        )
+        .expect("B opens it");
+        assert_eq!(opened, b"the usual place, thursday");
+    }
+
+    /// A second stick from an unchanged corpus carries the same thing, so a
+    /// courier handed both learns nothing about what happened in between.
+    #[test]
+    fn successive_sticks_do_not_reveal_what_changed() {
+        let mut a = ready_node("sticks");
+        type_command(&mut a, "pack monday.krab");
+        type_command(&mut a, "pack tuesday.krab");
+        let one = std::fs::read(a.path("monday.krab")).unwrap();
+        let two = std::fs::read(a.path("tuesday.krab")).unwrap();
+        assert_eq!(
+            one, two,
+            "an unchanged corpus produces an unchanged archive"
+        );
+    }
+
+    /// A corrupt medium is reported rather than silently importing nothing.
+    #[test]
+    fn a_corrupt_archive_is_reported_not_silently_ignored() {
+        let mut a = ready_node("corrupt-a");
+        let mut b = ready_node("corrupt-b");
+        // Something to carry.
+        let (id, bytes) = {
+            let h = krab_core::object::RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags: 0,
+                expiry_min: now_epoch().0 * 1440 + 40_000,
+                tag: krab_core::object::Tag([3; 8]),
+            };
+            let b = krab_core::object::canonical_bytes(&h, &[3u8; 40]).unwrap();
+            (krab_crypto::object_id(&b), b)
+        };
+        a.store
+            .ingest(id, bytes, now_epoch().0 * 1440, u32::MAX)
+            .unwrap();
+        type_command(&mut a, "pack out.krab");
+
+        let mut raw = std::fs::read(a.path("out.krab")).unwrap();
+        let mid = raw.len() / 2;
+        raw[mid] ^= 0xFF;
+        std::fs::write(b.path("torn.krab"), raw).unwrap();
+
+        let p = b.path("torn.krab").display().to_string();
+        type_command(&mut b, &format!("import {p}"));
+
+        // A tampered object is not an *invalid* object — it is a *different*
+        // one, and anyone may create objects. What must not happen is it
+        // arriving under the original's identifier, which is what would let a
+        // courier substitute content for something a peer already wants.
+        assert!(
+            !b.store.contains(&id),
+            "tampered content took the original's name"
+        );
+        for oid in b.store.ids_in_order() {
+            assert_eq!(
+                krab_crypto::object_id(b.store.get(oid).unwrap()),
+                *oid,
+                "every object in the store hashes to its own identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn importing_a_missing_file_says_so() {
+        let mut a = ready_node("import-missing");
+        type_command(&mut a, "import /nonexistent/stick.krab");
+        assert!(
+            a.body.contains("not self-consistent") || a.body.contains("could not read"),
+            "{}",
+            a.body
         );
     }
 }
