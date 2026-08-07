@@ -74,6 +74,17 @@ fn expand_tag(prk: &[u8; 32], label: &[u8], epoch: Epoch) -> Tag {
     Tag(out)
 }
 
+/// The frozen construction, exposed for RFC 1 §12's vector file.
+///
+/// Takes a PRK directly rather than a [`Shared`], so a vector can be pinned
+/// without depending on X25519's clamping — which is what lets a second
+/// implementation check the KDF with nothing but HMAC-SHA256.
+///
+/// Not for production use: the two callers below are the correct ones.
+pub fn expand_tag_for_vectors(prk: &[u8; 32], label: &[u8], epoch: Epoch) -> Tag {
+    expand_tag(prk, label, epoch)
+}
+
 /// The pairwise tag for `epoch`, RFC 1 §6.2 / RFC 2 §4.1.
 ///
 /// Unlinkable across epochs and across senders. `S` is stable per pair, so a
