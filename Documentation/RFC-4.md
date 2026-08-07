@@ -313,6 +313,26 @@ tools — and it means parsing an attacker-supplied database with a library
 that has a long history of CVEs against malformed files. Import into your
 own store; never open theirs.
 
+**An archive is a window, not a diff.**
+
+```
+A courier archive MUST contain a time window of the sender's corpus, selected
+by expiry range and independent of when any object was acquired or composed.
+An implementation MUST NOT restrict an archive to objects acquired since a
+previous archive.
+```
+
+An archive of what changed is a statement about what its author did between two
+dates. Successive archives handed to one courier reconstruct the sender's
+composition schedule, which is the correlation RFC 5 §6.1 forbids on the
+network arriving by another route.
+
+This is what the capacity note above is for. "Capacity never binds" is not
+reassurance about disk sizes; it is the reason the privacy-preserving choice is
+free. An implementer optimising the obvious way — send only what is new, it is
+smaller — builds a timing oracle, and nothing else in this section tells them
+not to.
+
 A separate human-readable `MANIFEST.hjson` MAY accompany the archive for
 the courier's benefit. This is where HJSON is genuinely the right format:
 a human reads it, nothing signs it, and nothing hashes it.

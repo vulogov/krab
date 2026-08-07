@@ -367,7 +367,7 @@ mod tests {
             name: name.into(),
             correspondence: theirs.public(),
             shared: krab_crypto::agree(ours, &theirs.public()).unwrap(),
-            reservoir: root.map(|r| Reservoir::new(r, Epoch(0))),
+            reservoir: root.map(|r| Reservoir::new(r, NOW)),
         }
     }
 
@@ -382,7 +382,7 @@ mod tests {
     ) -> ObjectId {
         let shared = krab_crypto::agree(from, &to.public()).unwrap();
         let tag = krab_crypto::pairwise_tag(&shared, epoch);
-        let chunk = root.map(|r| Reservoir::new(r, Epoch(0)).chunk(epoch).unwrap());
+        let chunk = root.map(|r| Reservoir::new(r, epoch).chunk(epoch).unwrap());
         let composed = seal_to(
             from,
             &Recipient::Known {

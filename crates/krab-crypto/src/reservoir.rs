@@ -45,6 +45,7 @@
 //! one differ by which function you call.
 
 use crate::secret::Secret;
+use alloc::collections::BTreeMap;
 use hkdf::Hkdf;
 use krab_core::tag::Epoch;
 use sha2::Sha256;
@@ -53,76 +54,143 @@ use sha2::Sha256;
 /// module documentation.
 pub const LABEL_CHUNK: &[u8] = b"krab/chunk/v1";
 
+/// Domain label for the epoch ratchet.
+///
+/// **Also not specified by RFC 7 §6**, and its absence is worse than the
+/// chunk label's — without a ratchet, §6's destruction claim is false. See
+/// `CRYPTO-REVIEW.md` §11.
+pub const LABEL_RATCHET: &[u8] = b"krab/ratchet/v1";
+
 /// A per-epoch chunk. Zeroized on drop.
 pub type Chunk = Secret<32>;
 
-/// The reservoir root, `R_A ⊕ R_B` (RFC 7 §6.2).
+/// The reservoir: a **one-way ratchet** plus the chunks still inside the
+/// retention window.
 ///
-/// Held wrapped under the epoch key at rest; this is the in-memory form.
+/// # Why this is a ratchet and not a root
+///
+/// RFC 7 §6 says that at the close of epoch N, `chunk_N` "is destroyed. Every
+/// message of that epoch becomes permanently undecryptable — by anyone,
+/// including the participants."
+///
+/// A static root cannot deliver that. `chunk_N = HKDF(reservoir, N)` is a pure
+/// function, so anyone holding the reservoir recomputes any chunk they like in
+/// microseconds. Destroying a chunk while retaining the value it derives from
+/// destroys nothing.
+///
+/// The root also cannot simply be shredded with the epoch key, because epoch
+/// N+1 needs it — so a naive implementation either keeps the root forever
+/// (destruction is illusory) or loses the peering at the first shred.
+///
+/// A ratchet resolves both:
+///
+/// ```text
+/// chunk_N  = HKDF(root_N, "krab/chunk/v1"   ‖ u32_le(N),   32)
+/// root_N+1 = HKDF(root_N, "krab/ratchet/v1" ‖ u32_le(N+1), 32)
+/// ```
+///
+/// `root_N` is destroyed once `root_N+1` exists. The peering survives, and
+/// `chunk_N` becomes underivable — because inverting HKDF is the assumption
+/// everything else here already rests on.
+///
+/// # Why chunks are retained rather than re-derived
+///
+/// RFC 1 §6.2's acceptance window is `MAX_TTL`, so an object may arrive up to
+/// 45 epochs after the epoch its tag derives from. Those chunks must remain
+/// available or the mail is stored and undecryptable — the silent failure
+/// RFC 0 §6 guarantees nobody is told about.
+///
+/// So the retained window holds derived chunks, and the ratchet has already
+/// passed them. 45 chunks at 32 bytes is 1 440 bytes, alongside RFC 7 §4.1's
+/// 2 700 bytes of epoch wrappers.
 pub struct Reservoir {
+    /// `root_N` for the current epoch. Ratcheted forward, never rewound.
     root: Secret<32>,
-    /// The oldest epoch still derivable. Below this, chunks are shredded.
+    /// The epoch `root` corresponds to.
+    epoch: Epoch,
+    /// Derived chunks still inside the retention window.
+    retained: BTreeMap<u32, Chunk>,
+    /// The oldest epoch still retained.
     floor: Epoch,
 }
 
 impl core::fmt::Debug for Reservoir {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // The floor is operational metadata; the root is not.
-        write!(f, "Reservoir(floor: {})", self.floor.0)
+        // Operational metadata only.
+        write!(
+            f,
+            "Reservoir(epoch: {}, floor: {}, retained: {})",
+            self.epoch.0,
+            self.floor.0,
+            self.retained.len()
+        )
     }
 }
 
 impl Reservoir {
-    /// Adopt a root established by RFC 3 §11's ceremony.
-    ///
-    /// `floor` is the first epoch this reservoir covers — chunks before it are
-    /// never derivable, which is what makes shredding monotonic.
-    pub fn new(root: [u8; 32], floor: Epoch) -> Reservoir {
-        Reservoir {
+    /// Adopt a root established by RFC 3 §11's ceremony, as of `epoch`.
+    pub fn new(root: [u8; 32], epoch: Epoch) -> Reservoir {
+        let mut r = Reservoir {
             root: Secret::new(root),
-            floor,
+            epoch,
+            retained: BTreeMap::new(),
+            floor: epoch,
+        };
+        r.derive_current();
+        r
+    }
+
+    fn derive_current(&mut self) {
+        if self.root.is_destroyed() {
+            return;
+        }
+        let c = expand(self.root.expose(), LABEL_CHUNK, self.epoch);
+        self.retained.insert(self.epoch.0, c);
+    }
+
+    /// Advance to `to`, deriving each chunk on the way and destroying each
+    /// intermediate root.
+    ///
+    /// Idempotent, and **never rewinds**: asking to advance backwards is a
+    /// no-op rather than an error, because the alternative is a caller with a
+    /// stale clock silently resurrecting a destroyed epoch.
+    pub fn advance_to(&mut self, to: Epoch) {
+        if self.root.is_destroyed() || to <= self.epoch {
+            return;
+        }
+        // Bounded so a wildly wrong clock cannot spin for 2³² iterations.
+        let steps = (to.0 - self.epoch.0).min(4 * 365);
+        for _ in 0..steps {
+            let next = Epoch(self.epoch.0 + 1);
+            let new_root = expand32(self.root.expose(), LABEL_RATCHET, next);
+            // The old root dies here. This line is the destruction claim.
+            self.root.destroy();
+            self.root = Secret::new(new_root);
+            self.epoch = next;
+            self.derive_current();
         }
     }
 
-    /// `chunk_N` for `epoch`, or `None` if it has been shredded.
+    /// `chunk_N` for `epoch`, or `None` if it is outside the retained window.
     ///
-    /// Returning `None` rather than deriving anyway is the whole mechanism: the
-    /// root still exists and the arithmetic would still work, so a caller that
-    /// bypassed this would silently resurrect an epoch RFC 7 §4 promised was
-    /// destroyed.
+    /// Returns `None` for a **future** epoch too: the chunk is derivable only
+    /// after the ratchet reaches it, and a caller asking early would otherwise
+    /// get a value that depends on a root it should not still hold.
     pub fn chunk(&self, epoch: Epoch) -> Option<Chunk> {
-        // Destruction is asked about directly rather than encoded as a
-        // sentinel floor. A sentinel has a boundary, and a boundary in a
-        // "can this still be derived" check is a bug that hands back a chunk
-        // that was supposed to be gone.
-        if self.root.is_destroyed() || epoch < self.floor {
-            return None;
-        }
-        let hk = Hkdf::<Sha256>::from_prk(self.root.expose())
-            .expect("32-byte root matches SHA-256 output length");
-        let mut info = [0u8; 20];
-        info[..LABEL_CHUNK.len()].copy_from_slice(LABEL_CHUNK);
-        info[LABEL_CHUNK.len()..LABEL_CHUNK.len() + 4].copy_from_slice(&epoch.to_le_bytes());
-
-        let mut out = [0u8; 32];
-        hk.expand(&info[..LABEL_CHUNK.len() + 4], &mut out)
-            .expect("32 bytes is far below 255·HashLen");
-        let c = Secret::new(out);
-        // `out` is a stack copy of a chunk.
-        use zeroize::Zeroize;
-        out.zeroize();
-        Some(c)
+        self.retained
+            .get(&epoch.0)
+            .map(|c| Secret::new(*c.expose()))
     }
 
     /// Shred every chunk before `keep_from` — RFC 7 §4 and §6.
     ///
-    /// Monotonic: the floor only rises. A caller cannot lower it to recover an
-    /// epoch, because "erase" in this series means a thing becomes impossible,
-    /// not merely unavailable.
+    /// Monotone, and now genuinely destructive: the chunk is dropped and the
+    /// root it derived from is already gone, so nothing recomputes it.
     pub fn shred_before(&mut self, keep_from: Epoch) {
         if keep_from > self.floor {
             self.floor = keep_from;
         }
+        self.retained.retain(|&e, _| e >= self.floor.0);
     }
 
     /// The oldest derivable epoch.
@@ -130,10 +198,53 @@ impl Reservoir {
         self.floor
     }
 
-    /// Destroy the root. Every epoch becomes underivable at once.
+    /// The epoch the ratchet has reached.
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// Chunks currently retained. RFC 1 §6.2's window is 45 either side.
+    pub fn retained(&self) -> usize {
+        self.retained.len()
+    }
+
+    /// The current root, for wrapping at rest.
+    ///
+    /// This is `root_N`, not the value the ceremony produced — that one no
+    /// longer exists once the ratchet has moved. Storing it is what carries a
+    /// peering across a restart.
+    pub fn root_bytes(&self) -> Option<[u8; 32]> {
+        if self.root.is_destroyed() {
+            return None;
+        }
+        Some(*self.root.expose())
+    }
+
+    /// Destroy the root and every retained chunk. Every epoch, at once.
     pub fn destroy(&mut self) {
         self.root.destroy();
+        for (_, c) in self.retained.iter_mut() {
+            c.destroy();
+        }
+        self.retained.clear();
     }
+}
+
+fn expand(prk: &[u8; 32], label: &[u8], epoch: Epoch) -> Chunk {
+    Secret::new(expand32(prk, label, epoch))
+}
+
+fn expand32(prk: &[u8; 32], label: &[u8], epoch: Epoch) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::from_prk(prk).expect("32-byte PRK matches SHA-256 output length");
+    let mut info = [0u8; 24];
+    let n = label.len();
+    info[..n].copy_from_slice(label);
+    info[n..n + 4].copy_from_slice(&epoch.to_le_bytes());
+
+    let mut out = [0u8; 32];
+    hk.expand(&info[..n + 4], &mut out)
+        .expect("32 bytes is far below 255·HashLen");
+    out
 }
 
 #[cfg(test)]
@@ -144,30 +255,36 @@ mod tests {
     const NOW: Epoch = Epoch(20_671);
 
     fn reservoir() -> Reservoir {
-        Reservoir::new([0x5A; 32], Epoch(NOW.0 - 45))
+        let mut r = Reservoir::new([0x5A; 32], Epoch(NOW.0 - 45));
+        r.advance_to(NOW);
+        r
     }
 
-    /// Both ends derive the same chunk from the same root — the property the
-    /// whole scheme rests on, and the reason `R_A ⊕ R_B` must agree.
+    /// Both ends derive the same chunks from the same root, having ratcheted
+    /// the same distance.
     #[test]
-    fn the_same_root_yields_the_same_chunks() {
+    fn the_same_root_and_the_same_ratchet_yield_the_same_chunks() {
         let a = reservoir();
         let b = reservoir();
-        for d in 0..5 {
-            let e = Epoch(NOW.0 + d);
-            assert_eq!(a.chunk(e).unwrap().expose(), b.chunk(e).unwrap().expose());
+        for d in 0..40u32 {
+            let e = Epoch(NOW.0 - d);
+            assert_eq!(
+                a.chunk(e).map(|c| *c.expose()),
+                b.chunk(e).map(|c| *c.expose()),
+                "epoch {}",
+                e.0
+            );
         }
     }
 
-    /// Chunks are independent: compromising one exposes that epoch's traffic
-    /// with that peer and nothing else (RFC 7 §6.1's stated tradeoff).
     #[test]
     fn every_epoch_gets_a_distinct_chunk() {
         let r = reservoir();
-        let mut seen: Vec<[u8; 32]> = (0..40)
-            .map(|d| *r.chunk(Epoch(NOW.0 + d)).unwrap().expose())
+        let mut seen: Vec<[u8; 32]> = (0..40u32)
+            .filter_map(|d| r.chunk(Epoch(NOW.0 - d)).map(|c| *c.expose()))
             .collect();
         let before = seen.len();
+        assert!(before > 30, "only {before} chunks retained");
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(
@@ -179,71 +296,140 @@ mod tests {
 
     #[test]
     fn different_roots_share_no_chunks() {
-        let a = Reservoir::new([1; 32], Epoch(0));
-        let b = Reservoir::new([2; 32], Epoch(0));
+        let mut a = Reservoir::new([1; 32], NOW);
+        let mut b = Reservoir::new([2; 32], NOW);
+        a.advance_to(Epoch(NOW.0 + 1));
+        b.advance_to(Epoch(NOW.0 + 1));
         assert_ne!(
-            a.chunk(NOW).unwrap().expose(),
-            b.chunk(NOW).unwrap().expose()
+            a.chunk(NOW).map(|c| *c.expose()),
+            b.chunk(NOW).map(|c| *c.expose())
         );
     }
 
-    /// **RFC 7 §4's promise.** A shredded epoch is not merely unavailable: it
-    /// cannot be produced, even though the root is still right there.
+    /// **The finding this rewrite exists for.** Under a static root, a shredded
+    /// chunk was recomputable in microseconds from the value it derived from,
+    /// so RFC 7 §6's "permanently undecryptable — by anyone, including the
+    /// participants" was false. Under a ratchet it is true.
     #[test]
-    fn a_shredded_epoch_cannot_be_derived_though_the_root_remains() {
+    fn a_shredded_chunk_cannot_be_recomputed_from_what_remains() {
         let mut r = reservoir();
-        let target = Epoch(NOW.0 - 45);
+        let target = Epoch(NOW.0 - 40);
         assert!(r.chunk(target).is_some());
+        let before = *r.chunk(target).unwrap().expose();
 
-        r.shred_before(Epoch(NOW.0 - 44));
-        assert!(r.chunk(target).is_none(), "gone");
-        assert!(r.chunk(NOW).is_some(), "and only that epoch");
+        r.shred_before(Epoch(NOW.0 - 39));
+        assert!(r.chunk(target).is_none(), "gone from the window");
+
+        // And the root cannot regenerate it: the root has ratcheted past that
+        // epoch, and the intermediate roots were destroyed on the way.
+        let root = r.root_bytes().expect("the peering survives");
+        let mut fresh = Reservoir::new(root, r.epoch());
+        fresh.advance_to(Epoch(NOW.0 + 10));
+        assert!(
+            fresh.chunk(target).is_none(),
+            "the current root regenerated a destroyed chunk"
+        );
+        // Nor does deriving directly from the current root reproduce it.
+        assert_ne!(*expand(&root, LABEL_CHUNK, target).expose(), before);
     }
 
-    /// Shredding is monotonic — an epoch cannot be recovered by lowering the
-    /// floor, because that would make "erase" mean "hide".
+    /// **The peering survives the destruction**, which is the half a naive
+    /// implementation gets wrong in the other direction: shredding the root
+    /// with the epoch key would lose the correspondent entirely.
     #[test]
-    fn the_floor_only_rises() {
+    fn the_peering_survives_across_epochs_and_a_restart() {
         let mut r = reservoir();
-        r.shred_before(Epoch(NOW.0));
-        let high = r.floor();
-        r.shred_before(Epoch(NOW.0 - 100));
-        assert_eq!(r.floor(), high, "the floor did not drop");
-        assert!(r.chunk(Epoch(NOW.0 - 1)).is_none());
-    }
+        let root = r.root_bytes().unwrap();
+        let epoch = r.epoch();
 
-    /// Destroying the root ends every epoch, including the boundary ones an
-    /// off-by-one would let through.
-    #[test]
-    fn destroying_the_root_ends_every_epoch_at_once() {
-        let mut r = reservoir();
-        assert!(r.chunk(NOW).is_some());
-        r.destroy();
-        for e in [
-            Epoch(0),
-            Epoch(NOW.0 - 45),
-            NOW,
-            Epoch(u32::MAX - 1),
-            Epoch(u32::MAX),
-        ] {
-            assert!(r.chunk(e).is_none(), "epoch {} survived destruction", e.0);
+        // A restart: only the wrapped root survived.
+        let mut restored = Reservoir::new(root, epoch);
+        restored.advance_to(Epoch(epoch.0 + 3));
+        r.advance_to(Epoch(epoch.0 + 3));
+
+        for d in 0..3u32 {
+            let e = Epoch(epoch.0 + d);
+            assert_eq!(
+                r.chunk(e).map(|c| *c.expose()),
+                restored.chunk(e).map(|c| *c.expose()),
+                "epoch {} diverged across a restart",
+                e.0
+            );
         }
     }
 
-    /// RFC 7 §6.1's figure: 45 epochs of retention is 45 chunks of 32 bytes.
+    /// The ratchet never rewinds. A caller with a stale clock must not
+    /// resurrect a destroyed epoch.
     #[test]
-    fn a_retention_window_costs_what_rfc7_says() {
-        let n = 45usize;
-        assert_eq!(n * 32, 1_440, "45 epochs at 32 bytes");
-        // And a peer-year, §6.1's headline comparison.
+    fn the_ratchet_does_not_rewind() {
+        let mut r = reservoir();
+        let at = r.epoch();
+        r.advance_to(Epoch(at.0 - 10));
+        assert_eq!(r.epoch(), at, "advancing backwards moved the ratchet");
+        r.advance_to(at);
+        assert_eq!(r.epoch(), at, "advancing to the current epoch is a no-op");
+    }
+
+    /// A future chunk is not derivable before the ratchet reaches it.
+    #[test]
+    fn a_future_chunk_is_not_available_early() {
+        let r = reservoir();
+        assert!(r.chunk(Epoch(NOW.0 + 1)).is_none());
+        assert!(r.chunk(NOW).is_some());
+    }
+
+    /// RFC 1 §6.2's acceptance window: an object may arrive up to MAX_TTL after
+    /// its epoch, so those chunks must still be there or the mail is stored and
+    /// undecryptable, silently.
+    #[test]
+    fn the_retention_window_covers_max_ttl() {
+        let mut r = Reservoir::new([7; 32], Epoch(NOW.0 - 45));
+        r.advance_to(NOW);
+        assert!(
+            r.chunk(Epoch(NOW.0 - 45)).is_some(),
+            "the far edge of MAX_TTL"
+        );
+        assert_eq!(r.retained(), 46, "45 epochs back plus today");
+        assert_eq!(46 * 32, 1_472, "under 1.5 KB of chunks");
+    }
+
+    #[test]
+    fn shredding_is_monotone() {
+        let mut r = reservoir();
+        r.shred_before(NOW);
+        let high = r.floor();
+        r.shred_before(Epoch(NOW.0 - 100));
+        assert_eq!(r.floor(), high, "the floor fell");
+        assert!(r.chunk(Epoch(NOW.0 - 1)).is_none());
+    }
+
+    #[test]
+    fn destroying_ends_every_epoch_at_once() {
+        let mut r = reservoir();
+        assert!(r.chunk(NOW).is_some());
+        r.destroy();
+        assert!(r.root_bytes().is_none());
+        for d in 0..46u32 {
+            assert!(
+                r.chunk(Epoch(NOW.0 - d)).is_none(),
+                "epoch {} survived",
+                NOW.0 - d
+            );
+        }
+    }
+
+    /// RFC 7 §6.1's figures.
+    #[test]
+    fn a_peer_year_costs_what_rfc7_says() {
         assert_eq!(365 * 32, 11_680, "under 12 KB for a peer-year");
+        assert_eq!(45 * 32, 1_440, "a 45-epoch window");
     }
 
     #[test]
     fn a_reservoir_prints_no_secret() {
         let r = reservoir();
         let s = alloc::format!("{r:?}");
-        assert!(s.starts_with("Reservoir(floor:"), "{s}");
+        assert!(s.starts_with("Reservoir(epoch:"), "{s}");
         assert!(!s.contains("5a") && !s.contains("90"), "{s}");
     }
 }
