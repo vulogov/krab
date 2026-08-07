@@ -412,15 +412,19 @@ impl App {
                     continue;
                 };
 
-                // The stored root is `root_N` for the epoch it was last
-                // ratcheted to, so it is adopted at the current epoch. A real
-                // deployment stores the epoch alongside it; see
-                // `CRYPTO-REVIEW.md` §11.3 on what still needs wiring.
+                // The stored record carries `root_N` and `N`, so the ratchet
+                // resumes at the right index and advances to today. A node
+                // returning after a gap derives every chunk it missed on the
+                // way, and destroys each intermediate root (RFC 7 §6).
                 let reservoir = std::fs::read(self.path(&format!("{name}.reservoir")))
                     .ok()
                     .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/reservoir", &s).ok())
-                    .and_then(|r| <[u8; 32]>::try_from(r.as_slice()).ok())
-                    .map(|root| krab_crypto::reservoir::Reservoir::new(root, now_epoch()));
+                    .and_then(|r| persist::decode_reservoir(&r).ok())
+                    .map(|(root, stored_epoch)| {
+                        let mut res = krab_crypto::reservoir::Reservoir::new(root, stored_epoch);
+                        res.advance_to(now_epoch());
+                        res
+                    });
 
                 // A completed peering is a peer worth reconciling with. Adding
                 // is not triggering: the first interval is drawn from entropy.
@@ -864,8 +868,11 @@ impl App {
         }
 
         // Seal the reservoir under W_N and retire the ceremony.
+        // Root *and* ratchet epoch (RFC 7 §6.4). The ceremony's output is
+        // root_N for the current epoch, so that is what is recorded.
+        let record = persist::encode_reservoir(&reservoir, now_epoch());
         let out = match self.epoch_key.and_then(|w| {
-            krab_crypto::kek::seal_under(&w, b"krab/reservoir", &reservoir, &mut OsRng).ok()
+            krab_crypto::kek::seal_under(&w, b"krab/reservoir", &record, &mut OsRng).ok()
         }) {
             Some(sealed) => sealed,
             None => return "locked".into(),
@@ -964,8 +971,12 @@ impl App {
         let reservoir = std::fs::read(self.path(&format!("{peer}.reservoir")))
             .ok()
             .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
-            .and_then(|raw| <[u8; 32]>::try_from(raw.as_slice()).ok())
-            .map(|root| krab_crypto::reservoir::Reservoir::new(root, epoch));
+            .and_then(|raw| persist::decode_reservoir(&raw).ok())
+            .map(|(root, stored_epoch)| {
+                let mut r = krab_crypto::reservoir::Reservoir::new(root, stored_epoch);
+                r.advance_to(epoch);
+                r
+            });
         let chunk = reservoir.as_ref().and_then(|r| r.chunk(epoch));
 
         let their_pk = krab_crypto::dh::PublicKey(card.correspondence_pk);
@@ -2396,17 +2407,17 @@ mod tests {
         // B never sealed (it only offered), so B has no reservoir file. The
         // chunk therefore comes from A's root, which is the same value.
         let _ = chunk;
-        let root = krab_crypto::kek::open_under(
+        // The stored record is root + ratchet epoch (RFC 7 §6.4).
+        let record = krab_crypto::kek::open_under(
             &a.epoch_key.unwrap(),
             b"krab/reservoir",
             &std::fs::read(a.path(&format!("{peer}.reservoir"))).unwrap(),
         )
         .unwrap();
-        let mut r = [0u8; 32];
-        r.copy_from_slice(&root);
-        let chunk = krab_crypto::reservoir::Reservoir::new(r, now_epoch())
-            .chunk(now_epoch())
-            .unwrap();
+        let (r, stored_epoch) = persist::decode_reservoir(&record).unwrap();
+        let mut res = krab_crypto::reservoir::Reservoir::new(r, stored_epoch);
+        res.advance_to(now_epoch());
+        let chunk = res.chunk(now_epoch()).unwrap();
 
         let mut enc = [0u8; krab_crypto::seal::ENC_LEN];
         enc.copy_from_slice(env.enc);
@@ -2527,17 +2538,17 @@ mod tests {
             "B recognises the tag it never received"
         );
 
-        let root = krab_crypto::kek::open_under(
+        // The stored record is root + ratchet epoch (RFC 7 §6.4).
+        let record = krab_crypto::kek::open_under(
             &a.epoch_key.unwrap(),
             b"krab/reservoir",
             &std::fs::read(a.path(&format!("{peer}.reservoir"))).unwrap(),
         )
         .unwrap();
-        let mut r = [0u8; 32];
-        r.copy_from_slice(&root);
-        let chunk = krab_crypto::reservoir::Reservoir::new(r, now_epoch())
-            .chunk(now_epoch())
-            .unwrap();
+        let (r, stored_epoch) = persist::decode_reservoir(&record).unwrap();
+        let mut res = krab_crypto::reservoir::Reservoir::new(r, stored_epoch);
+        res.advance_to(now_epoch());
+        let chunk = res.chunk(now_epoch()).unwrap();
         let mut enc = [0u8; krab_crypto::seal::ENC_LEN];
         enc.copy_from_slice(env.enc);
         let opened = krab_crypto::seal::open(
@@ -3259,5 +3270,77 @@ mod tests {
         a.lock();
         type_command(&mut a, "request anything.card note");
         assert!(a.body.contains("locked"), "{}", a.body);
+    }
+
+    /// **CRYPTO-REVIEW.md §11.5, wired.** A node that was off for a long gap
+    /// resumes the ratchet at the recorded epoch rather than inferring one.
+    ///
+    /// Inferring is the silent failure: it derives chunks at the wrong index,
+    /// its peer does not recognise them, and RFC 0 §6 guarantees nobody is
+    /// told. The stored record therefore carries `root_N` and `N` together
+    /// (RFC 7 §6.4).
+    #[test]
+    fn a_reservoir_resumes_at_its_recorded_ratchet_epoch() {
+        let home = temp_home("ratchet-resume");
+        let mut a = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        let mut id = Identity::generate(&mut OsRng);
+        id.kek_params.m_kib = 64;
+        id.kek_params.t = 1;
+        id.kek_params.p = 1;
+        a.identity = Some(id);
+        a.passphrase.push_str("passphrase");
+        a.open_store().unwrap();
+
+        // A reservoir as the ceremony would have left it, some epochs ago.
+        let root = [0x5A; 32];
+        let then = krab_core::tag::Epoch(now_epoch().0 - 30);
+        let record = persist::encode_reservoir(&root, then);
+        let sealed = krab_crypto::kek::seal_under(
+            &a.epoch_key.unwrap(),
+            b"krab/reservoir",
+            &record,
+            &mut OsRng,
+        )
+        .unwrap();
+        std::fs::write(a.path("abcd1234.reservoir"), sealed).unwrap();
+
+        // What a peer that stayed up would hold today.
+        let mut peer = krab_crypto::reservoir::Reservoir::new(root, then);
+        peer.advance_to(now_epoch());
+
+        // What this node reconstructs from the record alone.
+        let raw = std::fs::read(a.path("abcd1234.reservoir")).unwrap();
+        let opened =
+            krab_crypto::kek::open_under(&a.epoch_key.unwrap(), b"krab/reservoir", &raw).unwrap();
+        let (stored_root, stored_epoch) = persist::decode_reservoir(&opened).unwrap();
+        assert_eq!(stored_epoch, then, "the ratchet position survived storage");
+
+        let mut mine = krab_crypto::reservoir::Reservoir::new(stored_root, stored_epoch);
+        mine.advance_to(now_epoch());
+
+        assert_eq!(mine.epoch(), peer.epoch(), "the ratchets agree");
+        assert_eq!(mine.root_bytes(), peer.root_bytes());
+        for d in 0..20u32 {
+            let e = krab_core::tag::Epoch(now_epoch().0 - d);
+            assert_eq!(
+                mine.chunk(e).map(|c| *c.expose()),
+                peer.chunk(e).map(|c| *c.expose()),
+                "epoch {} diverged after the gap",
+                e.0
+            );
+        }
+
+        // And adopting at the wrong epoch — what inferring would do — produces
+        // chunks the peer does not recognise. This is the failure being fixed.
+        let mut inferred = krab_crypto::reservoir::Reservoir::new(stored_root, now_epoch());
+        inferred.advance_to(now_epoch());
+        assert_ne!(
+            inferred.chunk(now_epoch()).map(|c| *c.expose()),
+            peer.chunk(now_epoch()).map(|c| *c.expose()),
+            "inferring the ratchet position must not accidentally agree"
+        );
     }
 }

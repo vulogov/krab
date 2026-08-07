@@ -280,6 +280,31 @@ then Expand. Extract is used here, unlike RFC 1 §6.2's tag derivation: a
 reservoir root is not a curve point and no existing tag space derives from it,
 so there is no namespace to fork and no reason to inherit that compromise.
 
+The reservoir is a **ratchet, not a constant**:
+
+```
+root_{N+1} = HKDF(root_N, "krab/ratchet/v1" ‖ u32_le(N+1), 32)
+```
+
+An implementation MUST destroy `root_N` once `root_{N+1}` is derived, and MUST
+NOT retain any value from which a destroyed chunk can be recomputed. Chunks
+within the acceptance window of RFC 1 §6.2 are retained directly; a chunk
+outside it MUST be unrecoverable.
+
+> **§6's destruction guarantee depends on this.** A reservoir stored as a
+> constant root satisfies every other requirement in this section and provides
+> none of the forward secrecy it claims: `chunk_N = HKDF(reservoir, N)` is a
+> pure function of a value the node must retain, because epoch N+1 needs it, so
+> destroying the chunk while keeping the reservoir destroys nothing.
+>
+> The two failure modes are exclusive, which is why a constant cannot be made
+> to work: keep the root and destruction is illusory; shred it with the epoch
+> key and the correspondent is lost. Recorded in `CRYPTO-REVIEW.md` §11.2.
+>
+> §6.3's "ratchet on contact" is a different mechanism and does not substitute.
+> It mixes fresh DH at contact, which strengthens the root against compromise;
+> between contacts the root is static, and that is where this guarantee lives.
+
 **Message keys** — the previous derivation is withdrawn. `chunk_N` is not a
 message key and MUST NOT be used as one:
 
@@ -435,6 +460,13 @@ until a contribution is exchanged over an independent channel.
 Reservoir exchange is step 3 of the peering ceremony (RFC 3 §11), not a separate
 operation someone might skip. The `peer-link` records the reservoir identifier
 and current epoch; **the material itself MUST NOT appear in the credential.**
+
+The recorded epoch is the **ratchet position**, and it is load-bearing rather
+than informational. A node stores `root_N` alongside `N`; on resuming it
+advances the ratchet from `N` to the current epoch. Storing the root without
+its epoch means a node returning after a gap infers the position, derives
+chunks at the wrong index, and its peer does not recognise them — silently,
+because RFC 0 §6 makes delivery failure silent by design.
 
 Steps 2 and 3 may be separated by days when the ceremony is conducted by
 courier, and an implementation holding a part-finished ceremony MUST NOT accept

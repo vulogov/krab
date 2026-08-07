@@ -51,6 +51,46 @@ use std::path::Path;
 /// Domain label binding the identity record to its purpose.
 pub const CONTEXT_IDENTITY: &[u8] = b"krab/identity/v1";
 
+/// Encode a reservoir for storage: the current root **and its ratchet epoch**.
+///
+/// RFC 7 §6.4 requires the peer-link record "the reservoir identifier and
+/// current epoch", and the epoch is load-bearing rather than informational.
+/// A root stored alone means a node returning after a gap infers the ratchet's
+/// position, derives chunks at the wrong index, and its peer does not
+/// recognise them — silently, because RFC 0 §6 makes delivery failure silent.
+///
+/// `CRYPTO-REVIEW.md` §11.5.
+pub fn encode_reservoir(root: &[u8; 32], epoch: krab_core::tag::Epoch) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.map(2);
+    w.uint(1).uint(epoch.0 as u64);
+    w.uint(2).bstr(root);
+    w.finish()
+}
+
+/// Decode a stored reservoir.
+///
+/// A record without an epoch is refused rather than defaulted. Guessing would
+/// mean guessing the ratchet position, and a wrong guess is the silent failure
+/// above — better to fail loudly at load than to derive unrecognisable tags
+/// for a day.
+pub fn decode_reservoir(bytes: &[u8]) -> Result<([u8; 32], krab_core::tag::Epoch), Error> {
+    let mut r = Reader::new(bytes);
+    let mut m = r.map().map_err(|_| Error::Malformed)?;
+    let (mut epoch, mut root) = (None, None);
+    while let Some(key) = m.key().map_err(|_| Error::Malformed)? {
+        match (key, m.value().map_err(|_| Error::Malformed)?) {
+            (1, Item::Uint(v)) => epoch = u32::try_from(v).ok(),
+            (2, Item::Bstr(b)) => root = <[u8; 32]>::try_from(b).ok(),
+            _ => return Err(Error::Malformed),
+        }
+    }
+    Ok((
+        root.ok_or(Error::Malformed)?,
+        krab_core::tag::Epoch(epoch.ok_or(Error::Malformed)?),
+    ))
+}
+
 /// Domain label for the duress marker — RFC 7 §10.
 ///
 /// Separate from [`CONTEXT_IDENTITY`] so the duress passphrase cannot open the
@@ -349,6 +389,34 @@ mod tests {
         }
         for oid in back.ids_in_order() {
             assert_eq!(krab_crypto::object_id(back.get(oid).unwrap()), *oid);
+        }
+    }
+
+    /// **RFC 7 §6.4 / CRYPTO-REVIEW.md §11.5.** The ratchet position travels
+    /// with the root, so a node returning after a gap resumes at the right
+    /// index rather than inferring one.
+    #[test]
+    fn a_stored_reservoir_carries_its_ratchet_epoch() {
+        let root = [0x5A; 32];
+        let epoch = krab_core::tag::Epoch(20_671);
+        let (back_root, back_epoch) = decode_reservoir(&encode_reservoir(&root, epoch)).unwrap();
+        assert_eq!(back_root, root);
+        assert_eq!(back_epoch, epoch);
+    }
+
+    /// A record without an epoch is refused, not defaulted. A guessed ratchet
+    /// position produces tags a peer does not recognise, silently.
+    #[test]
+    fn a_reservoir_without_an_epoch_is_refused() {
+        let mut w = Writer::new();
+        w.map(1);
+        w.uint(2).bstr(&[0u8; 32]);
+        assert_eq!(decode_reservoir(&w.finish()).err(), Some(Error::Malformed));
+
+        // And every truncation refuses rather than panicking.
+        let good = encode_reservoir(&[1; 32], krab_core::tag::Epoch(5));
+        for n in 0..good.len() {
+            let _ = decode_reservoir(&good[..n]);
         }
     }
 

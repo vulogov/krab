@@ -522,18 +522,38 @@ substitute**: it mixes fresh DH on contact, which strengthens the root against
 compromise but happens at contact rather than per epoch. Between contacts the
 root is static, and that is where the destruction claim lives.
 
-### 11.5 Still to wire
+### 11.5 The ratchet position — **wired**
 
-The stored root has no epoch beside it, so a restart adopts it at the current
-epoch and the ratchet's position is inferred rather than recorded. That is
-correct while a node runs continuously and wrong after a gap: a node offline
-for a week resumes with a root labelled the wrong epoch and derives chunks its
-peer will not recognise.
+The stored root originally had no epoch beside it, so a restart inferred the
+ratchet's position. That is correct while a node runs continuously and wrong
+after a gap: a node offline for a week resumes at the wrong index and derives
+chunks its peer does not recognise, silently.
 
-**The peer-link must record the ratchet epoch alongside the wrapped root.**
-RFC 7 §6.4 already says the `peer-link` "records the reservoir identifier and
-current epoch" — so the RFC anticipated this and the implementation has not
-caught up. Tracked, not fixed.
+Now stored as a record carrying `root_N` and `N` together, sealed under `W_N`.
+On resuming, the ratchet advances from `N` to the current epoch, deriving every
+chunk it missed and destroying each intermediate root on the way. RFC 7 §6.4
+already required this — "the `peer-link` records the reservoir identifier and
+current epoch" — and §6.4 now says why it is load-bearing rather than
+informational.
+
+A record without an epoch is **refused, not defaulted**. Guessing the ratchet
+position produces unrecognisable tags for as long as the guess is wrong, and
+failing at load is the only place that surfaces.
+
+`a_reservoir_resumes_at_its_recorded_ratchet_epoch` checks both halves: a node
+resuming from the record agrees with one that stayed up, and one that *infers*
+the position does not — so the test would fail if the epoch were dropped again.
+
+Two further consequences fell out of the ratchet itself:
+
+- **`advance_to` trims to RFC 1 §6.2's window automatically.** A node resuming
+  after 400 epochs ratchets 400 steps, and a caller who forgot to trim would
+  retain every chunk it passed — turning a bounded window into an archive of
+  precisely the material §6 destroys. Leaving that to the caller was not a
+  reasonable default.
+- **The ratchet is path-independent.** A node advancing one epoch at a time and
+  one advancing fifty at once reach the same root and the same chunks, which is
+  what lets peers with different uptime stay in sync.
 
 ### 11.6 Standing caveat
 
