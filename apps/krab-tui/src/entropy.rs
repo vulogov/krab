@@ -1,13 +1,22 @@
 //! The operating system's generator.
 //!
 //! `krab-crypto` takes randomness as an argument and has no platform
-//! dependency (see `krab_crypto::rng`), so **this file is the only place in
-//! the workspace that names an entropy source**. Every key the node ever holds
-//! traces back through here.
+//! dependency (see `krab_crypto::rng`), so **this file is the only place that
+//! names an entropy source for object-layer keys**. Every identity, every
+//! reservoir contribution, every HPKE ephemeral traces back through here.
 //!
 //! That concentration is the point. "Where does this key's entropy come from?"
-//! has exactly one answer, checkable by reading one screen, rather than an
-//! answer per call site that has to be re-established at every review.
+//! has one answer for the object layer, checkable by reading one screen.
+//!
+//! # The link layer is the exception, and it is not this file
+//!
+//! `snow` draws Noise's ephemeral inside `write_message` and reaches for
+//! `getrandom` itself — see `krab_fabric::backend::tcp`. So there are two
+//! entropy call sites in a built binary, matching the two cryptographic
+//! boundaries in `Documentation/CRYPTO-BOUNDARIES.md`.
+//!
+//! Both are the OS generator. The difference is that one is injectable and
+//! therefore reproducible under test, and one is not.
 
 use krab_crypto::rng::Rng;
 
