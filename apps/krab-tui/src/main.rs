@@ -42,6 +42,10 @@ mod render;
 mod request;
 mod shred;
 mod sync;
+// RFC 1 §12's vector file is a test artifact: it is generated and checked by
+// the test suite and no runtime path consults it.
+#[cfg(test)]
+mod vectors;
 
 use activity::{NodeState, Spinner};
 use command::{admit, Command, InitStep, Peering, Refusal};

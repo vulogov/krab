@@ -41,6 +41,14 @@ pub enum Reject {
     /// covers the padding, so a node relaying it carries whatever was put
     /// there, indefinitely, believing it to be an ordinary object.
     BadPadding,
+    /// Check 3 — the version or class is not one this implementation knows.
+    ///
+    /// RFC 1 §4.3: "unknown keys in a body of a known version MUST be
+    /// rejected", and the same reasoning applies to the version itself. An
+    /// object this node cannot fully validate must not enter the store,
+    /// because the identifier covers bytes it did not understand — which is a
+    /// malleability surface, not merely an unknown.
+    Unrecognised,
     /// Check 5 — the object does not hash to the identifier it was offered
     /// under.
     ///
@@ -120,6 +128,20 @@ impl Store {
         // be suppressing the wrong thing.
         if krab_crypto::object_id(&bytes) != id {
             return Err(Reject::IdMismatch);
+        }
+
+        // RFC 1 §11 check 3 — version and class are recognised.
+        //
+        // `RoutingHeader::parse` deliberately does not check these: parsing and
+        // validating are separate so there is one rejection path rather than
+        // two, and the store is where an object is admitted. A v2 object is
+        // well-formed and unreadable here, and storing it would mean relaying
+        // bytes whose meaning this node cannot check.
+        if header.version != 1 {
+            return Err(Reject::Unrecognised);
+        }
+        if krab_core::object::Class::from_byte(header.class).is_none() {
+            return Err(Reject::Unrecognised);
         }
 
         // RFC 1 §11 check 1 — length equals the declared bucket, and padding
