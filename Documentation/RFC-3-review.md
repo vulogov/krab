@@ -261,3 +261,91 @@ RFC 0 §9's courier-only end-to-end peering test is likewise still outstanding.
 that no step needs an unnoticed round trip — and not *viability*: §2 above
 shows the mechanism can be sound while one negotiation in eight still dies in
 transit.
+
+---
+
+## 8. Gap — the credential is the one signed document with no signature domain
+
+Raised while implementing `peer offer`. §2.1 says credential documents use the
+deterministic CBOR profile of RFC 1 §4.3 and stops. It never says what an
+Ed25519 signature over a credential covers.
+
+That is an omission rather than a design choice, and the evidence is that **the
+series gets this right everywhere else**:
+
+| document | signature covers | where |
+|---|---|---|
+| peer-link | `"krab/link/v1" ‖ body` | RFC 3 §4 |
+| bulletin | `"krab/bul/v1" ‖ header ‖ body-without-key-3` | RFC 1 §5.2 |
+| **credential / rollcall entry** | **unspecified** | RFC 3 §2.1, §5.1 |
+
+Every *hash* in the series is domain-separated — `krab/obj/v1`,
+`krab/node/v1`, `krab/chan/v1`, `krab/tag/v1`, `krab/inbox/v1`,
+`krab/pkidx/v1`. Two of the three signed documents are too. The credential is
+the exception, and it is the document carrying the most consequential claims: a
+node's Noise static, its correspondence key, and its policy.
+
+### 8.1 What goes wrong
+
+Without a domain prefix, a credential signature is a bare Ed25519 signature
+over a deterministic CBOR map with small integer keys — and so is every other
+document the same identity key signs. Two document types whose encodings
+coincide are then interchangeable under one signature: the signer consented to
+one meaning and is bound to the other.
+
+The shapes are close enough to matter. A credential is `{1: bstr32, 2: bstr32,
+3: bstr32, …}`. Any future document that opens with two or three 32-byte keys
+under the same indices — a subscription (RFC 6 §8), an introduction, a rotation
+notice — is a candidate. The attack needs no cryptographic weakness; it needs
+two documents that happen to encode alike, and deterministic CBOR guarantees
+that identical structure yields identical bytes. That is normally the property
+one wants.
+
+This is not hypothetical for a series still adding documents. Every new signed
+document type is a new opportunity for a collision with an existing one, and
+nothing in §2.1 makes the author of that document think about it.
+
+### 8.2 It is also an interoperability gap
+
+Independent of any attack: **§2.1 as written is not implementable
+interoperably.** An implementer following the pattern set by §4 and RFC 1 §5.2
+will invent a prefix — and will pick their own string. An implementer following
+§2.1 literally will use none. Neither is wrong by the text, and their
+credentials do not verify against each other.
+
+The failure surfaces as "peering with that person never works", at the
+ceremony, in person, with no diagnostic. RFC 3 §11 makes the ceremony a
+deliberate event people travel for.
+
+### 8.3 Proposed text for §2.1
+
+> A credential's signature is Ed25519 over `"krab/cred/v1" ‖ body`, where
+> `body` is the deterministic CBOR encoding of the document with the signature
+> field omitted.
+>
+> Every signed document in this series MUST prefix its signing input with a
+> domain string unique to that document type. A signature produced over one
+> document type MUST NOT be valid over any other.
+
+The second paragraph is the part worth adding, because it converts a per-document
+decision into a rule the next document inherits.
+
+### 8.4 What the implementation does
+
+`apps/krab-tui/src/peering.rs` signs `DOMAIN_CARD ‖ deterministic_cbor(body)`
+with `DOMAIN_CARD = b"krab/card/v1"`. That string is a placeholder pending the
+RFC; if §2.1 adopts `krab/cred/v1` the constant changes and no format does.
+
+Two implementation notes fell out of the same work:
+
+- **The card body is a flat map, not nested.** RFC 1 §4.3 requires map keys to
+  ascend, and a nested map's keys restart at 1 — so a decoder reading both
+  levels from one cursor sees keys go backwards and correctly rejects its own
+  encoder's output. Flattening removes the question. §2.1 should say whether
+  credential documents may nest maps at all; if they may, the profile needs to
+  say that ordering is per-map rather than per-document.
+- **Decoding does not verify.** `Card::decode` returns an unverified card and
+  `Card::verify` is separate, so there is one rejection path rather than two.
+  Folding them together reads as safer and is not: it leaves no way to express
+  "parsed but untrusted", which is exactly what a credential is until RFC 3 §11
+  step 2 has been performed by a human.

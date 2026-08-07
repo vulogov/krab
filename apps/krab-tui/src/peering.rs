@@ -56,7 +56,7 @@
 #![allow(dead_code)]
 
 use core::fmt;
-use krab_core::cbor::Writer;
+use krab_core::cbor::{Error as CborError, Item, Reader, Writer};
 use krab_crypto::sign::{Sig, SigningKey, VerifyingKey};
 
 /// How an artifact reached this node.
@@ -265,16 +265,19 @@ impl Card {
         correspondence_pk: &[u8; 32],
         policy: &Policy,
     ) -> Vec<u8> {
+        // Flat, not nested. RFC 1 §4.3's profile requires map keys to ascend,
+        // and a nested map restarts at 1 — so a decoder reading both levels
+        // from one cursor sees keys go backwards. Flattening removes the
+        // question rather than requiring every decoder to get it right.
         let mut w = Writer::new();
-        w.map(4);
+        w.map(7);
         w.uint(1).bstr(identity_pk);
         w.uint(2).bstr(noise_static_pk);
         w.uint(3).bstr(correspondence_pk);
-        w.uint(4).map(4);
-        w.uint(1).uint(policy.max_bucket as u64);
-        w.uint(2).bool(policy.relay);
-        w.uint(3).uint(policy.retention_bytes);
-        w.uint(4).uint(policy.shard_bits as u64);
+        w.uint(4).uint(policy.max_bucket as u64);
+        w.uint(5).bool(policy.relay);
+        w.uint(6).uint(policy.retention_bytes);
+        w.uint(7).uint(policy.shard_bits as u64);
         let body = w.finish();
 
         let mut out = Vec::with_capacity(DOMAIN_CARD.len() + body.len());
@@ -318,6 +321,92 @@ impl Card {
         VerifyingKey::from_bytes(self.identity_pk).verify(&msg, &Sig(self.sig))
     }
 
+    /// The full wire encoding: the signed body plus the signature.
+    ///
+    /// Deterministic CBOR (RFC 3 §2.1, RFC 1 §4.3) — ascending integer keys,
+    /// definite lengths, shortest-form integers. Two implementations encoding
+    /// the same card produce the same bytes, which is what lets a signature
+    /// mean anything.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.map(8);
+        w.uint(1).bstr(&self.identity_pk);
+        w.uint(2).bstr(&self.noise_static_pk);
+        w.uint(3).bstr(&self.correspondence_pk);
+        w.uint(4).uint(self.policy.max_bucket as u64);
+        w.uint(5).bool(self.policy.relay);
+        w.uint(6).uint(self.policy.retention_bytes);
+        w.uint(7).uint(self.policy.shard_bits as u64);
+        w.uint(8).bstr(&self.sig);
+        w.finish()
+    }
+
+    /// Decode a card.
+    ///
+    /// **Does not verify the signature.** Parsing and verification are
+    /// separate so there is one rejection path rather than two: a caller sees
+    /// a `Card` and must still ask [`Card::verify`], and `accept` does.
+    /// Folding them together would let a future caller that only decodes
+    /// silently skip the check.
+    pub fn decode(bytes: &[u8]) -> Result<Card, CborError> {
+        let mut r = Reader::new(bytes);
+        let mut m = r.map()?;
+        let mut card = Card {
+            identity_pk: [0; 32],
+            noise_static_pk: [0; 32],
+            correspondence_pk: [0; 32],
+            policy: Policy::default(),
+            sig: [0; 64],
+        };
+        let mut seen = 0u8;
+        while let Some(key) = m.key()? {
+            match (key, m.value()?) {
+                (1, Item::Bstr(b)) => {
+                    card.identity_pk = fixed(b)?;
+                    seen |= 1;
+                }
+                (2, Item::Bstr(b)) => {
+                    card.noise_static_pk = fixed(b)?;
+                    seen |= 2;
+                }
+                (3, Item::Bstr(b)) => {
+                    card.correspondence_pk = fixed(b)?;
+                    seen |= 4;
+                }
+                (4, Item::Uint(v)) => {
+                    card.policy.max_bucket = clamp_u8(v)?;
+                    seen |= 8;
+                }
+                (5, Item::Bool(v)) => {
+                    card.policy.relay = v;
+                    seen |= 16;
+                }
+                (6, Item::Uint(v)) => {
+                    card.policy.retention_bytes = v;
+                    seen |= 32;
+                }
+                (7, Item::Uint(v)) => {
+                    card.policy.shard_bits = clamp_u8(v)?;
+                    seen |= 64;
+                }
+                (8, Item::Bstr(b)) => {
+                    let mut sig = [0u8; 64];
+                    if b.len() != 64 {
+                        return Err(CborError::Malformed);
+                    }
+                    sig.copy_from_slice(b);
+                    card.sig = sig;
+                    seen |= 128;
+                }
+                _ => return Err(CborError::Malformed),
+            }
+        }
+        if seen != 0xFF {
+            return Err(CborError::Truncated);
+        }
+        Ok(card)
+    }
+
     /// `node_id = BLAKE3("krab/node/v1" ‖ identity_pk)`, RFC 3 §2.
     pub fn node_id(&self) -> [u8; 32] {
         VerifyingKey::from_bytes(self.identity_pk).node_id()
@@ -359,6 +448,19 @@ impl Contribution {
         }
         out
     }
+}
+
+fn fixed(b: &[u8]) -> Result<[u8; 32], CborError> {
+    if b.len() != 32 {
+        return Err(CborError::Malformed);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(b);
+    Ok(out)
+}
+
+fn clamp_u8(v: u64) -> Result<u8, CborError> {
+    u8::try_from(v).map_err(|_| CborError::Malformed)
 }
 
 /// What `peer offer` produces: two artifacts, deliberately separate.
@@ -534,6 +636,44 @@ mod tests {
         );
         assert!(degraded.is_usable(), "remote peering still works");
         assert_eq!(degraded.caveats.len(), 2);
+    }
+
+    /// A card survives the round trip through its wire form, signature intact.
+    #[test]
+    fn a_card_round_trips_through_cbor() {
+        let c = card(1, Policy { max_bucket: 3, relay: false, retention_bytes: 77, shard_bits: 5 });
+        let bytes = c.encode();
+        let back = Card::decode(&bytes).expect("decodes");
+        assert_eq!(back, c);
+        assert!(back.verify(), "the signature survives encoding");
+        assert_eq!(back.encode(), bytes, "encoding is deterministic");
+    }
+
+    /// A card is what travels between strangers, so malformed input must
+    /// produce an error rather than a panic — at any truncation point.
+    #[test]
+    fn a_malformed_card_is_rejected_at_every_truncation() {
+        let bytes = card(1, Policy::default()).encode();
+        for n in 0..bytes.len() {
+            let _ = Card::decode(&bytes[..n]);
+        }
+        assert!(Card::decode(&[]).is_err());
+        assert!(Card::decode(&[0xff, 0xff, 0xff]).is_err());
+        // A card missing a field must not decode to defaults.
+        let mut w = Writer::new();
+        w.map(1);
+        w.uint(1).bstr(&[0u8; 32]);
+        assert!(Card::decode(&w.finish()).is_err(), "an incomplete card is not a card");
+    }
+
+    /// Decoding deliberately does not verify. This pins that, so the split
+    /// stays visible: `accept` is what checks, and it is tested to.
+    #[test]
+    fn decoding_does_not_verify() {
+        let mut c = card(1, Policy::default());
+        c.sig[0] ^= 1;
+        let back = Card::decode(&c.encode()).expect("still decodes");
+        assert!(!back.verify(), "and is caught at verification, not at parse");
     }
 
     /// RFC 3 §2 — the spoken fingerprint is eight words from the node id.
