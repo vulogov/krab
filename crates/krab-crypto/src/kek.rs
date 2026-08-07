@@ -173,6 +173,56 @@ impl Kek {
     }
 }
 
+/// Wrap a secret under an epoch key `W_N` — RFC 7 §4's third tier.
+///
+/// This is what "prekey privates · reservoir chunks · session state · message
+/// store" means concretely: everything beneath `W_N` is sealed with it, so
+/// destroying `W_N` destroys all of it at once regardless of what the storage
+/// controller retained.
+///
+/// `context` is bound as AAD. Callers pass something that identifies what is
+/// being wrapped, so a record cannot be lifted from one slot into another.
+pub fn seal_under(
+    epoch_key: &[u8; 32],
+    context: &[u8],
+    secret: &[u8],
+    rng: &mut impl Rng,
+) -> Result<Vec<u8>, Error> {
+    let cipher = ChaCha20Poly1305::new(epoch_key.into());
+    let mut nonce = [0u8; 12];
+    rng.fill(&mut nonce);
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: secret,
+                aad: context,
+            },
+        )
+        .map_err(|_| Error::Unwrap)?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Unwrap what [`seal_under`] produced.
+pub fn open_under(epoch_key: &[u8; 32], context: &[u8], record: &[u8]) -> Result<Vec<u8>, Error> {
+    if record.len() < 12 + 16 {
+        return Err(Error::Malformed);
+    }
+    let cipher = ChaCha20Poly1305::new(epoch_key.into());
+    cipher
+        .decrypt(
+            Nonce::from_slice(&record[..12]),
+            Payload {
+                msg: &record[12..],
+                aad: context,
+            },
+        )
+        .map_err(|_| Error::Unwrap)
+}
+
 /// The epoch wrapper hierarchy: `W_N` for each retained epoch, wrapped under
 /// the KEK and stored.
 ///
@@ -404,6 +454,43 @@ mod tests {
         let mut h = Hierarchy::new();
         h.records.push((Epoch(1), alloc::vec![0u8; 12]));
         assert_eq!(h.epoch_key(&kek, Epoch(1)), Err(Error::Malformed));
+    }
+
+    /// RFC 7 §4's third tier: a secret sealed under `W_N` dies with it.
+    #[test]
+    fn a_secret_sealed_under_an_epoch_key_dies_with_that_key() {
+        let mut rng = NotRandom::seeded(11);
+        let w = rng.next_32();
+        let sealed = seal_under(&w, b"reservoir", b"half a shared secret", &mut rng).unwrap();
+        assert_eq!(
+            open_under(&w, b"reservoir", &sealed).unwrap(),
+            b"half a shared secret"
+        );
+
+        // Wrong context, wrong key, and tampering all fail identically.
+        assert_eq!(open_under(&w, b"prekey", &sealed), Err(Error::Unwrap));
+        assert_eq!(
+            open_under(&[0u8; 32], b"reservoir", &sealed),
+            Err(Error::Unwrap)
+        );
+        let mut torn = sealed.clone();
+        torn[13] ^= 1;
+        assert_eq!(open_under(&w, b"reservoir", &torn), Err(Error::Unwrap));
+        assert_eq!(
+            open_under(&w, b"reservoir", &sealed[..10]),
+            Err(Error::Malformed)
+        );
+    }
+
+    /// Two seals of the same secret differ, so a stored record does not reveal
+    /// that a ceremony was restarted with the same contribution.
+    #[test]
+    fn sealing_is_randomised() {
+        let mut rng = NotRandom::seeded(12);
+        let w = rng.next_32();
+        let a = seal_under(&w, b"c", b"secret", &mut rng).unwrap();
+        let b = seal_under(&w, b"c", b"secret", &mut rng).unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]
