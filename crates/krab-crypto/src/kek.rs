@@ -40,7 +40,7 @@ use crate::secret::Key;
 use alloc::vec::Vec;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use chacha20poly1305::ChaCha20Poly1305;
 use core::fmt;
 use krab_core::tag::Epoch;
 use zeroize::Zeroize;
@@ -139,7 +139,7 @@ impl Kek {
         rng.fill(&mut nonce);
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                (&nonce).into(),
                 Payload {
                     msg: key,
                     aad: &epoch.to_le_bytes(),
@@ -160,7 +160,7 @@ impl Kek {
         let cipher = ChaCha20Poly1305::new(self.0.expose().into());
         let pt = cipher
             .decrypt(
-                Nonce::from_slice(&record[..12]),
+                record[..12].try_into().map_err(|_| Error::Malformed)?,
                 Payload {
                     msg: &record[12..],
                     aad: &epoch.to_le_bytes(),
@@ -193,7 +193,7 @@ pub fn seal_under(
     rng.fill(&mut nonce);
     let ct = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            (&nonce).into(),
             Payload {
                 msg: secret,
                 aad: context,
@@ -214,7 +214,7 @@ pub fn open_under(epoch_key: &[u8; 32], context: &[u8], record: &[u8]) -> Result
     let cipher = ChaCha20Poly1305::new(epoch_key.into());
     cipher
         .decrypt(
-            Nonce::from_slice(&record[..12]),
+            record[..12].try_into().map_err(|_| Error::Malformed)?,
             Payload {
                 msg: &record[12..],
                 aad: context,
