@@ -32,11 +32,20 @@
 //!
 //! # Why random rather than zeros
 //!
-//! Zeros are as effective against media analysis and worse for everything
-//! else: a region of zeros on a device is visibly *a region that was
-//! deliberately cleared*, which is a statement about the operator. Random
-//! bytes are indistinguishable from the ciphertext that surrounds them, and
-//! every other file Krab writes is ciphertext.
+//! Not because random is harder to recover — against media analysis the two
+//! are equivalent. Because of what each *tells an analyst*.
+//!
+//! Forensic work on an image is triage: which regions look structured, which
+//! look like a filesystem, which look cleared. A zero-filled region answers
+//! all three at once — it is visibly a region someone deliberately erased,
+//! which is a signpost and a statement of intent.
+//!
+//! Random bytes answer none of them, because every other file Krab writes is
+//! ciphertext and these are indistinguishable from it. The analyst cannot tell
+//! which regions were overwritten, how much was removed, or whether a stale
+//! page is worth recovering. That turns a targeted search into an undirected
+//! one, and it holds **whether or not the overwrite reached the medium** — the
+//! cost is imposed by the ambiguity, not by the erasure.
 
 use krab_crypto::rng::Rng;
 use std::fs::OpenOptions;
