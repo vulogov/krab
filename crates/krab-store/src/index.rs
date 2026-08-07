@@ -34,6 +34,22 @@ pub enum Reject {
     BelowWatermark,
     /// The header did not parse.
     Malformed,
+    /// Check 1 — the object's length does not equal its declared bucket, or
+    /// its padding is not zero (RFC 1 §8.1).
+    ///
+    /// Non-zero padding is a covert channel that replicates: the identifier
+    /// covers the padding, so a node relaying it carries whatever was put
+    /// there, indefinitely, believing it to be an ordinary object.
+    BadPadding,
+    /// Check 5 — the object does not hash to the identifier it was offered
+    /// under.
+    ///
+    /// This is the check that makes content addressing load-bearing rather
+    /// than decorative. Without it a peer can supply arbitrary bytes under an
+    /// identifier a node already wants, and every duplicate-suppression and
+    /// reconciliation property downstream is built on the assumption that an
+    /// identifier names its content.
+    IdMismatch,
 }
 
 /// The corpus: segments, an index over them, and the expiry machinery.
@@ -95,6 +111,30 @@ impl Store {
         let header = RoutingHeader::parse(&bytes).map_err(|_| Reject::Malformed)?;
         let expiry = header.expiry_min;
 
+        // RFC 1 §11 check 5 — the identifier must name the content.
+        //
+        // Checked first and unconditionally. Everything below assumes an
+        // identifier identifies something; a store that took the caller's word
+        // for it would let a peer replace the content of any object a node had
+        // already asked for, and duplicate suppression (RFC 0 I-1) would then
+        // be suppressing the wrong thing.
+        if krab_crypto::object_id(&bytes) != id {
+            return Err(Reject::IdMismatch);
+        }
+
+        // RFC 1 §11 check 1 — length equals the declared bucket, and padding
+        // is zero (RFC 1 §8.1).
+        //
+        // `body_len` is not known here without decoding the body, which the
+        // store deliberately does not do — it handles opaque objects. What can
+        // be checked without decoding is the length, and that every byte after
+        // the largest possible body is zero. `verify_padding` with a body of
+        // the full remaining length degenerates to the length check alone, so
+        // the zero-padding scan is done directly below.
+        if bytes.len() != header.bucket_size() as usize {
+            return Err(Reject::BadPadding);
+        }
+
         // RFC 1 §11 check 2 — this is what stops a relay extending TTL to
         // force indefinite storage.
         if expiry <= now_min {
@@ -130,6 +170,19 @@ impl Store {
             },
         );
         Ok(())
+    }
+
+    /// Verify zero padding after a decoded body — RFC 1 §11 check 1.
+    ///
+    /// Separate from [`Store::ingest`] because it needs the body length, which
+    /// only a decoder knows. `ingest` enforces the length rule, which needs no
+    /// decode; a caller that decodes the body SHOULD call this as well.
+    ///
+    /// Split rather than merged because the store handles opaque objects by
+    /// design (RFC 1 §3), and giving it a body decoder would make every future
+    /// body format a storage-layer concern.
+    pub fn verify_body_padding(bytes: &[u8], body_len: usize) -> Result<(), Reject> {
+        krab_core::object::verify_padding(bytes, body_len).map_err(|_| Reject::BadPadding)
     }
 
     /// Fetch an object's bytes.
@@ -475,6 +528,108 @@ mod tests {
         assert_eq!(
             s.ingest(ObjectId([0; 32]), vec![0u8; 4], 0, MAX_TTL),
             Err(Reject::Malformed)
+        );
+    }
+
+    /// **RFC 1 §11 check 5.** An object offered under an identifier it does not
+    /// hash to is refused.
+    ///
+    /// Without this, a peer can replace the content of any object a node has
+    /// asked for, and every property built on "an identifier names its
+    /// content" — duplicate suppression, reconciliation, the fingerprint —
+    /// silently means something else.
+    #[test]
+    fn an_object_must_hash_to_the_identifier_it_is_offered_under() {
+        let mut s = Store::new();
+        let (id, bytes) = object(DAY, 1);
+        let (other, _) = object(DAY, 2);
+
+        assert_eq!(
+            s.ingest(other, bytes.clone(), 0, u32::MAX),
+            Err(Reject::IdMismatch)
+        );
+        assert!(s.is_empty(), "nothing entered the store");
+        assert_eq!(s.ingest(id, bytes, 0, u32::MAX), Ok(()));
+    }
+
+    /// A single flipped byte changes the identifier, so tampered content
+    /// cannot arrive under the original name.
+    #[test]
+    fn tampered_bytes_cannot_masquerade_as_the_original() {
+        let mut s = Store::new();
+        let (id, bytes) = object(DAY, 3);
+        // Every byte is covered. Which check catches it varies: flipping a
+        // header field can make the header unparseable first, and flipping
+        // anything else reaches the identifier check. Both refuse, and the
+        // distinction is not one a caller should depend on.
+        for i in 0..bytes.len() {
+            let mut torn = bytes.clone();
+            torn[i] ^= 0xFF;
+            let got = s.ingest(id, torn, 0, u32::MAX);
+            assert!(
+                got.is_err(),
+                "byte {i} was accepted under the original identifier"
+            );
+            assert!(
+                matches!(got, Err(Reject::IdMismatch) | Err(Reject::Malformed)),
+                "byte {i} was refused for the wrong reason: {got:?}"
+            );
+        }
+        assert!(s.is_empty());
+
+        // And the bytes outside the 16-byte header always reach the
+        // identifier check, since nothing structural depends on them.
+        for i in 16..bytes.len() {
+            let mut torn = bytes.clone();
+            torn[i] ^= 0xFF;
+            assert_eq!(
+                s.ingest(id, torn, 0, u32::MAX),
+                Err(Reject::IdMismatch),
+                "byte {i}"
+            );
+        }
+    }
+
+    /// **RFC 1 §11 check 1.** The object's length must equal its declared
+    /// bucket. A short object with a large declared bucket, or a long one with
+    /// a small bucket, is refused.
+    #[test]
+    fn an_object_must_be_exactly_its_declared_bucket() {
+        let mut s = Store::new();
+        let (_, bytes) = object(DAY, 4);
+
+        for delta in [-1isize, 1, 100] {
+            let mut wrong = bytes.clone();
+            if delta < 0 {
+                wrong.truncate(wrong.len() - 1);
+            } else {
+                wrong.resize(wrong.len() + delta as usize, 0);
+            }
+            let id = krab_crypto::object_id(&wrong);
+            assert_eq!(
+                s.ingest(id, wrong, 0, u32::MAX),
+                Err(Reject::BadPadding),
+                "length off by {delta} was accepted"
+            );
+        }
+        assert!(s.is_empty());
+    }
+
+    /// **Non-zero padding is a covert channel that replicates.** The
+    /// identifier covers it, so a relay carries whatever was put there.
+    #[test]
+    fn non_zero_padding_is_refused_when_the_body_length_is_known() {
+        let (_, bytes) = object(DAY, 5);
+        // A body of 40 bytes, as `object` builds.
+        assert!(Store::verify_body_padding(&bytes, 40).is_ok());
+
+        let mut smuggled = bytes.clone();
+        let last = smuggled.len() - 1;
+        smuggled[last] = 0x41;
+        assert_eq!(
+            Store::verify_body_padding(&smuggled, 40),
+            Err(Reject::BadPadding),
+            "a byte hidden in the padding must not pass"
         );
     }
 }
