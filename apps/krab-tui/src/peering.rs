@@ -641,7 +641,15 @@ mod tests {
     /// A card survives the round trip through its wire form, signature intact.
     #[test]
     fn a_card_round_trips_through_cbor() {
-        let c = card(1, Policy { max_bucket: 3, relay: false, retention_bytes: 77, shard_bits: 5 });
+        let c = card(
+            1,
+            Policy {
+                max_bucket: 3,
+                relay: false,
+                retention_bytes: 77,
+                shard_bits: 5,
+            },
+        );
         let bytes = c.encode();
         let back = Card::decode(&bytes).expect("decodes");
         assert_eq!(back, c);
@@ -663,7 +671,10 @@ mod tests {
         let mut w = Writer::new();
         w.map(1);
         w.uint(1).bstr(&[0u8; 32]);
-        assert!(Card::decode(&w.finish()).is_err(), "an incomplete card is not a card");
+        assert!(
+            Card::decode(&w.finish()).is_err(),
+            "an incomplete card is not a card"
+        );
     }
 
     /// Decoding deliberately does not verify. This pins that, so the split
@@ -673,7 +684,10 @@ mod tests {
         let mut c = card(1, Policy::default());
         c.sig[0] ^= 1;
         let back = Card::decode(&c.encode()).expect("still decodes");
-        assert!(!back.verify(), "and is caught at verification, not at parse");
+        assert!(
+            !back.verify(),
+            "and is caught at verification, not at parse"
+        );
     }
 
     /// RFC 3 §2 — the spoken fingerprint is eight words from the node id.

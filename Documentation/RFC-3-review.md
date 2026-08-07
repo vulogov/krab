@@ -349,3 +349,66 @@ Two implementation notes fell out of the same work:
   Folding them together reads as safer and is not: it leaves no way to express
   "parsed but untrusted", which is exactly what a credential is until RFC 3 §11
   step 2 has been performed by a human.
+
+---
+
+## 9. §11.3's courier-only gate — status
+
+The gate is implemented in two halves, because §11.3 asks for two things:
+
+> "a complete peering **negotiation** and **first message exchange** with all
+> network interfaces down, using only file import and export."
+
+| half | where | status |
+|---|---|---|
+| peering negotiation | `apps/krab-tui/src/main.rs::courier_only_peering_completes_with_no_network` | **passes** |
+| message exchange | `crates/krab-node/tests/courier_only.rs` | **passes, with one caveat** |
+
+### 9.1 What the tests actually establish
+
+The negotiation test runs two nodes with two directories and nothing between
+them but `std::fs`. Both offer, both accept, both seal, and both derive the
+same reservoir — having exchanged four files and no packets. Artifacts are
+renamed in transit, since RFC 4 §5.5 requires filenames be ignored.
+
+The message-exchange test is structured as **strictly alternating one-way
+legs**. A leg writes an archive and stops; nothing reads while anything writes,
+and no session is open at both ends at once. The sending node's inbox path is
+one that never comes into existence, and the test asserts so at the end — if
+any step had needed a reply, it would have had nowhere to look for one.
+
+That structure is the point. The gate is not testing cryptography; it is
+testing for a **hidden round trip**, which over TCP is free and invisible and
+over a posted USB stick is fatal. §11.3 says as much: "if any step requires a
+round trip that was not noticed, air-gapped nodes silently cannot join, and
+that will not be discovered until someone tries."
+
+A third test pins the reason RFC 5 §4.5 derives `sync_mode` from latency class
+rather than configuring it: a courier link resolves to `Manifest`, and a node
+that chose RBSR would negotiate one round per courier, forever.
+
+### 9.2 The caveat, stated plainly
+
+**Object bodies are opaque bytes, not HPKE-sealed plaintext.** Sealing is
+blocked on `CRYPTO-REVIEW.md` §1 — RFC 7 §6's message key derivation produces
+one key per (pair, epoch) and must not be implemented as written.
+
+This does not weaken what the gate measures. Reconciliation is defined over
+opaque objects by design (RFC 1 §3 puts FEC and armor *after* identity, so the
+store never inspects a body), and whether the corpus converges without a round
+trip is independent of how the body was encrypted.
+
+It does mean **the gate is not yet fully satisfied**, and the test file says so
+at the top. It should be revisited when §1 is resolved and bodies are sealed.
+
+### 9.3 One thing the gate surfaced
+
+Persisting a half-finished ceremony creates an opening §11 does not discuss:
+the operator compares fingerprints aloud at step 2, and steps 3 and 4 may
+happen days later. A second card arriving in between could substitute the
+counterparty **after** the verification everyone remembers performing.
+
+`Pending::accept_card` refuses a second, different card once one is recorded,
+and re-accepting an identical one succeeds — a resend is not an attack. Worth a
+sentence in §11: the ceremony is described as "one event", and for a sneakernet
+peering it is demonstrably not.

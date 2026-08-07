@@ -113,6 +113,11 @@ mod tests {
     #[test]
     fn window_covers_max_ttl() {
         const MAX_TTL_DAYS: u32 = 45;
+        // Constant on both sides, and deliberately so: this asserts a
+        // *relationship between two constants*, which is the only kind of
+        // check that catches someone narrowing EPOCH_WINDOW later. Clippy
+        // reads a constant assertion as a mistake; here it is the mechanism.
+        #[allow(clippy::assertions_on_constants)]
         assert!(
             EPOCH_WINDOW >= MAX_TTL_DAYS,
             "an object delivered inside its declared TTL must still be recognisable"
