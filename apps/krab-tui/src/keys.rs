@@ -29,17 +29,35 @@ pub struct KeyPress {
 }
 
 impl KeyPress {
+    // Constructors used by this module's tests. `main.rs` builds a `KeyPress`
+    // from a crossterm event directly, because `BackTab` needs to set both the
+    // code and the shift flag and these would obscure that.
     /// A plain character.
+    #[allow(dead_code)]
     pub fn char(c: char) -> KeyPress {
-        KeyPress { code: Key::Char(c), ctrl: false, shift: false }
+        KeyPress {
+            code: Key::Char(c),
+            ctrl: false,
+            shift: false,
+        }
     }
     /// A character with Ctrl.
+    #[allow(dead_code)]
     pub fn ctrl(c: char) -> KeyPress {
-        KeyPress { code: Key::Char(c), ctrl: true, shift: false }
+        KeyPress {
+            code: Key::Char(c),
+            ctrl: true,
+            shift: false,
+        }
     }
     /// A named key.
+    #[allow(dead_code)]
     pub fn key(k: Key) -> KeyPress {
-        KeyPress { code: k, ctrl: false, shift: false }
+        KeyPress {
+            code: k,
+            ctrl: false,
+            shift: false,
+        }
     }
 }
 
@@ -143,7 +161,11 @@ mod tests {
     #[test]
     fn lock_is_reachable_from_every_mode() {
         for mode in [Mode::Browse, Mode::Compose] {
-            assert_eq!(Binding::of(KeyPress::ctrl('l'), mode), Binding::Lock, "{mode:?}");
+            assert_eq!(
+                Binding::of(KeyPress::ctrl('l'), mode),
+                Binding::Lock,
+                "{mode:?}"
+            );
         }
     }
 
@@ -151,16 +173,25 @@ mod tests {
     #[test]
     fn lock_is_not_swallowed_by_the_composer() {
         // Ordinary characters become input.
-        assert_eq!(Binding::of(KeyPress::char('l'), Mode::Compose), Binding::Input('l'));
+        assert_eq!(
+            Binding::of(KeyPress::char('l'), Mode::Compose),
+            Binding::Input('l')
+        );
         // The chord does not.
-        assert_eq!(Binding::of(KeyPress::ctrl('l'), Mode::Compose), Binding::Lock);
+        assert_eq!(
+            Binding::of(KeyPress::ctrl('l'), Mode::Compose),
+            Binding::Lock
+        );
     }
 
     /// One motion, no confirmation. Lock is used when someone walks in.
     #[test]
     fn lock_is_a_single_press_not_a_sequence() {
         // There is no intermediate state: one press resolves to Lock outright.
-        assert_eq!(Binding::of(KeyPress::ctrl('l'), Mode::Browse), Binding::Lock);
+        assert_eq!(
+            Binding::of(KeyPress::ctrl('l'), Mode::Browse),
+            Binding::Lock
+        );
     }
 
     /// `Ctrl-L` conventionally redraws, so redraw is displaced rather than
@@ -168,8 +199,14 @@ mod tests {
     /// worse than either.
     #[test]
     fn redraw_moved_off_the_lock_chord() {
-        assert_eq!(Binding::of(KeyPress::ctrl('r'), Mode::Browse), Binding::Redraw);
-        assert_eq!(Binding::of(KeyPress::ctrl('r'), Mode::Compose), Binding::Redraw);
+        assert_eq!(
+            Binding::of(KeyPress::ctrl('r'), Mode::Browse),
+            Binding::Redraw
+        );
+        assert_eq!(
+            Binding::of(KeyPress::ctrl('r'), Mode::Compose),
+            Binding::Redraw
+        );
     }
 
     /// Tab cycles panes in both modes, so the user can reach the peers panel
@@ -177,8 +214,15 @@ mod tests {
     #[test]
     fn tab_cycles_panes_even_while_composing() {
         for mode in [Mode::Browse, Mode::Compose] {
-            assert_eq!(Binding::of(KeyPress::key(Key::Tab), mode), Binding::CycleFocus);
-            let shift_tab = KeyPress { code: Key::Tab, ctrl: false, shift: true };
+            assert_eq!(
+                Binding::of(KeyPress::key(Key::Tab), mode),
+                Binding::CycleFocus
+            );
+            let shift_tab = KeyPress {
+                code: Key::Tab,
+                ctrl: false,
+                shift: true,
+            };
             assert_eq!(Binding::of(shift_tab, mode), Binding::CycleFocusBack);
         }
     }
@@ -186,16 +230,28 @@ mod tests {
     /// RFC 8 §4.2 requirement 3 — **pressing reply must never publish.**
     #[test]
     fn reply_and_publish_are_different_keys() {
-        assert_eq!(Binding::of(KeyPress::char('r'), Mode::Browse), Binding::Reply);
-        assert_eq!(Binding::of(KeyPress::char('P'), Mode::Browse), Binding::Publish);
+        assert_eq!(
+            Binding::of(KeyPress::char('r'), Mode::Browse),
+            Binding::Reply
+        );
+        assert_eq!(
+            Binding::of(KeyPress::char('P'), Mode::Browse),
+            Binding::Publish
+        );
         assert_ne!(Binding::Reply, Binding::Publish);
     }
 
     #[test]
     fn zoom_is_bound_and_composition_does_not_steal_it() {
-        assert_eq!(Binding::of(KeyPress::char('z'), Mode::Browse), Binding::ToggleZoom);
+        assert_eq!(
+            Binding::of(KeyPress::char('z'), Mode::Browse),
+            Binding::ToggleZoom
+        );
         // While composing, `z` is a character the user is typing.
-        assert_eq!(Binding::of(KeyPress::char('z'), Mode::Compose), Binding::Input('z'));
+        assert_eq!(
+            Binding::of(KeyPress::char('z'), Mode::Compose),
+            Binding::Input('z')
+        );
     }
 
     /// No key press may panic or be silently reinterpreted.
@@ -204,7 +260,11 @@ mod tests {
         for mode in [Mode::Browse, Mode::Compose] {
             for ctrl in [false, true] {
                 for c in ' '..='~' {
-                    let k = KeyPress { code: Key::Char(c), ctrl, shift: false };
+                    let k = KeyPress {
+                        code: Key::Char(c),
+                        ctrl,
+                        shift: false,
+                    };
                     let b = Binding::of(k, mode);
                     if ctrl && c == 'l' {
                         assert_eq!(b, Binding::Lock, "lock must win everywhere");

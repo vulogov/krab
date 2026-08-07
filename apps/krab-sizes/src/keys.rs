@@ -64,7 +64,11 @@ pub fn batch_for(needed: usize) -> usize {
 
 /// Milliseconds to trial-decapsulate one tag-matched object.
 pub fn decap_ms(batch: usize, deterministic: bool) -> f64 {
-    let attempts = if deterministic { LIVE_BATCHES } else { batch * LIVE_BATCHES };
+    let attempts = if deterministic {
+        LIVE_BATCHES
+    } else {
+        batch * LIVE_BATCHES
+    };
     attempts as f64 * DECAP_US / 1000.0
 }
 
@@ -90,9 +94,12 @@ mod tests {
     /// RFC 7 §2.1 / the reservoir table, reproduced exactly.
     #[test]
     fn reservoir_table_matches_rfc7() {
-        for (eps, per_peer, twenty_five) in
-            [(30usize, 960usize, 24_000usize), (45, 1_440, 36_000), (60, 1_920, 48_000), (90, 2_880, 72_000)]
-        {
+        for (eps, per_peer, twenty_five) in [
+            (30usize, 960usize, 24_000usize),
+            (45, 1_440, 36_000),
+            (60, 1_920, 48_000),
+            (90, 2_880, 72_000),
+        ] {
             assert_eq!(reservoir(1, eps), per_peer, "{eps} epochs, one peer");
             assert_eq!(reservoir(25, eps), twenty_five, "{eps} epochs, 25 peers");
         }
@@ -113,7 +120,14 @@ mod tests {
     fn batch_sizing_matches_rfc7() {
         // (msgs/day, republish days, needed, batch, wire, bucket)
         let want = [
-            (5usize, 30usize, 150usize, 256usize, 8_312usize, Some(16_384usize)),
+            (
+                5usize,
+                30usize,
+                150usize,
+                256usize,
+                8_312usize,
+                Some(16_384usize),
+            ),
             (20, 30, 600, 1_024, 32_888, Some(65_536)),
             (20, 7, 140, 256, 8_312, Some(16_384)),
             (50, 7, 350, 1_024, 32_888, Some(65_536)),
@@ -133,7 +147,10 @@ mod tests {
     #[test]
     fn no_batch_crosses_a_512_byte_gate() {
         for n in [64usize, 128, 256, 512, 1_024, 2_048] {
-            assert!(!batch_crosses(n, 512), "batch {n} should not cross a 512 B gate");
+            assert!(
+                !batch_crosses(n, 512),
+                "batch {n} should not cross a 512 B gate"
+            );
         }
     }
 
@@ -142,18 +159,33 @@ mod tests {
     /// different LoRa gates; see RFC-7-review.md.
     #[test]
     fn a_small_batch_does_cross_at_rfc1_s_lora_gate() {
-        assert!(batch_crosses(64, 4_096), "batch 64 is 2168 B -> 4096 bucket");
-        assert!(!batch_crosses(128, 4_096), "batch 128 is 4216 B -> 16384 bucket");
+        assert!(
+            batch_crosses(64, 4_096),
+            "batch 64 is 2168 B -> 4096 bucket"
+        );
+        assert!(
+            !batch_crosses(128, 4_096),
+            "batch 128 is 4216 B -> 16384 bucket"
+        );
     }
 
     /// RFC 7 §5.5's decapsulation table, reproduced exactly.
     #[test]
     fn decapsulation_cost_matches_rfc7() {
-        for (batch, exhaustive) in
-            [(64usize, 19.2f64), (128, 38.4), (512, 153.6), (2_048, 614.4)]
-        {
-            assert!((decap_ms(batch, false) - exhaustive).abs() < 0.05, "batch {batch}");
-            assert!((decap_ms(batch, true) - 0.30).abs() < 0.01, "batch {batch} deterministic");
+        for (batch, exhaustive) in [
+            (64usize, 19.2f64),
+            (128, 38.4),
+            (512, 153.6),
+            (2_048, 614.4),
+        ] {
+            assert!(
+                (decap_ms(batch, false) - exhaustive).abs() < 0.05,
+                "batch {batch}"
+            );
+            assert!(
+                (decap_ms(batch, true) - 0.30).abs() < 0.01,
+                "batch {batch} deterministic"
+            );
         }
         // At 200 tag-matched objects in one reconciliation.
         assert!((decap_ms(512, false) * 200.0 / 1000.0 - 30.7).abs() < 0.1);

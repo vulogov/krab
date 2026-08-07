@@ -136,7 +136,8 @@ impl Writer {
     }
     /// Emit `true` or `false`. No other simple value is representable.
     pub fn bool(&mut self, v: bool) -> &mut Self {
-        self.buf.push((MT_SIMPLE << 5) | if v { SIMPLE_TRUE } else { SIMPLE_FALSE });
+        self.buf
+            .push((MT_SIMPLE << 5) | if v { SIMPLE_TRUE } else { SIMPLE_FALSE });
         self
     }
     /// Consume the writer, yielding the encoded bytes.
@@ -267,9 +268,13 @@ impl<'a> Reader<'a> {
             MT_TSTR => {
                 let n = usize::try_from(v).map_err(|_| Error::Truncated)?;
                 let b = self.take(n)?;
-                core::str::from_utf8(b).map(Item::Tstr).map_err(|_| Error::Malformed)
+                core::str::from_utf8(b)
+                    .map(Item::Tstr)
+                    .map_err(|_| Error::Malformed)
             }
-            MT_ARRAY => Ok(Item::Array(usize::try_from(v).map_err(|_| Error::Truncated)?)),
+            MT_ARRAY => Ok(Item::Array(
+                usize::try_from(v).map_err(|_| Error::Truncated)?,
+            )),
             MT_MAP => Ok(Item::Map(usize::try_from(v).map_err(|_| Error::Truncated)?)),
             MT_SIMPLE => match v {
                 x if x == SIMPLE_FALSE as u64 => Ok(Item::Bool(false)),
@@ -291,7 +296,11 @@ impl<'a> Reader<'a> {
     /// not a strictly ascending unsigned integer.
     pub fn map(&mut self) -> Result<MapReader<'a, '_>, Error> {
         match self.item()? {
-            Item::Map(n) => Ok(MapReader { r: self, left: n, last: None }),
+            Item::Map(n) => Ok(MapReader {
+                r: self,
+                left: n,
+                last: None,
+            }),
             _ => Err(Error::Malformed),
         }
     }
@@ -363,7 +372,13 @@ mod tests {
     #[test]
     fn round_trips_every_supported_item() {
         let mut w = Writer::new();
-        w.map(3).uint(0).uint(1).uint(1).bstr(&[1, 2, 3]).uint(2).tstr("krab");
+        w.map(3)
+            .uint(0)
+            .uint(1)
+            .uint(1)
+            .bstr(&[1, 2, 3])
+            .uint(2)
+            .tstr("krab");
         let bytes = w.finish();
 
         let mut r = Reader::new(&bytes);
@@ -380,7 +395,14 @@ mod tests {
 
     #[test]
     fn writer_emits_shortest_form() {
-        for (v, want) in [(0u64, 1usize), (23, 1), (24, 2), (255, 2), (256, 3), (65_536, 5)] {
+        for (v, want) in [
+            (0u64, 1usize),
+            (23, 1),
+            (24, 2),
+            (255, 2),
+            (256, 3),
+            (65_536, 5),
+        ] {
             let mut w = Writer::new();
             w.uint(v);
             assert_eq!(w.len(), want, "uint {v}");
@@ -393,9 +415,15 @@ mod tests {
         // 0x18 0x05 is 5 encoded in two bytes; 0x05 is canonical.
         assert_eq!(Reader::new(&[0x18, 0x05]).item(), Err(Error::NotCanonical));
         // 0x19 0x00 0xFF is 255 in three bytes.
-        assert_eq!(Reader::new(&[0x19, 0x00, 0xFF]).item(), Err(Error::NotCanonical));
+        assert_eq!(
+            Reader::new(&[0x19, 0x00, 0xFF]).item(),
+            Err(Error::NotCanonical)
+        );
         // 0x1a with a value that fits two bytes.
-        assert_eq!(Reader::new(&[0x1a, 0, 0, 0xFF, 0xFF]).item(), Err(Error::NotCanonical));
+        assert_eq!(
+            Reader::new(&[0x1a, 0, 0, 0xFF, 0xFF]).item(),
+            Err(Error::NotCanonical)
+        );
         // 0x1b with a value that fits four.
         assert_eq!(
             Reader::new(&[0x1b, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]).item(),
@@ -408,7 +436,11 @@ mod tests {
     fn rejects_indefinite_lengths() {
         for major in [MT_BSTR, MT_TSTR, MT_ARRAY, MT_MAP] {
             let b = [(major << 5) | AI_INDEFINITE];
-            assert_eq!(Reader::new(&b).item(), Err(Error::NotCanonical), "major {major}");
+            assert_eq!(
+                Reader::new(&b).item(),
+                Err(Error::NotCanonical),
+                "major {major}"
+            );
         }
     }
 
@@ -446,8 +478,14 @@ mod tests {
     fn rejects_floats_tags_null_and_undefined() {
         // half, single, double float
         assert_eq!(Reader::new(&[0xf9, 0, 0]).item(), Err(Error::NotCanonical));
-        assert_eq!(Reader::new(&[0xfa, 0, 0, 0, 0]).item(), Err(Error::NotCanonical));
-        assert_eq!(Reader::new(&[0xfb, 0, 0, 0, 0, 0, 0, 0, 0]).item(), Err(Error::NotCanonical));
+        assert_eq!(
+            Reader::new(&[0xfa, 0, 0, 0, 0]).item(),
+            Err(Error::NotCanonical)
+        );
+        assert_eq!(
+            Reader::new(&[0xfb, 0, 0, 0, 0, 0, 0, 0, 0]).item(),
+            Err(Error::NotCanonical)
+        );
         // null (0xf6) and undefined (0xf7)
         assert_eq!(Reader::new(&[0xf6]).item(), Err(Error::NotCanonical));
         assert_eq!(Reader::new(&[0xf7]).item(), Err(Error::NotCanonical));

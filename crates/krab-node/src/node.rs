@@ -48,7 +48,10 @@ impl Corpus for StoreView<'_> {
         self.0
             .entries_in_range(lo, hi)
             .into_iter()
-            .map(|(expiry_min, id)| Entry { expiry_min, id: id.truncated() })
+            .map(|(expiry_min, id)| Entry {
+                expiry_min,
+                id: id.truncated(),
+            })
             .collect()
     }
     fn fingerprint(&self, lo: u32, hi: u32) -> krab_crypto::Fingerprint {
@@ -67,7 +70,9 @@ impl Corpus for StoreView<'_> {
         if let Ok(h) = krab_core::object::RoutingHeader::parse(&bytes) {
             let id = krab_crypto::object_id(&bytes);
             // RFC 1 §11's checks live in the store; a refusal here is normal.
-            let _ = self.0.ingest(id, bytes, h.expiry_min.saturating_sub(1), u32::MAX);
+            let _ = self
+                .0
+                .ingest(id, bytes, h.expiry_min.saturating_sub(1), u32::MAX);
         }
     }
 }
@@ -153,7 +158,9 @@ impl Node {
         // 2. Outbound, driven only by the Poisson schedule.
         let due = self.scheduler.due(now, entropy);
         for peer in due {
-            let Some(idx) = self.links.iter().position(|l| l.peer == peer) else { continue };
+            let Some(idx) = self.links.iter().position(|l| l.peer == peer) else {
+                continue;
+            };
             if self.links[idx].fabric.connect().is_err() {
                 // I-4: unreachable is the normal case on an intermittent link.
                 // The schedule has already advanced, so a failed attempt does
@@ -191,7 +198,10 @@ mod tests {
 
     fn session() -> Session {
         Session::unlocked(
-            LinkKeys { noise_static: Key::new([1; 32]), credentials: 4 },
+            LinkKeys {
+                noise_static: Key::new([1; 32]),
+                credentials: 4,
+            },
             ContentKeys {
                 kek: Key::new([2; 32]),
                 tag_table_len: 100,
@@ -237,7 +247,10 @@ mod tests {
     fn inbound_is_accepted_without_user_involvement() {
         let mut n = node();
         n.add_link(
-            Link { peer: [1; 32], fabric: Box::new(SimFabric::new(LinkProfile::tcp())) },
+            Link {
+                peer: [1; 32],
+                fabric: Box::new(SimFabric::new(LinkProfile::tcp())),
+            },
             0,
             42,
         );
@@ -252,7 +265,10 @@ mod tests {
     fn outbound_is_initiated_by_the_schedule_alone() {
         let mut n = node();
         n.add_link(
-            Link { peer: [2; 32], fabric: Box::new(SimFabric::new(LinkProfile::tcp())) },
+            Link {
+                peer: [2; 32],
+                fabric: Box::new(SimFabric::new(LinkProfile::tcp())),
+            },
             0,
             42,
         );
@@ -260,7 +276,10 @@ mod tests {
         for t in (0..20_000u64).step_by(60) {
             initiated += n.tick(t, 0xBEEF ^ t).initiated;
         }
-        assert!(initiated > 0, "the schedule must actually drive connections");
+        assert!(
+            initiated > 0,
+            "the schedule must actually drive connections"
+        );
     }
 
     /// **Both continue while locked.** A locked node is a relay: it carries
@@ -269,7 +288,10 @@ mod tests {
     fn a_locked_node_still_serves_and_initiates() {
         let mut n = node();
         n.add_link(
-            Link { peer: [3; 32], fabric: Box::new(SimFabric::new(LinkProfile::tcp())) },
+            Link {
+                peer: [3; 32],
+                fabric: Box::new(SimFabric::new(LinkProfile::tcp())),
+            },
             0,
             42,
         );
@@ -332,7 +354,14 @@ mod tests {
         let sim = SimFabric::new(LinkProfile::courier());
         sim.partition(true);
         let mut n = node();
-        n.add_link(Link { peer: [7; 32], fabric: Box::new(sim) }, 0, 42);
+        n.add_link(
+            Link {
+                peer: [7; 32],
+                fabric: Box::new(sim),
+            },
+            0,
+            42,
+        );
 
         for t in (0..10_000u64).step_by(60) {
             let r = n.tick(t, 0xF00D ^ t);

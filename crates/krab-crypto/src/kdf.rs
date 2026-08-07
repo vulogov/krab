@@ -69,7 +69,8 @@ fn expand_tag(prk: &[u8; 32], label: &[u8], epoch: Epoch) -> Tag {
     info[n..n + 4].copy_from_slice(&epoch.to_le_bytes());
 
     let mut out = [0u8; 8];
-    hk.expand(&info[..n + 4], &mut out).expect("8 bytes is far below 255·HashLen");
+    hk.expand(&info[..n + 4], &mut out)
+        .expect("8 bytes is far below 255·HashLen");
     Tag(out)
 }
 
@@ -137,7 +138,9 @@ mod tests {
     #[test]
     fn a_pairwise_tag_changes_every_epoch() {
         let s = agree(&sk(1), &sk(2).public()).unwrap();
-        let tags: Vec<Tag> = (0..10).map(|d| pairwise_tag(&s, Epoch(NOW.0 + d))).collect();
+        let tags: Vec<Tag> = (0..10)
+            .map(|d| pairwise_tag(&s, Epoch(NOW.0 + d)))
+            .collect();
         for (i, t) in tags.iter().enumerate() {
             for (j, u) in tags.iter().enumerate() {
                 assert!(i == j || t != u, "epochs {i} and {j} collide");
@@ -173,7 +176,11 @@ mod tests {
         let recipient = sk(5);
         let pk = recipient.public();
         assert_eq!(inbox_tag(&pk, NOW), inbox_tag(&pk, NOW));
-        assert_ne!(inbox_tag(&pk, NOW), inbox_tag(&pk, Epoch(NOW.0 + 1)), "rotates out");
+        assert_ne!(
+            inbox_tag(&pk, NOW),
+            inbox_tag(&pk, Epoch(NOW.0 + 1)),
+            "rotates out"
+        );
         assert_ne!(inbox_tag(&pk, NOW), inbox_tag(&sk(6).public(), NOW));
     }
 
@@ -189,11 +196,17 @@ mod tests {
         let mut seen: Vec<Tag> = table.iter().map(|(_, t)| *t).collect();
         seen.sort_by_key(|t| t.0);
         seen.dedup_by_key(|t| t.0);
-        assert_eq!(seen.len(), table.len(), "a collision would misroute a decrypt");
+        assert_eq!(
+            seen.len(),
+            table.len(),
+            "a collision would misroute a decrypt"
+        );
 
         // And an object at the far edge of MAX_TTL is still in the table.
         let far = Epoch(NOW.0 - 45);
-        assert!(table.iter().any(|(e, t)| *e == far && *t == pairwise_tag(&s, far)));
+        assert!(table
+            .iter()
+            .any(|(e, t)| *e == far && *t == pairwise_tag(&s, far)));
     }
 
     /// A tag is 8 bytes — RFC 1 §4.1's frozen header field.

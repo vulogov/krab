@@ -57,6 +57,9 @@ mod tests {
         r.fill(&mut buf);
         let zeros = buf.iter().filter(|&&b| b == 0).count();
         // ~16 expected in 4 KiB; 200 would mean a large unwritten region.
-        assert!(zeros < 200, "{zeros} zero bytes suggests an unfilled buffer");
+        assert!(
+            zeros < 200,
+            "{zeros} zero bytes suggests an unfilled buffer"
+        );
     }
 }

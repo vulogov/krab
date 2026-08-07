@@ -237,7 +237,10 @@ mod tests {
         let ids: Vec<ObjectId> = (0..8).map(id).collect();
         let forward = Fingerprint::over(ids.iter());
         let backward = Fingerprint::over(ids.iter().rev());
-        assert_eq!(forward, backward, "a range fingerprint cannot depend on scan order");
+        assert_eq!(
+            forward, backward,
+            "a range fingerprint cannot depend on scan order"
+        );
     }
 
     /// The property RBSR needs from the storage layer: any range's fingerprint

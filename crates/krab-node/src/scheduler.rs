@@ -43,7 +43,10 @@ impl Scheduler {
     /// RFC 5 §5 recommends lengthening this on links whose `latency_class` is
     /// not `Interactive`, since manifest cost is per-exchange.
     pub fn new(mean_interval_s: u64) -> Scheduler {
-        Scheduler { mean_interval_s: mean_interval_s.max(1), next: BTreeMap::new() }
+        Scheduler {
+            mean_interval_s: mean_interval_s.max(1),
+            next: BTreeMap::new(),
+        }
     }
 
     /// Mean interval, seconds.
@@ -53,7 +56,8 @@ impl Scheduler {
 
     /// Enrol a peer, drawing its first attempt.
     pub fn add(&mut self, peer: PeerId, now: u64, entropy: u64) {
-        self.next.insert(peer, Self::draw(now, self.mean_interval_s, entropy));
+        self.next
+            .insert(peer, Self::draw(now, self.mean_interval_s, entropy));
     }
 
     /// Remove a peer.
@@ -88,20 +92,27 @@ impl Scheduler {
     /// must not retry sooner than one that succeeded, or failure becomes an
     /// observable timing signal.
     pub fn due(&mut self, now: u64, entropy: u64) -> Vec<PeerId> {
-        let mut ready: Vec<PeerId> =
-            self.next.iter().filter(|(_, &t)| t <= now).map(|(p, _)| *p).collect();
+        let mut ready: Vec<PeerId> = self
+            .next
+            .iter()
+            .filter(|(_, &t)| t <= now)
+            .map(|(p, _)| *p)
+            .collect();
 
         // Fisher-Yates from the supplied entropy: deterministic per seed, so
         // the simulator and the fuzzer replay exactly.
         let mut e = mix(entropy) | 1;
         for i in (1..ready.len()).rev() {
-            e = e.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            e = e
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             ready.swap(i, (e >> 33) as usize % (i + 1));
         }
 
         for (i, p) in ready.iter().enumerate() {
             let seed = entropy.rotate_left(((i % 63) + 1) as u32) ^ (i as u64);
-            self.next.insert(*p, Self::draw(now, self.mean_interval_s, seed));
+            self.next
+                .insert(*p, Self::draw(now, self.mean_interval_s, seed));
         }
         ready
     }
@@ -179,9 +190,16 @@ mod tests {
             samples.push(s.next_due(&peer(1)).unwrap());
         }
         let avg = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
-        assert!((mean as f64 * 0.8..mean as f64 * 1.2).contains(&avg), "mean {avg} off");
-        let spread = samples.iter().copied().max().unwrap() - samples.iter().copied().min().unwrap();
-        assert!(spread > mean * 3, "exponential, not near-constant: spread {spread}");
+        assert!(
+            (mean as f64 * 0.8..mean as f64 * 1.2).contains(&avg),
+            "mean {avg} off"
+        );
+        let spread =
+            samples.iter().copied().max().unwrap() - samples.iter().copied().min().unwrap();
+        assert!(
+            spread > mean * 3,
+            "exponential, not near-constant: spread {spread}"
+        );
     }
 
     /// **The I-5 absence test.**
@@ -223,7 +241,10 @@ mod tests {
             samples.push(s.next_due(&peer(1)).unwrap());
         }
         let avg = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
-        assert!((mean as f64 * 0.7..mean as f64 * 1.4).contains(&avg), "mean {avg} off");
+        assert!(
+            (mean as f64 * 0.7..mean as f64 * 1.4).contains(&avg),
+            "mean {avg} off"
+        );
     }
 
     /// A failed reconciliation must not retry sooner than a successful one, or

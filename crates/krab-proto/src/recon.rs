@@ -69,7 +69,11 @@ pub trait Corpus {
 /// This is the whole of manifest mode's difference computation, and RBSR's
 /// leaf case reduces to it.
 pub fn wanted<C: Corpus + ?Sized>(local: &C, offered: &[Entry]) -> Vec<[u8; TRUNC]> {
-    offered.iter().filter(|e| !local.has(&e.id)).map(|e| e.id).collect()
+    offered
+        .iter()
+        .filter(|e| !local.has(&e.id))
+        .map(|e| e.id)
+        .collect()
 }
 
 /// Split a range into at most [`RBSR_BRANCH`] sub-ranges, RFC 5 §4.4.
@@ -99,7 +103,12 @@ pub fn split(range: &Range) -> Vec<(u32, u32)> {
 
 /// Describe a range from the local corpus.
 pub fn describe<C: Corpus + ?Sized>(local: &C, lo: u32, hi: u32) -> Range {
-    Range { lo, hi, fingerprint: local.fingerprint(lo, hi), count: local.count(lo, hi) }
+    Range {
+        lo,
+        hi,
+        fingerprint: local.fingerprint(lo, hi),
+        count: local.count(lo, hi),
+    }
 }
 
 /// One side's response to a batch of ranges, RFC 5 §4.4.
@@ -187,7 +196,11 @@ pub fn reconcile<A: Corpus + ?Sized, B: Corpus + ?Sized>(
                     n += 1;
                 }
             }
-            Outcome { rounds: 1, transferred: n, fell_back: false }
+            Outcome {
+                rounds: 1,
+                transferred: n,
+                fell_back: false,
+            }
         }
         Mode::Rbsr => {
             let mut pending = alloc::vec![describe(a, lo, hi)];
@@ -238,7 +251,11 @@ pub fn reconcile<A: Corpus + ?Sized, B: Corpus + ?Sized>(
                     n += 1;
                 }
             }
-            Outcome { rounds, transferred: n, fell_back }
+            Outcome {
+                rounds,
+                transferred: n,
+                fell_back,
+            }
         }
     }
 }
@@ -291,19 +308,27 @@ mod tests {
         fn entries(&self, lo: u32, hi: u32) -> Vec<Entry> {
             self.objs
                 .range((lo, [0; TRUNC])..(hi, [0; TRUNC]))
-                .map(|((e, i), _)| Entry { expiry_min: *e, id: *i })
+                .map(|((e, i), _)| Entry {
+                    expiry_min: *e,
+                    id: *i,
+                })
                 .collect()
         }
         fn fingerprint(&self, lo: u32, hi: u32) -> Fingerprint {
             self.objs
                 .range((lo, [0; TRUNC])..(hi, [0; TRUNC]))
-                .fold(Fingerprint::ZERO, |a, (_, (id, _))| a.add(Fingerprint::of(id)))
+                .fold(Fingerprint::ZERO, |a, (_, (id, _))| {
+                    a.add(Fingerprint::of(id))
+                })
         }
         fn count(&self, lo: u32, hi: u32) -> u32 {
             self.objs.range((lo, [0; TRUNC])..(hi, [0; TRUNC])).count() as u32
         }
         fn get(&self, id: &[u8; TRUNC]) -> Option<Vec<u8>> {
-            self.objs.values().find(|(i, _)| &i.truncated() == id).map(|(_, b)| b.clone())
+            self.objs
+                .values()
+                .find(|(i, _)| &i.truncated() == id)
+                .map(|(_, b)| b.clone())
         }
         fn has(&self, id: &[u8; TRUNC]) -> bool {
             self.objs.keys().any(|(_, i)| i == id)
@@ -311,7 +336,8 @@ mod tests {
         fn put(&mut self, bytes: Vec<u8>) {
             if let Ok(h) = RoutingHeader::parse(&bytes) {
                 let id = krab_crypto::object_id(&bytes);
-                self.objs.insert((h.expiry_min, id.truncated()), (id, bytes));
+                self.objs
+                    .insert((h.expiry_min, id.truncated()), (id, bytes));
             }
         }
     }
@@ -348,7 +374,11 @@ mod tests {
             converges(mode, &[(DAY, 1)], &[]);
             converges(mode, &[], &[(DAY, 1)]);
             converges(mode, &[(DAY, 1)], &[(DAY, 1)]);
-            converges(mode, &[(DAY, 1), (2 * DAY, 2)], &[(2 * DAY, 2), (3 * DAY, 3)]);
+            converges(
+                mode,
+                &[(DAY, 1), (2 * DAY, 2)],
+                &[(2 * DAY, 2), (3 * DAY, 3)],
+            );
         }
     }
 
@@ -388,16 +418,28 @@ mod tests {
         let (mut a, mut b) = (Mem::with(&same), Mem::with(&same));
         let out = reconcile(&mut a, &mut b, Mode::Rbsr, 0, 400 * DAY);
         assert_eq!(out.transferred, 0);
-        assert_eq!(out.rounds, 1, "identical corpora agree at the root, in one round");
+        assert_eq!(
+            out.rounds, 1,
+            "identical corpora agree at the root, in one round"
+        );
         assert!(!out.fell_back);
     }
 
     /// Both sides must derive identical boundaries with no coordination.
     #[test]
     fn split_is_deterministic_and_covers_without_gaps() {
-        let r = Range { lo: 0, hi: 10_000, fingerprint: Fingerprint::ZERO, count: 999 };
+        let r = Range {
+            lo: 0,
+            hi: 10_000,
+            fingerprint: Fingerprint::ZERO,
+            count: 999,
+        };
         let parts = split(&r);
-        assert_eq!(parts, split(&r), "both sides must derive the same boundaries");
+        assert_eq!(
+            parts,
+            split(&r),
+            "both sides must derive the same boundaries"
+        );
         assert!(parts.len() <= RBSR_BRANCH as usize);
         assert_eq!(parts.first().unwrap().0, r.lo);
         assert_eq!(parts.last().unwrap().1, r.hi);
@@ -409,7 +451,12 @@ mod tests {
     #[test]
     fn split_terminates_on_degenerate_ranges() {
         for (lo, hi) in [(0u32, 0u32), (5, 5), (5, 6), (u32::MAX - 1, u32::MAX)] {
-            let r = Range { lo, hi, fingerprint: Fingerprint::ZERO, count: 1 };
+            let r = Range {
+                lo,
+                hi,
+                fingerprint: Fingerprint::ZERO,
+                count: 1,
+            };
             assert!(split(&r).len() <= RBSR_BRANCH as usize);
         }
     }

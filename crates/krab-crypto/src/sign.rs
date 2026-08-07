@@ -31,7 +31,9 @@
 use crate::hash::node_id;
 use crate::rng::Rng;
 use core::fmt;
-use ed25519_dalek::{Signature, Signer, SigningKey as DalekSigning, VerifyingKey as DalekVerifying};
+use ed25519_dalek::{
+    Signature, Signer, SigningKey as DalekSigning, VerifyingKey as DalekVerifying,
+};
 use zeroize::Zeroize;
 
 /// A 64-byte Ed25519 signature.
@@ -53,7 +55,11 @@ pub struct VerifyingKey([u8; 32]);
 impl fmt::Debug for VerifyingKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let id = self.node_id();
-        write!(f, "VerifyingKey({:02x}{:02x}{:02x}{:02x}..)", id[0], id[1], id[2], id[3])
+        write!(
+            f,
+            "VerifyingKey({:02x}{:02x}{:02x}{:02x}..)",
+            id[0], id[1], id[2], id[3]
+        )
     }
 }
 
@@ -170,7 +176,10 @@ mod tests {
         let sig = a.sign(b"peer-link");
         assert!(a.verifying_key().verify(b"peer-link", &sig));
         assert!(!b.verifying_key().verify(b"peer-link", &sig), "wrong key");
-        assert!(!a.verifying_key().verify(b"peer-lin", &sig), "wrong message");
+        assert!(
+            !a.verifying_key().verify(b"peer-lin", &sig),
+            "wrong message"
+        );
     }
 
     /// **`CRYPTO-REVIEW.md` §2.** A non-canonical `S` is a different byte
@@ -185,7 +194,10 @@ mod tests {
         let a = key(3);
         let vk = a.verifying_key();
         let sig = a.sign(b"amplify me");
-        assert!(vk.verify(b"amplify me", &sig), "the canonical form verifies");
+        assert!(
+            vk.verify(b"amplify me", &sig),
+            "the canonical form verifies"
+        );
 
         // L = 2^252 + 27742317777372353535851937790883648493
         const L: [u8; 32] = [

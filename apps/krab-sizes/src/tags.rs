@@ -107,7 +107,10 @@ mod tests {
             (100_000, 1_525, 8.267e-12),
             (500_000, 22_750, 6.166e-10),
         ] {
-            assert!(close(false_match_p(corpus, entries), p, 0.01), "{corpus}/{entries}");
+            assert!(
+                close(false_match_p(corpus, entries), p, 0.01),
+                "{corpus}/{entries}"
+            );
         }
     }
 
@@ -116,7 +119,14 @@ mod tests {
     fn shard_table_matches_rfc2() {
         // RFC 2 gives these to two significant figures, so k=8's 2.4414
         // prints as "2.4" — a 1.7% gap that is typography, not arithmetic.
-        for (k, mb) in [(0u32, 625.0f64), (1, 312.5), (2, 156.2), (4, 39.1), (6, 9.8), (8, 2.4)] {
+        for (k, mb) in [
+            (0u32, 625.0f64),
+            (1, 312.5),
+            (2, 156.2),
+            (4, 39.1),
+            (6, 9.8),
+            (8, 2.4),
+        ] {
             assert!(close(shard_ingress_mb(10_000, k), mb, 0.02), "k={k}");
         }
         // "k=4 at n=10 000, k=7 at n=100 000" for a 50 MB/day target.
@@ -134,7 +144,11 @@ mod tests {
             (100, 512, 9.77),
             (200, 1_024, 19.53),
         ] {
-            assert_eq!(prekey_batch_for_correspondents(correspondents), batch, "{correspondents}");
+            assert_eq!(
+                prekey_batch_for_correspondents(correspondents),
+                batch,
+                "{correspondents}"
+            );
             assert!(close(index_collisions(correspondents, batch), shared, 0.02));
             // The rule's stated property: at most 10% of senders share.
             assert!(index_collisions(correspondents, batch) / correspondents as f64 <= 0.10 + 1e-9);
@@ -146,13 +160,17 @@ mod tests {
     fn erratum_shrink_factors_match_rfc2() {
         // (correspondents, published batch, corrected batch, shrink)
         for (c, old, new, shrink) in [
-            (12usize, 256usize, 64usize, 4usize),   // solo, 5 msg/d, 30 d
-            (25, 512, 128, 4),                      // group of 20, 7 d
-            (49, 2_048, 256, 8),                    // group of 50, 7 d
-            (49, 8_192, 256, 32),                   // group of 50, 30 d
-            (100, 8_192, 512, 16),                  // busy node, 100 msg/d
+            (12usize, 256usize, 64usize, 4usize), // solo, 5 msg/d, 30 d
+            (25, 512, 128, 4),                    // group of 20, 7 d
+            (49, 2_048, 256, 8),                  // group of 50, 7 d
+            (49, 8_192, 256, 32),                 // group of 50, 30 d
+            (100, 8_192, 512, 16),                // busy node, 100 msg/d
         ] {
-            assert_eq!(prekey_batch_for_correspondents(c), new, "{c} correspondents");
+            assert_eq!(
+                prekey_batch_for_correspondents(c),
+                new,
+                "{c} correspondents"
+            );
             assert_eq!(old / new, shrink, "{c} shrink factor");
         }
     }
@@ -162,7 +180,10 @@ mod tests {
     #[test]
     fn erratum_removes_the_max_object_ceiling() {
         // RFC 7 §5.3's impossible case: 100 msg/day republished monthly.
-        assert!(prekey_batch_wire(8_192) > MAX_OBJECT, "published model overflows");
+        assert!(
+            prekey_batch_wire(8_192) > MAX_OBJECT,
+            "published model overflows"
+        );
         // Under the corrected model that node has ~100 correspondents.
         let corrected = prekey_batch_for_correspondents(100);
         assert_eq!(corrected, 512);
@@ -186,8 +207,14 @@ mod tests {
         let rfc1_floor = MAX_TTL_D / EPOCH_D;
         let rfc2_default = 30;
         let rfc2_minimum = 14;
-        assert!(rfc2_default < rfc1_floor, "RFC 2 default ±{rfc2_default} < RFC 1 floor ±{rfc1_floor}");
-        assert!(rfc2_minimum < rfc1_floor, "RFC 2 minimum ±{rfc2_minimum} < RFC 1 floor ±{rfc1_floor}");
+        assert!(
+            rfc2_default < rfc1_floor,
+            "RFC 2 default ±{rfc2_default} < RFC 1 floor ±{rfc1_floor}"
+        );
+        assert!(
+            rfc2_minimum < rfc1_floor,
+            "RFC 2 minimum ±{rfc2_minimum} < RFC 1 floor ±{rfc1_floor}"
+        );
     }
 
     /// RFC 2 §9 declares the precomputation table key material. RFC 7 §2.1's

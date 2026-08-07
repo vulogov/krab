@@ -62,6 +62,6 @@ pub use hash::{channel_id, channel_tag, node_id, object_id, Fingerprint};
 pub use kdf::{inbox_tag, pairwise_tag, pairwise_window};
 pub use kek::{Hierarchy, Kek, KekParams};
 pub use rng::Rng;
+pub use secret::{Key, Secret};
 pub use sign::{Sig, SigningKey, VerifyingKey};
 pub use words::phrase;
-pub use secret::{Key, Secret};

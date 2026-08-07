@@ -118,8 +118,17 @@ impl Store {
         }
 
         let bucket = bucket_of(expiry);
-        self.segments.entry(bucket).or_insert_with(|| Segment::new(bucket)).append(id, bytes);
-        self.index.insert((expiry, id), Location { bucket, expiry_min: expiry });
+        self.segments
+            .entry(bucket)
+            .or_insert_with(|| Segment::new(bucket))
+            .append(id, bytes);
+        self.index.insert(
+            (expiry, id),
+            Location {
+                bucket,
+                expiry_min: expiry,
+            },
+        );
         Ok(())
     }
 
@@ -142,7 +151,10 @@ impl Store {
 
     /// Objects within `[lo, hi)`.
     pub fn count_in_range(&self, lo_min: u32, hi_min: u32) -> u32 {
-        self.index.keys().filter(|(e, _)| *e >= lo_min && *e < hi_min).count() as u32
+        self.index
+            .keys()
+            .filter(|(e, _)| *e >= lo_min && *e < hi_min)
+            .count() as u32
     }
 
     /// Fetch by a 12-byte truncated identifier (RFC 1 §9.3).
@@ -150,7 +162,11 @@ impl Store {
     /// Valid only inside an agreed reconciliation scope, which the caller has
     /// already established.
     pub fn get_truncated(&self, trunc: &[u8; 12]) -> Option<&[u8]> {
-        let id = self.index.keys().find(|(_, i)| &i.truncated() == trunc).map(|(_, i)| *i)?;
+        let id = self
+            .index
+            .keys()
+            .find(|(_, i)| &i.truncated() == trunc)
+            .map(|(_, i)| *i)?;
         self.get(&id)
     }
 
@@ -193,7 +209,10 @@ impl Store {
     }
 
     fn locate(&self, id: &ObjectId) -> Option<Location> {
-        self.index.iter().find(|((_, i), _)| i == id).map(|(_, l)| *l)
+        self.index
+            .iter()
+            .find(|((_, i), _)| i == id)
+            .map(|(_, l)| *l)
     }
 
     /// Drop everything that has expired, tombstoning it.
@@ -236,8 +255,12 @@ impl Store {
     pub fn evict_to(&mut self, cap_bytes: u64) -> usize {
         let mut dropped = 0;
         while self.bytes() > cap_bytes {
-            let Some(&oldest) = self.segments.keys().next() else { break };
-            let Some(seg) = self.segments.remove(&oldest) else { break };
+            let Some(&oldest) = self.segments.keys().next() else {
+                break;
+            };
+            let Some(seg) = self.segments.remove(&oldest) else {
+                break;
+            };
             for id in seg.ids() {
                 self.tombstones.insert(*id);
                 dropped += 1;
@@ -259,7 +282,13 @@ impl Store {
         for (&bucket, seg) in &self.segments {
             for (id, bytes) in seg.entries() {
                 let h = RoutingHeader::parse(bytes).map_err(|_| Error::Corrupt)?;
-                self.index.insert((h.expiry_min, *id), Location { bucket, expiry_min: h.expiry_min });
+                self.index.insert(
+                    (h.expiry_min, *id),
+                    Location {
+                        bucket,
+                        expiry_min: h.expiry_min,
+                    },
+                );
             }
         }
         Ok(())
@@ -350,7 +379,10 @@ mod tests {
         let (fid, fb) = object(DAY / 2 + 10, 1);
         let _ = fid;
         let _ = fb;
-        assert!(s.watermark() >= DAY, "watermark advanced past the evicted range");
+        assert!(
+            s.watermark() >= DAY,
+            "watermark advanced past the evicted range"
+        );
     }
 
     /// I-6 — eviction is oldest-first, whole segments, and depends on nothing
@@ -379,7 +411,10 @@ mod tests {
         let mut s = store_with(0, &[(DAY, 1), (2 * DAY, 2), (3 * DAY, 3)]);
         assert_eq!(s.watermark(), 0);
         s.evict_to(1);
-        assert!(s.watermark() > 0, "a peer must learn not to re-offer what was evicted");
+        assert!(
+            s.watermark() > 0,
+            "a peer must learn not to re-offer what was evicted"
+        );
     }
 
     /// RFC 5 §7 — the index MUST be fully rebuildable from the segments by one
@@ -394,7 +429,10 @@ mod tests {
         s.rebuild_index().unwrap();
 
         let after: Vec<ObjectId> = s.ids_in_order().copied().collect();
-        assert_eq!(before, after, "rebuilt identically, and in (expiry, id) order");
+        assert_eq!(
+            before, after,
+            "rebuilt identically, and in (expiry, id) order"
+        );
     }
 
     /// RFC 5 §4.4 — RBSR descends `(expiry, id)`, which is identical on both
@@ -425,12 +463,18 @@ mod tests {
     fn a_divergent_range_does_not_look_synchronised() {
         let a = store_with(0, &[(DAY, 1), (2 * DAY, 2)]);
         let b = store_with(0, &[(DAY, 1), (2 * DAY, 9)]);
-        assert_ne!(a.range_fingerprint(0, 5 * DAY), b.range_fingerprint(0, 5 * DAY));
+        assert_ne!(
+            a.range_fingerprint(0, 5 * DAY),
+            b.range_fingerprint(0, 5 * DAY)
+        );
     }
 
     #[test]
     fn rejects_a_malformed_header() {
         let mut s = Store::new();
-        assert_eq!(s.ingest(ObjectId([0; 32]), vec![0u8; 4], 0, MAX_TTL), Err(Reject::Malformed));
+        assert_eq!(
+            s.ingest(ObjectId([0; 32]), vec![0u8; 4], 0, MAX_TTL),
+            Err(Reject::Malformed)
+        );
     }
 }

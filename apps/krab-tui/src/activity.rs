@@ -108,7 +108,13 @@ pub enum Activity {
 }
 
 /// Where a peering ceremony has reached, RFC 3 §11.
+///
+/// `PackRequest` and `Import` are constructed once `peer accept` and `peer
+/// seal` read files; the whole sequence is enumerated now because RFC 8 §5.1's
+/// rule — indicate only what is genuinely running — is easier to hold to when
+/// the full set of runnable things is written down in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum CeremonyStep {
     /// Writing this node's `peer-request` to removable media.
     PackRequest,
@@ -215,7 +221,9 @@ impl Spinner {
 
     /// The glyph to draw for `activity`, or `None` when nothing is in flight.
     pub fn glyph(&self, activity: &Activity) -> Option<char> {
-        activity.animates().then(|| FRAMES[self.frame % FRAMES.len()])
+        activity
+            .animates()
+            .then(|| FRAMES[self.frame % FRAMES.len()])
     }
 }
 
@@ -273,6 +281,7 @@ pub fn schedule_window(secs_until: u64) -> &'static str {
 /// And if push-on-send were implemented, an honest indicator would have to
 /// show activity on compose, which RFC 8 §5.1 forbids. All three cannot hold.
 /// This implements scheduled-only emission.
+#[allow(dead_code)] // the spinner-aware form is what renders
 pub fn status_line(state: &NodeState) -> String {
     status_line_with(state, &Spinner::default())
 }
@@ -308,7 +317,11 @@ mod tests {
     /// because there is none to produce.
     #[test]
     fn sending_shows_a_queue_and_never_progress() {
-        let after_send = NodeState { queued: 1, next_sync_in_s: Some(7_800), ..Default::default() };
+        let after_send = NodeState {
+            queued: 1,
+            next_sync_in_s: Some(7_800),
+            ..Default::default()
+        };
         assert_eq!(Activity::of(&after_send), Activity::Idle);
         assert!(!Activity::of(&after_send).is_visible());
 
@@ -317,15 +330,24 @@ mod tests {
         assert!(line.contains("next reconciliation"));
         // Never a signal implying the user's action caused a transfer.
         for forbidden in ["syncing", "sending", "transferring", "uploading", "%"] {
-            assert!(!line.to_lowercase().contains(forbidden), "{line:?} implies causation");
+            assert!(
+                !line.to_lowercase().contains(forbidden),
+                "{line:?} implies causation"
+            );
         }
     }
 
     /// RFC 8 §5.1 — establishment progress is required, not merely allowed.
     #[test]
     fn establishment_is_shown_because_it_is_real_work() {
-        let s = NodeState { establishing: Some("tor"), ..Default::default() };
-        assert_eq!(Activity::of(&s), Activity::Establishing { transport: "tor" });
+        let s = NodeState {
+            establishing: Some("tor"),
+            ..Default::default()
+        };
+        assert_eq!(
+            Activity::of(&s),
+            Activity::Establishing { transport: "tor" }
+        );
         assert!(Activity::of(&s).is_visible());
         assert!(status_line(&s).contains("connecting (tor)"));
     }
@@ -334,7 +356,10 @@ mod tests {
     /// doing nothing, which is what makes it safe to show.
     #[test]
     fn a_running_reconciliation_may_be_shown_but_is_never_called_syncing() {
-        let s = NodeState { reconciling: Some("m4k2"), ..Default::default() };
+        let s = NodeState {
+            reconciling: Some("m4k2"),
+            ..Default::default()
+        };
         assert!(status_line(&s).contains("reconciling with m4k2"));
         assert!(!status_line(&s).to_lowercase().contains("syncing now"));
     }
@@ -367,7 +392,10 @@ mod tests {
             assert_eq!(sp.glyph(&Activity::Idle), None);
         }
         // It appears only because the node state says so.
-        let s = NodeState { reconciling: Some("p1"), ..Default::default() };
+        let s = NodeState {
+            reconciling: Some("p1"),
+            ..Default::default()
+        };
         assert!(sp.glyph(&Activity::of(&s)).is_some());
     }
 
@@ -376,15 +404,26 @@ mod tests {
     fn queueing_a_message_does_not_start_the_spinner() {
         let sp = Spinner::default();
         for queued in [1usize, 5, 999] {
-            let s = NodeState { queued, next_sync_in_s: Some(7_800), ..Default::default() };
-            assert_eq!(sp.glyph(&Activity::of(&s)), None, "{queued} queued must not animate");
+            let s = NodeState {
+                queued,
+                next_sync_in_s: Some(7_800),
+                ..Default::default()
+            };
+            assert_eq!(
+                sp.glyph(&Activity::of(&s)),
+                None,
+                "{queued} queued must not animate"
+            );
         }
     }
 
     /// Foreground work is the user's operation and is shown as one.
     #[test]
     fn the_ceremony_is_foreground_and_names_its_step() {
-        let s = NodeState { ceremony: Some(CeremonyStep::Verify), ..Default::default() };
+        let s = NodeState {
+            ceremony: Some(CeremonyStep::Verify),
+            ..Default::default()
+        };
         let line = status_line(&s);
         assert!(line.contains("compare the word list aloud"), "{line}");
         // It outranks a background reconciliation, because the user is waiting
@@ -455,12 +494,24 @@ mod tests {
     /// indicator cannot be attached to a keypress even by mistake.
     #[test]
     fn activity_is_derived_from_state_alone() {
-        let a = NodeState { reconciling: Some("p1"), queued: 3, ..Default::default() };
-        let b = NodeState { reconciling: Some("p1"), queued: 3, ..Default::default() };
+        let a = NodeState {
+            reconciling: Some("p1"),
+            queued: 3,
+            ..Default::default()
+        };
+        let b = NodeState {
+            reconciling: Some("p1"),
+            queued: 3,
+            ..Default::default()
+        };
         assert_eq!(Activity::of(&a), Activity::of(&b));
         // Queue depth -- the closest thing to a user action -- does not reach
         // the indicator at all.
-        let c = NodeState { reconciling: Some("p1"), queued: 999, ..Default::default() };
+        let c = NodeState {
+            reconciling: Some("p1"),
+            queued: 999,
+            ..Default::default()
+        };
         assert_eq!(Activity::of(&a), Activity::of(&c));
     }
 }

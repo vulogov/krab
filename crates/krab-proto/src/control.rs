@@ -30,7 +30,10 @@ pub struct Entry {
 impl Entry {
     /// Build a row from a full identifier.
     pub fn new(expiry_min: u32, id: &ObjectId) -> Entry {
-        Entry { expiry_min, id: id.truncated() }
+        Entry {
+            expiry_min,
+            id: id.truncated(),
+        }
     }
 }
 
@@ -124,12 +127,27 @@ impl Control {
     pub fn write(&self) -> Vec<u8> {
         let mut w = cbor::Writer::new();
         match self {
-            Control::Hello { version, node, watermark, filter_digest } => {
-                w.array(5).uint(0).uint(*version as u64).bstr(node).uint(*watermark as u64);
+            Control::Hello {
+                version,
+                node,
+                watermark,
+                filter_digest,
+            } => {
+                w.array(5)
+                    .uint(0)
+                    .uint(*version as u64)
+                    .bstr(node)
+                    .uint(*watermark as u64);
                 w.bstr(filter_digest);
             }
-            Control::Manifest { filter_digest, entries } => {
-                w.array(3).uint(1).bstr(filter_digest).array(entries.len() * 2);
+            Control::Manifest {
+                filter_digest,
+                entries,
+            } => {
+                w.array(3)
+                    .uint(1)
+                    .bstr(filter_digest)
+                    .array(entries.len() * 2);
                 for e in entries {
                     w.uint(e.expiry_min as u64).bstr(&e.id);
                 }
@@ -205,7 +223,12 @@ impl Control {
                 let node = bytes32(&bstr(&mut r)?)?;
                 let watermark = u32f(uint(&mut r)?)?;
                 let filter_digest = bytes32(&bstr(&mut r)?)?;
-                Ok(Control::Hello { version, node, watermark, filter_digest })
+                Ok(Control::Hello {
+                    version,
+                    node,
+                    watermark,
+                    filter_digest,
+                })
             }
             1 => {
                 let filter_digest = bytes32(&bstr(&mut r)?)?;
@@ -216,17 +239,27 @@ impl Control {
                 let mut entries = Vec::with_capacity(n / 2);
                 for _ in 0..n / 2 {
                     let expiry_min = u32f(uint(&mut r)?)?;
-                    let id: [u8; TRUNC] =
-                        bstr(&mut r)?.as_slice().try_into().map_err(|_| Error::BadField)?;
+                    let id: [u8; TRUNC] = bstr(&mut r)?
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::BadField)?;
                     entries.push(Entry { expiry_min, id });
                 }
-                Ok(Control::Manifest { filter_digest, entries })
+                Ok(Control::Manifest {
+                    filter_digest,
+                    entries,
+                })
             }
             2 => {
                 let n = arr(&mut r)?;
                 let mut ids = Vec::with_capacity(n);
                 for _ in 0..n {
-                    ids.push(bstr(&mut r)?.as_slice().try_into().map_err(|_| Error::BadField)?);
+                    ids.push(
+                        bstr(&mut r)?
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| Error::BadField)?,
+                    );
                 }
                 Ok(Control::Want(ids))
             }
@@ -243,12 +276,19 @@ impl Control {
                     let hi = u32f(uint(&mut r)?)?;
                     let fingerprint = Fingerprint::from_bytes(&bytes32(&bstr(&mut r)?)?);
                     let count = u32f(uint(&mut r)?)?;
-                    rs.push(Range { lo, hi, fingerprint, count });
+                    rs.push(Range {
+                        lo,
+                        hi,
+                        fingerprint,
+                        count,
+                    });
                 }
                 Ok(Control::Range(rs))
             }
             6 => Ok(Control::RangeDone),
-            7 => Ok(Control::Bye { reason: u32f(uint(&mut r)?)? as u16 }),
+            7 => Ok(Control::Bye {
+                reason: u32f(uint(&mut r)?)? as u16,
+            }),
             _ => Err(Error::UnknownOpcode),
         }
     }
@@ -264,7 +304,12 @@ mod tests {
 
     fn all() -> Vec<Control> {
         alloc::vec![
-            Control::Hello { version: 1, node: [3; 32], watermark: 4_200, filter_digest: [9; 32] },
+            Control::Hello {
+                version: 1,
+                node: [3; 32],
+                watermark: 4_200,
+                filter_digest: [9; 32]
+            },
             Control::Manifest {
                 filter_digest: [9; 32],
                 entries: alloc::vec![Entry::new(100, &oid(1)), Entry::new(200, &oid(2))],
@@ -287,7 +332,12 @@ mod tests {
     fn every_opcode_round_trips() {
         for msg in all() {
             let bytes = msg.write();
-            assert_eq!(Control::parse(&bytes), Ok(msg.clone()), "opcode {}", msg.opcode());
+            assert_eq!(
+                Control::parse(&bytes),
+                Ok(msg.clone()),
+                "opcode {}",
+                msg.opcode()
+            );
         }
     }
 
@@ -321,7 +371,10 @@ mod tests {
         };
         let two = Control::Manifest {
             filter_digest: [0; 32],
-            entries: alloc::vec![Entry::new(REALISTIC, &oid(1)), Entry::new(REALISTIC + 1, &oid(2))],
+            entries: alloc::vec![
+                Entry::new(REALISTIC, &oid(1)),
+                Entry::new(REALISTIC + 1, &oid(2))
+            ],
         };
         let delta = two.write().len() - one.write().len();
         assert_eq!(delta, 18, "CBOR row cost, against RFC 1 §9.3's packed 16");
@@ -333,8 +386,13 @@ mod tests {
         w.array(1).uint(99);
         assert_eq!(Control::parse(&w.finish()), Err(Error::UnknownOpcode));
 
-        let full = Control::Hello { version: 1, node: [0; 32], watermark: 0, filter_digest: [0; 32] }
-            .write();
+        let full = Control::Hello {
+            version: 1,
+            node: [0; 32],
+            watermark: 0,
+            filter_digest: [0; 32],
+        }
+        .write();
         for n in 0..full.len() {
             // Truncated input must error, never panic.
             let _ = Control::parse(&full[..n]);

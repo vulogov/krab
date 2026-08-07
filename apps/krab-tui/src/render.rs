@@ -15,7 +15,12 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 fn to_rect(r: UiRect) -> Rect {
-    Rect { x: r.x, y: r.y, width: r.w, height: r.h }
+    Rect {
+        x: r.x,
+        y: r.y,
+        width: r.w,
+        height: r.h,
+    }
 }
 
 /// What the interface is showing, beyond layout.
@@ -36,6 +41,13 @@ pub struct View<'a> {
     pub composer: &'a str,
     /// Whether the node is locked. A locked node draws no message content.
     pub locked: bool,
+    /// Whether command-pane input is a passphrase.
+    ///
+    /// A passphrase must not reach the screen: RFC 7 §4 makes it the only root
+    /// of the hierarchy, and it is typed at exactly the moment someone may be
+    /// looking over a shoulder — a first-run ceremony is often performed with
+    /// company.
+    pub masked: bool,
 }
 
 /// Draw one frame.
@@ -52,7 +64,16 @@ pub fn draw(f: &mut Frame, view: &View) {
     };
 
     if tabs_h == 1 {
-        draw_tabs(f, Rect { x: area.x, y: area.y, width: area.width, height: 1 }, ui);
+        draw_tabs(
+            f,
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 1,
+            },
+            ui,
+        );
     }
 
     for (pane, rect) in ui.layout(body) {
@@ -65,7 +86,10 @@ pub fn draw(f: &mut Frame, view: &View) {
 }
 
 fn draw_tabs(f: &mut Frame, area: Rect, ui: &Ui) {
-    let sel = Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD);
+    let sel = Style::default()
+        .fg(Color::Black)
+        .bg(Color::White)
+        .add_modifier(Modifier::BOLD);
     let un = Style::default().fg(Color::DarkGray);
     let (a, b) = match ui.tab() {
         Tab::Private => (sel, un),
@@ -85,7 +109,11 @@ fn frame_for(ui: &Ui, pane: Pane, title: String) -> Block<'static> {
     let focused = ui.focus() == pane;
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused { Color::White } else { Color::DarkGray }))
+        .border_style(Style::default().fg(if focused {
+            Color::White
+        } else {
+            Color::DarkGray
+        }))
         .title(title)
 }
 
@@ -98,7 +126,10 @@ fn draw_list(f: &mut Frame, area: Rect, view: &View) {
         (Tab::Channels, Level::Messages) => " channel ▸ posts ".to_string(),
     };
     let rows: Vec<Line> = view.list.iter().map(|s| Line::from(s.as_str())).collect();
-    f.render_widget(Paragraph::new(rows).block(frame_for(view.ui, Pane::List, title)), area);
+    f.render_widget(
+        Paragraph::new(rows).block(frame_for(view.ui, Pane::List, title)),
+        area,
+    );
 }
 
 fn draw_view(f: &mut Frame, area: Rect, view: &View) {
@@ -107,7 +138,11 @@ fn draw_view(f: &mut Frame, area: Rect, view: &View) {
     }
     // RFC 7 §8 and RFC 8 §2.2: plaintext exists only while displayed, and a
     // locked node has no key to produce any.
-    let body = if view.locked { "locked — no message content" } else { view.body };
+    let body = if view.locked {
+        "locked — no message content"
+    } else {
+        view.body
+    };
     f.render_widget(
         Paragraph::new(body).block(frame_for(view.ui, Pane::View, " message ".into())),
         area,
@@ -140,18 +175,27 @@ fn draw_composer(f: &mut Frame, area: Rect, view: &View) {
 
     // The banner is repeated inside the frame, not only in the title: a title
     // is one line at the top of a pane that may be taller than the screen.
-    let lines =
-        vec![Line::from(Span::styled(format!(" {} ", banner.text()), style)), Line::from("")];
+    let lines = vec![
+        Line::from(Span::styled(format!(" {} ", banner.text()), style)),
+        Line::from(""),
+    ];
     if inner.height > 0 {
         f.render_widget(
             Paragraph::new(lines),
-            Rect { height: inner.height.min(2), ..inner },
+            Rect {
+                height: inner.height.min(2),
+                ..inner
+            },
         );
     }
     if inner.height > 2 {
         f.render_widget(
             Paragraph::new(view.composer),
-            Rect { y: inner.y + 2, height: inner.height - 2, ..inner },
+            Rect {
+                y: inner.y + 2,
+                height: inner.height - 2,
+                ..inner
+            },
         );
     }
 }
@@ -161,8 +205,15 @@ fn draw_composer(f: &mut Frame, area: Rect, view: &View) {
 fn draw_command(f: &mut Frame, area: Rect, view: &View) {
     let status = status_line_with(view.node, view.spinner);
     let lock = if view.locked { "  🔒" } else { "" };
+    // Length is shown, contents are not: an operator needs to see that keys
+    // are registering without the passphrase reaching the screen.
+    let shown = if view.masked {
+        "•".repeat(view.command.chars().count())
+    } else {
+        view.command.to_string()
+    };
     let lines = vec![
-        Line::from(format!("> {}", view.command)),
+        Line::from(format!("> {shown}")),
         Line::from(Span::styled(
             format!("{status}{lock}"),
             Style::default().fg(Color::DarkGray),

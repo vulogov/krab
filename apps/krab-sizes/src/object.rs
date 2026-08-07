@@ -41,7 +41,10 @@ impl Default for Magnitudes {
     fn default() -> Self {
         // 2026-08-05, give or take. Any value in the same head class gives
         // identical sizes, which is the property that matters.
-        Magnitudes { epoch: 20_671, created_min: 29_766_240 }
+        Magnitudes {
+            epoch: 20_671,
+            created_min: 29_766_240,
+        }
     }
 }
 
@@ -81,7 +84,7 @@ pub fn inner_plaintext(addr: usize, ctype: usize, body: usize, m: Magnitudes) ->
         + 1 + cbor::uint(m.epoch)       // 3: sender epoch base
         + 1 + cbor::uint(m.created_min) // 4: created
         + 1 + cbor::tstr(ctype)         // 5: content type
-        + 1 + cbor::bstr(body)          // 6: body
+        + 1 + cbor::bstr(body) // 6: body
 }
 
 /// As above but `mode_base`: adds the Ed25519 signature and sender node id,
@@ -89,7 +92,7 @@ pub fn inner_plaintext(addr: usize, ctype: usize, body: usize, m: Magnitudes) ->
 pub fn inner_plaintext_base(addr: usize, ctype: usize, body: usize, m: Magnitudes) -> usize {
     inner_plaintext(addr, ctype, body, m) - cbor::map(7) + cbor::map(9)
         + 1 + cbor::bstr(ED25519_SIG)   // 7: signature
-        + 1 + cbor::bstr(32)            // 8: sender node identifier
+        + 1 + cbor::bstr(32) // 8: sender node identifier
 }
 
 /// RFC 1 §4.2. Envelope body for `sealed`, keys 0..5.
@@ -108,7 +111,7 @@ pub fn envelope(enc: usize, ct: usize, m: Magnitudes) -> usize {
         + 1 + cbor::uint(1)        // 1: tag mode
         + 1 + cbor::uint(1)        // 2: HPKE suite
         + 1 + cbor::bstr(enc)      // 4: HPKE encapsulated key
-        + 1 + cbor::bstr(ct)       // 5: ciphertext ‖ AEAD tag
+        + 1 + cbor::bstr(ct) // 5: ciphertext ‖ AEAD tag
 }
 
 /// A fully described sealed object.
@@ -122,17 +125,17 @@ pub struct Sealed {
 }
 
 /// Compute a sealed object end to end, per RFC 1 §3's layering.
-pub fn sealed(
-    body: usize,
-    addr: usize,
-    ctype: usize,
-    suite: Suite,
-    m: Magnitudes,
-) -> Sealed {
+pub fn sealed(body: usize, addr: usize, ctype: usize, suite: Suite, m: Magnitudes) -> Sealed {
     let plaintext = inner_plaintext(addr, ctype, body, m);
     let ciphertext = plaintext + AEAD_TAG;
     let on_wire = ROUTING_HEADER + envelope(suite.enc_len(), ciphertext, m);
-    Sealed { body, plaintext, ciphertext, on_wire, bucket: bucket_for(on_wire) }
+    Sealed {
+        body,
+        plaintext,
+        ciphertext,
+        on_wire,
+        bucket: bucket_for(on_wire),
+    }
 }
 
 /// Smallest bucket that fits, or `None` if the object exceeds `MAX_OBJECT`.
@@ -145,9 +148,13 @@ pub fn bucket_for(on_wire: usize) -> Option<usize> {
 /// Searched rather than solved: the relationship is monotone but not
 /// continuous, because a CBOR head gains a byte at 24, 256 and 65 536, and
 /// those steps land inside the bucket ranges.
-pub fn max_body_for(bucket: usize, addr: usize, ctype: usize, suite: Suite, m: Magnitudes)
-    -> Option<usize>
-{
+pub fn max_body_for(
+    bucket: usize,
+    addr: usize,
+    ctype: usize,
+    suite: Suite,
+    m: Magnitudes,
+) -> Option<usize> {
     if sealed(0, addr, ctype, suite, m).on_wire > bucket {
         return None;
     }
@@ -167,7 +174,10 @@ pub fn max_body_for(bucket: usize, addr: usize, ctype: usize, suite: Suite, m: M
 mod tests {
     use super::*;
 
-    const M: Magnitudes = Magnitudes { epoch: 20_671, created_min: 29_766_240 };
+    const M: Magnitudes = Magnitudes {
+        epoch: 20_671,
+        created_min: 29_766_240,
+    };
     // RFC 1 §7.2's worked example: "dst=<16 hex>" is 20 characters.
     const ADDR: usize = 20;
     // "text/plain"
