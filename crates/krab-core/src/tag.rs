@@ -27,6 +27,21 @@ pub const EPOCH_SECS: u64 = 86_400;
 /// — the object is accepted, stored, and undecryptable.
 pub const EPOCH_WINDOW: u32 = 45;
 
+/// `MAX_TTL` in days, RFC 1 §2.
+pub const MAX_TTL_DAYS: u32 = 45;
+
+/// The window covers the declared TTL — **checked at compile time**.
+///
+/// A test would catch a narrowed `EPOCH_WINDOW` when someone ran it. This
+/// refuses to build, which is the right strength for a constraint whose
+/// violation is invisible at runtime: an object delivered inside its declared
+/// TTL but outside the window is accepted, stored, and undecryptable, and
+/// RFC 0 §6 makes delivery failure silent by design so nothing surfaces it.
+const _: () = assert!(
+    EPOCH_WINDOW >= MAX_TTL_DAYS,
+    "EPOCH_WINDOW must cover MAX_TTL: a narrower window silently loses mail"
+);
+
 /// Domain label for pairwise tag derivation, RFC 2 §4.1. Frozen.
 pub const LABEL_TAG: &[u8] = b"krab/tag/v1";
 /// Domain label for inbox tag derivation, RFC 2 §4.2. Frozen.
@@ -110,18 +125,11 @@ mod tests {
     }
 
     /// RFC 1 §6.2: the window must cover MAX_TTL, not a latency percentile.
+    ///
+    /// The relationship itself is asserted at compile time beside the
+    /// constants. This covers the behaviour that follows from it.
     #[test]
     fn window_covers_max_ttl() {
-        const MAX_TTL_DAYS: u32 = 45;
-        // Constant on both sides, and deliberately so: this asserts a
-        // *relationship between two constants*, which is the only kind of
-        // check that catches someone narrowing EPOCH_WINDOW later. Clippy
-        // reads a constant assertion as a mistake; here it is the mechanism.
-        #[allow(clippy::assertions_on_constants)]
-        assert!(
-            EPOCH_WINDOW >= MAX_TTL_DAYS,
-            "an object delivered inside its declared TTL must still be recognisable"
-        );
         let now = Epoch(20_671);
         // An object created at the far edge of MAX_TTL is still accepted.
         assert!(Epoch(now.0 - MAX_TTL_DAYS).accepted_at(now));
