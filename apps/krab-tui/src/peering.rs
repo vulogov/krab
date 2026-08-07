@@ -231,16 +231,15 @@ impl Policy {
     }
 }
 
-/// Domain label for a card signature. Frozen.
+/// Domain label for a credential signature — RFC 3 §2.1. Frozen.
 ///
-/// **Not specified by RFC 3 §2.1**, which says credential documents are
-/// deterministic CBOR and stops there. Without a domain prefix, a signature
-/// over a card is a bare Ed25519 signature over an attacker-influenced byte
-/// string, and any other document in the series that happens to encode to the
-/// same bytes would carry a valid signature it never earned. Cross-protocol
-/// signature reuse is cheap to prevent and awkward to retrofit, so the label
-/// is applied here and flagged for the RFC.
-pub const DOMAIN_CARD: &[u8] = b"krab/card/v1";
+/// §2.1 also carries the general rule this instance is one case of: every
+/// signed document in the series prefixes its signing input with a domain
+/// string unique to that type, so a signature over one is never valid over
+/// another. Without it, two documents whose deterministic-CBOR encodings
+/// coincide are interchangeable under one signature — the signer consented to
+/// one meaning and is bound to the other.
+pub const DOMAIN_CARD: &[u8] = b"krab/cred/v1";
 
 /// The public half — RFC 3 §11 step 1.
 ///

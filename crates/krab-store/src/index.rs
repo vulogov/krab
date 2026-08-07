@@ -22,26 +22,26 @@ pub struct Location {
 /// Why an ingest was refused. Each maps to a check in RFC 1 §11.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
-    /// Check 2 — expiry has passed.
+    /// I2 — expiry has passed.
     Expired,
-    /// Check 2 — expiry is further out than `MAX_TTL` allows.
+    /// I2 — expiry is further out than `MAX_TTL` allows.
     TooFarFuture,
-    /// Check 6 — already held. RFC 0 I-1's duplicate suppression.
+    /// I6 — already held. RFC 0 I-1's duplicate suppression.
     Duplicate,
-    /// Check 6 — in the tombstone set. Expiry resurrection (RFC 5 §8).
+    /// I6 — in the tombstone set. Expiry resurrection (RFC 5 §8).
     Tombstoned,
     /// Below the `min_expiry` watermark (RFC 5 §8).
     BelowWatermark,
     /// The header did not parse.
     Malformed,
-    /// Check 1 — the object's length does not equal its declared bucket, or
-    /// its padding is not zero (RFC 1 §8.1).
+    /// I1 — the object's length does not equal its declared bucket, or its
+    /// padding is not zero (RFC 1 §8.1).
     ///
     /// Non-zero padding is a covert channel that replicates: the identifier
     /// covers the padding, so a node relaying it carries whatever was put
     /// there, indefinitely, believing it to be an ordinary object.
     BadPadding,
-    /// Check 3 — the version or class is not one this implementation knows.
+    /// I3 — the version or class is not one this implementation knows.
     ///
     /// RFC 1 §4.3: "unknown keys in a body of a known version MUST be
     /// rejected", and the same reasoning applies to the version itself. An
@@ -49,8 +49,7 @@ pub enum Reject {
     /// because the identifier covers bytes it did not understand — which is a
     /// malleability surface, not merely an unknown.
     Unrecognised,
-    /// Check 5 — the object does not hash to the identifier it was offered
-    /// under.
+    /// I5 — the object does not hash to the identifier it was offered under.
     ///
     /// This is the check that makes content addressing load-bearing rather
     /// than decorative. Without it a peer can supply arbitrary bytes under an
@@ -119,7 +118,11 @@ impl Store {
         let header = RoutingHeader::parse(&bytes).map_err(|_| Reject::Malformed)?;
         let expiry = header.expiry_min;
 
-        // RFC 1 §11 check 5 — the identifier must name the content.
+        // RFC 1 §11 I5 — the identifier must name the content.
+        //
+        // §11 requires I5 before anything that consults the identifier: a store
+        // that indexes by an unverified one has already lost the property I6,
+        // reconciliation and the range fingerprint all rest on.
         //
         // Checked first and unconditionally. Everything below assumes an
         // identifier identifies something; a store that took the caller's word
@@ -130,7 +133,7 @@ impl Store {
             return Err(Reject::IdMismatch);
         }
 
-        // RFC 1 §11 check 3 — version and class are recognised.
+        // RFC 1 §11 I3 — version and class are recognised.
         //
         // `RoutingHeader::parse` deliberately does not check these: parsing and
         // validating are separate so there is one rejection path rather than
@@ -144,7 +147,7 @@ impl Store {
             return Err(Reject::Unrecognised);
         }
 
-        // RFC 1 §11 check 1 — length equals the declared bucket, and padding
+        // RFC 1 §11 I1 — length equals the declared bucket, and padding
         // is zero (RFC 1 §8.1).
         //
         // `body_len` is not known here without decoding the body, which the
@@ -194,7 +197,7 @@ impl Store {
         Ok(())
     }
 
-    /// Verify zero padding after a decoded body — RFC 1 §11 check 1.
+    /// Verify zero padding after a decoded body — RFC 1 §11 I1.
     ///
     /// Separate from [`Store::ingest`] because it needs the body length, which
     /// only a decoder knows. `ingest` enforces the length rule, which needs no

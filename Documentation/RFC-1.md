@@ -591,21 +591,44 @@ because the nodes that would bridge it are the ones offline for a month.
 
 ## 11. Validation on ingest
 
-A receiver MUST reject an object unless all hold:
+A receiver MUST reject an object unless all of the following hold. Each check
+has a **stable identifier**, so an implementation can be audited against this
+list line by line and a conformance suite can name what it exercises.
 
-1. Length ≤ `MAX_OBJECT` and equal to the declared `size_bucket`.
-2. `expiry_min` > now − skew, and ≤ now + `MAX_TTL` + skew.
-3. `class` known for this `ver`; reserved flag bits zero.
-4. Body parses as deterministic CBOR with no unknown keys (known `ver`).
-5. Recomputed identifier matches the identifier it was offered under.
-6. Not already present, and not in the expired-tombstone set.
+```
+I1  length ≤ MAX_OBJECT, equal to the declared size_bucket, padding zero  (§8.1)
+I2  expiry_min > now − skew, and ≤ now + MAX_TTL + skew                   (§2)
+I3  class known for this ver; reserved flag bits zero                     (§4.1)
+I4  body parses as deterministic CBOR, no unknown keys for a known ver    (§4.3)
+I5  recomputed identifier matches the identifier it was offered under     (§4)
+I6  not already present, and not in the expired-tombstone set             (I-1, RFC 5 §8)
+```
 
-Rejection MUST be silent to the peer beyond ordinary flow control, and
-MUST be counted per peer as a quota signal (RFC 3).
+**An implementation MUST apply every check before an object enters the store,
+and MUST NOT accept an object on which any check was skipped. A conformance
+suite SHOULD exercise each by identifier.**
 
-Check 2 is what prevents a relay extending TTL to force indefinite
-storage, and check 6 is what prevents expiry resurrection — a returning
-courier node re-injecting objects the network already evicted.
+**Ordering.** I5 MUST run before anything that consults the identifier. A store
+that indexes by an unverified identifier has already lost the property the rest
+depends on: I6's duplicate suppression, RFC 5's reconciliation, and the range
+fingerprint are all built on an identifier naming its content.
+
+Rejection MUST be silent to the peer beyond ordinary flow control, and MUST be
+counted per peer as a quota signal (RFC 3).
+
+I2 is what prevents a relay extending TTL to force indefinite storage. I6 is
+what prevents expiry resurrection — a returning courier node re-injecting
+objects the network already evicted. I1's zero-padding rule matters for a
+reason easy to miss: the identifier covers the padding, so a non-zero pad is a
+covert channel that every relay carries until expiry, believing it ordinary.
+
+> **Why identifiers rather than an ordered list.** In a reference
+> implementation of this document, three of these six were absent and nothing
+> failed — objects flowed, reconciliation converged, and the test suite passed.
+> Each was found by writing a test that tried to smuggle something past a
+> check, never by reading code against prose. A numbered prose list invites an
+> implementer to believe they have done all six; identifiers let a reviewer
+> ask which one a given line implements.
 
 ---
 

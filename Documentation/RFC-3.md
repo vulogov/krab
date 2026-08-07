@@ -51,6 +51,37 @@ mechanism here.
 ### 2.1 Document encoding
 
 Credential documents use the deterministic CBOR profile of RFC 1 §4.3.
+
+A credential's signature is Ed25519 over `"krab/cred/v1" ‖ body`, where `body`
+is the deterministic CBOR encoding of the document with the signature field
+omitted.
+
+**Every signed document in this series MUST prefix its signing input with a
+domain string unique to that document type. A signature produced over one
+document type MUST NOT be valid over any other.**
+
+A credential body MUST be a flat CBOR map. Nested maps are not permitted:
+RFC 1 §4.3 requires map keys to ascend, a nested map's keys restart, and a
+decoder reading both levels from one cursor correctly rejects its own
+encoder's output.
+
+> **Why the general rule and not just the constant.** The series already
+> domain-separates every hash and two of its three signed documents — RFC 3 §4's
+> peer-link uses `"krab/link/v1"`, RFC 1 §5.2's bulletin uses `"krab/bul/v1"` —
+> and the credential was the exception, carrying a node's Noise static, its
+> correspondence key, and its policy.
+>
+> Without a prefix, two document types whose encodings coincide are
+> interchangeable under one signature: the signer consented to one meaning and
+> is bound to the other. Deterministic CBOR guarantees identical structure
+> yields identical bytes, which is normally the property one wants. The rule
+> above converts a per-document decision into one the next signed document
+> inherits.
+>
+> It is also an interoperability requirement. Without it, an implementer
+> following §4's pattern invents a prefix and picks their own string while one
+> following this section literally uses none — and their credentials do not
+> verify against each other, at the ceremony, in person, with no diagnostic.
 Implementations MUST render any credential as HJSON on request
 (`krab peer show`), and that rendering is what an operator inspects.
 

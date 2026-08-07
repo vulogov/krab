@@ -8,12 +8,16 @@ out of implementing the thing the paragraph describes.
 | 1 | RFC 7 §6 | `msg_key` reuses one key per (pair, epoch) — **critical** | **ADOPTED** 2026-08-07 |
 | 2 | RFC 7 §6.2 | no channel rule; the post-quantum property can be silently void | **ADOPTED** 2026-08-07 |
 | 3 | RFC 7 §6 | chunk derivation is drawn as an arrow, never defined | **ADOPTED** 2026-08-07 |
-| 4 | RFC 3 §2.1 | the credential is the one signed document with no signature domain | §A below |
+| 4 | RFC 3 §2.1 | the credential is the one signed document with no signature domain | **ADOPTED** 2026-08-07 |
 | 5 | RFC 4 §5.5 | nothing says an archive must be a window rather than a diff | **ADOPTED** 2026-08-07 |
-| 6 | RFC 1 §11 | the checks are prose; two of six were never implemented | §C below |
+| 6 | RFC 1 §11 | the checks are prose; three of six were never implemented | **ADOPTED** 2026-08-07 |
 
 Findings 1–3 land in one section, so `RFC-7-section-6-proposed.md` closes all
 three in a single edit.
+
+**All six adopted 2026-08-07.** The RFC 0 editorial rule below is in
+`Documentation/RFC-0-editorial-rule.md`, as text to paste — RFC 0 is not in
+this repository.
 
 ## The pattern worth naming in RFC 0
 
