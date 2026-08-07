@@ -36,7 +36,7 @@ use krab_core::tag::Epoch;
 use krab_crypto::dh::{PublicKey, SecretKey};
 use krab_crypto::reservoir::Chunk;
 use krab_crypto::rng::Rng;
-use krab_crypto::seal::{info_for, seal, Mode, ENC_LEN};
+use krab_crypto::seal::{begin_seal, info_for, Mode, ENC_LEN};
 
 /// RFC 1 §6.1 — suite `0x0001`, the v1 mandatory one.
 pub const SUITE_V1: u64 = 0x0001;
@@ -131,6 +131,17 @@ pub struct Composed {
     pub bucket: u8,
 }
 
+/// RFC 1 §6.1's AAD: `ROUTING_HEADER ‖ deterministic_cbor(body without key 5)`.
+///
+/// One definition, used by the sender and the receiver. Two implementations of
+/// this that differ by a byte produce a link where nothing decrypts and no
+/// error explains why, so it is worth not having two.
+pub fn aad_for(header: &RoutingHeader, env: &Envelope) -> Vec<u8> {
+    let mut aad = header.write().to_vec();
+    aad.extend_from_slice(&env.aad());
+    aad
+}
+
 /// The smallest bucket admitting `n` bytes **including the routing header**.
 ///
 /// RFC 1 §8.1's ladder is six buckets in ×4 steps, and `canonical_bytes`
@@ -172,29 +183,59 @@ pub fn seal_to(
         expiry_min,
         tag: recipient.tag(),
     };
-    let aad = header.write();
     let info = info_for(class);
 
-    // 3. Seal. RFC 1 §6.2's coupling: the mode follows the tag mode.
+    // 3. Encapsulate first. RFC 1 §6.1's AAD contains the encapsulated key,
+    // so it cannot be built until the KEM has run — see `krab_crypto::seal`'s
+    // `SealCtx` on why a single-shot call silently produces a weaker AAD.
+    //
+    // The mode follows the tag mode; RFC 2 §4.2 calls that "not a policy
+    // choice but a consequence".
     let mode = match recipient {
         Recipient::FirstContact { .. } => Mode::Base,
         Recipient::Known { chunk: Some(c), .. } => Mode::AuthPsk { chunk: c, epoch },
         Recipient::Known { chunk: None, .. } => Mode::Auth,
     };
-    let sealed = seal(&mode, sender, recipient.key(), &info, &aad, plaintext, rng)
-        .map_err(|_| Error::Seal)?;
+    let (enc, mut ctx) =
+        begin_seal(&mode, sender, recipient.key(), &info, rng).map_err(|_| Error::Seal)?;
 
-    // 4. The envelope. Key 3 is absent by construction (RFC 1 §4.2).
+    // 4. The full AAD: header, then the envelope's first four keys. This is
+    // what binds expiry, tag, class, epoch and suite together, so a relay
+    // editing any of them produces something undecryptable.
+    let mut aad = header.write().to_vec();
+    aad.extend_from_slice(&Envelope::aad_prefix(
+        epoch.0 as u64,
+        recipient.tag_mode(),
+        SUITE_V1,
+        &enc,
+    ));
+    let ct = ctx.seal(plaintext, &aad).map_err(|_| Error::Seal)?;
+    debug_assert_eq!(
+        aad,
+        aad_for(
+            &header,
+            &Envelope {
+                epoch: epoch.0 as u64,
+                tag_mode: recipient.tag_mode(),
+                suite: SUITE_V1,
+                enc: &enc,
+                ciphertext: &ct,
+            }
+        ),
+        "the sender's AAD must equal what the receiver will reconstruct"
+    );
+
+    // 5. The envelope. Key 3 is absent by construction (RFC 1 §4.2).
     let body = Envelope {
         epoch: epoch.0 as u64,
         tag_mode: recipient.tag_mode(),
         suite: SUITE_V1,
-        enc: &sealed.enc,
-        ciphertext: &sealed.ct,
+        enc: &enc,
+        ciphertext: &ct,
     }
     .write();
 
-    // 5. Canonical bytes: header, body, zero padding to the bucket.
+    // 6. Canonical bytes: header, body, zero padding to the bucket.
     //
     // If this fails the bucket was wrong, and the honest response is to refuse
     // rather than re-seal under a header the AAD no longer matches.
@@ -279,7 +320,7 @@ mod tests {
                 ct: env.ciphertext.to_vec(),
             },
             &info_for(header.class),
-            &header.write(),
+            &aad_for(&header, &env),
         )
         .unwrap();
         assert_eq!(opened, plaintext);
@@ -320,7 +361,7 @@ mod tests {
                 ct: env.ciphertext.to_vec(),
             },
             &info_for(header.class),
-            &header.write(),
+            &aad_for(&header, &env),
         )
         .unwrap();
         assert_eq!(opened, b"hello, we have not met");
@@ -370,7 +411,7 @@ mod tests {
                     ct: env.ciphertext.to_vec(),
                 },
                 &info_for(0),
-                &header.write(),
+                &aad_for(&header, &env),
             )
             .unwrap_or_else(|e| panic!("len {len} did not open: {e:?}"));
             assert_eq!(opened.len(), len);
