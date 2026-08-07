@@ -117,6 +117,37 @@ impl Identity {
         Kek::derive(passphrase, &self.kek_params)
     }
 
+    /// Reconstruct from stored seeds — see `crate::persist`.
+    pub fn from_parts(
+        signing_seed: &[u8; 32],
+        noise: [u8; 32],
+        correspondence: [u8; 32],
+        kek_params: KekParams,
+    ) -> Identity {
+        Identity {
+            signing: SigningKey::from_seed(signing_seed),
+            noise: SecretKey::from_bytes(noise),
+            correspondence: SecretKey::from_bytes(correspondence),
+            kek_params,
+            hierarchy: Hierarchy::new(),
+        }
+    }
+
+    /// The Ed25519 seed, for wrapping. Never for display.
+    pub fn signing_seed(&self) -> [u8; 32] {
+        self.signing.to_seed()
+    }
+
+    /// The Noise static, for wrapping.
+    pub fn noise_bytes(&self) -> [u8; 32] {
+        self.noise.to_bytes()
+    }
+
+    /// The correspondence key, for wrapping.
+    pub fn correspondence_bytes(&self) -> [u8; 32] {
+        self.correspondence.to_bytes()
+    }
+
     /// This node's correspondence key, for sealing.
     pub fn correspondence(&self) -> &SecretKey {
         &self.correspondence

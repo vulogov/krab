@@ -131,6 +131,31 @@ impl Kek {
         Ok(Kek(k))
     }
 
+    /// Seal a secret directly under the KEK, bypassing the epoch tier.
+    ///
+    /// **For the identity only.** RFC 7 §4's hierarchy puts prekey privates,
+    /// reservoir chunks, session state and the message store under `W_N`, and
+    /// the identity is deliberately absent from that list — shredding an epoch
+    /// is routine, and it would otherwise take the node's identity with it.
+    /// RFC 7 §11 makes that unrecoverable: every peer re-verifies out of band,
+    /// in person, from scratch.
+    ///
+    /// The key never leaves this type. A caller that could ask for the KEK's
+    /// bytes would be one refactor from logging them.
+    pub fn seal(
+        &self,
+        context: &[u8],
+        secret: &[u8],
+        rng: &mut impl Rng,
+    ) -> Result<Vec<u8>, Error> {
+        seal_under(self.0.expose(), context, secret, rng)
+    }
+
+    /// Open what [`Kek::seal`] produced.
+    pub fn open(&self, context: &[u8], record: &[u8]) -> Result<Vec<u8>, Error> {
+        open_under(self.0.expose(), context, record)
+    }
+
     /// Wrap an epoch key. The epoch is bound as AAD, so a wrapper lifted from
     /// one epoch's record cannot be replayed into another's.
     fn wrap(&self, epoch: Epoch, key: &[u8; 32], rng: &mut impl Rng) -> Result<Vec<u8>, Error> {
@@ -491,6 +516,31 @@ mod tests {
         let a = seal_under(&w, b"c", b"secret", &mut rng).unwrap();
         let b = seal_under(&w, b"c", b"secret", &mut rng).unwrap();
         assert_ne!(a, b);
+    }
+
+    /// The identity tier: sealed under the KEK directly, so shredding an
+    /// epoch cannot destroy it.
+    #[test]
+    fn the_identity_tier_survives_epoch_shredding() {
+        let (kek, _, mut rng) = setup();
+        let sealed = kek
+            .seal(b"krab/identity/v1", b"three private keys", &mut rng)
+            .unwrap();
+        let mut h = Hierarchy::new();
+        h.open_epoch(&kek, Epoch(20_671), &mut rng).unwrap();
+
+        // Shred every epoch there is.
+        h.shred_before(Epoch(u32::MAX));
+        assert_eq!(h.epochs().count(), 0);
+
+        // The identity is untouched, which is the point.
+        assert_eq!(
+            kek.open(b"krab/identity/v1", &sealed).unwrap(),
+            b"three private keys"
+        );
+        // And the context binds it: an identity record cannot be opened as
+        // something else.
+        assert_eq!(kek.open(b"krab/reservoir", &sealed), Err(Error::Unwrap));
     }
 
     #[test]
