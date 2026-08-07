@@ -154,6 +154,88 @@ pub struct Scan {
     pub examined: usize,
 }
 
+/// A first-contact request this node could open.
+pub struct Incoming {
+    /// The request, already verified and addressed here.
+    pub request: crate::request::PeerRequest,
+    /// The epoch its inbox tag derives from.
+    ///
+    /// Held so a caller can say how old a request is without the node
+    /// recording arrival times, which RFC 3 §12 forbids.
+    #[allow(dead_code)]
+    pub epoch: Epoch,
+}
+
+/// Scan for first-contact requests on this node's own inbox tag.
+///
+/// Separate from [`Inbox::scan`] because the two use different HPKE modes and
+/// different authentication: a pairwise message is authenticated by the KEM, a
+/// request only by its inner signature. Merging them would mean one code path
+/// where the authentication check is conditional, which is the shape of a
+/// check that eventually gets skipped.
+pub fn scan_requests(
+    store: &Store,
+    ours: &SecretKey,
+    our_node_id: &[u8; 32],
+    now: Epoch,
+    window: (u32, u32),
+) -> Vec<Incoming> {
+    // An inbox tag needs only our own public key — which is the property that
+    // makes first contact possible and makes it linkable within an epoch
+    // (RFC 2 §4.2).
+    let mut tags = std::collections::HashMap::new();
+    for epoch in Epoch::window(now) {
+        tags.insert(krab_crypto::inbox_tag(&ours.public(), epoch).0, epoch);
+    }
+
+    let mut out = Vec::new();
+    for (_, id) in store.entries_in_range(window.0, window.1) {
+        let Some(bytes) = store.get(&id) else {
+            continue;
+        };
+        let Ok(header) = RoutingHeader::parse(bytes) else {
+            continue;
+        };
+        let Some(&epoch) = tags.get(&header.tag.0) else {
+            continue;
+        };
+
+        let Ok((env, _)) = decode_envelope(&bytes[ROUTING_HEADER_LEN..]) else {
+            continue;
+        };
+        if env.tag_mode != 1 || env.enc.len() != ENC_LEN {
+            continue;
+        }
+        let mut enc = [0u8; ENC_LEN];
+        enc.copy_from_slice(env.enc);
+        let aad = crate::compose::aad_for(&header, &env);
+
+        // `mode_base`: no sender key is bound, so anyone may have sealed this.
+        // The signature inside is what says who.
+        let Ok(mut ctx) = begin_open(
+            &Mode::Base,
+            ours,
+            &ours.public(),
+            &enc,
+            &info_for(header.class),
+        ) else {
+            continue;
+        };
+        let Ok(pt) = ctx.open(env.ciphertext, &aad) else {
+            continue;
+        };
+        let Ok(request) = crate::request::PeerRequest::decode(&pt) else {
+            continue;
+        };
+
+        // Both checks, and neither implies the other.
+        if request.verify() && request.is_for(our_node_id) {
+            out.push(Incoming { request, epoch });
+        }
+    }
+    out
+}
+
 /// The recognition and decryption path.
 pub struct Inbox;
 

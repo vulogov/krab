@@ -58,6 +58,11 @@ pub enum Command {
     Lock,
     /// **Not in RFC 8 §5.** Set a duress passphrase (RFC 7 §10).
     Duress,
+    /// **Not in RFC 8 §5.** Send a first-contact `peer-request` (RFC 3 §5.1).
+    ///
+    /// §5 has `pack` and `import` — the transport of a ceremony — but no verb
+    /// that *initiates* one with someone not yet met.
+    Request,
     /// **Not in RFC 8 §5.** Re-derive the KEK and reopen the store.
     ///
     /// §5 has no way to *create* an identity and no way to *reopen* one, which
@@ -97,6 +102,7 @@ impl Command {
             "lock" => Command::Lock,
             "unlock" => Command::Unlock,
             "duress" => Command::Duress,
+            "request" => Command::Request,
             "wipe" => Command::Wipe,
             "connect" => Command::Connect,
             "disconnect" => Command::Disconnect,
@@ -138,6 +144,7 @@ impl Command {
                 | Command::Keys
                 | Command::Verify
                 | Command::Duress
+                | Command::Request
         )
     }
 
@@ -160,6 +167,7 @@ impl fmt::Display for Command {
             Command::Lock => "lock",
             Command::Unlock => "unlock",
             Command::Duress => "duress",
+            Command::Request => "request",
             Command::Wipe => "wipe",
             Command::Connect => "connect",
             Command::Disconnect => "disconnect",
@@ -318,6 +326,7 @@ mod tests {
             Command::Lock,
             Command::Unlock,
             Command::Duress,
+            Command::Request,
             Command::Wipe,
             Command::Connect,
             Command::Disconnect,
