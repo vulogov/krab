@@ -362,7 +362,7 @@ The gate is implemented in two halves, because §11.3 asks for two things:
 | half | where | status |
 |---|---|---|
 | peering negotiation | `apps/krab-tui/src/main.rs::courier_only_peering_completes_with_no_network` | **passes** |
-| message exchange | `crates/krab-node/tests/courier_only.rs` | **passes, with one caveat** |
+| message exchange | `crates/krab-node/tests/courier_only.rs` | **passes** |
 
 ### 9.1 What the tests actually establish
 
@@ -387,19 +387,28 @@ A third test pins the reason RFC 5 §4.5 derives `sync_mode` from latency class
 rather than configuring it: a courier link resolves to `Manifest`, and a node
 that chose RBSR would negotiate one round per courier, forever.
 
-### 9.2 The caveat, stated plainly
+### 9.2 Bodies are sealed — the earlier caveat is closed
 
-**Object bodies are opaque bytes, not HPKE-sealed plaintext.** Sealing is
-blocked on `CRYPTO-REVIEW.md` §1 — RFC 7 §6's message key derivation produces
-one key per (pair, epoch) and must not be implemented as written.
+An earlier revision of this section recorded that object bodies were opaque
+bytes rather than HPKE-sealed plaintext, because sealing was blocked on
+`CRYPTO-REVIEW.md` §1. That is resolved: `a_sealed_message_crosses_by_courier`
+carries a real payload sealed under `mode_auth_psk` with a reservoir chunk as
+PSK, and the recipient opens it having received nothing but a file.
 
-This does not weaken what the gate measures. Reconciliation is defined over
-opaque objects by design (RFC 1 §3 puts FEC and armor *after* identity, so the
-store never inspects a body), and whether the corpus converges without a round
-trip is independent of how the body was encrypted.
+Sealing turned out to be the more interesting half of the gate, not the
+incidental one. A courier deployment cannot fall back on negotiation, so
+**everything the key schedule needs must already be shared**: `mode_auth`
+requires the recipient hold the sender's static key, and the PSK requires a
+reservoir root. Both come from the offline ceremony. Had either quietly needed
+a live exchange, the gate would have caught it — which is precisely the class
+of defect §11.3 exists to find, and it would not have been visible over TCP.
 
-It does mean **the gate is not yet fully satisfied**, and the test file says so
-at the top. It should be revisited when §1 is resolved and bodies are sealed.
+One implementation note worth recording, because it is easy to get wrong in the
+other direction: the body is padded to its size bucket and the identifier covers
+the padding (RFC 1 §8.1), so **the ciphertext length cannot be recovered from
+what is on disk**. It has to come from the sender's framing. An implementation
+that inferred it from the object's length would decrypt padding as ciphertext
+and fail authentication for reasons that look like corruption.
 
 ### 9.3 One thing the gate surfaced
 

@@ -22,12 +22,24 @@ zeroize = { version = "1", default-features = false, features = ["zeroize_derive
 
 # RFC 1 §6.1 names the suite: DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 /
 # ChaCha20-Poly1305. These are those primitives and nothing else.
-ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
-hkdf = { version = "0.12", default-features = false }
-sha2 = { version = "0.10", default-features = false }
+ed25519-dalek = { version = "3", default-features = false, features = ["zeroize"] }
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }
+hkdf = { version = "0.13", default-features = false }
+# RFC 9180, for RFC 1 §6.1's suite. Hand-rolling a key schedule is the kind of
+# thing this crate exists to avoid; `default-features = false` drops
+# `getrandom`, so randomness stays an argument here too.
+#
+# Every version above is pinned to whatever `hpke` resolves to. That is not
+# tidiness: two copies of X25519 or of ChaCha20-Poly1305 in one binary would
+# defeat the reason this crate exists. The header above claims a single
+# localised audit surface, and an auditor facing two independent
+# implementations of the same primitive -- one deriving tags, the other running
+# the KEM -- does not have one. `cargo tree` is the check.
+hpke = { version = "0.14", default-features = false, features = ["x25519", "chacha", "alloc"] }
+rand_core = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 
 # Note the absence of `getrandom`. Randomness is an argument here, never
 # ambient -- see `rng::Rng`. The OS entropy source lives in the application

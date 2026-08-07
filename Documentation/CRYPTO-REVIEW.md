@@ -36,6 +36,20 @@ concludes.
 
 ## 1. CRITICAL — the reservoir derives one message key per epoch, not per message
 
+> **Implementation status, 2026-08-07.** §1.2's recommended construction is
+> implemented in `crates/krab-crypto/src/seal.rs` and the defective derivation
+> is not. There is no `message_key` function anywhere in `krab-crypto`, so the
+> defect cannot be reached by calling the wrong thing.
+>
+> **The finding remains open against RFC 7 §6**, which still specifies the
+> defective derivation. Until §6 is amended, an implementation following it
+> literally and this one will not interoperate. That is the safer direction:
+> §6 as written reuses one key for every message a pair exchanges in a day.
+>
+> Demonstrated by `two_messages_in_one_epoch_do_not_share_a_key`, which holds
+> constant everything §6's derivation takes as input — same chunk, same tag,
+> same epoch, same plaintext — and shows the ciphertexts differ.
+
 RFC 7 §6:
 
 ```

@@ -548,3 +548,76 @@ Not a defect in a deployed system — nothing implements the reservoir yet, and
 the specification that an implementer would fall into by doing the reasonable
 thing. **Recommend §6.2 gain the channel rule before RFC 7 leaves Draft**,
 alongside the §1 fix.
+
+---
+
+## 11. Gap — §6 never says how a chunk is derived
+
+Raised while implementing the reservoir. §6 draws:
+
+```
+reservoir → chunk_N  (32 bytes, one per epoch)
+```
+
+and never says what the arrow is. Every other derivation in the series is
+written out as a function with a frozen domain label — RFC 1 §6.2's tag, RFC 2
+§4.1's inbox tag, RFC 3 §2's node identifier. This one is an arrow.
+
+### 11.1 Why it matters more than it looks
+
+Two implementations will pick different functions and **fail silently**. RFC 0
+§6 makes delivery failure silent by design, so the symptom is not an error: it
+is "that peer stopped being able to read my mail after we set up the
+reservoir", with both nodes reporting success and the objects sitting
+undecryptable in both stores.
+
+That is the same failure mode as the §6.2 channel gap (§10 above) and the RFC 1
+§6.2 hash-function gap: a specification that is implementable *two ways*, where
+neither implementer can tell they diverged. The series has now produced three
+of these, which suggests the check worth adding to RFC 0 is **"can two
+independent implementations of this paragraph disagree, and would either
+notice?"**
+
+### 11.2 Proposed text for §6
+
+> ```
+> chunk_N = HKDF-Expand(reservoir, "krab/chunk/v1" ‖ u32_le(N), 32)
+> ```
+>
+> using the KDF of the suite in force (RFC 1 §6.1).
+
+That is what `crates/krab-crypto/src/reservoir.rs` implements. The label is a
+placeholder pending adoption; the shape follows RFC 1 §6.2's tag derivation so
+there is one pattern rather than two.
+
+Note this one **can** take Extract rather than Expand-only without the
+objection that applies to §6.2: a reservoir root is not a curve point, and no
+tags derive from it, so there is no existing namespace to fork. If §6 is
+written now it should be written correctly, using full HKDF.
+
+### 11.3 What the implementation does with §1
+
+`crates/krab-crypto/src/seal.rs` implements the `mode_auth_psk` construction
+§6's own fix note recommends, and **not** §6's `msg_key = HKDF(chunk_N,
+"krab/msg/v1" ‖ tag)`, which §6 marks `⚠ DEFECTIVE` and says MUST NOT be
+implemented.
+
+There is deliberately no `message_key` function anywhere in `krab-crypto`. The
+safe construction and the defective one would otherwise differ only by which
+function a caller reached for, and the defective one has the more obvious name.
+
+Three properties hold together under the fix, which is why this shape:
+
+- **Per-message keys** — the ephemeral `skE` enters the schedule, so two
+  messages in one epoch derive different keys. This is what §6 lacked.
+- **Post-quantum** — the PSK is symmetric and established out of band, so
+  breaking X25519 from a recording is not sufficient. Tested directly:
+  `the_psk_is_required_even_holding_the_recipients_private_key`.
+- **Deniability and forward secrecy** unchanged — `mode_auth` still
+  authenticates to the recipient alone, and §4's shredding still bounds
+  exposure at epoch granularity.
+
+RFC 1 §6.1's suite space accommodates it, so **RFC 1 stays frozen and only §6
+needs amending.** Until it is, an implementation following §6 literally and
+this one will not interoperate — which is the safer direction to fail in, since
+§6 as written reuses a key for every message a pair exchanges in a day.

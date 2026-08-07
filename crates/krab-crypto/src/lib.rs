@@ -21,17 +21,33 @@
 //! # Status
 //!
 //! Implemented: hashing and content addressing, Ed25519 identity ([`sign`]),
-//! X25519 agreement ([`dh`]), tag derivation ([`kdf`]), and the Argon2id key
-//! hierarchy ([`kek`]).
+//! X25519 agreement ([`dh`]), tag derivation ([`kdf`]), the Argon2id key
+//! hierarchy ([`kek`]), the epoch-chunked [`reservoir`], and HPKE [`seal`]ing.
 //!
-//! Not implemented: HPKE sealing and the reservoir, both blocked on
-//! `CRYPTO-REVIEW.md` §1 below. See `Documentation/MILESTONE-0.1.md` §2 phase
-//! B. The three findings that shape this crate:
+//! **[`seal`] implements the construction `CRYPTO-REVIEW.md` §1 recommends,
+//! not RFC 7 §6 as written** — §6 marks its own derivation defective and says
+//! it MUST NOT be implemented. RFC 7 §6 needs amending to match; RFC 1 stays
+//! frozen, because §6.1's suite space already accommodates it.
 //!
-//! - **§1, critical and open.** RFC 7 §6's reservoir derives one message key
-//!   per (pair, epoch) rather than per message. Not implemented; the
-//!   recommended `mode_auth_psk` construction needs no format change. RFC 7 §5
-//!   makes the reservoir a *conditional* tier, so this does not block v1.
+//! # One copy of each primitive
+//!
+//! Every version in `Cargo.toml` is pinned to whatever `hpke` resolves to.
+//! Two copies of X25519 or ChaCha20-Poly1305 in one binary would defeat the
+//! reason this crate exists: the claim above is a *single localised audit
+//! surface*, and an auditor facing two independent implementations of the same
+//! primitive — one deriving tags, the other running the KEM — does not have
+//! one. `cargo tree | grep curve25519` is the check.
+//!
+//! The three findings that shape this crate:
+//!
+//! - **§1, critical.** RFC 7 §6's reservoir derives one message key per (pair,
+//!   epoch) rather than per message, because `tag` is constant for a pair
+//!   across an epoch and `chunk_N` is constant by definition. **Fixed here**
+//!   by supplying the chunk as an HPKE PSK under `mode_auth_psk` with the
+//!   epoch as `psk_id`, so the ephemeral makes the schedule per-message while
+//!   the PSK carries the post-quantum property. There is deliberately no
+//!   `message_key` function anywhere in this crate — the safe construction and
+//!   the defective one would differ only by which function you called.
 //! - **§2.** Ed25519 verification MUST be strict — canonical `S`, canonical
 //!   encodings, small-order `A` rejected — or malleability defeats RFC 0 I-1's
 //!   duplicate suppression and one signature amplifies without bound.
@@ -52,7 +68,9 @@ pub mod dh;
 pub mod hash;
 pub mod kdf;
 pub mod kek;
+pub mod reservoir;
 pub mod rng;
+pub mod seal;
 pub mod secret;
 pub mod sign;
 pub mod words;
@@ -61,7 +79,9 @@ pub use dh::{agree, PublicKey, SecretKey, Shared};
 pub use hash::{channel_id, channel_tag, node_id, object_id, Fingerprint};
 pub use kdf::{inbox_tag, pairwise_tag, pairwise_window};
 pub use kek::{Hierarchy, Kek, KekParams};
+pub use reservoir::{Chunk, Reservoir};
 pub use rng::Rng;
+pub use seal::{info_for, open, seal, Sealed};
 pub use secret::{Key, Secret};
 pub use sign::{Sig, SigningKey, VerifyingKey};
 pub use words::phrase;

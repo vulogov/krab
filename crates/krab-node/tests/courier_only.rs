@@ -24,20 +24,21 @@
 //! session is ever open at both ends at once. If reconciliation needed a reply
 //! mid-leg it would fail here rather than hang.
 //!
-//! # What this does not yet cover
+//! # Bodies are sealed
 //!
-//! The object bodies are opaque bytes rather than HPKE-sealed plaintext,
-//! because sealing is blocked on `CRYPTO-REVIEW.md` §1 — RFC 7 §6's message
-//! key derivation is defective and must not be implemented as written.
+//! `a_sealed_message_crosses_by_courier` carries a real HPKE-sealed payload
+//! under `mode_auth_psk` — RFC 1 §6.1's suite, with a reservoir chunk as PSK
+//! (`CRYPTO-REVIEW.md` §1's recommended construction). The recipient opens it
+//! having received nothing but a file.
 //!
-//! That is honest to state and does not weaken the gate: the property under
-//! test is whether the corpus converges without a round trip, and the body's
-//! encryption is not an input to reconciliation (RFC 1 §3 — FEC and armor are
-//! applied after identity, and the store handles opaque objects by design).
-//! **The gate is not fully satisfied until bodies are sealed**, and this file
-//! should be revisited then.
+//! That matters because it exercises the one thing a courier deployment cannot
+//! fall back on: **the sender and recipient must already share everything the
+//! key schedule needs.** `mode_auth` requires the recipient hold the sender's
+//! static key, and the PSK requires a reservoir root — both established by the
+//! peering ceremony, offline, in the test above this one. If either had
+//! quietly needed a live negotiation, it would surface here.
 
-use krab_core::object::{canonical_bytes, ObjectId, RoutingHeader, Tag};
+use krab_core::object::{canonical_bytes, ObjectId, RoutingHeader, Tag, ROUTING_HEADER_LEN};
 use krab_fabric::backend::courier::{read_archive, CourierFabric};
 use krab_fabric::profile::LinkProfile;
 use krab_fabric::Fabric;
@@ -203,6 +204,127 @@ fn a_corrupted_archive_is_refused_and_leaves_the_store_untouched() {
             "an object in the store always hashes to its own identifier"
         );
     }
+}
+
+/// **The gate, with a sealed body.**
+///
+/// Everything the key schedule needs was established by the offline ceremony:
+/// the recipient's static key, the sender's static key, and a reservoir root.
+/// Nothing is negotiated here — a courier link has no opportunity to.
+#[test]
+fn a_sealed_message_crosses_by_courier() {
+    use krab_core::tag::Epoch;
+    use krab_crypto::dh::SecretKey;
+    use krab_crypto::reservoir::Reservoir;
+    use krab_crypto::rng::NotRandom;
+    use krab_crypto::seal::{info_for, open, seal, Mode, Sealed, ENC_LEN};
+
+    let post = temp_dir("sealed");
+    let archive = post.join("out.krab");
+    let never = post.join("no-reply-ever.krab");
+
+    // What the ceremony established, offline: two static keypairs and a
+    // reservoir root both ends hold.
+    let sender = SecretKey::generate(&mut NotRandom::seeded(1));
+    let recipient = SecretKey::generate(&mut NotRandom::seeded(2));
+    let epoch = Epoch(20_671);
+    let root = [0x5A; 32];
+    let chunk_s = Reservoir::new(root, Epoch(0)).chunk(epoch).unwrap();
+    let chunk_r = Reservoir::new(root, Epoch(0)).chunk(epoch).unwrap();
+
+    let plaintext = b"the message that must not be readable in transit";
+    let header = RoutingHeader {
+        version: 1,
+        class: 0,
+        size_bucket: 0,
+        flags: 0,
+        expiry_min: NOW_MIN + 40_000,
+        tag: Tag([0x11; 8]),
+    };
+    // RFC 1 §6.1: the AAD binds the routing header, so a relay that edits the
+    // expiry to force indefinite storage produces something undecryptable.
+    let aad = header.write();
+    let info = info_for(header.class);
+
+    let sealed = seal(
+        &Mode::AuthPsk {
+            chunk: &chunk_s,
+            epoch,
+        },
+        &sender,
+        &recipient.public(),
+        &info,
+        &aad,
+        plaintext,
+        &mut NotRandom::seeded(3),
+    )
+    .expect("sealed");
+
+    // The object body is the encapsulated key followed by the ciphertext.
+    let mut body = Vec::with_capacity(ENC_LEN + sealed.ct.len());
+    body.extend_from_slice(&sealed.enc);
+    body.extend_from_slice(&sealed.ct);
+    let object_bytes = canonical_bytes(&header, &body).expect("canonical");
+    let id = krab_crypto::object_id(&object_bytes);
+
+    // Nothing recognisable is on the wire.
+    assert!(
+        !object_bytes
+            .windows(plaintext.len())
+            .any(|w| w == plaintext),
+        "plaintext must not appear in the object"
+    );
+
+    // ---- One leg. Write, and stop. ----
+    let fabric = CourierFabric::new(LinkProfile::courier(), &archive, &never);
+    {
+        let mut s = fabric.connect().unwrap();
+        s.send(&Control::Obj(object_bytes.clone())).unwrap();
+        s.send(&Control::Done).unwrap();
+        s.close().unwrap();
+    }
+    assert!(!never.exists(), "no reply was needed");
+
+    // ---- Carried, renamed, and opened offline. ----
+    let delivered = temp_dir("sealed-inbox").join("photos.zip");
+    std::fs::copy(&archive, &delivered).unwrap();
+
+    let mut store = Store::new();
+    for msg in read_archive(&delivered).expect("reads") {
+        if let Control::Obj(bytes) = msg {
+            let derived = krab_crypto::object_id(&bytes);
+            let _ = store.ingest(derived, bytes, NOW_MIN, u32::MAX);
+        }
+    }
+    let held = store.get(&id).expect("the object arrived");
+
+    // Reconstruct and open, using only what the ceremony established.
+    let recovered = RoutingHeader::parse(held).expect("header parses");
+    let payload = &held[ROUTING_HEADER_LEN..];
+    let mut enc = [0u8; ENC_LEN];
+    enc.copy_from_slice(&payload[..ENC_LEN]);
+    // The body was padded to its size bucket, and the identifier covers the
+    // padding (RFC 1 §8.1), so the ciphertext length has to come from the
+    // sender's framing rather than from what is on disk.
+    let ct = payload[ENC_LEN..ENC_LEN + sealed.ct.len()].to_vec();
+
+    let opened = open(
+        &Mode::AuthPsk {
+            chunk: &chunk_r,
+            epoch,
+        },
+        &recipient,
+        &sender.public(),
+        &Sealed { enc, ct },
+        &info_for(recovered.class),
+        &recovered.write(),
+    )
+    .expect("opens with what the ceremony established, and nothing else");
+
+    assert_eq!(
+        opened, plaintext,
+        "the message crossed intact and confidential"
+    );
 }
 
 /// Reconciliation over a courier link uses manifest mode, not RBSR.
