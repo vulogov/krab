@@ -195,9 +195,16 @@ pub struct Policy {
 
 impl Default for Policy {
     /// Full participation: relay for others, no sharding, 1 GB, all buckets.
+    ///
+    /// `max_bucket` is the **highest index in RFC 1 §8.1's ladder**, which has
+    /// six entries and therefore tops out at 5. An earlier revision used 7,
+    /// which admitted everything and was harmless — and wrong in a way that
+    /// matters here, because this value travels inside a *signed card*. A
+    /// number naming no bucket is a term two implementations could read
+    /// differently, in a document neither can revise.
     fn default() -> Policy {
         Policy {
-            max_bucket: 7,
+            max_bucket: krab_core::object::BUCKETS.len() as u8 - 1,
             relay: true,
             retention_bytes: 1 << 30,
             shard_bits: 0,
@@ -639,6 +646,21 @@ mod tests {
     }
 
     /// A card survives the round trip through its wire form, signature intact.
+    /// The default ceiling must name a bucket that exists — it is on the wire
+    /// inside a signed card, so an out-of-range value is a term nobody can
+    /// later correct.
+    #[test]
+    fn the_default_ceiling_is_a_real_bucket() {
+        let p = Policy::default();
+        assert!(
+            (p.max_bucket as usize) < krab_core::object::BUCKETS.len(),
+            "max_bucket {} is not an index into RFC 1 §8.1's ladder",
+            p.max_bucket
+        );
+        assert_eq!(p.max_bucket, 5);
+        assert_eq!(krab_core::object::BUCKETS[p.max_bucket as usize], 262_144);
+    }
+
     #[test]
     fn a_card_round_trips_through_cbor() {
         let c = card(
