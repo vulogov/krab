@@ -9,4 +9,7 @@
 
 pub mod courier;
 
+#[cfg(feature = "tcp")]
+pub mod tcp;
+
 pub mod sim;

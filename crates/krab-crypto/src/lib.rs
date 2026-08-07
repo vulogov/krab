@@ -1,6 +1,14 @@
 //! Krab cryptographic primitives.
 //!
-//! **This is the only crate in the workspace with third-party dependencies.**
+//! **This crate owns the workspace's object-layer cryptography** — everything
+//! that protects message content, identity and tags.
+//!
+//! It is not the *only* crate with cryptographic dependencies: `krab-fabric`
+//! owns the link layer, because RFC 4 §4.1's Noise IK resolves older major
+//! versions of three primitives than RFC 1 §6.1's suite requires and no
+//! combination satisfies both. Two boundaries, both named, in
+//! `Documentation/CRYPTO-BOUNDARIES.md`. A third would mean there is no
+//! boundary, only a habit.
 //! That is deliberate: it localises the audit surface and RFC 0 §9's
 //! reproducible-builds argument to a single boundary, and it keeps `krab-core`
 //! literally zero-dependency so its no-I/O, no-clock, no-ambient-randomness
@@ -29,14 +37,15 @@
 //! it MUST NOT be implemented. RFC 7 §6 needs amending to match; RFC 1 stays
 //! frozen, because §6.1's suite space already accommodates it.
 //!
-//! # One copy of each primitive
+//! # One copy of each primitive, *within this crate*
 //!
-//! Every version in `Cargo.toml` is pinned to whatever `hpke` resolves to.
-//! Two copies of X25519 or ChaCha20-Poly1305 in one binary would defeat the
-//! reason this crate exists: the claim above is a *single localised audit
-//! surface*, and an auditor facing two independent implementations of the same
-//! primitive — one deriving tags, the other running the KEM — does not have
-//! one. `cargo tree | grep curve25519` is the check.
+//! Every version in `Cargo.toml` is pinned to whatever `hpke` resolves to. Two
+//! copies inside this crate would mean one implementation deriving tags and a
+//! different one running the KEM, which is a genuine hazard rather than a
+//! bookkeeping one.
+//!
+//! `cargo tree -p krab-crypto | grep curve25519` must show exactly one version.
+//! If it ever shows two, that is a regression.
 //!
 //! The three findings that shape this crate:
 //!

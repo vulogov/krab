@@ -24,6 +24,38 @@ pub fn write(out: &mut impl Write, msg: &Control) -> Result<usize, Error> {
     Ok(4 + body.len())
 }
 
+/// Write raw framed bytes.
+///
+/// Used for Noise: handshake messages and transport ciphertext are opaque at
+/// this layer, and the framing is identical. Sharing the length check matters
+/// more than the type — RFC 4 §9's "validate before allocating" applies to
+/// ciphertext exactly as it does to control messages.
+pub fn write_bytes(out: &mut impl Write, body: &[u8]) -> Result<usize, Error> {
+    if body.len() > MAX_FRAME {
+        return Err(Error::Frame);
+    }
+    out.write_all(&(body.len() as u32).to_le_bytes())?;
+    out.write_all(body)?;
+    Ok(4 + body.len())
+}
+
+/// Read raw framed bytes, or `None` at clean end of input.
+pub fn read_bytes(input: &mut impl Read) -> Result<Option<Vec<u8>>, Error> {
+    let mut len = [0u8; 4];
+    match input.read_exact(&mut len) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(Error::Io(e)),
+    }
+    let n = u32::from_le_bytes(len) as usize;
+    if n > MAX_FRAME {
+        return Err(Error::Frame);
+    }
+    let mut body = vec![0u8; n];
+    input.read_exact(&mut body).map_err(|_| Error::Frame)?;
+    Ok(Some(body))
+}
+
 /// Read one framed control message, or `None` at clean end of input.
 pub fn read(input: &mut impl Read) -> Result<Option<Control>, Error> {
     let mut len = [0u8; 4];

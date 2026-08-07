@@ -8,7 +8,36 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# RFC 4 §4.1's Noise IK.
+#
+# **This crate is the workspace's second cryptographic boundary**, and that is a
+# deliberate change from the single boundary `krab-crypto` originally claimed.
+# `snow` resolves the older major versions of curve25519-dalek,
+# chacha20poly1305 and sha2 than `hpke` requires, and no combination satisfies
+# both — so a binary linking Noise and HPKE contains two of each primitive.
+#
+# The boundary is therefore restated rather than pretended away:
+#
+#   krab-crypto  — object-layer crypto. What protects messages.
+#   krab-fabric  — link-layer crypto.   What protects transports.
+#
+# Two audits, both named. They are genuinely different trust domains — a link
+# compromise exposes traffic analysis, an object compromise exposes content —
+# and both duplicated implementations are dalek, differing by major version
+# rather than by author. Recorded in `Documentation/CRYPTO-BOUNDARIES.md`.
 [dependencies]
+# Constant-time comparison for the static-key check. `snow` already links it.
+subtle = { version = "2", default-features = false }
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "std",
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-sha2",
+    # Noise draws its ephemeral internally, so entropy is not injectable here
+    # the way it is in `krab-crypto`. See `backend::tcp`'s note.
+    "use-getrandom",
+] }
 krab-core = { workspace = true }
 krab-proto = { workspace = true }
 
