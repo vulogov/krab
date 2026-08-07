@@ -37,6 +37,7 @@ mod peering;
 mod peers;
 mod reach;
 mod render;
+mod sync;
 
 use activity::{NodeState, Spinner};
 use command::{admit, Command, InitStep, Peering, Refusal};

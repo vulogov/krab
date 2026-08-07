@@ -42,7 +42,9 @@ concludes.
 > defect cannot be reached by calling the wrong thing.
 >
 > **The finding remains open against RFC 7 §6**, which still specifies the
-> defective derivation. Until §6 is amended, an implementation following it
+> defective derivation. Drop-in replacement text is in
+> `Documentation/RFC-7-section-6-proposed.md`, which closes this finding and
+> `RFC-7-review.md` §§10–11 in one edit — all three land in §6. Until §6 is amended, an implementation following it
 > literally and this one will not interoperate. That is the safer direction:
 > §6 as written reuses one key for every message a pair exchanges in a day.
 >

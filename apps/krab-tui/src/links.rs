@@ -203,7 +203,6 @@ impl LinkTable {
     ///
     /// Called by the scheduler, never by a command. The signature takes minutes
     /// rather than a closure precisely so a caller cannot pass "now".
-    #[allow(dead_code)] // driven by the scheduler once it owns the loop
     pub fn set_next_sync(&mut self, peer: &str, minutes: u64) {
         if let Some(l) = self.links.get_mut(peer) {
             l.next_sync_min = Some(minutes);
@@ -218,6 +217,11 @@ impl LinkTable {
     /// Every link, in stable order.
     pub fn iter(&self) -> impl Iterator<Item = &LinkState> {
         self.links.values()
+    }
+
+    /// Every peer name, for joining against the scheduler.
+    pub fn peer_names(&self) -> Vec<String> {
+        self.links.keys().cloned().collect()
     }
 
     /// Links currently up.
