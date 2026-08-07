@@ -41,7 +41,13 @@ use std::collections::BTreeMap;
 ///
 /// Everything here derives from `(expiry, id)` ordering and the frozen header,
 /// so none of it requires a decryption key.
-struct StoreView<'a>(&'a mut Store);
+/// A [`Store`] as a reconcilable [`Corpus`].
+///
+/// Public so SIM-2 can drive the real state machine over real stores —
+/// `MILESTONE-0.1.md` §2 phase F requires the measurements run "against the
+/// implementations ... not against a third model", and a second adapter
+/// written for the simulator would be exactly that third model.
+pub struct StoreView<'a>(pub &'a mut Store);
 
 impl Corpus for StoreView<'_> {
     fn entries(&self, lo: u32, hi: u32) -> Vec<Entry> {
