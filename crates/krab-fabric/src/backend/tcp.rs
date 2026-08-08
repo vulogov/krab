@@ -61,6 +61,24 @@ use std::sync::Mutex;
 /// RFC 4 §4.1's pattern, with RFC 1 §6.1's primitives.
 pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
+/// Generate a Noise static keypair for RFC 4 §4.1's IK handshake.
+///
+/// Lives here rather than in `krab-crypto` because it is a *link* key and this
+/// crate owns link-layer cryptography — see
+/// `Documentation/CRYPTO-BOUNDARIES.md`. Entropy comes from `snow`'s generator,
+/// which is the same OS source and is not injectable; the module note above
+/// explains why that boundary is not crossed.
+pub fn generate_static() -> Result<([u8; 32], [u8; 32]), Error> {
+    let params = NOISE_PARAMS.parse().map_err(|_| Error::Frame)?;
+    let kp = Builder::new(params)
+        .generate_keypair()
+        .map_err(|_| Error::Frame)?;
+    Ok((
+        kp.private.try_into().map_err(|_| Error::Frame)?,
+        kp.public.try_into().map_err(|_| Error::Frame)?,
+    ))
+}
+
 /// An established Noise session over TCP.
 pub struct TcpSession {
     stream: TcpStream,

@@ -107,7 +107,7 @@ mod tests {
             s.add(id, 0, 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1));
             let name = format!("{:02x}{:02x}{:02x}{:02x}", id[0], id[1], id[2], id[3]);
             l.connect(&name, LinkProfile::tcp());
-            l.established(&name);
+            l.established(&name, None);
         }
         (s, l)
     }

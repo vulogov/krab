@@ -41,6 +41,12 @@ pub struct View<'a> {
     pub composer: &'a str,
     /// Whether the node is locked. A locked node draws no message content.
     pub locked: bool,
+    /// Recent background activity, newest last.
+    ///
+    /// Bounded and transient — see `crate::activity_log`. It shares the command
+    /// pane with the status line, so zooming the pane is what an operator does
+    /// to watch a reconciliation (RFC 8 §2, §3).
+    pub log: &'a [String],
     /// Whether command-pane input is a passphrase.
     ///
     /// A passphrase must not reach the screen: RFC 7 §4 makes it the only root
@@ -205,6 +211,8 @@ fn draw_composer(f: &mut Frame, area: Rect, view: &View) {
 fn draw_command(f: &mut Frame, area: Rect, view: &View) {
     let status = status_line_with(view.node, view.spinner);
     let lock = if view.locked { "  🔒" } else { "" };
+    // Two lines unzoomed (RFC 8 §3); the log fills whatever a zoomed pane has.
+    let room = area.height.saturating_sub(2) as usize;
     // Length is shown, contents are not: an operator needs to see that keys
     // are registering without the passphrase reaching the screen.
     let shown = if view.masked {
@@ -212,13 +220,24 @@ fn draw_command(f: &mut Frame, area: Rect, view: &View) {
     } else {
         view.command.to_string()
     };
-    let lines = vec![
-        Line::from(format!("> {shown}")),
-        Line::from(Span::styled(
-            format!("{status}{lock}"),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
+    let mut lines: Vec<Line> = view
+        .log
+        .iter()
+        .rev()
+        .take(room)
+        .rev()
+        .map(|l| {
+            Line::from(Span::styled(
+                l.clone(),
+                Style::default().fg(Color::DarkGray),
+            ))
+        })
+        .collect();
+    lines.push(Line::from(format!("> {shown}")));
+    lines.push(Line::from(Span::styled(
+        format!("{status}{lock}"),
+        Style::default().fg(Color::DarkGray),
+    )));
     f.render_widget(
         Paragraph::new(lines).block(frame_for(view.ui, Pane::Command, String::new())),
         area,

@@ -24,6 +24,7 @@
 //! where unwinding is enabled.
 
 mod activity;
+mod activity_log;
 mod ceremony;
 mod command;
 mod compose;
@@ -135,6 +136,8 @@ struct App {
     messages: Vec<receive::Message>,
     /// Which message the list pane has selected.
     selected: usize,
+    /// Background activity, bounded and transient — see `activity_log`.
+    log: activity_log::ActivityLog,
     /// The recognition table, rebuilt on epoch rollover.
     ///
     /// Cached because it is 4 550 HKDF passes at 50 correspondents (RFC 2
@@ -173,6 +176,7 @@ impl Default for App {
             scheduler: krab_node::scheduler::Scheduler::new(4 * 3_600),
             messages: Vec::new(),
             selected: 0,
+            log: activity_log::ActivityLog::new(),
             tag_table: None,
             confirmed: false,
             init_step: None,
@@ -224,6 +228,7 @@ impl App {
     fn run(&mut self, term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         let mut last = Instant::now();
         while !self.quit {
+            let log_lines = self.log.recent(activity_log::CAPACITY);
             term.draw(|f| {
                 render::draw(
                     f,
@@ -240,6 +245,7 @@ impl App {
                         },
                         composer: &self.composer,
                         locked: self.locked,
+                        log: &log_lines,
                         masked: self.init_step == Some(InitStep::Passphrase),
                     },
                 )
@@ -356,6 +362,13 @@ impl App {
             u64::from_le_bytes(entropy),
         )
         .due;
+        // Provenance for what the schedule did. Aggregates only, no clock —
+        // RFC 3 §12, and `activity_log`'s module note on why.
+        for peer in &due {
+            let short = short_id(peer);
+            let event = self.reconcile_with(&short);
+            self.log.push(event);
+        }
         if !due.is_empty() {
             // Reconciliation itself needs a live session, which arrives with
             // the transport work. The schedule fires regardless, so that when
@@ -372,6 +385,44 @@ impl App {
             .filter_map(|l| l.next_sync_min)
             .min()
             .map(|m| m * 60);
+    }
+
+    /// Reconcile with one peer over its established session.
+    ///
+    /// **Called only from the schedule.** `connect` cannot reach this: it goes
+    /// through `establish`, which returns a session and nothing else. RFC 8
+    /// §5.1's guarantee is that a keypress never causes a transfer, and the
+    /// separation is that the two paths do not share a function.
+    fn reconcile_with(&mut self, peer: &str) -> activity_log::Event {
+        let window = {
+            let now = now_epoch().0 * 1440;
+            (
+                now.saturating_sub(45 * 1440),
+                now.saturating_add(45 * 1440) + 1,
+            )
+        };
+        let Some(session) = self.links.session_mut(peer) else {
+            return activity_log::Event::Failed {
+                peer: peer.to_string(),
+                why: "no session — nothing exchanged",
+            };
+        };
+        let mut view = krab_node::node::StoreView(&mut self.store);
+        match krab_node::exchange::initiate(session, &mut view, [0u8; 32], window.0, window.1) {
+            Ok(moved) => activity_log::Event::Reconciled {
+                peer: peer.to_string(),
+                received: moved.received,
+                sent: moved.sent,
+            },
+            Err(_) => {
+                // A dead session is ordinary on an intermittent link (I-4).
+                self.links.failed(peer);
+                activity_log::Event::Failed {
+                    peer: peer.to_string(),
+                    why: "session ended",
+                }
+            }
+        }
     }
 
     /// Rebuild the tag table and open what this node can read.
@@ -641,7 +692,7 @@ impl App {
                     self.body = format!("unknown transport {kind:?}");
                     return;
                 };
-                self.links.connect(peer, profile);
+                self.links.connect(peer, profile.clone());
                 // Register with the schedule. This is the *only* coupling
                 // between a user action and the scheduler, and it adds a peer
                 // rather than triggering anything: the first interval is drawn
@@ -655,10 +706,29 @@ impl App {
                     OsRng.fill(&mut e);
                     self.scheduler.add(id, now_s, u64::from_le_bytes(e));
                 }
-                // Establishment is synchronous here; a real transport would
-                // leave it `Establishing` and animate that, which RFC 4 §5.2
-                // requires and RFC 8 §5.1 explicitly permits.
-                self.links.established(peer);
+                // A real handshake, if an address and a peer-link are both
+                // available. RFC 4 §4.1 requires the presented static match
+                // the credential, and `TcpFabric` takes the expected key as a
+                // required argument — so a peer with no stored card cannot be
+                // connected to over TCP at all, which is the correct refusal.
+                match self.establish(peer, arg(line, 3)) {
+                    Ok(session) => {
+                        self.links.established(peer, session);
+                        self.log.push(activity_log::Event::LinkUp {
+                            peer: peer.to_string(),
+                            kind: profile.kind,
+                        });
+                    }
+                    Err(why) => {
+                        self.links.failed(peer);
+                        self.log.push(activity_log::Event::Failed {
+                            peer: peer.to_string(),
+                            why: "handshake refused",
+                        });
+                        self.body = why;
+                        return;
+                    }
+                }
                 let l = self.links.get(peer).expect("just connected");
                 self.body = format!(
                     "{}\n\nnothing was transferred. Reconciliation is scheduled \
@@ -673,6 +743,11 @@ impl App {
                 };
                 if let Some(id) = sync::peer_id_of(peer) {
                     self.scheduler.remove(&id);
+                }
+                if self.links.get(peer).is_some() {
+                    self.log.push(activity_log::Event::LinkDown {
+                        peer: peer.to_string(),
+                    });
                 }
                 self.body = if self.links.disconnect(peer) {
                     // RFC 3 §6.2's quota reduction is deliberately not bundled:
@@ -1192,8 +1267,52 @@ impl App {
         }
     }
 
+    /// Perform RFC 4 §4.1's Noise IK handshake toward `peer`.
+    ///
+    /// `Ok(None)` means there is no address to dial — a courier peer, or one
+    /// reachable only inbound. That is not a failure: RFC 4 §5.5 is explicit
+    /// that "whether anyone carries it is not the protocol's business", and
+    /// I-4 forbids assuming reachability.
+    fn establish(
+        &self,
+        peer: &str,
+        addr: Option<&str>,
+    ) -> Result<Option<Box<dyn krab_fabric::Session>>, String> {
+        let Some(addr) = addr else {
+            return Ok(None);
+        };
+        let Some(id) = &self.identity else {
+            return Err("no identity — run `init` first".into());
+        };
+
+        // The expected static comes from the stored peer-link, which is signed.
+        // There is no path that dials without one, and no prompt: RFC 4 §4.1
+        // requires a mismatch be "a hard failure, never a TOFU prompt".
+        let card_bytes = std::fs::read(self.path(&format!("{peer}.link")))
+            .map_err(|_| format!("no peer-link for {peer} — complete a peering first"))?;
+        let card = peering::Card::decode(&card_bytes)
+            .ok()
+            .filter(|c| c.verify())
+            .ok_or_else(|| "the stored peer-link does not verify".to_string())?;
+
+        let fabric = krab_fabric::backend::tcp::TcpFabric::new(
+            krab_fabric::profile::LinkProfile::tcp(),
+            addr,
+            id.noise_bytes(),
+            card.noise_static_pk,
+        );
+        use krab_fabric::Fabric;
+        fabric
+            .connect()
+            .map(Some)
+            .map_err(|e| format!("could not establish a session with {peer}: {e}"))
+    }
+
     /// RFC 8 §5.3's panel.
     fn peers_panel(&self) -> String {
+        // Activity provenance belongs beside the per-peer aggregates: the log
+        // says what just happened, `PeerMetrics` says what has been happening.
+        let recent = self.log.recent(6);
         // No metrics source is wired yet, so the panel is honest about being
         // empty rather than inventing rows. `PeerMetrics` is counters-only by
         // construction (RFC 3 §12), which is the part that had to be right
@@ -1208,6 +1327,16 @@ impl App {
             out.push('\n');
         }
         out.push_str("\nno accountability metrics yet — nothing has reconciled.");
+        if !recent.is_empty() {
+            out.push_str(&format!(
+                "\n\nrecent activity ({} of at most {}, cleared on lock):\n",
+                recent.len(),
+                activity_log::CAPACITY
+            ));
+            for line in &recent {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
         out
     }
 
@@ -1264,6 +1393,7 @@ impl App {
             "identity   {}\n\
              epochs     {epochs} wrapper{} ({} bytes)\n\
              tags       {table}\n\
+             activity   {} line{} held, cleared on lock (RFC 3 §12)\n\
              backup     shown once at init and never again (RFC 7 §11)\n\
              \n\
              message history is not recoverable from the identity backup, and \
@@ -1271,6 +1401,8 @@ impl App {
             id.short_id(),
             if epochs == 1 { "" } else { "s" },
             id.hierarchy.stored_bytes(),
+            self.log.len(),
+            if self.log.len() == 1 { "" } else { "s" },
         )
     }
 
@@ -1623,6 +1755,9 @@ impl App {
         // The table derives from static-static shared secrets, so it is
         // content-key material. A locked node is a relay and must not hold it.
         self.tag_table = None;
+        // The counters in `PeerMetrics` keep moving — a relay still
+        // reconciles — but the screen must not list correspondents.
+        self.log.clear();
         self.list = vec!["(locked)".into()];
         overwrite(&mut self.passphrase);
         overwrite(&mut self.composer);
@@ -3342,5 +3477,51 @@ mod tests {
             peer.chunk(now_epoch()).map(|c| *c.expose()),
             "inferring the ratchet position must not accidentally agree"
         );
+    }
+
+    /// **Provenance in the command pane, within RFC 3 §12's limits.**
+    ///
+    /// The log names peers and counts, never objects and never times, and it
+    /// is cleared on lock — a locked screen must not list correspondents.
+    #[test]
+    fn background_activity_is_visible_and_bounded() {
+        let mut a = ready_node("log");
+        type_command(&mut a, "connect a1b2c3d4 tcp");
+        assert_ne!(a.log.len(), 0, "connecting produced no provenance");
+        let lines = a.log.recent(8);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("a1b2c3d4") && l.contains("link up")),
+            "{lines:?}"
+        );
+
+        // Ticking the schedule reports what it did, per peer.
+        for _ in 0..40 {
+            a.tick_schedule();
+        }
+        let lines = a.log.recent(activity_log::CAPACITY);
+        assert!(
+            lines.len() <= activity_log::CAPACITY,
+            "the ring is not bounded"
+        );
+
+        // No line carries a wall-clock time or an object identifier.
+        for line in &lines {
+            for leak in ["id=", "0x", " obj ", "tag "] {
+                assert!(!line.contains(leak), "{line:?} leaks {leak:?}");
+            }
+        }
+    }
+
+    /// **Cleared on lock.** The counters in `PeerMetrics` keep moving — a relay
+    /// still reconciles — but the screen stops naming who.
+    #[test]
+    fn locking_clears_the_activity_log() {
+        let mut a = ready_node("log-lock");
+        type_command(&mut a, "connect a1b2c3d4 tcp");
+        assert_ne!(a.log.len(), 0);
+        a.lock();
+        assert_eq!(a.log.len(), 0, "a locked screen listed correspondents");
     }
 }

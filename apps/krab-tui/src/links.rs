@@ -77,6 +77,17 @@ impl fmt::Display for Transport {
 
 /// One peer's link.
 pub struct LinkState {
+    /// The established session, if the transport is up.
+    ///
+    /// **Held open across reconciliation cycles.** RFC 4 §4.1: a handshake is
+    /// ~3 minutes of LoRa airtime, so constrained links "MUST hold sessions
+    /// open ... and SHOULD treat session teardown as expensive". Nothing here
+    /// closes on idle.
+    ///
+    /// A session can carry bytes; it cannot reconcile. The driver is
+    /// `krab_node::exchange`, and this module does not depend on it — which is
+    /// what keeps RFC 8 §5.1's guarantee structural rather than a convention.
+    pub session: Option<Box<dyn krab_fabric::Session + 'static>>,
     /// Short peer identifier, as displayed.
     pub peer: String,
     /// What this link can carry.
@@ -167,16 +178,42 @@ impl LinkTable {
                 profile,
                 transport: Transport::Down,
                 next_sync_min: None,
+                session: None,
             });
         entry.transport = Transport::Establishing;
         entry
     }
 
-    /// Mark establishment complete.
-    pub fn established(&mut self, peer: &str) {
+    /// Mark establishment complete, adopting the session.
+    pub fn established(
+        &mut self,
+        peer: &str,
+        session: Option<Box<dyn krab_fabric::Session + 'static>>,
+    ) {
         if let Some(l) = self.links.get_mut(peer) {
             l.transport = Transport::Up;
+            l.session = session;
         }
+    }
+
+    /// Mark establishment as having failed.
+    pub fn failed(&mut self, peer: &str) {
+        if let Some(l) = self.links.get_mut(peer) {
+            l.transport = Transport::Failed;
+            l.session = None;
+        }
+    }
+
+    /// The session for a peer whose transport is up.
+    pub fn session_mut<'a>(
+        &'a mut self,
+        peer: &str,
+    ) -> Option<&'a mut (dyn krab_fabric::Session + 'static)> {
+        let l = self.links.get_mut(peer)?;
+        if l.transport != Transport::Up {
+            return None;
+        }
+        l.session.as_deref_mut()
     }
 
     /// Tear a link down — RFC 8 §5's `disconnect`.
@@ -188,6 +225,9 @@ impl LinkTable {
         match self.links.get_mut(peer) {
             Some(l) => {
                 l.transport = Transport::Down;
+                if let Some(mut s) = l.session.take() {
+                    let _ = s.close();
+                }
                 true
             }
             None => false,
@@ -251,7 +291,7 @@ mod tests {
     fn table() -> LinkTable {
         let mut t = LinkTable::new();
         t.connect("q3m9", LinkProfile::tcp());
-        t.established("q3m9");
+        t.established("q3m9", None);
         t
     }
 
@@ -334,7 +374,7 @@ mod tests {
         let mut t = LinkTable::new();
         t.connect("m4k2", LinkProfile::lora_sf10());
         assert_eq!(t.get("m4k2").unwrap().transport, Transport::Establishing);
-        t.established("m4k2");
+        t.established("m4k2", None);
         assert_eq!(t.get("m4k2").unwrap().transport, Transport::Up);
     }
 

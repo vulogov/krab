@@ -215,7 +215,7 @@ mod tests {
     fn table() -> LinkTable {
         let mut t = LinkTable::new();
         t.connect("q3m9", LinkProfile::tcp());
-        t.established("q3m9");
+        t.established("q3m9", None);
         t
     }
 
