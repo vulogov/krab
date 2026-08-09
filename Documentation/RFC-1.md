@@ -545,7 +545,7 @@ cryptographic guarantee in the system with a font.
 
 ### 9.3 Truncated, within a scoped range
 
-Manifest entries carry `(expiry_min, id[0..12])` = 16 bytes.
+Manifest entries carry `(expiry_min, id[0..16])` = 20 bytes.
 
 | corpus | 8 B id | 12 B id | 16 B id | 32 B id |
 |---|---|---|---|---|
@@ -553,9 +553,31 @@ Manifest entries carry `(expiry_min, id[0..12])` = 16 bytes.
 | 100 000 | 1.2 MB | 1.6 MB | 2.0 MB | 3.6 MB |
 | 500 000 | 6.0 MB | 8.0 MB | 10.0 MB | 18.0 MB |
 
-12 bytes is normative. 8 bytes admits a 2³² birthday grind; 12 bytes
-raises that to 2⁴⁸, and the consequence of a collision is bounded — one
-object not transferred on one link, recoverable through another peer.
+**16 bytes is normative**, raised from 12. 8 bytes admits a 2³² birthday
+grind and 12 bytes a 2⁴⁸ one, which is affordable against a chosen target.
+16 bytes puts it at 2⁶⁴, and the accidental rate in a 500 000-object corpus
+near 2⁻²⁵.
+
+> **An earlier version of this section said 12 bytes was sufficient because
+> "the consequence of a collision is bounded — one object not transferred on
+> one link, recoverable through another peer." That was wrong**, and the error
+> was in the consequence rather than in the arithmetic.
+>
+> Reconciliation asks for what it lacks by testing the truncated identifier
+> against what it holds (RFC 5 §4.4). A node that accepts a colliding object
+> therefore *holds* something with that prefix, stops asking for the target,
+> and stops asking **from every peer, permanently** — not from one link, and
+> not recoverably. RFC 0 §6 guarantees it is never told.
+>
+> So a 2⁴⁸ grind against one chosen object bought permanent silent suppression
+> of that object at that node, for the cost of a targeted collision search. The
+> width is raised because the consequence cannot be bounded by the protocol:
+> the requester never learns the full identifier, so it cannot tell the
+> collision from the target.
+
+Truncation remains a size optimisation and not an identifier. The
+consequence of any residual collision is still silent, so the width is set
+where a grind is infeasible rather than where the damage is tolerable.
 
 **Truncated identifiers are valid only inside a reconciliation range that
 both parties have already agreed on.** They MUST NOT appear in a routing

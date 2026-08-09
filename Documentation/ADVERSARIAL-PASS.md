@@ -6,7 +6,9 @@ Commissioned because external review will not happen (see
 produced findings in this project: pick a claim, ask what would have to be true
 for it to be false, and go looking.
 
-**Four findings. Two fixed here, two open.** The first is the most serious
+**Four findings, all now fixed.** Two were fixed when this was written; the
+remaining two are fixed below, and investigating one of them showed the
+finding had been understated. The first is the most serious
 thing found in the project so far, because it defeats a feature under precisely
 the threat model that feature exists for.
 
@@ -62,7 +64,7 @@ to give gives it then. That is the same shape as every other limit here —
 RFC 5's reconciliation is designed to be resumable, so ending early costs
 nothing.
 
-## 3. OPEN — truncated identifiers permit a targeted liveness attack
+## 3. Truncated identifiers permitted targeted, permanent suppression · **FIXED**
 
 `TRUNC` is 12 bytes. Reconciliation addresses objects by truncated identifier:
 `Want([u8; 12])`, and the responder serves via `Corpus::get(&[u8; 12])`.
@@ -71,33 +73,40 @@ nothing.
 grinds an object colliding with a *specific* target's truncated identifier can,
 whenever that object is requested, answer with the collision instead.
 
-**This is not a content-substitution attack.** RFC 1 §11's I5 is checked on
-ingest, so the collision is stored under its own full identifier and the
-requester still lacks the target. Confidentiality and integrity hold.
+**This is not content substitution.** RFC 1 §11's I5 is checked on ingest, so
+the collision is stored under its own full identifier. Confidentiality and
+integrity hold.
 
-**It is a liveness attack, and it is targeted.** The requester asks again next
-cycle, receives the collision again, and never obtains the object — while every
-check passes and RFC 0 §6 guarantees nothing is reported. One specific message
-can be suppressed indefinitely by one relay on the path.
+**It was worse than first described, and worse than RFC 1 §9.3 claimed.** §9.3
+justified 12 bytes on the grounds that "the consequence of a collision is
+bounded — one object not transferred on one link, recoverable through another
+peer." Tracing it showed that sentence to be false.
 
-The cost is 2⁴⁸ work *per target object*, which is expensive for bulk
-suppression and affordable for a single message someone cares about.
+`recon::wanted` asks for what it lacks by testing the *truncated* identifier
+against what it holds. A node that accepts the collision therefore holds
+something with that prefix, `has(trunc)` returns true, and it **stops asking
+for the target — from every peer, permanently.** Not one link, and not
+recoverable. RFC 0 §6 guarantees it is never told.
 
-**Not fixed, because the fix is a format change.** Options, in order of my
-preference:
+So a 2⁴⁸ grind against one chosen object bought permanent silent suppression of
+that object at that node. My first write-up said "asks again next cycle", which
+was wrong in the direction that made it sound survivable.
 
-1. **Serve the full identifier alongside the object** and have the requester
-   drop a response whose full identifier is not one it asked for. Costs 20
-   bytes per delivered object; detects the attack rather than preventing it,
-   which is enough — the requester can then ask a different peer.
-2. Widen `TRUNC` to 16 bytes, moving the bound to 2⁶⁴. Costs 4 bytes per
-   manifest row, and RFC 1 §9.3's row size is a published figure.
-3. Accept it, and document the bound.
+**Fix.** `TRUNC` widened to 16 bytes: grind at 2⁶⁴, accidental rate in a
+500 000-object corpus near 2⁻²⁵. The manifest row goes from 16 to 20 bytes
+packed, which §9.3's own table prices at 8.0 MB → 10.0 MB for that corpus.
 
-RFC 1 §9.3 sizes the manifest row and RFC 5 §4.4 assumes truncation, so this
-crosses two frozen documents and should be decided rather than patched.
+The width is now set where a grind is *infeasible* rather than where the damage
+is tolerable, because the damage cannot be bounded by the protocol: the
+requester never learns the full identifier, so it cannot distinguish the
+collision from the target. The serve-the-full-identifier option I ranked first
+does not work for the same reason — the requester has nothing to compare
+against.
 
-## 4. OPEN — the tombstone set grows without bound
+RFC 1 §9.3 is amended, including a note recording that its original
+justification was wrong and why.
+
+## 4. The tombstone set grew without bound · **FIXED**
 
 `Store::tombstones` is a `BTreeSet<ObjectId>` that is inserted into on expiry
 and on eviction, and **never pruned** — there is no `remove` or `retain` on it
@@ -112,11 +121,19 @@ At 32 bytes per entry and SIM-0's corpus rates, a long-lived node accumulates
 tombstones indefinitely — memory that only grows, on a node RFC 4 §5.4
 contemplates running on constrained hardware.
 
-**Not fixed, because the retention period is a protocol decision.** The obvious
-answer is to drop a tombstone once `now > expiry + MAX_TTL`, which needs RFC 5
-§8 to say so. Note this is the same defect pattern the series has already been
-bitten by four times: a retention parameter that should be a function of the
-declared guarantee (`MAX_TTL`) and is instead unspecified.
+**Fix.** `Store::prune_tombstones` drops entries past `expiry + MAX_TTL`, and
+RFC 5 §8 now requires it. Past that horizon no honest peer holds the object and
+a dishonest one gains nothing by offering it, because RFC 1 §11's I2 rejects an
+expired object regardless.
+
+The set now stores `(expiry, id)` rather than `id` alone, since an identifier
+does not reveal when its object expired. Eviction and expiry work by segment,
+so the bucket's upper edge is used as the bound — keeping a tombstone slightly
+longer than needed, which is the safe direction.
+
+This was the fifth instance of one pattern: a retention parameter that should
+be a function of the declared guarantee (`MAX_TTL`) and was instead
+unspecified. RFC 1 §6.2, RFC 7 §12 and §5.2, RFC 2 §5, and now RFC 5 §8.
 
 ---
 

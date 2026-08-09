@@ -321,6 +321,17 @@ an unbridgeable gap before spending capacity on it.
 
 ---
 
+
+**Tombstones MUST be bounded.** A tombstone is useful only while some peer
+might still hold the object, and `MAX_TTL` bounds that: past
+`expiry + MAX_TTL` no honest peer holds it, and a dishonest one gains nothing
+by offering it because RFC 1 §11's I2 rejects an expired object regardless.
+
+An implementation MUST drop tombstones past that horizon. Without it the set
+only grows — every expiry and every eviction inserts and nothing removes — on
+a node RFC 4 §5.4 expects to run on constrained hardware.
+
+
 ## 9. Eviction under pressure
 
 TTL handles the normal case. When storage fills before TTL:

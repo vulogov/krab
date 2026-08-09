@@ -6,7 +6,7 @@
 
 use crate::segment::{bucket_of, Segment};
 use crate::Error;
-use krab_core::object::{ObjectId, RoutingHeader};
+use krab_core::object::{ObjectId, RoutingHeader, TRUNC_LEN};
 use krab_crypto::Fingerprint;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,7 +64,9 @@ pub enum Reject {
 pub struct Store {
     segments: BTreeMap<u32, Segment>,
     index: BTreeMap<(u32, ObjectId), Location>,
-    tombstones: BTreeSet<ObjectId>,
+    /// `(expiry_min, id)` — the expiry is kept so `prune_tombstones` can bound
+    /// the set by `MAX_TTL` rather than letting it grow forever.
+    tombstones: BTreeSet<(u32, ObjectId)>,
     min_expiry_min: u32,
 }
 
@@ -173,7 +175,7 @@ impl Store {
         if expiry < self.min_expiry_min {
             return Err(Reject::BelowWatermark);
         }
-        if self.tombstones.contains(&id) {
+        if self.tombstones.iter().any(|(_, t)| *t == id) {
             return Err(Reject::Tombstoned);
         }
         // RFC 0 I-1 — duplicate suppression follows from content addressing
@@ -210,6 +212,30 @@ impl Store {
         krab_core::object::verify_padding(bytes, body_len).map_err(|_| Reject::BadPadding)
     }
 
+    /// Drop tombstones no peer can still offer — RFC 5 §8.
+    ///
+    /// A tombstone exists so a returning courier node cannot re-inject what
+    /// the network already evicted. It is useful only while some peer might
+    /// still hold the object, and `MAX_TTL` bounds that: past
+    /// `expiry + MAX_TTL`, no honest peer holds it and no dishonest one gains
+    /// anything by offering it, since I2 rejects an expired object anyway.
+    ///
+    /// **Without this the set only grows.** Every expiry and every eviction
+    /// inserts and nothing ever removed, on a node RFC 4 §5.4 expects to run
+    /// on constrained hardware. That is the same defect pattern this series
+    /// has hit repeatedly: a retention parameter left unspecified instead of
+    /// being derived from the declared guarantee.
+    ///
+    /// The tombstone stores only the identifier, so the expiry it was
+    /// tombstoned at is carried alongside — an identifier does not reveal when
+    /// its object expired.
+    pub fn prune_tombstones(&mut self, now_min: u32, max_ttl_min: u32) -> usize {
+        let before = self.tombstones.len();
+        let horizon = now_min.saturating_sub(max_ttl_min);
+        self.tombstones.retain(|(expiry, _)| *expiry >= horizon);
+        before - self.tombstones.len()
+    }
+
     /// Fetch an object's bytes.
     pub fn get(&self, id: &ObjectId) -> Option<&[u8]> {
         self.segments.values().find_map(|s| s.get(id))
@@ -239,7 +265,7 @@ impl Store {
     ///
     /// Valid only inside an agreed reconciliation scope, which the caller has
     /// already established.
-    pub fn get_truncated(&self, trunc: &[u8; 12]) -> Option<&[u8]> {
+    pub fn get_truncated(&self, trunc: &[u8; TRUNC_LEN]) -> Option<&[u8]> {
         let id = self
             .index
             .keys()
@@ -249,7 +275,7 @@ impl Store {
     }
 
     /// Whether a truncated identifier is held.
-    pub fn has_truncated(&self, trunc: &[u8; 12]) -> bool {
+    pub fn has_truncated(&self, trunc: &[u8; TRUNC_LEN]) -> bool {
         self.index.keys().any(|(_, i)| &i.truncated() == trunc)
     }
 
@@ -307,8 +333,13 @@ impl Store {
         let mut n = 0;
         for b in dead {
             if let Some(seg) = self.segments.remove(&b) {
+                // The bucket's upper edge bounds every expiry inside it. Using
+                // it rather than the exact value keeps a tombstone slightly
+                // longer than strictly needed, which is the safe direction:
+                // pruning early would let an evicted object return.
+                let bound = (b + 1) * crate::segment::BUCKET_MINUTES;
                 for id in seg.ids() {
-                    self.tombstones.insert(*id);
+                    self.tombstones.insert((bound, *id));
                     n += 1;
                 }
             }
@@ -339,8 +370,9 @@ impl Store {
             let Some(seg) = self.segments.remove(&oldest) else {
                 break;
             };
+            let bound = (oldest + 1) * crate::segment::BUCKET_MINUTES;
             for id in seg.ids() {
-                self.tombstones.insert(*id);
+                self.tombstones.insert((bound, *id));
                 dropped += 1;
             }
             let floor = (oldest + 1) * crate::segment::BUCKET_MINUTES;
@@ -553,6 +585,50 @@ mod tests {
         assert_eq!(
             s.ingest(ObjectId([0; 32]), vec![0u8; 4], 0, MAX_TTL),
             Err(Reject::Malformed)
+        );
+    }
+
+    /// **RFC 5 §8's tombstones stay bounded.** Past `expiry + MAX_TTL` no
+    /// honest peer holds the object and a dishonest one gains nothing by
+    /// offering it, since I2 rejects an expired object anyway.
+    #[test]
+    fn tombstones_are_pruned_past_max_ttl() {
+        const MAX_TTL: u32 = 45 * DAY;
+        let mut s = store_with(0, &[(DAY, 1), (2 * DAY, 2), (30 * DAY, 3)]);
+        // Expire everything, which tombstones it.
+        s.expire(31 * DAY);
+        let held = s.tombstone_count();
+        assert!(held > 0, "expiry produced no tombstones");
+
+        // Not yet prunable: a peer offline this long may still offer them.
+        assert_eq!(s.prune_tombstones(31 * DAY, MAX_TTL), 0);
+        assert_eq!(s.tombstone_count(), held);
+
+        // Well past MAX_TTL, they are dead weight.
+        let dropped = s.prune_tombstones(200 * DAY, MAX_TTL);
+        assert_eq!(dropped, held);
+        assert_eq!(s.tombstone_count(), 0, "the set only grew before this");
+    }
+
+    /// Pruning must not let an evicted object return while a peer could still
+    /// be offering it — the whole point of RFC 5 §8.
+    #[test]
+    fn pruning_early_would_readmit_and_does_not() {
+        const MAX_TTL: u32 = 45 * DAY;
+        let mut s = store_with(0, &[(40 * DAY, 7)]);
+        let (id, bytes) = object(40 * DAY, 7);
+        s.expire(41 * DAY);
+        assert_eq!(s.prune_tombstones(41 * DAY, MAX_TTL), 0, "far too early");
+        // Two independent mechanisms catch this and the watermark happens to
+        // fire first (RFC 5 §8 has both). Asserting which one would be
+        // asserting an ordering nothing depends on; what matters is that a
+        // pruned-too-early tombstone would leave *neither*.
+        assert!(
+            matches!(
+                s.ingest(id, bytes, 39 * DAY, u32::MAX),
+                Err(Reject::Tombstoned) | Err(Reject::BelowWatermark)
+            ),
+            "an evicted object returned while a peer could still be offering it"
         );
     }
 

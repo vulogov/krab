@@ -32,6 +32,21 @@ pub const ROUTING_HEADER_LEN: usize = 16;
 /// Size buckets, RFC 1 §8.1. `size_bucket` indexes this.
 pub const BUCKETS: [u32; 6] = [256, 1_024, 4_096, 16_384, 65_536, 262_144];
 
+/// Truncated identifier width, RFC 1 §9.3 — manifests only.
+///
+/// **16 bytes, raised from 12.** At 12 bytes a targeted 2⁴⁸ grind is
+/// affordable, and §9.3's stated consequence — "one object not transferred on
+/// one link, recoverable through another peer" — was wrong. `wanted()` filters
+/// on `has(truncated)`, so a node holding *any* object with a colliding prefix
+/// stops asking for the target, from every peer, permanently. The failure is
+/// not bounded to a link and is not recoverable; it is silent suppression of
+/// one chosen object, and RFC 0 §6 guarantees nobody is told.
+///
+/// 16 bytes puts the grind at 2⁶⁴ and the accidental rate in a 500 000-object
+/// corpus near 2⁻²⁵. §9.3's own table prices the change at 8.0 MB → 10.0 MB
+/// for that corpus — 25% of a manifest RFC 5 already scopes to a filtered set.
+pub const TRUNC_LEN: usize = 16;
+
 /// RFC 1 §2. Equal to the largest bucket.
 pub const MAX_OBJECT: u32 = 262_144;
 
@@ -71,9 +86,9 @@ impl ObjectId {
     /// Valid **only** inside an agreed reconciliation range. RFC 5 §3.1
     /// forbids it in a routing header, in stored structures, or in any request
     /// outside an established session.
-    pub fn truncated(&self) -> [u8; 12] {
-        let mut t = [0u8; 12];
-        t.copy_from_slice(&self.0[..12]);
+    pub fn truncated(&self) -> [u8; TRUNC_LEN] {
+        let mut t = [0u8; TRUNC_LEN];
+        t.copy_from_slice(&self.0[..TRUNC_LEN]);
         t
     }
 }

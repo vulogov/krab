@@ -16,9 +16,9 @@ use krab_core::object::ObjectId;
 use krab_crypto::Fingerprint;
 
 /// Truncated identifier width in manifests, RFC 1 §9.3.
-pub const TRUNC: usize = 12;
+pub const TRUNC: usize = krab_core::object::TRUNC_LEN;
 
-/// One manifest row: `(expiry_min, id[0..12])` — 16 bytes on the wire.
+/// One manifest row: `(expiry_min, id[0..16])` — 20 bytes on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Entry {
     /// Absolute expiry in minutes, as in the frozen header.
@@ -361,7 +361,7 @@ mod tests {
     /// higher and its conclusion holds a fortiori. Recorded here rather than
     /// silently accommodated.
     #[test]
-    fn a_manifest_row_costs_eighteen_bytes_as_cbor_not_sixteen() {
+    fn a_manifest_row_costs_twenty_two_bytes_as_cbor_not_twenty() {
         // A realistic expiry: minutes since the Unix epoch is ~29.7 million,
         // which needs a 5-byte CBOR head. Small test values do not.
         const REALISTIC: u32 = 29_766_240;
@@ -377,7 +377,7 @@ mod tests {
             ],
         };
         let delta = two.write().len() - one.write().len();
-        assert_eq!(delta, 18, "CBOR row cost, against RFC 1 §9.3's packed 16");
+        assert_eq!(delta, 22, "CBOR row cost, against RFC 1 §9.3\'s packed 20");
     }
 
     #[test]
