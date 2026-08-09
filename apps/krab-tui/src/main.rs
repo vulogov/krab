@@ -349,6 +349,7 @@ impl App {
     /// the only caller — so there is no place for one to be threaded through
     /// later without the change being visible (RFC 5 §6.1, RFC 0 I-5).
     fn tick_schedule(&mut self) {
+        self.shred_expired_epochs();
         let now_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -385,6 +386,33 @@ impl App {
             .filter_map(|l| l.next_sync_min)
             .min()
             .map(|m| m * 60);
+    }
+
+    /// Destroy epoch wrapper keys past the retention window — RFC 7 §4.
+    ///
+    /// **Nothing called this before, which meant §4's forward secrecy was not
+    /// happening at all.** `Hierarchy::shred_epoch` existed, was tested, and
+    /// had no caller: wrappers accumulated and every past epoch stayed
+    /// openable with the passphrase. §4's promise is that destroying `W_N`
+    /// makes an epoch unreadable "regardless of what the flash controller
+    /// did"; an implementation that never destroys one keeps that promise in
+    /// the same sense that an unused lock secures a door.
+    ///
+    /// The window is `EPOCH_WINDOW`, because RFC 1 §6.2 says an object may
+    /// arrive that late and a shredded epoch cannot decrypt it. Erasure lags
+    /// rotation by exactly the acceptance window and not by a chosen number.
+    fn shred_expired_epochs(&mut self) {
+        let now = now_epoch();
+        let keep_from = krab_core::tag::Epoch(now.0.saturating_sub(krab_core::tag::EPOCH_WINDOW));
+        if let Some(id) = &mut self.identity {
+            let dropped = id.hierarchy.shred_before(keep_from);
+            if dropped > 0 {
+                self.log.push(activity_log::Event::Failed {
+                    peer: "local".into(),
+                    why: "epochs shredded — that mail is unreadable now",
+                });
+            }
+        }
     }
 
     /// Reconcile with one peer over its established session.
@@ -471,10 +499,17 @@ impl App {
                     .ok()
                     .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/reservoir", &s).ok())
                     .and_then(|r| persist::decode_reservoir(&r).ok())
-                    .map(|(root, stored_epoch)| {
+                    .and_then(|(root, stored_epoch)| {
                         let mut res = krab_crypto::reservoir::Reservoir::new(root, stored_epoch);
-                        res.advance_to(now_epoch());
-                        res
+                        // A refused advance means the clock disagrees with the
+                        // stored position by more than a node can plausibly
+                        // have been away. Using the reservoir anyway would
+                        // derive chunks at the wrong index; dropping it
+                        // degrades to `mode_auth`, which `send` reports.
+                        if stored_epoch != now_epoch() && !res.advance_to(now_epoch()) {
+                            return None;
+                        }
+                        Some(res)
                     });
 
                 // A completed peering is a peer worth reconciling with. Adding
@@ -1047,10 +1082,12 @@ impl App {
             .ok()
             .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
             .and_then(|raw| persist::decode_reservoir(&raw).ok())
-            .map(|(root, stored_epoch)| {
+            .and_then(|(root, stored_epoch)| {
                 let mut r = krab_crypto::reservoir::Reservoir::new(root, stored_epoch);
-                r.advance_to(epoch);
-                r
+                if stored_epoch != epoch && !r.advance_to(epoch) {
+                    return None;
+                }
+                Some(r)
             });
         let chunk = reservoir.as_ref().and_then(|r| r.chunk(epoch));
 
@@ -1791,6 +1828,13 @@ enum Opened {
     Duress,
 }
 
+/// The earliest clock reading treated as a date rather than a fault.
+///
+/// 2026-01-01. Before this the protocol did not exist, so a reading below it is
+/// hardware — an unset RTC reads 1970, and deriving tags at epoch 0 puts a node
+/// in a tag space no peer computes, silently.
+const EPOCH_FLOOR_SECS: u64 = 1_767_225_600;
+
 /// A peer's short identifier, as used for on-disk link filenames.
 fn short_id(node_id: &[u8; 32]) -> String {
     format!(
@@ -1840,7 +1884,12 @@ fn now_epoch() -> krab_core::tag::Epoch {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    krab_core::tag::Epoch::at(secs)
+    // A clock reading before the protocol existed is a dead CMOS battery, not
+    // a date. Clamping keeps the node inside a tag space its peers compute,
+    // rather than deriving at epoch 0 where nobody is listening — and, since
+    // the ratchet refuses implausible jumps, keeps a wrong clock from
+    // presenting as a reservoir that will not advance.
+    krab_core::tag::Epoch::at(secs.max(EPOCH_FLOOR_SECS))
 }
 
 /// Overwrite a `String`'s bytes before clearing.
@@ -2574,7 +2623,11 @@ mod tests {
         .unwrap();
         let (r, stored_epoch) = persist::decode_reservoir(&record).unwrap();
         let mut res = krab_crypto::reservoir::Reservoir::new(r, stored_epoch);
-        res.advance_to(now_epoch());
+        // Nothing to advance when the record is already at today; `advance_to`
+        // reports that as `false` rather than as success.
+        if stored_epoch != now_epoch() {
+            assert!(res.advance_to(now_epoch()), "within MAX_ADVANCE");
+        }
         let chunk = res.chunk(now_epoch()).unwrap();
 
         let mut enc = [0u8; krab_crypto::seal::ENC_LEN];
@@ -2705,7 +2758,11 @@ mod tests {
         .unwrap();
         let (r, stored_epoch) = persist::decode_reservoir(&record).unwrap();
         let mut res = krab_crypto::reservoir::Reservoir::new(r, stored_epoch);
-        res.advance_to(now_epoch());
+        // Nothing to advance when the record is already at today; `advance_to`
+        // reports that as `false` rather than as success.
+        if stored_epoch != now_epoch() {
+            assert!(res.advance_to(now_epoch()), "within MAX_ADVANCE");
+        }
         let chunk = res.chunk(now_epoch()).unwrap();
         let mut enc = [0u8; krab_crypto::seal::ENC_LEN];
         enc.copy_from_slice(env.enc);
@@ -3473,7 +3530,7 @@ mod tests {
 
         // What a peer that stayed up would hold today.
         let mut peer = krab_crypto::reservoir::Reservoir::new(root, then);
-        peer.advance_to(now_epoch());
+        assert!(peer.advance_to(now_epoch()), "within MAX_ADVANCE");
 
         // What this node reconstructs from the record alone.
         let raw = std::fs::read(a.path("abcd1234.reservoir")).unwrap();
@@ -3483,7 +3540,7 @@ mod tests {
         assert_eq!(stored_epoch, then, "the ratchet position survived storage");
 
         let mut mine = krab_crypto::reservoir::Reservoir::new(stored_root, stored_epoch);
-        mine.advance_to(now_epoch());
+        assert!(mine.advance_to(now_epoch()), "within MAX_ADVANCE");
 
         assert_eq!(mine.epoch(), peer.epoch(), "the ratchets agree");
         assert_eq!(mine.root_bytes(), peer.root_bytes());
@@ -3499,8 +3556,9 @@ mod tests {
 
         // And adopting at the wrong epoch — what inferring would do — produces
         // chunks the peer does not recognise. This is the failure being fixed.
-        let mut inferred = krab_crypto::reservoir::Reservoir::new(stored_root, now_epoch());
-        inferred.advance_to(now_epoch());
+        // Already at `now_epoch()`, so there is nothing to advance — which is
+        // exactly what inferring the position produces.
+        let inferred = krab_crypto::reservoir::Reservoir::new(stored_root, now_epoch());
         assert_ne!(
             inferred.chunk(now_epoch()).map(|c| *c.expose()),
             peer.chunk(now_epoch()).map(|c| *c.expose()),
@@ -3552,5 +3610,61 @@ mod tests {
         assert_ne!(a.log.len(), 0);
         a.lock();
         assert_eq!(a.log.len(), 0, "a locked screen listed correspondents");
+    }
+
+    /// **RFC 7 §4's forward secrecy actually happens now.** Nothing called
+    /// `shred_epoch` before, so wrappers accumulated and every past epoch
+    /// stayed openable with the passphrase — §4's promise kept in the sense
+    /// that an unused lock secures a door.
+    #[test]
+    fn epoch_wrappers_past_the_window_are_destroyed() {
+        let mut a = ready_node("shred-epochs");
+        let now = now_epoch();
+        let kek = {
+            let id = a.identity.as_ref().unwrap();
+            persist::kek_for(b"a passphrase", &id.kek_params).unwrap()
+        };
+        {
+            let id = a.identity.as_mut().unwrap();
+            for back in [0u32, 10, 44, 45, 46, 200] {
+                let e = krab_core::tag::Epoch(now.0 - back);
+                id.hierarchy.open_epoch(&kek, e, &mut OsRng).unwrap();
+            }
+        }
+        let before = a.identity.as_ref().unwrap().hierarchy.epochs().count();
+        assert!(before >= 6);
+
+        a.shred_expired_epochs();
+
+        let id = a.identity.as_ref().unwrap();
+        let kept: Vec<u32> = id.hierarchy.epochs().map(|e| e.0).collect();
+        // The acceptance window is retained, because RFC 1 §6.2 says an object
+        // may arrive that late and a shredded epoch cannot decrypt it.
+        assert!(kept.contains(&now.0), "today was shredded");
+        assert!(
+            kept.contains(&(now.0 - 45)),
+            "the far edge of MAX_TTL was shredded"
+        );
+        // Beyond it, gone — and gone means the passphrase does not reopen it.
+        assert!(
+            !kept.contains(&(now.0 - 46)),
+            "an epoch past the window survived"
+        );
+        assert!(!kept.contains(&(now.0 - 200)));
+        assert!(id
+            .hierarchy
+            .epoch_key(&kek, krab_core::tag::Epoch(now.0 - 200))
+            .is_err());
+    }
+
+    /// A clock reading before the protocol existed is hardware, not a date.
+    /// Deriving at epoch 0 puts a node in a tag space no peer computes.
+    #[test]
+    fn the_clock_is_floored_at_a_plausible_date() {
+        assert!(now_epoch().0 >= krab_core::tag::Epoch::at(EPOCH_FLOOR_SECS).0);
+        assert!(
+            krab_core::tag::Epoch::at(EPOCH_FLOOR_SECS).0 > 20_000,
+            "the floor must be a real date, not epoch 0"
+        );
     }
 }

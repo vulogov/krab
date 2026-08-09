@@ -168,3 +168,106 @@ method that found the reservoir ratchet defect (`CRYPTO-REVIEW.md` §11.2), and
 in each case the sentence had been written by me and believed by me until it
 was attacked. **That is the argument for external review, restated as evidence
 rather than as principle.**
+
+---
+
+# Second pass — 2026-08-09 · axis: **time**
+
+The first pass attacked *claims in sentences*. This one attacks a different
+thing: **time**, because Krab takes time as an argument everywhere by design —
+`Scheduler::due(now, entropy)`, `Store::ingest(.., now_min, ..)`,
+`Epoch::at(unix_secs)` — and there is exactly one place it reads a clock. That
+asymmetry is worth pressing on.
+
+**Four findings, all fixed. Two are severe, and one was introduced by the fix
+in `CRYPTO-REVIEW.md` §11.**
+
+## 5. CRITICAL — a wrong clock permanently destroyed the reservoir · **FIXED**
+
+The epoch ratchet is irreversible by design: that is what makes §6's
+destruction claim true. `advance_to` capped its *iteration count* at 4×365 so a
+wild value could not spin, and advanced up to that many steps otherwise.
+
+So a clock reading ten years ahead — an NTP correction, a restored VM snapshot,
+a dead CMOS battery, a typed date — ratcheted **1 460 epochs**, destroyed every
+intermediate root on the way, and landed at neither the old epoch nor the
+requested one. The peer stayed where it was.
+
+**The reservoir was then permanently desynchronised with every correspondent,
+with no way back**, because the ratchet cannot rewind. An ordinary hardware
+fault became irreversible key loss, and the node would report nothing: chunks
+simply stopped matching, and RFC 0 §6 guarantees silence.
+
+This was **introduced by the ratchet added to fix `CRYPTO-REVIEW.md` §11.2**.
+The static root it replaced had no such failure — a wrong clock derived a wrong
+chunk and a right clock derived a right one, recoverably. Making destruction
+real made a clock fault destructive, and that consequence was not considered
+when the fix was made.
+
+**Fix.** `advance_to` now **refuses** an advance beyond `MAX_ADVANCE`
+(2 × `EPOCH_WINDOW`) and changes nothing at all — returning `bool` rather than
+silently doing part of the work. A node offline longer than `MAX_TTL` has
+already lost the mail it missed, so advancing further serves nothing, and every
+value beyond it is likelier to be a wrong clock than a long absence.
+
+The principle, stated in the module: **an irreversible operation must not run
+on unvalidated input, and a system clock is unvalidated input.**
+
+## 6. SEVERE — epoch keys were never shredded · **FIXED**
+
+`Hierarchy::shred_epoch` and `shred_before` existed, were tested, and **had no
+caller anywhere in the application.**
+
+RFC 7 §4's entire promise is that destroying `W_N` makes an epoch unreadable
+"regardless of what the flash controller did with the underlying blocks". An
+implementation that never destroys one keeps that promise in the sense that an
+unused lock secures a door. Every past epoch remained openable with the
+passphrase, indefinitely, and the wrapper set grew without bound.
+
+Every part of the mechanism was correct and tested. Nothing invoked it.
+
+**Fix.** `shred_expired_epochs` runs on the schedule tick, retaining
+`EPOCH_WINDOW` — because RFC 1 §6.2 says an object may arrive that late and a
+shredded epoch cannot decrypt it. Erasure lags rotation by exactly the
+acceptance window rather than by a chosen number, which is the rule this series
+has violated five times (§4 above).
+
+The test asserts what matters: after shredding, the correct passphrase does not
+reopen the epoch.
+
+## 7. A clock before the protocol existed was treated as a date · **FIXED**
+
+`now_epoch` used `unwrap_or(0)`, and an unset RTC reads 1970. A node with a
+dead battery derived tags at epoch 0 — a tag space no peer computes — and
+appeared to work: it composed, stored, packed and reconciled, and nothing it
+sent was ever recognised.
+
+**Fix.** Clamped to 2026-01-01. A reading below that is hardware, not a date.
+
+## 8. Reservoir use degrades silently on a refused advance · **checked, adequate**
+
+Raised and dismissed. If the ratchet cannot reach the current epoch the
+reservoir is dropped and sealing falls back to `mode_auth` — losing the
+post-quantum property.
+
+That is correct behaviour (RFC 7 §5 makes the reservoir a conditional tier) and
+it is **not** silent: `send` reports `", post-quantum"` or `", no reservoir"` on
+every message. Recorded because the check is the finding — a degradation that
+reports itself is a different thing from one that does not, and the difference
+is one line.
+
+## What this pass suggests about the last one
+
+Finding 5 exists because of a fix made three days earlier, and finding 6 is a
+tested mechanism with no caller. Neither is the kind of defect the first pass's
+method finds: attacking a *sentence* does not surface a function nobody calls,
+and it does not surface a consequence created by the previous fix.
+
+**The axes are not interchangeable, and running one does not reduce the yield
+of the next.** Two passes have now produced eight findings, three of them
+severe, and the second pass found the more serious pair. That is not evidence
+that the code is bad; it is evidence about how much a single reviewer with one
+method misses, which is the argument `RFC-0-section-9-proposed.md` makes.
+
+Axes not yet run: concurrency, resource exhaustion, partial-write and
+crash-consistency, and the decoders under an actual fuzzer.

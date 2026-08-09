@@ -148,18 +148,52 @@ impl Reservoir {
         self.retained.insert(self.epoch.0, c);
     }
 
+    /// How far the ratchet will advance in one call.
+    ///
+    /// Beyond this, [`Reservoir::advance_to`] **refuses and changes nothing**.
+    ///
+    /// Twice the acceptance window: a node offline longer than `MAX_TTL` has
+    /// already lost the mail it missed (RFC 1 §6.2), so advancing further
+    /// serves nothing, and every value beyond it is more likely to be a wrong
+    /// clock than a long absence.
+    pub const MAX_ADVANCE: u32 = 2 * EPOCH_WINDOW;
+
     /// Advance to `to`, deriving each chunk on the way and destroying each
     /// intermediate root.
     ///
-    /// Idempotent, and **never rewinds**: asking to advance backwards is a
-    /// no-op rather than an error, because the alternative is a caller with a
-    /// stale clock silently resurrecting a destroyed epoch.
-    pub fn advance_to(&mut self, to: Epoch) {
+    /// Returns whether the ratchet moved. Idempotent, and **never rewinds**:
+    /// asking to advance backwards is a no-op, because the alternative is a
+    /// caller with a stale clock resurrecting a destroyed epoch.
+    ///
+    /// # Refusing an implausible jump is the point
+    ///
+    /// Advancing is **destructive and irreversible** — that is what makes the
+    /// destruction claim in this module true. So it must not happen on
+    /// unvalidated input, and a system clock is unvalidated input: an NTP
+    /// correction, a restored VM snapshot, a dead CMOS battery or a typo can
+    /// move it years.
+    ///
+    /// An earlier version capped the *iteration count* rather than refusing.
+    /// A clock reading ten years ahead then ratcheted 1 460 epochs, destroyed
+    /// every root on the way, and landed at neither the old epoch nor the
+    /// requested one — while the peer stayed where it was. **The reservoir was
+    /// permanently desynchronised for every correspondent by one bad clock
+    /// reading, with no way back**, because the ratchet cannot rewind by
+    /// design. A hardware fault became irreversible key loss.
+    ///
+    /// Refusing leaves the reservoir usable and makes the clock the operator's
+    /// problem, which is where it belongs.
+    #[must_use]
+    pub fn advance_to(&mut self, to: Epoch) -> bool {
         if self.root.is_destroyed() || to <= self.epoch {
-            return;
+            return false;
         }
-        // Bounded so a wildly wrong clock cannot spin for 2³² iterations.
-        let steps = (to.0 - self.epoch.0).min(4 * 365);
+        if to.0 - self.epoch.0 > Self::MAX_ADVANCE {
+            // Nothing is touched. The caller has a clock problem, not a
+            // reservoir problem, and destroying key material would not fix it.
+            return false;
+        }
+        let steps = to.0 - self.epoch.0;
         for _ in 0..steps {
             let next = Epoch(self.epoch.0 + 1);
             let new_root = expand32(self.root.expose(), LABEL_RATCHET, next);
@@ -182,6 +216,7 @@ impl Reservoir {
             self.floor = floor;
         }
         self.retained.retain(|&e, _| e >= self.floor.0);
+        true
     }
 
     /// `chunk_N` for `epoch`, or `None` if it is outside the retained window.
@@ -269,7 +304,7 @@ mod tests {
 
     fn reservoir() -> Reservoir {
         let mut r = Reservoir::new([0x5A; 32], Epoch(NOW.0 - 45));
-        r.advance_to(NOW);
+        let _ = r.advance_to(NOW);
         r
     }
 
@@ -311,8 +346,14 @@ mod tests {
     fn different_roots_share_no_chunks() {
         let mut a = Reservoir::new([1; 32], NOW);
         let mut b = Reservoir::new([2; 32], NOW);
-        a.advance_to(Epoch(NOW.0 + 1));
-        b.advance_to(Epoch(NOW.0 + 1));
+        assert!(
+            a.advance_to(Epoch(NOW.0 + 1)),
+            "the advance must be within MAX_ADVANCE"
+        );
+        assert!(
+            b.advance_to(Epoch(NOW.0 + 1)),
+            "the advance must be within MAX_ADVANCE"
+        );
         assert_ne!(
             a.chunk(NOW).map(|c| *c.expose()),
             b.chunk(NOW).map(|c| *c.expose())
@@ -337,7 +378,10 @@ mod tests {
         // epoch, and the intermediate roots were destroyed on the way.
         let root = r.root_bytes().expect("the peering survives");
         let mut fresh = Reservoir::new(root, r.epoch());
-        fresh.advance_to(Epoch(NOW.0 + 10));
+        assert!(
+            fresh.advance_to(Epoch(NOW.0 + 10)),
+            "the advance must be within MAX_ADVANCE"
+        );
         assert!(
             fresh.chunk(target).is_none(),
             "the current root regenerated a destroyed chunk"
@@ -357,8 +401,14 @@ mod tests {
 
         // A restart: only the wrapped root survived.
         let mut restored = Reservoir::new(root, epoch);
-        restored.advance_to(Epoch(epoch.0 + 3));
-        r.advance_to(Epoch(epoch.0 + 3));
+        assert!(
+            restored.advance_to(Epoch(epoch.0 + 3)),
+            "the advance must be within MAX_ADVANCE"
+        );
+        assert!(
+            r.advance_to(Epoch(epoch.0 + 3)),
+            "the advance must be within MAX_ADVANCE"
+        );
 
         for d in 0..3u32 {
             let e = Epoch(epoch.0 + d);
@@ -377,10 +427,13 @@ mod tests {
     fn the_ratchet_does_not_rewind() {
         let mut r = reservoir();
         let at = r.epoch();
-        r.advance_to(Epoch(at.0 - 10));
+        assert!(!r.advance_to(Epoch(at.0 - 10)), "backwards must be refused");
         assert_eq!(r.epoch(), at, "advancing backwards moved the ratchet");
-        r.advance_to(at);
-        assert_eq!(r.epoch(), at, "advancing to the current epoch is a no-op");
+        assert!(
+            !r.advance_to(at),
+            "advancing to the current epoch is a no-op"
+        );
+        assert_eq!(r.epoch(), at);
     }
 
     /// A future chunk is not derivable before the ratchet reaches it.
@@ -397,7 +450,7 @@ mod tests {
     #[test]
     fn the_retention_window_covers_max_ttl() {
         let mut r = Reservoir::new([7; 32], Epoch(NOW.0 - 45));
-        r.advance_to(NOW);
+        let _ = r.advance_to(NOW);
         assert!(
             r.chunk(Epoch(NOW.0 - 45)).is_some(),
             "the far edge of MAX_TTL"
@@ -406,25 +459,24 @@ mod tests {
         assert_eq!(46 * 32, 1_472, "under 1.5 KB of chunks");
     }
 
-    /// **A node returning after a long gap.** The ratchet advances hundreds of
-    /// steps and must not accumulate every chunk it passed — that would turn a
-    /// bounded window into an archive of the material §6 destroys.
+    /// A gap inside the permitted advance stays bounded in memory: the ratchet
+    /// passes every epoch and retains only RFC 1 §6.2's window.
     #[test]
     fn a_long_gap_does_not_accumulate_chunks() {
         let mut r = Reservoir::new([3; 32], Epoch(20_000));
-        r.advance_to(Epoch(20_400));
-        assert_eq!(r.epoch(), Epoch(20_400));
+        assert!(r.advance_to(Epoch(20_000 + Reservoir::MAX_ADVANCE)));
+        assert_eq!(r.epoch(), Epoch(20_000 + Reservoir::MAX_ADVANCE));
         assert_eq!(
             r.retained(),
             EPOCH_WINDOW as usize + 1,
-            "the window must stay bounded across a 400-epoch gap"
+            "the window must stay bounded across a long gap"
         );
-        assert!(r.chunk(Epoch(20_400)).is_some(), "today");
+        assert!(r.chunk(r.epoch()).is_some(), "today");
         assert!(
-            r.chunk(Epoch(20_400 - EPOCH_WINDOW)).is_some(),
+            r.chunk(Epoch(r.epoch().0 - EPOCH_WINDOW)).is_some(),
             "the far edge of MAX_TTL"
         );
-        assert!(r.chunk(Epoch(20_100)).is_none(), "long past the window");
+        assert!(r.chunk(Epoch(20_000)).is_none(), "long past the window");
     }
 
     /// Two nodes that were apart for different lengths of time still agree,
@@ -433,10 +485,16 @@ mod tests {
     fn nodes_that_resume_from_different_gaps_still_agree() {
         let mut steady = Reservoir::new([9; 32], Epoch(20_000));
         for e in 20_001..=20_050 {
-            steady.advance_to(Epoch(e));
+            assert!(
+                steady.advance_to(Epoch(e)),
+                "the advance must be within MAX_ADVANCE"
+            );
         }
         let mut returning = Reservoir::new([9; 32], Epoch(20_000));
-        returning.advance_to(Epoch(20_050));
+        assert!(
+            returning.advance_to(Epoch(20_050)),
+            "the advance must be within MAX_ADVANCE"
+        );
 
         assert_eq!(steady.epoch(), returning.epoch());
         assert_eq!(steady.root_bytes(), returning.root_bytes());
