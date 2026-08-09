@@ -184,6 +184,28 @@ impl Control {
     }
 
     /// Decode. Never panics: this is pre-authentication input (RFC 0 §9).
+    /// Decode one control message.
+    ///
+    /// # Never allocate on a declared count
+    ///
+    /// The three collection arms build with `Vec::new` and push, rather than
+    /// pre-sizing from the array length the input claims. RFC 4 §9 states the
+    /// rule for frames — "the length is validated **before** any allocation" —
+    /// and `frame::read` obeys it; this decoder did not, one layer down.
+    ///
+    /// A found crash, not a hypothetical: a 40-byte frame whose CBOR array
+    /// head declares roughly 2⁶⁰ items reached `Vec::with_capacity`, which
+    /// multiplied by the element size and overflowed. RFC 7 §9 sets
+    /// `panic = "abort"` so a core dump cannot carry key material, which means
+    /// the panic was not a caught error — **the node died.** Any peer past the
+    /// Noise handshake could do it, repeatedly, for the cost of one small
+    /// frame.
+    ///
+    /// Pushing removes the attacker's control over the allocation entirely: a
+    /// truncated body fails on the first missing element, and the vector never
+    /// grows past what the buffer actually contained. Capping the capacity
+    /// against the remaining bytes would also work and is one arithmetic
+    /// mistake away from the same bug.
     pub fn parse(bytes: &[u8]) -> Result<Control, Error> {
         let mut r = cbor::Reader::new(bytes);
         let n = match r.item().map_err(|_| Error::Malformed)? {
@@ -236,7 +258,7 @@ impl Control {
                 if n % 2 != 0 {
                     return Err(Error::BadField);
                 }
-                let mut entries = Vec::with_capacity(n / 2);
+                let mut entries = Vec::new();
                 for _ in 0..n / 2 {
                     let expiry_min = u32f(uint(&mut r)?)?;
                     let id: [u8; TRUNC] = bstr(&mut r)?
@@ -252,7 +274,7 @@ impl Control {
             }
             2 => {
                 let n = arr(&mut r)?;
-                let mut ids = Vec::with_capacity(n);
+                let mut ids = Vec::new();
                 for _ in 0..n {
                     ids.push(
                         bstr(&mut r)?
@@ -270,7 +292,7 @@ impl Control {
                 if n % 4 != 0 {
                     return Err(Error::BadField);
                 }
-                let mut rs = Vec::with_capacity(n / 4);
+                let mut rs = Vec::new();
                 for _ in 0..n / 4 {
                     let lo = u32f(uint(&mut r)?)?;
                     let hi = u32f(uint(&mut r)?)?;
@@ -360,6 +382,36 @@ mod tests {
     /// SIM-1's LoRa starvation measurement used 16, so the real cost is
     /// higher and its conclusion holds a fortiori. Recorded here rather than
     /// silently accommodated.
+    /// **Found by fuzzing.** A small frame declaring an enormous array reached
+    /// `Vec::with_capacity`, overflowed, and — under RFC 7 §9's
+    /// `panic = "abort"` — killed the node. Reachable by any peer past the
+    /// handshake, and by anyone at all through a courier archive.
+    #[test]
+    fn a_huge_declared_array_does_not_allocate() {
+        // The reduced crash input: 0x9b is a CBOR array head with an 8-byte
+        // length, so this claims ~2^60 elements in 46 bytes.
+        const CRASH: &[u8] = &[
+            0x9b, 0x9b, 0x9b, 0x9b, 0x9b, 0x9b, 0x9b, 0x02, 0x02, 0x02, 0x9b, 0x9b, 0x77, 0x9b,
+            0x91, 0x00, 0xfe, 0x99, 0x00, 0x77, 0x2d, 0x84, 0x05, 0x84, 0xff, 0x00, 0x2d, 0x2d,
+            0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x9b, 0x91, 0x00,
+            0xfe, 0x99, 0x00, 0x00,
+        ];
+        assert!(
+            Control::parse(CRASH).is_err(),
+            "it must be refused, not fatal"
+        );
+
+        // Every message type, with a declared length far beyond the buffer.
+        for tag in 0u8..=7 {
+            for head in [0x9bu8, 0x9a, 0x99, 0x98] {
+                let probe = [
+                    0x82, tag, head, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                ];
+                let _ = Control::parse(&probe);
+            }
+        }
+    }
+
     #[test]
     fn a_manifest_row_costs_twenty_two_bytes_as_cbor_not_twenty() {
         // A realistic expiry: minutes since the Unix epoch is ~29.7 million,

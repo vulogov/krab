@@ -1,0 +1,53 @@
+[package]
+name = "krab-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Excluded from the workspace: `cargo fuzz` builds it under nightly with
+# sanitiser flags the workspace does not carry, and RFC 7 §9's `panic = "abort"`
+# in the release profile would hide the panics this exists to find.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+krab-core = { path = "../crates/krab-core" }
+krab-crypto = { path = "../crates/krab-crypto" }
+krab-proto = { path = "../crates/krab-proto" }
+krab-store = { path = "../crates/krab-store" }
+
+[[bin]]
+name = "cbor"
+path = "fuzz_targets/cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "object"
+path = "fuzz_targets/object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control"
+path = "fuzz_targets/control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ingest"
+path = "fuzz_targets/ingest.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
+# Unwinding, deliberately. The workspace uses `panic = "abort"` per RFC 7 §9 so
+# a core dump cannot carry key material; here a panic is the finding.
+panic = "unwind"

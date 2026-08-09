@@ -1,4 +1,8 @@
 [workspace]
+# `fuzz` is built by `cargo fuzz` under nightly with sanitiser flags, and the
+# workspace release profile sets `panic = "abort"` per RFC 7 §9 -- which would
+# hide the panics fuzzing exists to find.
+exclude = ["fuzz"]
 resolver = "2"
 members = [
     "crates/krab-core",

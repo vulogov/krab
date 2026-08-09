@@ -271,3 +271,75 @@ method misses, which is the argument `RFC-0-section-9-proposed.md` makes.
 
 Axes not yet run: concurrency, resource exhaustion, partial-write and
 crash-consistency, and the decoders under an actual fuzzer.
+
+---
+
+# Third pass — 2026-08-09 · axis: **fuzzing the decoders**
+
+`cargo-fuzz` against the four hostile-input surfaces. Setup and results in
+`fuzz/README.md`; this is the finding.
+
+**One finding, severe, found in under sixteen thousand executions.**
+
+## 9. CRITICAL — a 40-byte frame killed the node · **FIXED**
+
+`Control::parse` pre-sized its collections from the array length the input
+declared:
+
+```rust
+let n = arr(&mut r)?;
+let mut ids = Vec::with_capacity(n);   // n is attacker-controlled
+```
+
+A CBOR array head with an 8-byte length declares up to 2⁶⁴ elements. In a
+46-byte message, `Vec::with_capacity` multiplied that by the element size and
+overflowed, panicking inside the allocator.
+
+**RFC 7 §9 sets `panic = "abort"`** so a core dump cannot carry key material.
+So this was not a caught error: the process died. Any peer past the Noise
+handshake could kill a node with one small frame, repeatedly, and anyone at all
+could do it through a courier archive — `read_archive` reaches the same parser
+with no handshake.
+
+### The rule existed one layer up
+
+RFC 4 §9 states it and `frame::read` obeys it:
+
+> "The length is validated **before** any allocation. RFC 4 §9 requires it, and
+> a four-byte header claiming four gigabytes is the cheapest attack there is."
+
+The frame layer checks its length against `MAX_FRAME` before allocating. The
+message layer, decoding the body that check protected, allocated on a *nested*
+declared count with no check at all. The defence was implemented where it was
+written down and not where the same reasoning applied.
+
+That is worth more than the bug: **a rule stated once, in the section about the
+layer where someone happened to think of it.** RFC 4 §9 should say it applies
+to every length in every decoder, not to frames.
+
+### Fix
+
+The three collection arms build with `Vec::new` and push. That removes the
+attacker's control over the allocation entirely — a truncated body fails on the
+first missing element and the vector never grows past what the buffer actually
+contained. Capping capacity against the remaining bytes would also work and is
+one arithmetic mistake away from the same bug.
+
+The crash input is carried verbatim in a unit test, so the regression is caught
+by `cargo test` rather than depending on nightly or on anyone remembering to
+fuzz.
+
+## What this says about the previous passes
+
+`Control::parse` was already tested against truncation at every offset and
+against flipped bytes. Both of those mutate *valid* messages. Neither
+constructs a message that is structurally valid and semantically absurd — an
+array header promising 2⁶⁰ items — because a human writing tests starts from
+something that works and damages it.
+
+**A fuzzer starts from nothing and has no idea what is supposed to work.** That
+is the whole of the difference, and it took 15 694 executions.
+
+Three passes, nine findings, four severe. Each axis found what the previous
+ones structurally could not: sentences, then time, then a machine that does not
+know what the code is for.
