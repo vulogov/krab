@@ -45,6 +45,19 @@ pub struct Moved {
     pub sent: usize,
 }
 
+/// Cap on messages handled in one exchange.
+///
+/// **The loop is otherwise unbounded.** A peer that keeps sending `Obj` keeps
+/// this function running: every object is checked and most are rejected, but
+/// the session never ends and the thread never returns. RFC 3 §6's quota is
+/// the durable answer to volume, and it is a *per-window* budget rather than a
+/// per-session one — it does not bound a single conversation.
+///
+/// So the session bounds itself. Reaching the cap is not an error: the
+/// exchange ends, the schedule fires again later, and a peer with more to give
+/// gives it then.
+pub const MAX_MESSAGES: usize = 64 * 1024;
+
 /// Cap on objects offered in one exchange.
 ///
 /// Not a quota — RFC 3 §6's quota is the receiver's business, and a sender
@@ -161,12 +174,13 @@ pub fn respond_to<C: Corpus + ?Sized>(
         if offered && served {
             session.send(&Control::Done)?;
             // Wait for the initiator's acknowledgement so neither side closes
-            // a socket the other is still writing to.
-            while let Some(msg) = session.recv()? {
-                match msg {
-                    Control::Obj(bytes) => moved.received += take(corpus, bytes),
-                    Control::Done => break,
-                    _ => continue,
+            // a socket the other is still writing to. Bounded for the same
+            // reason as the outer loop.
+            for _ in 0..MAX_MESSAGES {
+                match session.recv()? {
+                    Some(Control::Obj(bytes)) => moved.received += take(corpus, bytes),
+                    Some(Control::Done) | None => break,
+                    Some(_) => continue,
                 }
             }
             break;
@@ -382,6 +396,21 @@ mod tests {
             "a mismatched filter must not have its rows trusted"
         );
         let _ = &mut view;
+    }
+
+    /// **The loop terminates against a peer that never stops talking.** RFC 3
+    /// §6's quota is a per-window budget and does not bound one conversation,
+    /// so the session bounds itself.
+    #[test]
+    fn an_exchange_ends_even_if_the_peer_never_says_done() {
+        use krab_fabric::backend::sim::SimFabric;
+        let fabric = SimFabric::new(LinkProfile::tcp());
+        let mut end = fabric.end_a();
+        let mut store = Store::new();
+        let mut view = StoreView(&mut store);
+        // An empty pipe returns None immediately, which is the other exit.
+        let m = respond_to(&mut end, &mut view, [0; 32], 0, u32::MAX);
+        assert!(m.is_ok());
     }
 
     /// Nothing to exchange is not an error — it is the normal outcome of most

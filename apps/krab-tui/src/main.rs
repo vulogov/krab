@@ -1518,25 +1518,46 @@ impl App {
         self.path("identity.wrapped").exists()
     }
 
-    /// Whether `passphrase` is the duress passphrase — RFC 7 §10.
+    /// Open the store with `passphrase`, distinguishing duress from normal.
     ///
-    /// A separate sealed record whose only content is a marker. It is
-    /// indistinguishable on disk from any other wrapped file: same size class,
-    /// same ciphertext, no name that gives it away beyond one an adversary
-    /// would have to already suspect. Its absence is also indistinguishable
-    /// from its presence without the passphrase, which is what makes "I do not
-    /// have one" a survivable answer.
-    fn is_duress(&self, passphrase: &[u8]) -> bool {
-        let Ok(params) = persist::read_params(&self.path("kek.params")) else {
-            return false;
-        };
-        let Ok(kek) = persist::kek_for(passphrase, &params) else {
-            return false;
-        };
-        std::fs::read(self.path("duress.wrapped"))
+    /// # One derivation, whatever the outcome
+    ///
+    /// **This must not be split into "is it duress?" then "is it correct?".**
+    /// An earlier version did, and it cost two Argon2 runs for a correct or
+    /// wrong passphrase and one for the duress passphrase — RFC 7 §4.1
+    /// calibrates Argon2 to about 500 ms, so the duress path completed in half
+    /// the time.
+    ///
+    /// A stopwatch is enough to read that, and the person holding the
+    /// stopwatch is the exact adversary §10's duress passphrase exists for:
+    /// someone standing over the operator watching them unlock. A feature
+    /// whose whole value is being indistinguishable was distinguishable by the
+    /// most obvious possible measurement.
+    ///
+    /// The KEK depends only on the passphrase and the stored parameters, and
+    /// both records use the same parameters — so it is derived once and used
+    /// to attempt both opens. Every outcome now costs one Argon2 and two AEAD
+    /// operations, which are microseconds against half a second.
+    fn open_with(&self, passphrase: &[u8]) -> Result<Opened, String> {
+        let params = persist::read_params(&self.path("kek.params"))
+            .map_err(|_| "no store here — run `init`".to_string())?;
+        let kek = persist::kek_for(passphrase, &params)
+            .map_err(|_| "that passphrase does not open this store".to_string())?;
+
+        // Both attempts run regardless of which succeeds. Ordering the duress
+        // check first would leak through early return; ordering it second
+        // would leak the same way for a correct passphrase.
+        let duress = std::fs::read(self.path("duress.wrapped"))
             .ok()
             .and_then(|sealed| kek.open(persist::CONTEXT_DURESS, &sealed).ok())
-            .is_some()
+            .is_some();
+        let identity = persist::read_identity(&self.path("identity.wrapped"), &kek, params).ok();
+
+        match (duress, identity) {
+            (true, _) => Ok(Opened::Duress),
+            (false, Some(id)) => Ok(Opened::Normal(Box::new(id), kek)),
+            (false, None) => Err("that passphrase does not open this store".into()),
+        }
     }
 
     /// Record a duress passphrase — RFC 7 §10.
@@ -1562,26 +1583,20 @@ impl App {
     /// open the epoch, then read. A second path would be a second place to get
     /// the ordering wrong.
     fn unlock(&mut self, passphrase: &[u8]) -> Result<(), String> {
-        // **RFC 7 §10.** Checked before anything else, and the response is
-        // silent: the node destroys itself and then presents exactly what a
-        // freshly initialised node presents. No warning, no distinct message,
-        // nothing an observer over the operator's shoulder can read.
-        if self.is_duress(passphrase) {
-            self.panic_wipe();
-            // What a first run looks like. The lie has to be complete or it is
-            // not a duress passphrase, it is a tell.
-            self.body = "no messages".into();
-            self.list = vec!["(no messages)".into()];
-            self.locked = false;
-            return Ok(());
-        }
-
-        let params = persist::read_params(&self.path("kek.params"))
-            .map_err(|_| "no store here — run `init`".to_string())?;
-        let kek = persist::kek_for(passphrase, &params)
-            .map_err(|_| "that passphrase does not open this store".to_string())?;
-        let mut id = persist::read_identity(&self.path("identity.wrapped"), &kek, params)
-            .map_err(|_| "that passphrase does not open this store".to_string())?;
+        let (mut id, kek) = match self.open_with(passphrase)? {
+            // **RFC 7 §10.** The response is silent: the node destroys itself
+            // and then presents exactly what a freshly initialised node
+            // presents. No warning, no distinct message, and — since
+            // `open_with` does one derivation either way — no timing tell.
+            Opened::Duress => {
+                self.panic_wipe();
+                self.body = "no messages".into();
+                self.list = vec!["(no messages)".into()];
+                self.locked = false;
+                return Ok(());
+            }
+            Opened::Normal(id, kek) => (*id, kek),
+        };
 
         let epoch = now_epoch();
         let w = id
@@ -1766,6 +1781,14 @@ impl App {
         self.ui.end_compose();
         self.locked = true;
     }
+}
+
+/// What a passphrase opened.
+enum Opened {
+    /// The real store.
+    Normal(Box<Identity>, krab_crypto::kek::Kek),
+    /// RFC 7 §10's duress passphrase.
+    Duress,
 }
 
 /// A peer's short identifier, as used for on-disk link filenames.
@@ -3238,8 +3261,11 @@ mod tests {
             home,
             ..App::default()
         };
-        assert!(!b.is_duress(b"the real one"), "the real one is not duress");
-        assert!(b.is_duress(b"under duress"));
+        assert!(
+            matches!(b.open_with(b"the real one"), Ok(Opened::Normal(..))),
+            "the real one is not duress"
+        );
+        assert!(matches!(b.open_with(b"under duress"), Ok(Opened::Duress)));
         b.unlock(b"the real one")
             .expect("the real passphrase still opens it");
         assert_eq!(b.identity.as_ref().unwrap().node_id(), node_id);
@@ -3267,7 +3293,10 @@ mod tests {
             home,
             ..App::default()
         };
-        assert!(!b.is_duress(b"anything at all"));
+        assert!(!matches!(
+            b.open_with(b"anything at all"),
+            Ok(Opened::Duress)
+        ));
         let e1 = b.unlock(b"wrong one").unwrap_err();
         let e2 = b.unlock(b"wrong two").unwrap_err();
         assert_eq!(e1, e2, "two wrong guesses must be indistinguishable");

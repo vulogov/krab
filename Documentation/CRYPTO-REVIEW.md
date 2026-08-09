@@ -2,7 +2,11 @@
 
     Subject:  RFC 1, RFC 2, RFC 4 §4/§8, RFC 7 — the composition, not the primitives
     Scope:    specification review against the documents as written
-    Status:   NOT a substitute for external professional review
+    Status:   NOT a substitute for external professional review.
+              External review will not happen -- see
+              Documentation/RFC-0-section-9-proposed.md. This is the review
+              this project has, and it is strictly worse than an independent
+              one. Adversarial pass: Documentation/ADVERSARIAL-PASS.md.
 
 ---
 
