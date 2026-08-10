@@ -26,6 +26,10 @@
 //! **required constructor argument**, and there is no variant that omits it.
 //! A caller who does not know who they are connecting to cannot express that.
 //!
+//! The handshake itself lives in [`crate::noise`], shared with every other
+//! stream transport so there is one copy of the static-key check rather than
+//! one per carrier.
+//!
 //! # Entropy is not an argument here, and that is a real difference
 //!
 //! `krab-crypto` takes randomness as a parameter so every key derivation is
@@ -49,87 +53,13 @@
 //! reconciliation cycles rather than reconnecting". Nothing here closes a
 //! session on idle.
 
-use crate::frame;
+pub use crate::noise::{generate_static, NOISE_PARAMS};
+
+use crate::noise::{handshake_initiator, handshake_responder, StreamSession};
 use crate::profile::LinkProfile;
 use crate::{Error, Fabric, Session};
-use krab_proto::control::Control;
-use snow::{Builder, TransportState};
-use std::io::Write;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
-
-/// RFC 4 §4.1's pattern, with RFC 1 §6.1's primitives.
-pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
-
-/// Generate a Noise static keypair for RFC 4 §4.1's IK handshake.
-///
-/// Lives here rather than in `krab-crypto` because it is a *link* key and this
-/// crate owns link-layer cryptography — see
-/// `Documentation/CRYPTO-BOUNDARIES.md`. Entropy comes from `snow`'s generator,
-/// which is the same OS source and is not injectable; the module note above
-/// explains why that boundary is not crossed.
-pub fn generate_static() -> Result<([u8; 32], [u8; 32]), Error> {
-    let params = NOISE_PARAMS.parse().map_err(|_| Error::Frame)?;
-    let kp = Builder::new(params)
-        .generate_keypair()
-        .map_err(|_| Error::Frame)?;
-    Ok((
-        kp.private.try_into().map_err(|_| Error::Frame)?,
-        kp.public.try_into().map_err(|_| Error::Frame)?,
-    ))
-}
-
-/// An established Noise session over TCP.
-pub struct TcpSession {
-    stream: TcpStream,
-    noise: TransportState,
-    /// Scratch for the Noise ciphertext, sized to `frame::MAX_FRAME`.
-    buf: Vec<u8>,
-}
-
-impl TcpSession {
-    /// The peer's static key, as presented and verified during the handshake.
-    pub fn peer_static(&self) -> Option<[u8; 32]> {
-        self.noise
-            .get_remote_static()
-            .and_then(|k| <[u8; 32]>::try_from(k).ok())
-    }
-}
-
-impl Session for TcpSession {
-    fn send(&mut self, msg: &Control) -> Result<(), Error> {
-        let plain = msg.write();
-        self.buf.resize(plain.len() + 16, 0);
-        let n = self
-            .noise
-            .write_message(&plain, &mut self.buf)
-            .map_err(|_| Error::Frame)?;
-        frame::write_bytes(&mut self.stream, &self.buf[..n])?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<Option<Control>, Error> {
-        let Some(ct) = frame::read_bytes(&mut self.stream)? else {
-            // The peer said nothing more. Distinct from unreachable, and only
-            // the first is normal.
-            return Ok(None);
-        };
-        self.buf.resize(ct.len(), 0);
-        let n = self
-            .noise
-            .read_message(&ct, &mut self.buf)
-            .map_err(|_| Error::Frame)?;
-        Control::parse(&self.buf[..n])
-            .map(Some)
-            .map_err(|_| Error::Frame)
-    }
-
-    fn close(&mut self) -> Result<(), Error> {
-        let _ = self.stream.flush();
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
-        Ok(())
-    }
-}
 
 /// A TCP link to one peer.
 pub struct TcpFabric {
@@ -139,8 +69,9 @@ pub struct TcpFabric {
     local_static: [u8; 32],
     /// The peer's expected static public key, **from their credential**.
     ///
-    /// Required, not optional. See the module note on why there is no variant
-    /// that omits it.
+    /// Required, not optional — RFC 4 §4.1 makes a mismatch a hard failure and
+    /// never a TOFU prompt, so a caller who does not know who they are
+    /// connecting to cannot express that.
     expected_peer: [u8; 32],
     listener: Mutex<Option<TcpListener>>,
 }
@@ -170,22 +101,6 @@ impl TcpFabric {
         *self.listener.lock().map_err(|_| Error::Frame)? = Some(l);
         Ok(port)
     }
-
-    /// Verify the presented static against the credential — RFC 4 §4.1.
-    ///
-    /// Constant-time, because the comparison is against a value an attacker
-    /// may be trying to guess a prefix of.
-    fn check_peer(&self, presented: Option<&[u8]>) -> Result<(), Error> {
-        use subtle::ConstantTimeEq;
-        let Some(k) = presented else {
-            return Err(Error::Frame);
-        };
-        if k.len() != 32 || !bool::from(k.ct_eq(&self.expected_peer)) {
-            // A hard failure. Never a prompt.
-            return Err(Error::Frame);
-        }
-        Ok(())
-    }
 }
 
 impl Fabric for TcpFabric {
@@ -194,32 +109,9 @@ impl Fabric for TcpFabric {
     }
 
     fn connect(&self) -> Result<Box<dyn Session>, Error> {
-        let mut hs = Builder::new(NOISE_PARAMS.parse().map_err(|_| Error::Frame)?)
-            .local_private_key(&self.local_static)
-            .map_err(|_| Error::Frame)?
-            .remote_public_key(&self.expected_peer)
-            .map_err(|_| Error::Frame)?
-            .build_initiator()
-            .map_err(|_| Error::Frame)?;
-
         let mut stream = TcpStream::connect(&self.addr)?;
-        let mut buf = vec![0u8; 1024];
-
-        // Message 1: e, es, s, ss.
-        let n = hs.write_message(&[], &mut buf).map_err(|_| Error::Frame)?;
-        frame::write_bytes(&mut stream, &buf[..n])?;
-
-        // Message 2: e, ee, se.
-        let msg2 = frame::read_bytes(&mut stream)?.ok_or(Error::Frame)?;
-        hs.read_message(&msg2, &mut buf).map_err(|_| Error::Frame)?;
-
-        // IK gives the initiator the responder's static up front, so this
-        // confirms the responder proved possession of the key we expected
-        // rather than merely claiming it.
-        self.check_peer(hs.get_remote_static())?;
-
-        let noise = hs.into_transport_mode().map_err(|_| Error::Frame)?;
-        Ok(Box::new(TcpSession { stream, noise, buf }))
+        let noise = handshake_initiator(&mut stream, &self.local_static, &self.expected_peer)?;
+        Ok(Box::new(StreamSession::new(stream, noise)))
     }
 
     fn accept(&self) -> Result<Option<Box<dyn Session>>, Error> {
@@ -233,30 +125,8 @@ impl Fabric for TcpFabric {
             Err(e) => return Err(e.into()),
         };
         stream.set_nonblocking(false)?;
-
-        let mut hs = Builder::new(NOISE_PARAMS.parse().map_err(|_| Error::Frame)?)
-            .local_private_key(&self.local_static)
-            .map_err(|_| Error::Frame)?
-            .build_responder()
-            .map_err(|_| Error::Frame)?;
-
-        let mut buf = vec![0u8; 1024];
-        let msg1 = frame::read_bytes(&mut stream)?.ok_or(Error::Frame)?;
-        hs.read_message(&msg1, &mut buf).map_err(|_| Error::Frame)?;
-
-        // **The responder's check.** IK transmits the initiator's static inside
-        // message 1, encrypted — so this is where the responder learns who is
-        // calling, and it must refuse anyone else. RFC 4 §4.1 requires *both*
-        // parties to verify, and the responder's half is the one an
-        // implementation is likelier to omit, because the connection already
-        // "worked".
-        self.check_peer(hs.get_remote_static())?;
-
-        let n = hs.write_message(&[], &mut buf).map_err(|_| Error::Frame)?;
-        frame::write_bytes(&mut stream, &buf[..n])?;
-
-        let noise = hs.into_transport_mode().map_err(|_| Error::Frame)?;
-        Ok(Some(Box::new(TcpSession { stream, noise, buf })))
+        let noise = handshake_responder(&mut stream, &self.local_static, &self.expected_peer)?;
+        Ok(Some(Box::new(StreamSession::new(stream, noise))))
     }
 }
 
@@ -265,30 +135,24 @@ mod tests {
     use super::*;
     use krab_proto::control::Control;
 
-    fn keypair(seed: u8) -> ([u8; 32], [u8; 32]) {
-        let b = Builder::new(NOISE_PARAMS.parse().unwrap());
-        let kp = b.generate_keypair().unwrap();
-        let _ = seed;
-        (
-            kp.private.try_into().unwrap(),
-            kp.public.try_into().unwrap(),
-        )
-    }
+    // The handshake itself, its sizes, and both halves of RFC 4 §4.1's
+    // static-key check are tested in `crate::noise`, which every stream
+    // transport shares. What is TCP-specific is sockets: listening, accepting,
+    // and an address that is not there.
 
-    /// A handshake, in both directions, with real sockets.
+    /// A session over real sockets, both directions.
     #[test]
     fn a_session_establishes_and_carries_control_messages() {
-        let (a_sk, a_pk) = keypair(1);
-        let (b_sk, b_pk) = keypair(2);
+        let (a_sk, a_pk) = generate_static().unwrap();
+        let (b_sk, b_pk) = generate_static().unwrap();
 
         let responder = TcpFabric::new(LinkProfile::tcp(), "", b_sk, a_pk);
         let port = responder.listen("127.0.0.1:0").unwrap();
-
         let initiator = TcpFabric::new(LinkProfile::tcp(), format!("127.0.0.1:{port}"), a_sk, b_pk);
 
         let handle = std::thread::spawn(move || {
-            for _ in 0..200 {
-                if let Some(mut s) = responder.accept().unwrap() {
+            for _ in 0..300 {
+                if let Ok(Some(mut s)) = responder.accept() {
                     let got = s.recv().unwrap();
                     s.send(&Control::Done).unwrap();
                     return got;
@@ -300,102 +164,17 @@ mod tests {
 
         let mut client = initiator.connect().expect("handshake completes");
         client.send(&Control::Done).unwrap();
-        let echoed = client.recv().unwrap();
-        assert!(matches!(echoed, Some(Control::Done)));
+        assert!(matches!(client.recv().unwrap(), Some(Control::Done)));
         assert!(matches!(handle.join().unwrap(), Some(Control::Done)));
     }
 
-    /// **RFC 4 §4.1's hard failure.** An initiator that expects a different
-    /// static key must refuse, and there is no path that prompts instead.
-    #[test]
-    fn an_initiator_refuses_a_peer_whose_static_does_not_match() {
-        let (a_sk, a_pk) = keypair(1);
-        let (b_sk, _b_pk) = keypair(2);
-        let (_c_sk, c_pk) = keypair(3);
-
-        let responder = TcpFabric::new(LinkProfile::tcp(), "", b_sk, a_pk);
-        let port = responder.listen("127.0.0.1:0").unwrap();
-        std::thread::spawn(move || {
-            for _ in 0..100 {
-                let _ = responder.accept();
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        });
-
-        // Expecting C's key, talking to B.
-        let wrong = TcpFabric::new(LinkProfile::tcp(), format!("127.0.0.1:{port}"), a_sk, c_pk);
-        assert!(
-            wrong.connect().is_err(),
-            "a mismatched static must be a hard failure"
-        );
-    }
-
-    /// **The responder's half**, which is the one likelier to be omitted
-    /// because the connection already appears to have worked.
-    #[test]
-    fn a_responder_refuses_an_unexpected_initiator() {
-        let (a_sk, _a_pk) = keypair(1);
-        let (b_sk, b_pk) = keypair(2);
-        let (_c_sk, c_pk) = keypair(3);
-
-        // The responder expects C; A calls.
-        let responder = TcpFabric::new(LinkProfile::tcp(), "", b_sk, c_pk);
-        let port = responder.listen("127.0.0.1:0").unwrap();
-
-        let handle = std::thread::spawn(move || {
-            for _ in 0..200 {
-                match responder.accept() {
-                    Ok(Some(_)) => return Ok(()),
-                    Err(_) => return Err(()),
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                }
-            }
-            Err(())
-        });
-
-        let initiator = TcpFabric::new(LinkProfile::tcp(), format!("127.0.0.1:{port}"), a_sk, b_pk);
-        let _ = initiator.connect();
-        assert!(
-            handle.join().unwrap().is_err(),
-            "the responder must refuse A"
-        );
-    }
-
-    /// RFC 4 §4.1's sizes: 96 B then 48 B, 144 B total.
-    #[test]
-    fn the_handshake_is_the_size_rfc4_says() {
-        let (a_sk, _) = keypair(1);
-        let (b_sk, b_pk) = keypair(2);
-
-        let mut i = Builder::new(NOISE_PARAMS.parse().unwrap())
-            .local_private_key(&a_sk)
-            .unwrap()
-            .remote_public_key(&b_pk)
-            .unwrap()
-            .build_initiator()
-            .unwrap();
-        let mut r = Builder::new(NOISE_PARAMS.parse().unwrap())
-            .local_private_key(&b_sk)
-            .unwrap()
-            .build_responder()
-            .unwrap();
-
-        let mut buf = [0u8; 1024];
-        let n1 = i.write_message(&[], &mut buf).unwrap();
-        assert_eq!(n1, 96, "message 1: e, es, s, ss");
-        let mut scratch = [0u8; 1024];
-        r.read_message(&buf[..n1], &mut scratch).unwrap();
-        let n2 = r.write_message(&[], &mut buf).unwrap();
-        assert_eq!(n2, 48, "message 2: e, ee, se");
-        assert_eq!(n1 + n2, 144, "RFC 4 §4.1 — 1-RTT, mutual auth");
-    }
-
-    /// A link to nowhere fails rather than hanging or panicking.
+    /// A link to nowhere fails rather than hanging — I-4 forbids assuming
+    /// reachability, so this must be an ordinary error.
     #[test]
     fn an_unreachable_peer_is_an_error() {
-        let (a_sk, _) = keypair(1);
-        let (_, b_pk) = keypair(2);
-        // Port 1 on loopback: reserved, and nothing is listening.
+        let (a_sk, _) = generate_static().unwrap();
+        let (_, b_pk) = generate_static().unwrap();
+        // Port 1 on loopback: reserved, nothing listening.
         let f = TcpFabric::new(LinkProfile::tcp(), "127.0.0.1:1", a_sk, b_pk);
         assert!(f.connect().is_err());
     }
@@ -404,8 +183,8 @@ mod tests {
     /// normal state of an outbound-only link.
     #[test]
     fn accept_without_listening_yields_nothing() {
-        let (a_sk, _) = keypair(1);
-        let (_, b_pk) = keypair(2);
+        let (a_sk, _) = generate_static().unwrap();
+        let (_, b_pk) = generate_static().unwrap();
         let f = TcpFabric::new(LinkProfile::tcp(), "127.0.0.1:1", a_sk, b_pk);
         assert!(f.accept().unwrap().is_none());
     }

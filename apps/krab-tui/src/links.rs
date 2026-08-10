@@ -277,6 +277,7 @@ impl LinkTable {
 pub fn profile_named(kind: &str) -> Option<LinkProfile> {
     Some(match kind {
         "tcp" => LinkProfile::tcp(),
+        "serial" | "modem" => LinkProfile::serial(),
         "courier" => LinkProfile::courier(),
         "lora" => LinkProfile::lora_sf10(),
         _ => return None,

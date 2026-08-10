@@ -123,6 +123,49 @@ impl LinkProfile {
         }
     }
 
+    /// A serial line at 115 200 baud — RFC 4 §5.3.
+    ///
+    /// "A direct cable, a wired radio modem, or an X.25 PAD are all serviceable
+    /// links, and serial is the natural carrier for a physically isolated but
+    /// co-located pair." 11 520 B/s moves §5.3's 447 MB corpus in about
+    /// eleven hours.
+    ///
+    /// `Batch` rather than `Interactive`, which still resolves to `Rbsr` — and
+    /// that is right, though not for the reason it first appears.
+    ///
+    /// A serial line is **low bandwidth, not high latency**: a direct cable
+    /// turns a round trip around in microseconds and moves 11 520 bytes a
+    /// second. RBSR trades round trips for bytes by binary-searching the
+    /// divergence, which is exactly the trade this carrier wants. `Manifest`
+    /// would send the whole filtered set and is the right answer only where a
+    /// round trip is measured in days, which is what `Courier` means.
+    ///
+    /// `Batch` rather than `Interactive` therefore records the throughput, not
+    /// a different protocol: RFC 5 §4.5's mapping is by round-trip cost, and
+    /// this carrier shares TCP's.
+    ///
+    /// `fec` is on. RFC 4 §5.3: "FEC SHOULD be enabled where there is no
+    /// link-layer retransmission." A raw cable has none — a modem with V.42
+    /// does, and an operator who knows they have it may turn this off.
+    ///
+    /// `armor` is off, because the common case is an 8-bit-clean line. §5.3
+    /// requires it "where the carrier is text-only", which is an X.25 PAD or a
+    /// radio link with a text-only modem, and is the operator's call.
+    pub fn serial() -> LinkProfile {
+        LinkProfile {
+            kind: "serial",
+            sustained_bps: 11_520.0,
+            duty_cycle: 1.0,
+            latency_class: LatencyClass::Batch,
+            metered: false,
+            max_bucket: MaxBucket(5),
+            shard_k: 0,
+            class_mask: u16::MAX,
+            armor: false,
+            fec: true,
+        }
+    }
+
     /// A courier. RFC 4 §5.5 — capacity never binds, human latency always does.
     pub fn courier() -> LinkProfile {
         LinkProfile {

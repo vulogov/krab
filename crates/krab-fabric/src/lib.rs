@@ -39,6 +39,7 @@
 
 pub mod backend;
 pub mod frame;
+pub mod noise;
 pub mod profile;
 
 pub use profile::{LatencyClass, LinkProfile, MaxBucket};

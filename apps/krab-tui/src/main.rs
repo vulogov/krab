@@ -720,7 +720,14 @@ impl App {
             // guarantee is structural -- `LinkTable` has no reconciler to call.
             Command::Connect => {
                 let (Some(peer), kind) = (arg(line, 1), arg(line, 2).unwrap_or("tcp")) else {
-                    self.body = "usage: connect <peer> [tcp|courier|lora]".into();
+                    self.body = format!(
+                        "usage: connect <peer> <transport> [address]\n\n  \
+                         tcp      host:port\n  \
+                         serial   {}\n  \
+                         modem    same as serial; add `answer` to wait for the call\n  \
+                         courier  no address — use `pack` and `import`",
+                        krab_fabric::backend::serial::SerialFabric::device_hint()
+                    );
                     return;
                 };
                 let Some(profile) = profile_named(kind) else {
@@ -746,7 +753,9 @@ impl App {
                 // the credential, and `TcpFabric` takes the expected key as a
                 // required argument — so a peer with no stored card cannot be
                 // connected to over TCP at all, which is the correct refusal.
-                match self.establish(peer, arg(line, 3)) {
+                // `connect <peer> <transport> <address> [answer]`
+                let answer = line.split_whitespace().any(|t| t == "answer");
+                match self.establish(peer, kind, arg(line, 3), answer) {
                     Ok(session) => {
                         self.links.established(peer, session);
                         self.log.push(activity_log::Event::LinkUp {
@@ -1313,11 +1322,28 @@ impl App {
     fn establish(
         &self,
         peer: &str,
+        kind: &str,
         addr: Option<&str>,
+        answer: bool,
     ) -> Result<Option<Box<dyn krab_fabric::Session>>, String> {
         let Some(addr) = addr else {
             return Ok(None);
         };
+
+        // Local input, checked before anything is looked up: the macOS `tty.`
+        // node blocks in open() until carrier detect, so originating through it
+        // hangs with no error and no timeout. Saying so beats a later, vaguer
+        // failure about the peer.
+        if matches!(kind, "serial" | "modem")
+            && krab_fabric::backend::serial::SerialFabric::is_dial_in_node(addr)
+        {
+            return Err(format!(
+                "{addr} is a dial-in device and will block until carrier detect. \
+                 Use the cu. node instead: {}",
+                krab_fabric::backend::serial::SerialFabric::device_hint()
+            ));
+        }
+
         let Some(id) = &self.identity else {
             return Err("no identity — run `init` first".into());
         };
@@ -1332,17 +1358,48 @@ impl App {
             .filter(|c| c.verify())
             .ok_or_else(|| "the stored peer-link does not verify".to_string())?;
 
-        let fabric = krab_fabric::backend::tcp::TcpFabric::new(
-            krab_fabric::profile::LinkProfile::tcp(),
-            addr,
-            id.noise_bytes(),
-            card.noise_static_pk,
-        );
         use krab_fabric::Fabric;
-        fabric
+        match kind {
+            "serial" | "modem" => {
+                use krab_fabric::backend::serial::{Role, SerialFabric};
+                let role = if answer {
+                    Role::Answer
+                } else {
+                    Role::Originate
+                };
+                let fabric = SerialFabric::new(
+                    krab_fabric::profile::LinkProfile::serial(),
+                    addr,
+                    // RFC 4 §5.3's fast end. A slower line still works; it is
+                    // the operator's cable, and both ends must agree.
+                    115_200,
+                    role,
+                    id.noise_bytes(),
+                    card.noise_static_pk,
+                );
+                if answer {
+                    fabric
+                        .accept()
+                        .map_err(|e| format!("could not answer on {addr}: {e}"))?
+                        .map(Some)
+                        .ok_or_else(|| format!("nobody called on {addr}"))
+                } else {
+                    fabric
+                        .connect()
+                        .map(Some)
+                        .map_err(|e| format!("could not originate on {addr}: {e}"))
+                }
+            }
+            _ => krab_fabric::backend::tcp::TcpFabric::new(
+                krab_fabric::profile::LinkProfile::tcp(),
+                addr,
+                id.noise_bytes(),
+                card.noise_static_pk,
+            )
             .connect()
             .map(Some)
-            .map_err(|e| format!("could not establish a session with {peer}: {e}"))
+            .map_err(|e| format!("could not establish a session with {peer}: {e}")),
+        }
     }
 
     /// RFC 8 §5.3's panel.
@@ -3666,5 +3723,73 @@ mod tests {
             krab_core::tag::Epoch::at(EPOCH_FLOOR_SECS).0 > 20_000,
             "the floor must be a real date, not epoch 0"
         );
+    }
+
+    /// **A modem link gets every feature TCP has.** Same Noise IK, same
+    /// framing, same session, same reconciliation driver — RFC 4 §5.3's
+    /// "direct cable, wired radio modem, or X.25 PAD".
+    #[test]
+    fn serial_is_a_first_class_transport() {
+        use krab_fabric::profile::LinkProfile;
+        // It resolves by name, under both spellings an operator might use.
+        assert_eq!(links::profile_named("serial").unwrap().kind, "serial");
+        assert_eq!(links::profile_named("modem").unwrap().kind, "serial");
+
+        let p = LinkProfile::serial();
+        // RFC 4 §5.3's table: 115 200 baud is 11 520 B/s.
+        assert_eq!(p.sustained_bps, 11_520.0);
+        // FEC on, because §5.3 requires it "where there is no link-layer
+        // retransmission" and a raw cable has none.
+        assert!(p.fec, "a serial line has no retransmission below it");
+        // The sync mode is derived, not chosen (RFC 5 §4.5) — and a serial
+        // line resolves to the *same* mode as TCP, which is correct: it is low
+        // bandwidth, not high latency. A direct cable turns a round trip
+        // around in microseconds, so RBSR's trade of round trips for bytes is
+        // exactly what this carrier wants. `Manifest` is for `Courier`, where
+        // a round trip is measured in days.
+        assert_eq!(p.sync_mode(), LinkProfile::tcp().sync_mode());
+        assert_ne!(p.sync_mode(), LinkProfile::courier().sync_mode());
+    }
+
+    /// **The macOS trap, refused rather than hung on.** `tty.*` blocks in
+    /// `open()` until carrier detect, so originating through it hangs with no
+    /// error and no timeout — the block is in the kernel, not in any read.
+    #[test]
+    fn a_dial_in_device_is_refused_with_the_remedy() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let mut a = ready_node("serial-tty");
+        type_command(&mut a, "connect a1b2c3d4 serial /dev/tty.usbserial-XX");
+        assert!(a.body.contains("dial-in"), "{}", a.body);
+        assert!(
+            a.body.contains("cu."),
+            "the remedy must be in the message: {}",
+            a.body
+        );
+    }
+
+    /// Usage names a device shape that exists on this host, because there is
+    /// no configuration file to copy one from.
+    #[test]
+    fn connect_usage_names_a_device_for_this_platform() {
+        let mut a = ready_node("serial-usage");
+        type_command(&mut a, "connect");
+        assert!(a.body.contains("serial"), "{}", a.body);
+        assert!(a.body.contains("modem"), "{}", a.body);
+        if cfg!(target_os = "windows") {
+            assert!(a.body.contains("COM"), "{}", a.body);
+        } else {
+            assert!(a.body.contains("/dev/"), "{}", a.body);
+        }
+    }
+
+    /// A serial peer still needs a signed peer-link: RFC 4 §4.1's static-key
+    /// check is a hard failure on every carrier, never a prompt.
+    #[test]
+    fn a_serial_link_still_requires_a_verified_credential() {
+        let mut a = ready_node("serial-nolink");
+        type_command(&mut a, "connect a1b2c3d4 serial /dev/cu.nonexistent");
+        assert!(a.body.contains("no peer-link"), "{}", a.body);
     }
 }

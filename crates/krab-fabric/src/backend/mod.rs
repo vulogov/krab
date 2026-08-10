@@ -9,6 +9,9 @@
 
 pub mod courier;
 
+#[cfg(feature = "serial")]
+pub mod serial;
+
 #[cfg(feature = "tcp")]
 pub mod tcp;
 

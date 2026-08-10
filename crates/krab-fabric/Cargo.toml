@@ -28,9 +28,23 @@ authors.workspace = true
 [dependencies]
 # Constant-time comparison for the static-key check. `snow` already links it.
 subtle = { version = "2", default-features = false }
+
+# RFC 4 §5.3's serial carrier: a direct cable, a wired radio modem, or an X.25
+# PAD. `default-features = false` drops `libudev`, which is a C dependency --
+# RFC 4 §5.5 rejected ZMQ partly for having one. What that costs is port
+# *enumeration*, not port *opening*, and the operator names the device anyway
+# (Documentation/NO-CONFIG.md).
+serialport = { version = "4", default-features = false, optional = true }
+# `std` is deliberately absent. snow's `std` feature lists `ring/std` rather
+# than `ring?/std`, so enabling it activates `ring` -- a C dependency, and
+# RFC 4 §5.5 rejected ZMQ partly for having one. It also does not
+# cross-compile without a target C toolchain, which would have made Windows
+# and Linux builds depend on the host.
+#
+# Dropping it removes `ring` entirely and costs nothing this crate uses.
+# `cargo tree -p krab-fabric | grep ring` is the check.
 snow = { version = "0.10", default-features = false, features = [
     "default-resolver",
-    "std",
     "use-curve25519",
     "use-chacha20poly1305",
     "use-sha2",
@@ -42,9 +56,9 @@ krab-core = { workspace = true }
 krab-proto = { workspace = true }
 
 [features]
-default = ["tcp", "courier", "sim"]
+default = ["tcp", "courier", "sim", "serial"]
 tcp = []
 socks = ["tcp"]
-serial = []
+serial = ["dep:serialport"]
 courier = []
 sim = []
