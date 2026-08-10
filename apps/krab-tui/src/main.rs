@@ -41,6 +41,7 @@ mod peers;
 mod persist;
 mod reach;
 mod receive;
+mod rekey;
 mod render;
 mod request;
 mod shared;

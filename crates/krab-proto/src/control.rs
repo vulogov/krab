@@ -91,6 +91,39 @@ pub enum Control {
         /// Machine-readable close reason.
         reason: u16,
     },
+    /// 8 — one end's half of a re-key, and its current policy.
+    ///
+    /// See `krab_crypto::rekey`. The payload is already sealed under a carrier
+    /// key derived from `root_n` before it reaches this layer, so what travels
+    /// here is opaque: an eavesdropper on the Noise session learns the two
+    /// nodes re-keyed and nothing else.
+    ///
+    /// Policy rides along because a re-key is a periodic, authenticated,
+    /// encrypted, peer-to-peer state update, and so is a policy change.
+    /// Building a second mechanism for the same shape is how two mechanisms
+    /// come to disagree.
+    Rekey {
+        /// The ratchet index this re-key produces — `n+1`.
+        index: u32,
+        /// Sealed contribution and policy. Opaque here.
+        sealed: Vec<u8>,
+        /// Ephemeral X25519 public key for the healing half of the mix.
+        ///
+        /// In the clear: it is a public key, and both ends need it before
+        /// either can derive the shared secret that protects everything else.
+        ephemeral: [u8; 32],
+    },
+    /// 9 — `index` adopted, and here is the confirmation.
+    ///
+    /// A re-key that half-completes is worse than one that fails: one end
+    /// advances, the other does not, and every subsequent tag silently stops
+    /// matching. RFC 0 §6 guarantees nobody is told.
+    RekeyAck {
+        /// The index being confirmed.
+        index: u32,
+        /// `krab_crypto::rekey::confirm_tag` of the root just derived.
+        confirm: [u8; 8],
+    },
 }
 
 /// Why a control message was refused.
@@ -120,6 +153,8 @@ impl Control {
             Control::Range(_) => 5,
             Control::RangeDone => 6,
             Control::Bye { .. } => 7,
+            Control::Rekey { .. } => 8,
+            Control::RekeyAck { .. } => 9,
         }
     }
 
@@ -178,6 +213,20 @@ impl Control {
             }
             Control::Bye { reason } => {
                 w.array(2).uint(7).uint(*reason as u64);
+            }
+            Control::Rekey {
+                index,
+                sealed,
+                ephemeral,
+            } => {
+                w.array(4)
+                    .uint(8)
+                    .uint(*index as u64)
+                    .bstr(sealed)
+                    .bstr(ephemeral);
+            }
+            Control::RekeyAck { index, confirm } => {
+                w.array(3).uint(9).uint(*index as u64).bstr(confirm);
             }
         }
         w.finish()
@@ -311,6 +360,26 @@ impl Control {
             7 => Ok(Control::Bye {
                 reason: u32f(uint(&mut r)?)? as u16,
             }),
+            8 => {
+                let index = u32f(uint(&mut r)?)?;
+                // No `with_capacity` on a declared length anywhere near this:
+                // a 40-byte frame declaring a huge array killed the node once
+                // already (see `ADVERSARIAL-PASS.md`). `bstr` is bounded by
+                // what actually arrived.
+                let sealed = bstr(&mut r)?.to_vec();
+                let ephemeral = bytes32(&bstr(&mut r)?)?;
+                Ok(Control::Rekey {
+                    index,
+                    sealed,
+                    ephemeral,
+                })
+            }
+            9 => {
+                let index = u32f(uint(&mut r)?)?;
+                let raw = bstr(&mut r)?;
+                let confirm: [u8; 8] = raw.try_into().map_err(|_| Error::BadField)?;
+                Ok(Control::RekeyAck { index, confirm })
+            }
             _ => Err(Error::UnknownOpcode),
         }
     }
@@ -470,5 +539,43 @@ mod tests {
         for n in 0..64usize {
             let _ = Control::parse(&alloc::vec![0xABu8; n]);
         }
+    }
+
+    /// The two re-key opcodes survive a round trip, and a truncated one is
+    /// refused rather than accepted with a short field.
+    #[test]
+    fn rekey_messages_round_trip() {
+        let m = Control::Rekey {
+            index: 4_294_967_295,
+            sealed: alloc::vec![7u8; 96],
+            ephemeral: [3u8; 32],
+        };
+        assert_eq!(Control::parse(&m.write()), Ok(m.clone()));
+
+        let a = Control::RekeyAck {
+            index: 12,
+            confirm: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        assert_eq!(Control::parse(&a.write()), Ok(a));
+
+        // A confirmation of the wrong width is a different message, not a
+        // shorter one — accepting it would compare eight bytes against seven.
+        let short = {
+            let mut w = cbor::Writer::new();
+            w.array(3).uint(9).uint(12).bstr(&[1, 2, 3]);
+            w.finish()
+        };
+        assert_eq!(Control::parse(&short), Err(Error::BadField));
+    }
+
+    /// **Pre-authentication input.** A declared length must never become an
+    /// allocation — the defect that let a 40-byte frame kill a node.
+    #[test]
+    fn a_rekey_declaring_an_enormous_payload_does_not_allocate_it() {
+        // A bstr header claiming 4 GiB, with nothing behind it.
+        let mut raw = alloc::vec![0x84, 0x08, 0x0c];
+        raw.push(0x5a);
+        raw.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(Control::parse(&raw).is_err());
     }
 }

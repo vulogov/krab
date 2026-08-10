@@ -268,6 +268,38 @@ impl Reservoir {
         Some(*self.root.expose())
     }
 
+    /// Adopt a re-keyed root, effective from `at`.
+    ///
+    /// See [`crate::rekey`]. The old root is destroyed here; the new one is
+    /// **not** derivable from it, which is the entire point — that is what
+    /// heals a compromise a pure ratchet cannot.
+    ///
+    /// # Retained chunks survive
+    ///
+    /// Chunks for epochs before `at` were derived from the old chain and stay
+    /// exactly as they were. Mail already in flight was tagged with them, and
+    /// RFC 1 §6.2 gives it up to `MAX_TTL` to arrive — dropping them here
+    /// would silently strand every object in transit at the moment of a
+    /// re-key, which is the failure RFC 0 §6 guarantees nobody is told about.
+    ///
+    /// # Refusing to go backwards
+    ///
+    /// `at` must be at or after the epoch the ratchet has reached. A re-key
+    /// landing in the past would make a chunk derivable twice from two
+    /// different chains, and the two ends would disagree about which.
+    #[must_use]
+    pub fn rekey(&mut self, new_root: [u8; 32], at: Epoch) -> bool {
+        if at < self.epoch {
+            return false;
+        }
+        self.root = Secret::new(new_root);
+        self.epoch = at;
+        // The chunk for `at` now comes from the new chain. Both ends derive it
+        // the same way because both adopt the same root at the same epoch.
+        self.derive_current();
+        true
+    }
+
     /// Destroy the root and every retained chunk. Every epoch, at once.
     pub fn destroy(&mut self) {
         self.root.destroy();
@@ -547,5 +579,95 @@ mod tests {
         let s = alloc::format!("{r:?}");
         assert!(s.starts_with("Reservoir(epoch:"), "{s}");
         assert!(!s.contains("5a") && !s.contains("90"), "{s}");
+    }
+
+    /// **A re-key must not strand mail already in flight.** Chunks derived
+    /// from the old chain stay derivable, because RFC 1 §6.2 gives an object
+    /// up to `MAX_TTL` to arrive and it was tagged before the re-key.
+    #[test]
+    fn a_rekey_keeps_the_chunks_mail_in_flight_was_tagged_with() {
+        let mut r = Reservoir::new([1u8; 32], Epoch(100));
+        assert!(r.advance_to(Epoch(110)));
+        let old = r.chunk(Epoch(105)).expect("inside the window");
+
+        assert!(r.rekey([9u8; 32], Epoch(110)));
+        assert_eq!(
+            r.chunk(Epoch(105)).map(|c| *c.expose()),
+            Some(*old.expose()),
+            "an object tagged before the re-key can no longer be opened"
+        );
+    }
+
+    /// The new root is not derivable from the old one. This is the healing
+    /// property, and it is the reason a re-key is not just a ratchet step.
+    #[test]
+    fn a_rekeyed_root_is_unrelated_to_the_one_it_replaced() {
+        let mut a = Reservoir::new([1u8; 32], Epoch(100));
+        let mut b = Reservoir::new([1u8; 32], Epoch(100));
+        assert!(a.rekey([9u8; 32], Epoch(100)));
+        // `b` ratchets instead. An adversary holding the old root gets this.
+        assert!(b.advance_to(Epoch(101)));
+        assert_ne!(a.root_bytes(), b.root_bytes());
+        assert_ne!(
+            a.chunk(Epoch(100)).map(|c| *c.expose()),
+            b.chunk(Epoch(100)).map(|c| *c.expose()),
+            "the re-keyed chunk is still derivable from the old chain"
+        );
+    }
+
+    /// A re-key landing in the past would make one epoch derivable from two
+    /// chains, and the two ends would disagree about which.
+    #[test]
+    fn a_rekey_cannot_go_backwards() {
+        let mut r = Reservoir::new([1u8; 32], Epoch(100));
+        assert!(r.advance_to(Epoch(110)));
+        assert!(!r.rekey([9u8; 32], Epoch(109)), "it went backwards");
+        assert_eq!(r.epoch(), Epoch(110), "and it changed something anyway");
+    }
+
+    /// Both ends adopting the same root at the same epoch derive the same
+    /// chunks from then on. Without this the peering is silently dead.
+    #[test]
+    fn both_ends_agree_after_a_rekey() {
+        let mut a = Reservoir::new([1u8; 32], Epoch(100));
+        let mut b = Reservoir::new([1u8; 32], Epoch(100));
+        assert!(a.advance_to(Epoch(105)));
+        assert!(b.advance_to(Epoch(105)));
+
+        let new = crate::rekey::next_root(
+            &a.root_bytes().unwrap(),
+            &[7u8; 32],
+            (&[1u8; 32], &Secret::new([0xaa; 32])),
+            (&[2u8; 32], &Secret::new([0xbb; 32])),
+            105,
+        );
+        assert!(a.rekey(new, Epoch(105)));
+        assert!(b.rekey(new, Epoch(105)));
+
+        for e in 105..=110 {
+            assert!(a.advance_to(Epoch(e)) || e == 105);
+            assert!(b.advance_to(Epoch(e)) || e == 105);
+            assert_eq!(
+                a.chunk(Epoch(e)).map(|c| *c.expose()),
+                b.chunk(Epoch(e)).map(|c| *c.expose()),
+                "the two ends diverged at epoch {e}"
+            );
+        }
+    }
+
+    /// **The 90-day death.** `MAX_ADVANCE` refuses a longer gap, correctly —
+    /// but that leaves the peering dead. A re-key re-seats both ends, which is
+    /// what makes a returning node recoverable instead of lost.
+    #[test]
+    fn a_rekey_revives_a_peering_that_advance_refuses_to_close() {
+        let mut r = Reservoir::new([1u8; 32], Epoch(100));
+        let far = Epoch(100 + Reservoir::MAX_ADVANCE + 1);
+        assert!(!r.advance_to(far), "the gap must be refused");
+        assert_eq!(r.epoch(), Epoch(100), "and nothing touched");
+
+        // The peering is not lost: a re-key seats it at the current epoch.
+        assert!(r.rekey([9u8; 32], far));
+        assert_eq!(r.epoch(), far);
+        assert!(r.chunk(far).is_some(), "and it works again");
     }
 }
