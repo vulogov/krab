@@ -303,8 +303,15 @@ mod tests {
     fn a_missing_device_is_unreachable() {
         let f = fabric(Role::Originate);
         assert!(matches!(f.connect(), Err(Error::Unreachable)));
-        // And answering on a missing device reports nobody, not a failure.
-        assert!(fabric(Role::Answer).accept().is_err() || true);
+        // And answering on a missing device says so. The assertion here was
+        // `is_err() || true`, which is `true` — it asserted nothing, and would
+        // have passed had `accept` returned a session on a device that does
+        // not exist. What matters is that it does not report a caller.
+        match fabric(Role::Answer).accept() {
+            Ok(None) | Err(Error::Unreachable) => {}
+            Ok(Some(_)) => panic!("a missing device answered a call"),
+            Err(e) => panic!("expected Unreachable, got {e:?}"),
+        }
     }
 
     /// **The macOS trap.** `tty.*` blocks in `open()` until carrier detect, so

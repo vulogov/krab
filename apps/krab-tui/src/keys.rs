@@ -72,12 +72,22 @@ pub enum Key {
     Enter,
     /// Leave, ascend, or cancel.
     Esc,
+    /// Delete backwards. Its absence is why a typo could not be corrected.
+    Backspace,
+    /// Delete forwards.
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
 }
 
 /// What a key press means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Binding {
+    /// **Leave.** `Ctrl-Q`, reachable from every mode.
+    Quit,
     /// **Lock immediately.** Reachable from every mode.
     Lock,
     /// Redraw. Displaced from `Ctrl-L`.
@@ -88,11 +98,17 @@ pub enum Binding {
     CycleFocusBack,
     /// Toggle full-screen on the focused pane.
     ToggleZoom,
+    /// Full-screen the focused pane — `Ctrl-O`. The command line and output
+    /// pane go full-screen together.
+    ToggleFullScreen,
     /// Switch between the private and channels tabs.
     SwitchTab,
+    /// Select a tab outright, rather than toggling.
+    SelectTab(crate::layout::Tab),
     /// Decrypt into the view, or descend a level.
     Activate,
-    /// Leave, ascend, or cancel a composition.
+    /// **Back to the default screen** — `Esc`. Not one level of a stack:
+    /// see [`crate::layout::Ui::reset`].
     Cancel,
     /// Begin composing.
     Compose,
@@ -102,8 +118,33 @@ pub enum Binding {
     Publish,
     /// A character typed into the composer or the command line.
     Input(char),
+    /// An edit to the line being typed. See [`crate::line::Line`].
+    Edit(Edit),
     /// Nothing.
     Ignored,
+}
+
+/// A one-line editing operation.
+///
+/// Separate from [`Binding`] so that the command line and the composer can be
+/// given the same editing vocabulary without the pane deciding what `Ctrl-W`
+/// means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edit {
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    Home,
+    End,
+    /// `Ctrl-W`.
+    KillWord,
+    /// `Ctrl-U`.
+    KillToStart,
+    /// `Ctrl-K`.
+    KillToEnd,
 }
 
 impl Binding {
@@ -113,6 +154,54 @@ impl Binding {
         // so no mode can shadow it and no future mode can either.
         if key.ctrl && key.code == Key::Char('l') {
             return Binding::Lock;
+        }
+        // And quit, for the same reason. There was previously no way to leave
+        // at all: `q` resolved to `Ignored` in browse mode, and the branch that
+        // set `quit` could only be reached while typing on the command line,
+        // where the character went into the command instead. An interface with
+        // no exit is not a small defect — an operator who cannot leave cannot
+        // stop the node.
+        if key.ctrl && key.code == Key::Char('q') {
+            return Binding::Quit;
+        }
+        // Tabs, likewise before any mode. `m` toggles them, but only in browse
+        // mode — and focus starts on the command line, where `m` is a letter.
+        // A security context this consequential (RFC 8 §4.1: a channel post is
+        // irreversible) needs a way to be *selected*, not toggled: an operator
+        // who cannot tell which tab they are on cannot toggle their way to
+        // certainty, and guessing wrong publishes.
+        if key.ctrl && key.code == Key::Char('o') {
+            return Binding::ToggleFullScreen;
+        }
+        if key.ctrl {
+            if key.code == Key::Char('1') {
+                return Binding::SelectTab(crate::layout::Tab::Private);
+            }
+            if key.code == Key::Char('2') {
+                return Binding::SelectTab(crate::layout::Tab::Channels);
+            }
+        }
+
+        // Editing, before mode. A line being typed is a line being typed, and
+        // there is no mode in which `Backspace` should mean something else.
+        let edit = match key.code {
+            Key::Backspace => Some(Edit::Backspace),
+            Key::Delete => Some(Edit::Delete),
+            Key::Home => Some(Edit::Home),
+            Key::End => Some(Edit::End),
+            Key::Left if key.ctrl => Some(Edit::WordLeft),
+            Key::Right if key.ctrl => Some(Edit::WordRight),
+            Key::Left => Some(Edit::Left),
+            Key::Right => Some(Edit::Right),
+            Key::Char('w') if key.ctrl => Some(Edit::KillWord),
+            Key::Char('u') if key.ctrl => Some(Edit::KillToStart),
+            Key::Char('k') if key.ctrl => Some(Edit::KillToEnd),
+            Key::Char('a') if key.ctrl => Some(Edit::Home),
+            Key::Char('e') if key.ctrl => Some(Edit::End),
+            _ => None,
+        };
+        if let Some(e) = edit {
+            return Binding::Edit(e);
         }
 
         match mode {
@@ -270,6 +359,35 @@ mod tests {
                         assert_eq!(b, Binding::Lock, "lock must win everywhere");
                     }
                 }
+            }
+        }
+    }
+
+    /// **Tabs must be reachable from the command line.** `m` toggles them,
+    /// but only in browse mode, and focus starts on the command line where
+    /// `m` is a letter — so on a fresh node there was no way to see channels
+    /// at all without first knowing to press Tab.
+    #[test]
+    fn the_tab_chords_resolve_before_any_mode() {
+        use crate::layout::Tab;
+        for mode in [Mode::Browse, Mode::Compose] {
+            for (c, tab) in [('1', Tab::Private), ('2', Tab::Channels)] {
+                let press = KeyPress {
+                    code: Key::Char(c),
+                    ctrl: true,
+                    shift: false,
+                };
+                assert_eq!(Binding::of(press, mode), Binding::SelectTab(tab));
+                // Without the modifier they are digits, so a channel named
+                // `1` can still be typed.
+                assert_eq!(
+                    Binding::of(KeyPress::key(Key::Char(c)), mode),
+                    if mode == Mode::Browse {
+                        Binding::Ignored
+                    } else {
+                        Binding::Input(c)
+                    }
+                );
             }
         }
     }

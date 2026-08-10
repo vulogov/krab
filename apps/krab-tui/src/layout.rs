@@ -23,20 +23,52 @@
 //! reclaim space" is therefore not a rule to follow but a thing there is no
 //! way to do.
 
+/// Rows the command pane occupies: RFC 8 §3's two content lines plus the
+/// rule that separates it from the body.
+///
+/// Two rows was not two lines. The pane drew a full border, so a two-row
+/// allocation left zero usable rows inside and the command line had nowhere
+/// to render — the interface looked as though typing did nothing.
+pub const COMMAND_ROWS: u16 = 3;
+
+/// Rows the output pane occupies, directly above the command pane.
+///
+/// Four: a border top and bottom, and two lines of output. Enough to read an
+/// acknowledgement and the line before it without zooming; anything longer is
+/// what `Ctrl-O` and `z` are for.
+pub const OUTPUT_ROWS: u16 = 4;
+
+/// What is full-screened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zoom {
+    /// One pane, RFC 8 §2.
+    One(Pane),
+    /// The output pane and the command line together — see
+    /// [`Ui::toggle_console`].
+    Console,
+}
+
 /// The three panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Pane {
     /// Messages, or channels. 40% of width, on the left.
     List,
-    /// The message body, or long command output. 60%, on the right.
+    /// The message body. 60%, on the right.
+    ///
+    /// No longer "or long command output": operator evidence and decrypted
+    /// plaintext in one pane means reading `peers` destroys the message you
+    /// were looking at, and RFC 3 §12 wants a disconnect decision one
+    /// keystroke from the evidence for it.
     View,
+    /// Command output. Between the body and the command line.
+    Output,
     /// Two lines at the bottom, combined input and output.
     Command,
 }
 
 impl Pane {
     /// Cycle order for `Tab`.
-    pub const CYCLE: [Pane; 3] = [Pane::List, Pane::View, Pane::Command];
+    pub const CYCLE: [Pane; 4] = [Pane::List, Pane::View, Pane::Output, Pane::Command];
 
     /// The next pane in the cycle, wrapping.
     pub fn next(self) -> Pane {
@@ -131,7 +163,7 @@ pub struct Rect {
 pub struct Ui {
     tab: Tab,
     focus: Pane,
-    zoomed: Option<Pane>,
+    zoomed: Option<Zoom>,
     mode: Mode,
     level: Level,
 }
@@ -142,7 +174,12 @@ impl Default for Ui {
     fn default() -> Ui {
         Ui {
             tab: Tab::Private,
-            focus: Pane::List,
+            // The command pane, because that is where every verb in RFC 8 §5 is
+            // typed and a node that has just started has nothing else to do.
+            // Starting on the list meant `init` went to a pane that treats
+            // letters as chords, so the characters were silently dropped and
+            // the interface looked broken.
+            focus: Pane::Command,
             zoomed: None,
             mode: Mode::Browse,
             level: Level::Channels,
@@ -169,7 +206,7 @@ impl Ui {
         self.focus
     }
     /// Zoomed pane, if any.
-    pub fn zoomed(&self) -> Option<Pane> {
+    pub fn zoomed(&self) -> Option<Zoom> {
         self.zoomed
     }
     /// Current mode.
@@ -186,16 +223,16 @@ impl Ui {
         self.focus = self.focus.next();
         // Focus follows into the zoom: cycling while zoomed moves the zoom,
         // rather than focusing a pane the user cannot see.
-        if self.zoomed.is_some() {
-            self.zoomed = Some(self.focus);
+        if matches!(self.zoomed, Some(Zoom::One(_))) {
+            self.zoomed = Some(Zoom::One(self.focus));
         }
     }
 
     /// Cycle focus backwards. Bound to `Shift-Tab`.
     pub fn cycle_focus_back(&mut self) {
         self.focus = self.focus.prev();
-        if self.zoomed.is_some() {
-            self.zoomed = Some(self.focus);
+        if matches!(self.zoomed, Some(Zoom::One(_))) {
+            self.zoomed = Some(Zoom::One(self.focus));
         }
     }
 
@@ -206,13 +243,57 @@ impl Ui {
     pub fn toggle_zoom(&mut self) {
         self.zoomed = match self.zoomed {
             Some(_) => None,
-            None => Some(self.focus),
+            None => Some(Zoom::One(self.focus)),
         };
+    }
+
+    /// Full-screen whatever has focus — `Ctrl-O`.
+    ///
+    /// The command line and the output pane full-screen **as a pair**, because
+    /// separately neither is usable: a zoomed output pane has no prompt to
+    /// type the next verb into, and a zoomed command line is a prompt whose
+    /// own output is somewhere off-screen. Every other pane full-screens
+    /// alone. Composing full-screens the composer, since that is what occupies
+    /// the view pane while it is running.
+    pub fn toggle_full_screen(&mut self) {
+        let want = match self.focus {
+            Pane::Command | Pane::Output => Zoom::Console,
+            p => Zoom::One(p),
+        };
+        self.zoomed = if self.zoomed == Some(want) {
+            None
+        } else {
+            Some(want)
+        };
+    }
+
+    /// Back to the default screen — `Esc`.
+    ///
+    /// This subsumes what used to be a separate `ascend`: leaving a channel's
+    /// message list is one of the things going back to the default screen
+    /// does, and two keystrokes that differ only in how far back they go is
+    /// two things for an operator to remember under pressure.
+    ///
+    /// One keystroke, not a stack to unwind: an operator who has zoomed a pane
+    /// while composing should not have to remember how many things are open.
+    /// The caller zeroizes the draft; this only decides what is on screen.
+    pub fn reset(&mut self) {
+        self.zoomed = None;
+        self.mode = Mode::Browse;
+        self.level = Level::Channels;
+        self.focus = Pane::Command;
     }
 
     /// Switch tabs.
     pub fn switch_tab(&mut self) {
-        self.tab = self.tab.other();
+        self.select_tab(self.tab.other());
+    }
+
+    /// Go to a named tab. Idempotent, which is the point: `Ctrl-1` twice
+    /// leaves you on Private, where `m` twice leaves you where you started
+    /// without ever telling you where that was.
+    pub fn select_tab(&mut self, tab: Tab) {
+        self.tab = tab;
         self.level = Level::Channels;
     }
 
@@ -220,13 +301,6 @@ impl Ui {
     pub fn descend(&mut self) {
         if self.tab == Tab::Channels {
             self.level = Level::Messages;
-        }
-    }
-
-    /// Leave the channel's message list.
-    pub fn ascend(&mut self) {
-        if self.tab == Tab::Channels {
-            self.level = Level::Channels;
         }
     }
 
@@ -258,11 +332,44 @@ impl Ui {
     ///
     /// A zoomed pane takes the whole area and the others are absent.
     pub fn layout(&self, area: Rect) -> Vec<(Pane, Rect)> {
-        if let Some(z) = self.zoomed {
-            return vec![(z, area)];
+        let cmd_h = COMMAND_ROWS.min(area.h);
+        match self.zoomed {
+            Some(Zoom::One(z)) => return vec![(z, area)],
+            Some(Zoom::Console) => {
+                return vec![
+                    (
+                        Pane::Output,
+                        Rect {
+                            x: area.x,
+                            y: area.y,
+                            w: area.w,
+                            h: area.h.saturating_sub(cmd_h),
+                        },
+                    ),
+                    (
+                        Pane::Command,
+                        Rect {
+                            x: area.x,
+                            y: area.y + area.h.saturating_sub(cmd_h),
+                            w: area.w,
+                            h: cmd_h,
+                        },
+                    ),
+                ]
+            }
+            None => {}
         }
-        let cmd_h = 2.min(area.h);
-        let body_h = area.h.saturating_sub(cmd_h);
+        // RFC 8 §3's two lines are two lines *of content*. The pane draws a
+        // top rule to separate it from the body, so it needs three rows —
+        // allocating two gave a bordered box with zero usable rows inside, and
+        // the command line had nowhere to render at all.
+        //
+        // The output pane sits directly above it, at a fixed height: a body
+        // pane that changes size when output arrives is a body pane that
+        // moves the line you were reading.
+        let rest = area.h.saturating_sub(cmd_h);
+        let out_h = OUTPUT_ROWS.min(rest);
+        let body_h = rest.saturating_sub(out_h);
         let list_w = (area.w as u32 * 40 / 100) as u16;
         let view_w = area.w.saturating_sub(list_w);
         vec![
@@ -285,10 +392,19 @@ impl Ui {
                 },
             ),
             (
-                Pane::Command,
+                Pane::Output,
                 Rect {
                     x: area.x,
                     y: area.y + body_h,
+                    w: area.w,
+                    h: out_h,
+                },
+            ),
+            (
+                Pane::Command,
+                Rect {
+                    x: area.x,
+                    y: area.y + body_h + out_h,
                     w: area.w,
                     h: cmd_h,
                 },
@@ -321,18 +437,23 @@ mod tests {
     fn tab_cycles_focus_through_all_panes() {
         let mut ui = Ui::default();
         let mut seen = vec![ui.focus()];
-        for _ in 0..2 {
+        for _ in 0..3 {
             ui.cycle_focus();
             seen.push(ui.focus());
         }
-        assert_eq!(seen, vec![Pane::List, Pane::View, Pane::Command]);
+        // Starting on Command, because that is where a fresh node's first verb
+        // is typed. The cycle order itself is unchanged.
+        assert_eq!(
+            seen,
+            vec![Pane::Command, Pane::List, Pane::View, Pane::Output]
+        );
 
         ui.cycle_focus();
-        assert_eq!(ui.focus(), Pane::List, "wraps");
+        assert_eq!(ui.focus(), Pane::Command, "wraps");
 
         // And backwards.
         ui.cycle_focus_back();
-        assert_eq!(ui.focus(), Pane::Command);
+        assert_eq!(ui.focus(), Pane::Output);
     }
 
     /// RFC 8 §2 — *any* pane may be zoomed to full screen.
@@ -344,7 +465,7 @@ mod tests {
                 ui.cycle_focus();
             }
             ui.toggle_zoom();
-            assert_eq!(ui.zoomed(), Some(target));
+            assert_eq!(ui.zoomed(), Some(Zoom::One(target)));
 
             let panes = ui.layout(SCREEN);
             assert_eq!(panes.len(), 1, "zoomed pane is alone");
@@ -352,7 +473,7 @@ mod tests {
 
             ui.toggle_zoom();
             assert_eq!(ui.zoomed(), None);
-            assert_eq!(ui.layout(SCREEN).len(), 3);
+            assert_eq!(ui.layout(SCREEN).len(), Pane::CYCLE.len());
         }
     }
 
@@ -362,17 +483,21 @@ mod tests {
     fn focus_follows_into_the_zoom() {
         let mut ui = Ui::default();
         ui.toggle_zoom();
-        assert_eq!(ui.zoomed(), Some(Pane::List));
-        ui.cycle_focus();
-        assert_eq!(ui.focus(), Pane::View);
         assert_eq!(
             ui.zoomed(),
-            Some(Pane::View),
+            Some(Zoom::One(Pane::Command)),
+            "zoom follows focus"
+        );
+        ui.cycle_focus();
+        assert_eq!(ui.focus(), Pane::List, "Command cycles round to List");
+        assert_eq!(
+            ui.zoomed(),
+            Some(Zoom::One(Pane::List)),
             "the zoom moved with the focus"
         );
     }
 
-    /// RFC 8 §2's 40/60 split and two-line command pane.
+    /// RFC 8 §2's 40/60 split and the command pane's rows.
     #[test]
     fn layout_matches_the_specified_proportions() {
         let panes = Ui::default().layout(SCREEN);
@@ -382,8 +507,16 @@ mod tests {
 
         assert_eq!(list.w, 40, "list pane is 40% of width");
         assert_eq!(view.w, 60, "view pane is 60%");
-        assert_eq!(cmd.h, 2, "command pane is two lines");
-        assert_eq!(list.h + cmd.h, SCREEN.h, "and they tile the screen");
+        assert_eq!(
+            cmd.h, COMMAND_ROWS,
+            "the command pane needs RFC 8 §3's two content lines plus its rule"
+        );
+        let out = panes.iter().find(|(p, _)| *p == Pane::Output).unwrap().1;
+        assert_eq!(out.h, OUTPUT_ROWS, "four rows above the command pane");
+        assert_eq!(out.w, SCREEN.w, "spanning the width");
+        assert_eq!(list.h + out.h + cmd.h, SCREEN.h, "and they tile the screen");
+        assert_eq!(list.y + list.h, out.y, "output sits under the body");
+        assert_eq!(out.y + out.h, cmd.y, "and directly above the command line");
         assert_eq!(list.x + list.w, view.x, "no gap between them");
     }
 
@@ -397,6 +530,7 @@ mod tests {
                 None,
                 Some(Pane::List),
                 Some(Pane::View),
+                Some(Pane::Output),
                 Some(Pane::Command),
             ] {
                 let mut ui = Ui::default();
@@ -448,8 +582,11 @@ mod tests {
         assert_eq!(ui.level(), Level::Channels);
         ui.descend();
         assert_eq!(ui.level(), Level::Messages, "inside a channel");
-        ui.ascend();
+        // Esc is the way back out, and it goes all the way rather than one
+        // level: see `reset`.
+        ui.reset();
         assert_eq!(ui.level(), Level::Channels);
+        ui.select_tab(Tab::Channels);
 
         // Switching tabs resets the level, so returning never lands somewhere
         // the user did not choose.

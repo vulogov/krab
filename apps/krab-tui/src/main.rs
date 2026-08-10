@@ -34,6 +34,7 @@ mod entropy;
 mod identity;
 mod keys;
 mod layout;
+mod line;
 mod links;
 mod peering;
 mod peers;
@@ -79,6 +80,31 @@ use std::time::{Duration, Instant};
 /// wording — plus this is bandwidth on a serial console or a poor SSH link,
 /// which are transports Krab exists to serve.
 const TICK: Duration = Duration::from_millis(250);
+
+/// How long `connect ... answer` waits for a call before handing the prompt
+/// back.
+///
+/// Bounded because the wait is on the UI thread: an unbounded accept is a hung
+/// interface with no way to cancel it.
+const ANSWER_WAIT_S: u64 = 30;
+
+/// Where a node keeps its store when `--home` is not given.
+///
+/// Under test this is a scratch directory, not the working directory. It was
+/// the working directory, and the working directory during `cargo test` is the
+/// package root — so the suite wrote a real `identity.wrapped`, `kek.params`
+/// and `corpus.krab` into the source tree, where they were committed. A test
+/// must not be able to produce a publishable key hierarchy by default.
+fn default_home() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!("krab-test-default-{}", std::process::id()))
+    }
+    #[cfg(not(test))]
+    {
+        PathBuf::from(".")
+    }
+}
 
 fn main() -> io::Result<()> {
     let mut app = match App::from_args(std::env::args().skip(1)) {
@@ -129,16 +155,25 @@ struct App {
     ui: Ui,
     node: NodeState,
     spinner: Spinner,
-    command: String,
+    command: line::Line,
     composer: String,
+    /// Decrypted message plaintext. **Only** [`App::show_selected`] writes
+    /// here, and RFC 7 §8 says it exists only while displayed.
     body: String,
+    /// Command output.
+    ///
+    /// Split from `body`, which used to carry both. Sharing one pane meant
+    /// running `peers` destroyed the message you were reading — and RFC 3 §12
+    /// wants a disconnect decision one keystroke from the evidence for it,
+    /// which is not true if reading the evidence costs you the message.
+    output: String,
     list: Vec<String>,
     locked: bool,
     quit: bool,
     /// This node's keys, once `init` has completed. `None` on a fresh install.
     identity: Option<Identity>,
     /// The passphrase being typed. Never echoed — see `View::masked`.
-    passphrase: String,
+    passphrase: line::Line,
     /// The current epoch wrapper key `W_N`, held **only while unlocked**.
     ///
     /// RFC 7 §4: the KEK is memory-only and re-derived on unlock. `W_N` is
@@ -148,6 +183,9 @@ struct App {
     epoch_key: Option<[u8; 32]>,
     /// Where cards, pads and ceremony state live.
     home: PathBuf,
+    /// Where inbound links arrive, from `--listen`. `None` means this node
+    /// only dials.
+    listen: Option<String>,
     /// Transports. **Holds nothing that can reconcile** — RFC 8 §5.1.
     links: LinkTable,
     /// The corpus, reachable from background exchanges.
@@ -187,16 +225,23 @@ impl Default for App {
             ui: Ui::default(),
             node: NodeState::default(),
             spinner: Spinner::default(),
-            command: String::new(),
+            command: line::Line::default(),
             composer: String::new(),
+            // Not "no message selected": on a fresh node that is true and
+            // useless. The first screen has to say what to type, because
+            // nothing else on it does.
             body: "no message selected".into(),
+            // One line, because the output pane is two and this is the line a
+            // first-time operator has to read. Everything longer is `help`.
+            output: "krab — no identity yet. Type `init`, or `help` for the verbs.".into(),
             list: vec!["(no messages)".into()],
             locked: false,
             quit: false,
             identity: None,
-            passphrase: String::new(),
+            passphrase: line::Line::default(),
             epoch_key: None,
-            home: PathBuf::from("."),
+            home: default_home(),
+            listen: None,
             links: LinkTable::new(),
             store: shared::SharedStore::new(krab_store::index::Store::new()),
             exchanges: std::sync::mpsc::channel(),
@@ -223,9 +268,14 @@ impl App {
     /// parent process would be choosing on the operator's behalf without the
     /// operator seeing it.
     fn from_args(args: impl Iterator<Item = String>) -> Result<App, String> {
-        const USAGE: &str = "krab [--home <dir>] [--sync-interval <seconds>]\n\n\
+        const USAGE: &str =
+            "krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>]\n\n\
              krab reads no configuration file. Everything else is set by a \
-             command-pane verb during the session.";
+             command-pane verb during the session.\n\n\
+             --listen names the address inbound links arrive on. It is a \
+             startup option because a listening socket is a property of how \
+             this node was launched, and because two nodes on one host must be \
+             told apart before either is typed into.";
 
         let mut app = App::default();
         let mut args = args.peekable();
@@ -233,6 +283,17 @@ impl App {
             match arg.as_str() {
                 "--home" => {
                     app.home = PathBuf::from(args.next().ok_or(USAGE)?);
+                }
+                "--listen" => {
+                    let addr = args.next().ok_or(USAGE)?;
+                    // Parsed here so a typo fails at launch rather than at the
+                    // first inbound link, which may be hours away.
+                    use std::net::ToSocketAddrs;
+                    addr.to_socket_addrs()
+                        .map_err(|e| format!("--listen {addr}: {e}"))?
+                        .next()
+                        .ok_or_else(|| format!("--listen {addr}: resolves to no address"))?;
+                    app.listen = Some(addr);
                 }
                 "--sync-interval" => {
                     let secs: u64 = args
@@ -254,31 +315,40 @@ impl App {
         Ok(app)
     }
 
+    /// Everything the renderer is allowed to see.
+    ///
+    /// Built here rather than inline in [`App::run`] so that a test can render
+    /// the same frame an operator gets. The command pane defect that prompted
+    /// this was invisible to every state assertion in this file: the typed
+    /// command was in the string, the string just had no rows to render into.
+    fn view<'a>(&'a self, log: &'a [String]) -> render::View<'a> {
+        let masked = self.init_step == Some(InitStep::Passphrase);
+        render::View {
+            ui: &self.ui,
+            node: &self.node,
+            spinner: &self.spinner,
+            list: &self.list,
+            body: &self.body,
+            output: &self.output,
+            // While the passphrase is being taken the prompt shows its length,
+            // not the command line — see `masked`.
+            command: if masked {
+                &self.passphrase
+            } else {
+                &self.command
+            },
+            composer: &self.composer,
+            locked: self.locked,
+            log,
+            masked,
+        }
+    }
+
     fn run(&mut self, term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         let mut last = Instant::now();
         while !self.quit {
             let log_lines = self.log.recent(activity_log::CAPACITY);
-            term.draw(|f| {
-                render::draw(
-                    f,
-                    &render::View {
-                        ui: &self.ui,
-                        node: &self.node,
-                        spinner: &self.spinner,
-                        list: &self.list,
-                        body: &self.body,
-                        command: if self.init_step == Some(InitStep::Passphrase) {
-                            &self.passphrase
-                        } else {
-                            &self.command
-                        },
-                        composer: &self.composer,
-                        locked: self.locked,
-                        log: &log_lines,
-                        masked: self.init_step == Some(InitStep::Passphrase),
-                    },
-                )
-            })?;
+            term.draw(|f| render::draw(f, &self.view(&log_lines)))?;
 
             if event::poll(TICK)? {
                 if let Event::Key(k) = event::read()? {
@@ -302,6 +372,12 @@ impl App {
                 KeyCode::Tab | KeyCode::BackTab => Key::Tab,
                 KeyCode::Enter => Key::Enter,
                 KeyCode::Esc => Key::Esc,
+                KeyCode::Backspace => Key::Backspace,
+                KeyCode::Delete => Key::Delete,
+                KeyCode::Left => Key::Left,
+                KeyCode::Right => Key::Right,
+                KeyCode::Home => Key::Home,
+                KeyCode::End => Key::End,
                 KeyCode::Char(c) => Key::Char(c),
                 _ => return,
             },
@@ -323,21 +399,56 @@ impl App {
 
         match Binding::of(press, interp) {
             // Reachable from every mode, dispatched above every mode branch.
+            Binding::Quit => self.quit = true,
             Binding::Lock => self.lock(),
             Binding::CycleFocus => self.ui.cycle_focus(),
             Binding::CycleFocusBack => self.ui.cycle_focus_back(),
             Binding::ToggleZoom => self.ui.toggle_zoom(),
             Binding::SwitchTab => self.ui.switch_tab(),
+            Binding::SelectTab(t) => self.ui.select_tab(t),
+            Binding::ToggleFullScreen => self.ui.toggle_full_screen(),
             Binding::Compose if !self.locked => self.ui.compose(),
-            Binding::Cancel if typing => self.command.clear(),
-            Binding::Cancel => {
-                if self.ui.mode() == Mode::Compose {
-                    // RFC 7 §8: plaintext exists only while displayed.
-                    overwrite(&mut self.composer);
-                    self.ui.end_compose();
+
+            // Editing goes to whichever line is being typed into. The
+            // passphrase gets the same vocabulary as the command line: it is
+            // masked, so an operator who cannot correct it cannot recover.
+            Binding::Edit(e) => {
+                let line = if self.init_step == Some(InitStep::Passphrase) {
+                    &mut self.passphrase
+                } else if typing {
+                    &mut self.command
                 } else {
-                    self.ui.ascend();
+                    return;
+                };
+                use keys::Edit;
+                match e {
+                    Edit::Backspace => line.backspace(),
+                    Edit::Delete => line.delete(),
+                    Edit::Left => line.left(),
+                    Edit::Right => line.right(),
+                    Edit::WordLeft => line.word_left(),
+                    Edit::WordRight => line.word_right(),
+                    Edit::Home => line.home(),
+                    Edit::End => line.end(),
+                    Edit::KillWord => line.kill_word(),
+                    Edit::KillToStart => line.kill_to_start(),
+                    Edit::KillToEnd => line.kill_to_end(),
                 }
+            }
+            // **Esc returns the interface to its default screen.** Not a
+            // stack to unwind one level at a time: an operator who has zoomed
+            // a pane while composing inside a channel should not have to
+            // remember how many things are open in order to get out.
+            Binding::Cancel => {
+                // RFC 7 §8: plaintext exists only while displayed, so a draft
+                // being abandoned is overwritten rather than dropped.
+                overwrite(&mut self.composer);
+                self.command.clear();
+                self.ui.reset();
+                // The first-run ceremony is deliberately not cancelled here.
+                // It owns Enter while it runs, it holds a passphrase that is
+                // mid-entry, and losing it to a stray Esc would mean starting
+                // the key hierarchy again.
             }
             // Enter in the command pane submits; elsewhere it descends into
             // the list. RFC 8 §2's two-level channel list needs both.
@@ -358,13 +469,11 @@ impl App {
             }
             Binding::Input(c) => {
                 if self.init_step == Some(InitStep::Passphrase) {
-                    self.passphrase.push(c);
+                    self.passphrase.insert(c);
                 } else if typing {
-                    self.command.push(c);
+                    self.command.insert(c);
                 } else if self.ui.mode() == Mode::Compose {
                     self.composer.push(c);
-                } else if c == 'q' {
-                    self.quit = true;
                 }
             }
             _ => {}
@@ -737,25 +846,28 @@ impl App {
 
     /// Run whatever is on the command line.
     fn submit(&mut self) {
-        let line = core::mem::take(&mut self.command);
+        let line = self.command.take();
         let Some(cmd) = Command::parse(&line) else {
-            self.body = format!("unknown command: {}", line.trim());
+            self.output = format!(
+                "unknown command: {}\n\nType `help` for the verbs, or Ctrl-Q to quit.",
+                line.trim()
+            );
             return;
         };
         match admit(&cmd, self.identity.is_some(), self.locked, self.confirmed) {
             Err(Refusal::NoIdentity) => {
-                self.body = "no identity yet — run `init` first".into();
+                self.output = "no identity yet — run `init` first".into();
             }
             Err(Refusal::Locked) => {
-                self.body = format!("`{cmd}` needs an unlocked node");
+                self.output = format!("`{cmd}` needs an unlocked node");
             }
             Err(Refusal::AlreadyInitialised) => {
-                self.body = "this node already has an identity; `init` runs once".into();
+                self.output = "this node already has an identity; `init` runs once".into();
             }
             Err(Refusal::NeedsConfirmation) => {
                 // RFC 7 §10 — the one irreversible verb, and the one prompt.
                 self.confirmed = true;
-                self.body = format!("`{cmd}` destroys the key hierarchy                     and cannot be undone. Type it again to confirm.");
+                self.output = format!("`{cmd}` destroys the key hierarchy and cannot be undone. Type it again to confirm.");
             }
             Ok(()) => {
                 self.confirmed = false;
@@ -768,14 +880,14 @@ impl App {
         match cmd {
             Command::Init => {
                 self.init_step = Some(InitStep::Passphrase);
-                self.body = InitStep::Passphrase.prompt().into();
+                self.output = InitStep::Passphrase.prompt().into();
             }
             Command::Lock => self.lock(),
             Command::Duress => {
                 // RFC 7 §10: "Neither MUST be enabled by default. Both MUST be
                 // discoverable." So it is a verb, and it says what it does.
                 let Some(phrase) = line.split_once(char::is_whitespace).map(|x| x.1) else {
-                    self.body = "usage: duress <passphrase>\n\n\
+                    self.output = "usage: duress <passphrase>\n\n\
                                  Sets a second passphrase that destroys this node \
                                  and then behaves like a fresh install. There is no \
                                  confirmation and no warning when it is used — that \
@@ -783,7 +895,7 @@ impl App {
                         .into();
                     return;
                 };
-                self.body = match self.set_duress(phrase.trim().as_bytes()) {
+                self.output = match self.set_duress(phrase.trim().as_bytes()) {
                     Ok(()) => "duress passphrase set. Entering it at the unlock \
                                prompt destroys this node and shows an empty one. \
                                Nothing will warn you, including this node."
@@ -797,12 +909,12 @@ impl App {
                 self.init_step = Some(InitStep::Passphrase);
                 self.unlocking = true;
                 self.node.unlocking = true;
-                self.body = "passphrase:".into();
+                self.output = "passphrase:".into();
             }
-            Command::Wipe => self.body = self.panic_wipe(),
+            Command::Wipe => self.output = self.panic_wipe(),
             Command::Peer => {
                 let rest = line.trim().strip_prefix("peer").unwrap_or("");
-                self.body = match Peering::parse(rest) {
+                self.output = match Peering::parse(rest) {
                     // `offer` writes two files on purpose — see `peering`.
                     Some(Peering::Offer) => self.peer_offer(),
                     Some(Peering::Accept) => self.peer_accept(arg(rest, 1)),
@@ -813,8 +925,50 @@ impl App {
                 };
             }
             // RFC 3 §11 step 2, and RFC 8 §5's `verify`.
+            Command::Quit => self.quit = true,
+            Command::Listen => {
+                // An address typed here wins over `--listen`; `--listen` is
+                // the default so the operator does not retype what they
+                // launched with.
+                let typed = arg(line, 2).map(str::to_string);
+                let addr = typed.or_else(|| self.listen.clone());
+                let (Some(peer), Some(addr)) = (arg(line, 1), addr.as_deref()) else {
+                    self.output = format!(
+                        "usage: listen <peer> <address>\n\n  \
+                         tcp     host:port — e.g. listen bob 127.0.0.1:40000\n  \
+                         serial  {}\n\n\
+                         Waits up to {ANSWER_WAIT_S}s for that peer to call, then \
+                         hands the prompt back. With --listen given at launch \
+                         the address may be omitted.",
+                        krab_fabric::backend::serial::SerialFabric::device_hint()
+                    );
+                    return;
+                };
+                // Serial device paths are not host:port; everything else is
+                // TCP. The transport is inferred rather than typed because a
+                // bind address already says which one it is.
+                let kind = if addr.contains(':') && !addr.starts_with('/') {
+                    "tcp"
+                } else {
+                    "serial"
+                };
+                self.dispatch_connect(peer, kind, Some(addr), true, line);
+            }
+            Command::Help => {
+                // Into the body pane: RFC 8 §3 forbids scrolling output
+                // through the two-line command pane.
+                let mut out = String::from("verbs\n");
+                for (verb, what) in Command::SYNOPSES {
+                    out.push_str(&format!("  {verb:<20}{what}\n"));
+                }
+                out.push_str("\nkeys\n");
+                for (chord, what) in Command::CHORDS {
+                    out.push_str(&format!("  {chord:<20}{what}\n"));
+                }
+                self.output = out;
+            }
             Command::Verify => {
-                self.body = match &self.identity {
+                self.output = match &self.identity {
                     Some(id) => format!(
                         "read these eight words aloud and hear the same back:\n\n  {}",
                         id.fingerprint()
@@ -826,69 +980,26 @@ impl App {
             // guarantee is structural -- `LinkTable` has no reconciler to call.
             Command::Connect => {
                 let (Some(peer), kind) = (arg(line, 1), arg(line, 2).unwrap_or("tcp")) else {
-                    self.body = format!(
+                    self.output = format!(
                         "usage: connect <peer> <transport> [address]\n\n  \
                          tcp      host:port\n  \
                          serial   {}\n  \
-                         modem    same as serial; add `answer` to wait for the call\n  \
-                         courier  no address — use `pack` and `import`",
+                         modem    same as serial\n  \
+                         courier  no address — use `pack` and `import`\n\n\
+                         To wait for a call instead of placing one, use `listen`.",
                         krab_fabric::backend::serial::SerialFabric::device_hint()
                     );
                     return;
                 };
-                let Some(profile) = profile_named(kind) else {
-                    self.body = format!("unknown transport {kind:?}");
-                    return;
-                };
-                self.links.connect(peer, profile.clone());
-                // Register with the schedule. This is the *only* coupling
-                // between a user action and the scheduler, and it adds a peer
-                // rather than triggering anything: the first interval is drawn
-                // from entropy, not from now (RFC 5 §6.1).
-                if let Some(id) = sync::peer_id_of(peer) {
-                    let now_s = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let mut e = [0u8; 8];
-                    OsRng.fill(&mut e);
-                    self.scheduler.add(id, now_s, u64::from_le_bytes(e));
-                }
-                // A real handshake, if an address and a peer-link are both
-                // available. RFC 4 §4.1 requires the presented static match
-                // the credential, and `TcpFabric` takes the expected key as a
-                // required argument — so a peer with no stored card cannot be
-                // connected to over TCP at all, which is the correct refusal.
-                // `connect <peer> <transport> <address> [answer]`
+                // `answer` is still accepted here, because it was documented
+                // and an operator may have it in their fingers, but `listen`
+                // is the verb that says what it does.
                 let answer = line.split_whitespace().any(|t| t == "answer");
-                match self.establish(peer, kind, arg(line, 3), answer) {
-                    Ok(session) => {
-                        self.links.established(peer, session);
-                        self.log.push(activity_log::Event::LinkUp {
-                            peer: peer.to_string(),
-                            kind: profile.kind,
-                        });
-                    }
-                    Err(why) => {
-                        self.links.failed(peer);
-                        self.log.push(activity_log::Event::Failed {
-                            peer: peer.to_string(),
-                            why: "handshake refused",
-                        });
-                        self.body = why;
-                        return;
-                    }
-                }
-                let l = self.links.get(peer).expect("just connected");
-                self.body = format!(
-                    "{}\n\nnothing was transferred. Reconciliation is scheduled \
-                     and does not follow your keypresses (RFC 8 §5.1).",
-                    l.status_line()
-                );
+                self.dispatch_connect(peer, kind, arg(line, 3), answer, line);
             }
             Command::Disconnect => {
                 let Some(peer) = arg(line, 1) else {
-                    self.body = "usage: disconnect <peer>".into();
+                    self.output = "usage: disconnect <peer>".into();
                     return;
                 };
                 if let Some(id) = sync::peer_id_of(peer) {
@@ -899,7 +1010,7 @@ impl App {
                         peer: peer.to_string(),
                     });
                 }
-                self.body = if self.links.disconnect(peer) {
+                self.output = if self.links.disconnect(peer) {
                     // RFC 3 §6.2's quota reduction is deliberately not bundled:
                     // making disconnect a punishment discourages using it, and
                     // RFC 8 §5.3 needs operators to act.
@@ -908,11 +1019,11 @@ impl App {
                     format!("no link to {peer}")
                 };
             }
-            Command::Peers => self.body = self.peers_panel(),
-            Command::Reach => self.body = self.reach_report(line),
-            Command::Keys => self.body = self.keys_report(),
+            Command::Peers => self.output = self.peers_panel(),
+            Command::Reach => self.output = self.reach_report(line),
+            Command::Keys => self.output = self.keys_report(),
             Command::Rollcall => {
-                self.body = match &self.identity {
+                self.output = match &self.identity {
                     Some(id) => format!(
                         "rollcall entry for {} refreshed.\n\nIt carries your statics \
                          and policy, signed. It does not carry endpoints — those are \
@@ -922,10 +1033,10 @@ impl App {
                     None => "no identity — run `init` first".into(),
                 };
             }
-            Command::Send => self.body = self.send(line),
-            Command::Request => self.body = self.peer_request(line),
-            Command::Pack => self.body = self.pack(line),
-            Command::Import => self.body = self.import(line),
+            Command::Send => self.output = self.send(line),
+            Command::Request => self.output = self.peer_request(line),
+            Command::Pack => self.output = self.pack(line),
+            Command::Import => self.output = self.import(line),
         }
     }
 
@@ -1435,6 +1546,65 @@ impl App {
     /// reachable only inbound. That is not a failure: RFC 4 §5.5 is explicit
     /// that "whether anyone carries it is not the protocol's business", and
     /// I-4 forbids assuming reachability.
+    /// Bring a link up, dialling or answering. Shared by `connect` and
+    /// `listen`, which differ only in which end waits.
+    fn dispatch_connect(
+        &mut self,
+        peer: &str,
+        kind: &str,
+        addr: Option<&str>,
+        answer: bool,
+        _line: &str,
+    ) {
+        let Some(profile) = profile_named(kind) else {
+            self.output = format!("unknown transport {kind:?}");
+            return;
+        };
+        self.links.connect(peer, profile.clone());
+        // Register with the schedule. This is the *only* coupling between a
+        // user action and the scheduler, and it adds a peer rather than
+        // triggering anything: the first interval is drawn from entropy, not
+        // from now (RFC 5 §6.1).
+        if let Some(id) = sync::peer_id_of(peer) {
+            let now_s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut e = [0u8; 8];
+            OsRng.fill(&mut e);
+            self.scheduler.add(id, now_s, u64::from_le_bytes(e));
+        }
+        // A real handshake, if an address and a peer-link are both available.
+        // RFC 4 §4.1 requires the presented static match the credential, and
+        // `TcpFabric` takes the expected key as a required argument — so a peer
+        // with no stored card cannot be connected to over TCP at all, which is
+        // the correct refusal.
+        match self.establish(peer, kind, addr, answer) {
+            Ok(session) => {
+                self.links.established(peer, session);
+                self.log.push(activity_log::Event::LinkUp {
+                    peer: peer.to_string(),
+                    kind: profile.kind,
+                });
+            }
+            Err(why) => {
+                self.links.failed(peer);
+                self.log.push(activity_log::Event::Failed {
+                    peer: peer.to_string(),
+                    why: "handshake refused",
+                });
+                self.output = why;
+                return;
+            }
+        }
+        let l = self.links.get(peer).expect("just connected");
+        self.output = format!(
+            "{}\n\nnothing was transferred. Reconciliation is scheduled \
+             and does not follow your keypresses (RFC 8 §5.1).",
+            l.status_line()
+        );
+    }
+
     fn establish(
         &self,
         peer: &str,
@@ -1506,15 +1676,47 @@ impl App {
                         .map_err(|e| format!("could not originate on {addr}: {e}"))
                 }
             }
-            _ => krab_fabric::backend::tcp::TcpFabric::new(
-                krab_fabric::profile::LinkProfile::tcp(),
-                addr,
-                id.noise_bytes(),
-                card.noise_static_pk,
-            )
-            .connect()
-            .map(Some)
-            .map_err(|e| format!("could not establish a session with {peer}: {e}")),
+            _ => {
+                let fabric = krab_fabric::backend::tcp::TcpFabric::new(
+                    krab_fabric::profile::LinkProfile::tcp(),
+                    addr,
+                    id.noise_bytes(),
+                    card.noise_static_pk,
+                );
+                // `answer` reached the serial branch and stopped there, so over
+                // TCP every node dialled and none listened — two nodes on one
+                // host could not link at all. The fabric could listen the whole
+                // time; nothing asked it to.
+                if answer {
+                    fabric
+                        .listen(addr)
+                        .map_err(|e| format!("could not listen on {addr}: {e}"))?;
+                    // `accept` is non-blocking, so this is a bounded wait
+                    // rather than a hang: the operator gets the prompt back
+                    // and can try again, which a blocked UI would not allow.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(ANSWER_WAIT_S);
+                    loop {
+                        match fabric.accept() {
+                            Ok(Some(s)) => return Ok(Some(s)),
+                            Ok(None) if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            Ok(None) => {
+                                return Err(format!(
+                                    "nobody called on {addr} within {ANSWER_WAIT_S}s"
+                                ))
+                            }
+                            Err(e) => return Err(format!("could not answer on {addr}: {e}")),
+                        }
+                    }
+                } else {
+                    fabric
+                        .connect()
+                        .map(Some)
+                        .map_err(|e| format!("could not establish a session with {peer}: {e}"))
+                }
+            }
         }
     }
 
@@ -1663,9 +1865,9 @@ impl App {
             overwrite(&mut m.body);
         }
         self.messages.clear();
-        overwrite(&mut self.passphrase);
+        self.passphrase.clear();
         overwrite(&mut self.composer);
-        overwrite(&mut self.body);
+        overwrite(&mut self.output);
         self.locked = true;
         self.list = vec!["(wiped)".into()];
 
@@ -1707,14 +1909,35 @@ impl App {
     /// Called after anything that changes the corpus or the key hierarchy.
     /// Only wrapped or self-authenticating data — see `persist`'s module docs
     /// and `Documentation/NO-CONFIG.md`.
-    fn save(&self, kek: &krab_crypto::kek::Kek) {
-        let _ = persist::write_params(&self.path("kek.params"), &self.identity_params());
+    /// Write the store out.
+    ///
+    /// Errors are returned, not discarded. They were discarded — all three
+    /// writes were `let _ =` — so a home directory that did not exist (nothing
+    /// created it) produced a ceremony that announced success and left an
+    /// empty disk. A node that believes it saved a key hierarchy it did not
+    /// save is worse than one that failed to start.
+    fn save(&self, kek: &krab_crypto::kek::Kek) -> Result<(), String> {
+        let at = |what: &str, e: persist::Error| format!("could not write {what}: {e:?}");
+        persist::write_params(&self.path("kek.params"), &self.identity_params())
+            .map_err(|e| at("kek.params", e))?;
         if let Some(id) = &self.identity {
-            let _ = persist::write_identity(&self.path("identity.wrapped"), id, kek, &mut OsRng);
+            persist::write_identity(&self.path("identity.wrapped"), id, kek, &mut OsRng)
+                .map_err(|e| at("identity.wrapped", e))?;
         }
-        let _ = self
-            .store
-            .with(|s| persist::write_corpus(&self.path("corpus.krab"), s));
+        self.store
+            .with(|s| persist::write_corpus(&self.path("corpus.krab"), s))
+            .map(|_| ())
+            .map_err(|e| at("corpus.krab", e))
+    }
+
+    /// Make sure `--home` exists before anything tries to write into it.
+    ///
+    /// Created here rather than at each write: the operator names the
+    /// directory on the command line, and a typo that silently produces an
+    /// empty node is the failure this prevents.
+    fn ensure_home(&self) -> Result<(), String> {
+        std::fs::create_dir_all(&self.home)
+            .map_err(|e| format!("could not create {}: {e}", self.home.display()))
     }
 
     /// Persist just the corpus. Cheap, and needs no key.
@@ -1835,13 +2058,20 @@ impl App {
     }
 
     /// Derive the KEK and open the current epoch, RFC 7 §4.
-    fn open_store(&mut self) -> Result<(), krab_crypto::kek::Error> {
+    fn open_store(&mut self) -> Result<(), String> {
+        self.ensure_home()?;
         let Some(id) = &mut self.identity else {
-            return Err(krab_crypto::kek::Error::Kdf);
+            return Err("no identity to open a store for".into());
         };
-        let kek = id.kek(self.passphrase.as_bytes())?;
-        self.epoch_key = Some(id.hierarchy.open_epoch(&kek, now_epoch(), &mut OsRng)?);
-        self.save(&kek);
+        let kek = id
+            .kek(self.passphrase.as_string().as_bytes())
+            .map_err(|e| format!("could not derive the key: {e:?}"))?;
+        self.epoch_key = Some(
+            id.hierarchy
+                .open_epoch(&kek, now_epoch(), &mut OsRng)
+                .map_err(|e| format!("could not open the epoch: {e:?}"))?,
+        );
+        self.save(&kek)?;
         // `kek` drops here. RFC 7 §4: it is memory-only and never written, and
         // the shorter it lives the better — it is re-derived on unlock.
         Ok(())
@@ -1894,11 +2124,11 @@ impl App {
         // An unlock is a single step: derive and open, or refuse.
         if self.unlocking && step == InitStep::Passphrase {
             if self.passphrase.is_empty() {
-                self.body = "a passphrase is required".into();
+                self.output = "a passphrase is required".into();
                 return;
             }
-            let passphrase = core::mem::take(&mut self.passphrase);
-            self.body = match self.unlock(passphrase.as_bytes()) {
+            let passphrase = self.passphrase.take();
+            self.output = match self.unlock(passphrase.as_bytes()) {
                 Ok(()) => format!(
                     "unlocked {}",
                     self.identity
@@ -1920,7 +2150,7 @@ impl App {
         // only root (RFC 7 §4), so an empty passphrase is a store anyone who
         // picks up the disk can open.
         if step == InitStep::Passphrase && self.passphrase.is_empty() {
-            self.body = "a passphrase is required — it is the only root".into();
+            self.output = "a passphrase is required — it is the only root".into();
             return;
         }
 
@@ -1930,7 +2160,7 @@ impl App {
                 // current epoch's wrapper. Argon2id at RFC 7 §4.1's parameters
                 // takes ~500 ms and 64 MiB, which is the whole point — it is
                 // what a seized disk has to get through.
-                self.body = match self.open_store() {
+                self.output = match self.open_store() {
                     Ok(()) => format!(
                         "{}\n\nmessage history is NOT recoverable from that backup, \
                          and that is intentional (RFC 7 §11).",
@@ -1939,18 +2169,18 @@ impl App {
                     Err(e) => {
                         // Leave the ceremony where it is: an identity without a
                         // KEK has nothing to wrap its keys under.
-                        return self.body = format!("could not derive the key: {e:?}");
+                        return self.output = e;
                     }
                 };
                 self.init_step = None;
                 // The passphrase has done its work and must not linger (§9).
-                overwrite(&mut self.passphrase);
+                self.passphrase.clear();
             }
             Some(next) => {
                 if next == InitStep::Generate {
                     // Every key this node will ever hold originates here.
                     let id = Identity::generate(&mut OsRng);
-                    self.body = format!("generated {}", id.short_id());
+                    self.output = format!("generated {}", id.short_id());
                     self.identity = Some(id);
                 }
                 self.init_step = Some(next);
@@ -1960,9 +2190,9 @@ impl App {
                         .as_ref()
                         .map(|i| i.backup_phrase())
                         .unwrap_or_default();
-                    self.body = format!("{}\n\n{}", next.prompt(), phrase);
+                    self.output = format!("{}\n\n{}", next.prompt(), phrase);
                 } else if next != InitStep::Generate {
-                    self.body = next.prompt().into();
+                    self.output = next.prompt().into();
                 }
             }
         }
@@ -1994,10 +2224,14 @@ impl App {
         // reconciles — but the screen must not list correspondents.
         self.log.clear();
         self.list = vec!["(locked)".into()];
-        overwrite(&mut self.passphrase);
+        self.passphrase.clear();
         overwrite(&mut self.composer);
+        // Both panes. `body` holds decrypted message plaintext and `output`
+        // holds command output, and RFC 7 §8 does not distinguish: what is on
+        // screen when the node locks must not survive the lock.
         overwrite(&mut self.body);
-        self.body.push_str("locked");
+        overwrite(&mut self.output);
+        self.output.push_str("locked");
         self.ui.end_compose();
         self.locked = true;
     }
@@ -2152,7 +2386,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         a.identity = Some(id);
-        a.passphrase.push_str("a passphrase");
+        a.passphrase = line::Line::from("a passphrase");
         a.open_store().expect("store opens");
         a
     }
@@ -2161,7 +2395,7 @@ mod tests {
     /// verb, which writes where told and never to the node's own storage.
     fn pad_onto(from: &mut App, dest: &std::path::Path) -> String {
         type_command(from, &format!("peer pad {}", dest.display()));
-        assert!(dest.exists(), "peer pad wrote nothing: {}", from.body);
+        assert!(dest.exists(), "peer pad wrote nothing: {}", from.output);
         dest.to_string_lossy().into_owned()
     }
 
@@ -2178,7 +2412,7 @@ mod tests {
     fn a_fresh_install_directs_the_operator_to_init() {
         let mut a = App::default();
         type_command(&mut a, "send");
-        assert!(a.body.contains("run `init` first"), "{}", a.body);
+        assert!(a.output.contains("run `init` first"), "{}", a.output);
         assert!(a.identity.is_none());
     }
 
@@ -2188,7 +2422,7 @@ mod tests {
     fn finishing_init_opens_the_current_epoch() {
         let mut a = App::default();
         a.identity = Some(Identity::generate(&mut OsRng));
-        a.passphrase.push_str("a passphrase");
+        a.passphrase = line::Line::from("a passphrase");
         // Use cheap Argon2id parameters; the specified ones are exercised in
         // `krab_crypto::kek`.
         {
@@ -2242,7 +2476,7 @@ mod tests {
         );
         // And it will not run twice.
         type_command(&mut a, "init");
-        assert!(a.body.contains("runs once"), "{}", a.body);
+        assert!(a.output.contains("runs once"), "{}", a.output);
     }
 
     /// Wipe is the only verb that asks twice, and lock is not on that list.
@@ -2251,7 +2485,7 @@ mod tests {
         let mut a = App::default();
         a.identity = Some(Identity::generate(&mut entropy::OsRng));
         type_command(&mut a, "wipe");
-        assert!(a.body.contains("cannot be undone"), "{}", a.body);
+        assert!(a.output.contains("cannot be undone"), "{}", a.output);
         assert!(a.identity.is_some(), "first wipe only prompts");
         type_command(&mut a, "wipe");
         assert!(a.identity.is_none(), "second wipe destroys");
@@ -2263,12 +2497,12 @@ mod tests {
         let mut a = ready_node("offer-names");
         type_command(&mut a, "peer offer");
         assert!(
-            a.body.contains("peer.card") && a.body.contains("peer.pad"),
+            a.output.contains("peer.card") && a.output.contains("peer.pad"),
             "{}",
-            a.body
+            a.output
         );
         assert!(
-            a.body.contains("SECRET"),
+            a.output.contains("SECRET"),
             "the unforwardable half is marked"
         );
     }
@@ -2277,7 +2511,7 @@ mod tests {
     fn an_unknown_command_is_reported_not_swallowed() {
         let mut a = App::default();
         type_command(&mut a, "frobnicate");
-        assert!(a.body.contains("unknown command"), "{}", a.body);
+        assert!(a.output.contains("unknown command"), "{}", a.output);
     }
 
     #[test]
@@ -2300,6 +2534,10 @@ mod tests {
     fn the_composer_does_not_swallow_the_lock_chord() {
         let mut a = app();
         a.ui.compose();
+        // Focus the view pane, where the composer is drawn — on the command
+        // line a letter goes to the command line, which is the point.
+        a.ui.cycle_focus();
+        a.ui.cycle_focus();
         a.on_key(KeyCode::Char('l'), KeyModifiers::NONE);
         assert!(a.composer.ends_with('l'), "plain l types");
         assert!(!a.locked);
@@ -2323,6 +2561,9 @@ mod tests {
     #[test]
     fn any_pane_zooms_and_unzooms() {
         let mut a = App::default();
+        // `z` is a chord in the body panes; on the command line it is a letter,
+        // which is the whole point of focus deciding interpretation.
+        a.ui.cycle_focus();
         a.on_key(KeyCode::Char('z'), KeyModifiers::NONE);
         assert!(a.ui.zoomed().is_some());
         a.on_key(KeyCode::Char('z'), KeyModifiers::NONE);
@@ -2343,6 +2584,9 @@ mod tests {
     fn cancelling_a_composition_zeroizes_the_draft() {
         let mut a = app();
         a.ui.compose();
+        // Esc on the command line clears the command line — the composer is
+        // cancelled from the pane it is displayed in.
+        a.ui.cycle_focus();
         a.on_key(KeyCode::Esc, KeyModifiers::NONE);
         assert!(a.composer.is_empty());
         assert_eq!(a.ui.mode(), Mode::Browse);
@@ -2383,15 +2627,15 @@ mod tests {
         // Step 1 (receive) and step 2. Each side sees the other's words.
         type_command(&mut a, &format!("peer accept {b_card}"));
         assert!(
-            a.body.contains("read these eight words aloud"),
+            a.output.contains("read these eight words aloud"),
             "{}",
-            a.body
+            a.output
         );
         type_command(&mut b, &format!("peer accept {a_card}"));
         assert!(
-            b.body.contains("read these eight words aloud"),
+            b.output.contains("read these eight words aloud"),
             "{}",
-            b.body
+            b.output
         );
 
         // The fingerprint each side is asked to read must be the other's.
@@ -2413,15 +2657,15 @@ mod tests {
         let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
         type_command(&mut a, &format!("peer seal {b_pad} media"));
         type_command(&mut b, &format!("peer seal {a_pad} media"));
-        assert!(a.body.starts_with("peer-link signed"), "{}", a.body);
-        assert!(b.body.starts_with("peer-link signed"), "{}", b.body);
+        assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
+        assert!(b.output.starts_with("peer-link signed"), "{}", b.output);
         // Both ends report the same agreed terms, from opposite directions.
-        assert!(a.body.contains("agreed: buckets to 5"), "{}", a.body);
-        assert!(b.body.contains("agreed: buckets to 5"), "{}", b.body);
+        assert!(a.output.contains("agreed: buckets to 5"), "{}", a.output);
+        assert!(b.output.contains("agreed: buckets to 5"), "{}", b.output);
 
         // Sneakernet keeps the post-quantum property, so neither is warned.
-        assert!(!a.body.contains("does NOT survive"), "{}", a.body);
-        assert!(!a.body.contains("never compared"), "{}", a.body);
+        assert!(!a.output.contains("does NOT survive"), "{}", a.output);
+        assert!(!a.output.contains("never compared"), "{}", a.output);
 
         // **Both ends derived the same reservoir**, having exchanged only files.
         // The peer-link is named for the counterparty, so each side looks the
@@ -2466,14 +2710,14 @@ mod tests {
         let pad = a.path("b.pad").display().to_string();
         type_command(&mut a, &format!("peer accept {card}"));
         type_command(&mut a, &format!("peer seal {pad} corpus"));
-        assert!(a.body.starts_with("peer-link signed"), "{}", a.body);
+        assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
         assert!(
-            a.body.contains("does NOT survive"),
+            a.output.contains("does NOT survive"),
             "the downgrade is stated: {}",
-            a.body
+            a.output
         );
         assert!(
-            a.body.contains("never compared"),
+            a.output.contains("never compared"),
             "and so is the skipped step"
         );
     }
@@ -2485,11 +2729,11 @@ mod tests {
         let mut a = ready_node("chan");
         type_command(&mut a, "peer offer");
         type_command(&mut a, "peer seal somewhere.pad");
-        assert!(a.body.contains("usage:"), "{}", a.body);
-        assert!(a.body.contains("not guessed"), "{}", a.body);
+        assert!(a.output.contains("usage:"), "{}", a.output);
+        assert!(a.output.contains("not guessed"), "{}", a.output);
 
         type_command(&mut a, "peer seal somewhere.pad probably-fine");
-        assert!(a.body.contains("unknown channel"), "{}", a.body);
+        assert!(a.output.contains("unknown channel"), "{}", a.output);
     }
 
     /// **A counterparty cannot be substituted after the words were read.**
@@ -2516,11 +2760,11 @@ mod tests {
 
         let p1 = a.path("first.card").display().to_string();
         type_command(&mut a, &format!("peer accept {p1}"));
-        assert!(a.body.contains("eight words"), "{}", a.body);
+        assert!(a.output.contains("eight words"), "{}", a.output);
 
         let p2 = a.path("second.card").display().to_string();
         type_command(&mut a, &format!("peer accept {p2}"));
-        assert!(a.body.contains("already recorded"), "{}", a.body);
+        assert!(a.output.contains("already recorded"), "{}", a.output);
     }
 
     /// **A locked node cannot read its own ceremony state.**
@@ -2565,7 +2809,7 @@ mod tests {
 
         let p = a.path("forged.card").display().to_string();
         type_command(&mut a, &format!("peer accept {p}"));
-        assert!(a.body.contains("does not verify"), "{}", a.body);
+        assert!(a.output.contains("does not verify"), "{}", a.output);
         assert!(
             a.load_ceremony().unwrap().their_card.is_none(),
             "nothing recorded"
@@ -2586,7 +2830,7 @@ mod tests {
         let mut a = ready_node("connect");
         type_command(&mut a, "connect q3m9 tcp");
 
-        let body = a.body.to_lowercase();
+        let body = a.output.to_lowercase();
         for forbidden in [
             "syncing",
             "sync now",
@@ -2599,12 +2843,12 @@ mod tests {
             assert!(
                 !body.contains(forbidden),
                 "{:?} contains {forbidden:?}",
-                a.body
+                a.output
             );
         }
         // It says the true thing instead.
-        assert!(a.body.contains("nothing was transferred"), "{}", a.body);
-        assert!(a.body.contains("link up"), "{}", a.body);
+        assert!(a.output.contains("nothing was transferred"), "{}", a.output);
+        assert!(a.output.contains("link up"), "{}", a.output);
         // And nothing was scheduled by the keypress.
         assert_eq!(a.links.get("q3m9").unwrap().next_sync_min, None);
     }
@@ -2628,11 +2872,11 @@ mod tests {
         let mut a = ready_node("disconnect");
         type_command(&mut a, "connect q3m9 tcp");
         type_command(&mut a, "disconnect q3m9");
-        assert!(a.body.contains("Quota unchanged"), "{}", a.body);
+        assert!(a.output.contains("Quota unchanged"), "{}", a.output);
         assert_eq!(a.links.up_count(), 0);
 
         type_command(&mut a, "disconnect nobody");
-        assert!(a.body.contains("no link"), "{}", a.body);
+        assert!(a.output.contains("no link"), "{}", a.output);
     }
 
     /// **RFC 8 §5.2's reason for existing.** A LoRa link silently drops
@@ -2643,22 +2887,22 @@ mod tests {
         type_command(&mut a, "connect m4k2 lora");
 
         type_command(&mut a, "reach m4k2 --size 256");
-        assert!(a.body.contains("ADMIT"), "{}", a.body);
-        assert!(a.body.contains("1 of 1"), "{}", a.body);
+        assert!(a.output.contains("ADMIT"), "{}", a.output);
+        assert!(a.output.contains("1 of 1"), "{}", a.output);
 
         type_command(&mut a, "reach m4k2 --size 8192");
-        assert!(a.body.contains("BLOCK"), "{}", a.body);
-        assert!(a.body.contains("max_bucket"), "{}", a.body);
-        assert!(a.body.contains("0 of 1"), "{}", a.body);
+        assert!(a.output.contains("BLOCK"), "{}", a.output);
+        assert!(a.output.contains("max_bucket"), "{}", a.output);
+        assert!(a.output.contains("0 of 1"), "{}", a.output);
         // The state where the operator most needs to know no error is coming.
-        assert!(a.body.contains("silent"), "{}", a.body);
+        assert!(a.output.contains("silent"), "{}", a.output);
     }
 
     #[test]
     fn reach_with_no_links_says_so() {
         let mut a = ready_node("reach-empty");
         type_command(&mut a, "reach anyone");
-        assert!(a.body.contains("no links"), "{}", a.body);
+        assert!(a.output.contains("no links"), "{}", a.output);
     }
 
     /// The panel must not invent rows it has no data for.
@@ -2666,18 +2910,18 @@ mod tests {
     fn peers_reports_honestly_when_nothing_has_reconciled() {
         let mut a = ready_node("peers");
         type_command(&mut a, "peers");
-        assert!(a.body.contains("peer offer"), "{}", a.body);
+        assert!(a.output.contains("peer offer"), "{}", a.output);
 
         type_command(&mut a, "connect q3m9 tcp");
         type_command(&mut a, "peers");
-        assert!(a.body.contains("q3m9"), "{}", a.body);
+        assert!(a.output.contains("q3m9"), "{}", a.output);
         assert!(
-            a.body.contains("no accountability metrics yet"),
+            a.output.contains("no accountability metrics yet"),
             "{}",
-            a.body
+            a.output
         );
         // Still no per-object anything (RFC 3 §12).
-        assert!(!a.body.contains("id="), "{}", a.body);
+        assert!(!a.output.contains("id="), "{}", a.output);
     }
 
     /// `keys` reports state and does not re-show the backup — RFC 7 §11 makes
@@ -2687,17 +2931,17 @@ mod tests {
     fn keys_reports_state_without_reprinting_the_backup() {
         let mut a = ready_node("keys");
         type_command(&mut a, "keys");
-        assert!(a.body.contains("shown once at init"), "{}", a.body);
-        assert!(a.body.contains("not recoverable"), "{}", a.body);
+        assert!(a.output.contains("shown once at init"), "{}", a.output);
+        assert!(a.output.contains("not recoverable"), "{}", a.output);
 
         // The backup words themselves must not be in the output.
         let backup = a.identity.as_ref().unwrap().backup_phrase();
         let first_word = backup.split_whitespace().next().unwrap();
         let second = backup.split_whitespace().nth(1).unwrap();
         assert!(
-            !(a.body.contains(first_word) && a.body.contains(second)),
+            !(a.output.contains(first_word) && a.output.contains(second)),
             "the backup phrase leaked into `keys`: {}",
-            a.body
+            a.output
         );
     }
 
@@ -2708,7 +2952,11 @@ mod tests {
     fn rollcall_does_not_publish_endpoints() {
         let mut a = ready_node("rollcall");
         type_command(&mut a, "rollcall");
-        assert!(a.body.contains("does not carry endpoints"), "{}", a.body);
+        assert!(
+            a.output.contains("does not carry endpoints"),
+            "{}",
+            a.output
+        );
     }
 
     /// An unknown transport is refused rather than silently defaulted, since a
@@ -2718,7 +2966,7 @@ mod tests {
     fn an_unknown_transport_is_refused() {
         let mut a = ready_node("transport");
         type_command(&mut a, "connect q3m9 carrier-pigeon");
-        assert!(a.body.contains("unknown transport"), "{}", a.body);
+        assert!(a.output.contains("unknown transport"), "{}", a.output);
         assert_eq!(a.links.iter().count(), 0);
     }
 
@@ -2747,24 +2995,24 @@ mod tests {
             a.save_ceremony(&p).unwrap();
         }
         type_command(&mut a, &format!("peer seal {b_pad} media"));
-        assert!(a.body.starts_with("peer-link signed"), "{}", a.body);
+        assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
 
         // The peer-link is durable, and named by the peer's identifier.
         let peer = short_id(&b.identity.as_ref().unwrap().node_id());
         assert!(a.path(&format!("{peer}.link")).exists());
 
         type_command(&mut a, &format!("send {peer} meet me at the usual place"));
-        assert!(a.body.contains("composed"), "{}", a.body);
+        assert!(a.output.contains("composed"), "{}", a.output);
         assert!(
-            a.body.contains("post-quantum"),
+            a.output.contains("post-quantum"),
             "the reservoir was used: {}",
-            a.body
+            a.output
         );
         assert_eq!(a.store.len(), 1, "the object is in the corpus");
 
         // **It did not transmit.** RFC 5 §6.1 -- emission is scheduled, and
         // saying otherwise would make transmission timing follow composition.
-        assert!(a.body.contains("not now"), "{}", a.body);
+        assert!(a.output.contains("not now"), "{}", a.output);
         assert_eq!(a.links.up_count(), 0);
 
         // Now read it as B would, from the object alone.
@@ -2841,8 +3089,8 @@ mod tests {
     fn send_without_a_peer_link_says_what_to_do() {
         let mut a = ready_node("send-nolink");
         type_command(&mut a, "send nobody hello");
-        assert!(a.body.contains("no peer-link"), "{}", a.body);
-        assert!(a.body.contains("peer offer"), "{}", a.body);
+        assert!(a.output.contains("no peer-link"), "{}", a.output);
+        assert!(a.output.contains("peer offer"), "{}", a.output);
         assert_eq!(a.store.len(), 0);
     }
 
@@ -2853,7 +3101,7 @@ mod tests {
         let mut a = ready_node("send-locked");
         a.lock();
         type_command(&mut a, "send anyone hello");
-        assert!(a.body.contains("locked"), "{}", a.body);
+        assert!(a.output.contains("locked"), "{}", a.output);
     }
 
     /// Objects are padded to a bucket, so two messages of very different
@@ -2895,13 +3143,13 @@ mod tests {
 
         let peer = short_id(&b.identity.as_ref().unwrap().node_id());
         type_command(&mut a, &format!("send {peer} the usual place, thursday"));
-        assert!(a.body.contains("composed"), "{}", a.body);
+        assert!(a.output.contains("composed"), "{}", a.output);
 
         // Pack a stick.
         type_command(&mut a, "pack outbound.krab");
-        assert!(a.body.contains("wrote 1 objects"), "{}", a.body);
+        assert!(a.output.contains("wrote 1 objects"), "{}", a.output);
         assert!(
-            a.body.contains("not what changed"),
+            a.output.contains("not what changed"),
             "the window property is stated"
         );
         assert!(a.path("outbound.krab").exists());
@@ -2913,12 +3161,12 @@ mod tests {
         let delivered = b.path("holiday-photos.zip");
         std::fs::copy(a.path("outbound.krab"), &delivered).unwrap();
         type_command(&mut b, &format!("import {}", delivered.display()));
-        assert!(b.body.starts_with("1 new"), "{}", b.body);
-        assert!(b.body.contains("re-hashed"), "{}", b.body);
+        assert!(b.output.starts_with("1 new"), "{}", b.output);
+        assert!(b.output.contains("re-hashed"), "{}", b.output);
         assert_eq!(b.store.len(), 1);
 
         // B reads it, having received one file and nothing else.
-        let (id, raw) = b.store.with(|s| {
+        let (_id, raw) = b.store.with(|s| {
             let id = *s.ids_in_order().next().unwrap();
             (id, s.get(&id).unwrap().to_vec())
         });
@@ -3043,9 +3291,9 @@ mod tests {
         let mut a = ready_node("import-missing");
         type_command(&mut a, "import /nonexistent/stick.krab");
         assert!(
-            a.body.contains("not self-consistent") || a.body.contains("could not read"),
+            a.output.contains("not self-consistent") || a.output.contains("could not read"),
             "{}",
-            a.body
+            a.output
         );
     }
 
@@ -3092,7 +3340,7 @@ mod tests {
         // The view pane holds the command's output, which is correct — the
         // operator just ran `import` and wants its result. Selecting the
         // message is what puts the body there.
-        assert!(b.body.contains("1 new"), "{}", b.body);
+        assert!(b.output.contains("1 new"), "{}", b.output);
         b.show_selected();
         assert!(b.body.starts_with("from "), "{}", b.body);
         assert!(b.body.contains("bring the good coffee"), "{}", b.body);
@@ -3137,7 +3385,7 @@ mod tests {
         // Peer names are short node identifiers, so they are hex.
         type_command(&mut a, "connect a1b2c3d4 tcp");
         a.composer.push_str("a draft in progress");
-        a.command.push_str("half-typed");
+        a.command = line::Line::from("half-typed");
         let before = (a.composer.clone(), a.command.clone(), a.store.len());
 
         for _ in 0..20 {
@@ -3173,11 +3421,7 @@ mod tests {
         // is inherited, so a parent process would choose unseen.
         std::env::set_var("KRAB_HOME", "/tmp/should-be-ignored");
         let b = App::from_args(std::iter::empty()).unwrap();
-        assert_eq!(
-            b.home,
-            PathBuf::from("."),
-            "the environment must not decide"
-        );
+        assert_eq!(b.home, default_home(), "the environment must not decide");
         std::env::remove_var("KRAB_HOME");
     }
 
@@ -3236,13 +3480,17 @@ mod tests {
 
         // No destination: refuses and explains, rather than picking one.
         type_command(&mut a, "peer pad");
-        assert!(a.body.contains("usage:"), "{}", a.body);
-        assert!(a.body.contains("carrying"), "{}", a.body);
+        assert!(a.output.contains("usage:"), "{}", a.output);
+        assert!(a.output.contains("carrying"), "{}", a.output);
 
         let medium = a.home.join("removable-medium.pad");
         type_command(&mut a, &format!("peer pad {}", medium.display()));
         assert!(medium.exists());
-        assert!(a.body.contains("only unprotected artifact"), "{}", a.body);
+        assert!(
+            a.output.contains("only unprotected artifact"),
+            "{}",
+            a.output
+        );
 
         // It is the ceremony's contribution, and it matches.
         let written = ceremony::decode_contribution(&std::fs::read(&medium).unwrap()).unwrap();
@@ -3268,9 +3516,9 @@ mod tests {
             a.identity.is_none(),
             "the key is destroyed — that is the erasure"
         );
-        assert!(a.body.contains("overwritten and removed"), "{}", a.body);
+        assert!(a.output.contains("overwritten and removed"), "{}", a.output);
         assert!(
-            a.body.contains("not the erasure"),
+            a.output.contains("not the erasure"),
             "and it does not overclaim"
         );
 
@@ -3303,7 +3551,7 @@ mod tests {
         their_id.kek_params.t = 1;
         their_id.kek_params.p = 1;
         them.identity = Some(their_id);
-        them.passphrase.push_str("their passphrase");
+        them.passphrase = line::Line::from("their passphrase");
         them.open_store().unwrap();
         type_command(&mut them, "peer offer");
 
@@ -3317,7 +3565,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         a.identity = Some(id);
-        a.passphrase.push_str("open sesame please");
+        a.passphrase = line::Line::from("open sesame please");
         a.open_store().unwrap();
         let node_id = a.identity.as_ref().unwrap().node_id();
         let fingerprint = a.identity.as_ref().unwrap().fingerprint();
@@ -3373,7 +3621,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         a.identity = Some(id);
-        a.passphrase.push_str("the right one");
+        a.passphrase = line::Line::from("the right one");
         a.open_store().unwrap();
         drop(a);
 
@@ -3412,7 +3660,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         a.identity = Some(id);
-        a.passphrase.push_str("passphrase");
+        a.passphrase = line::Line::from("passphrase");
         a.open_store().unwrap();
         type_command(&mut a, "peer offer");
 
@@ -3454,7 +3702,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         a.identity = Some(id);
-        a.passphrase.push_str("the real one");
+        a.passphrase = line::Line::from("the real one");
         a.open_store().unwrap();
         type_command(&mut a, "peer offer");
         a.set_duress(b"under duress").unwrap();
@@ -3470,9 +3718,9 @@ mod tests {
 
         // What they see is what a first run looks like.
         assert_eq!(b.list, vec!["(no messages)".to_string()]);
-        assert!(!b.body.to_lowercase().contains("wipe"), "{}", b.body);
-        assert!(!b.body.to_lowercase().contains("destroy"), "{}", b.body);
-        assert!(!b.body.to_lowercase().contains("duress"), "{}", b.body);
+        assert!(!b.output.to_lowercase().contains("wipe"), "{}", b.output);
+        assert!(!b.output.to_lowercase().contains("destroy"), "{}", b.output);
+        assert!(!b.output.to_lowercase().contains("duress"), "{}", b.output);
 
         // And the store is gone, irreversibly — the real passphrase now opens
         // nothing either.
@@ -3499,7 +3747,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         a.identity = Some(id);
-        a.passphrase.push_str("the real one");
+        a.passphrase = line::Line::from("the real one");
         a.open_store().unwrap();
         let node_id = a.identity.as_ref().unwrap().node_id();
         a.set_duress(b"under duress").unwrap();
@@ -3533,7 +3781,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         a.identity = Some(id);
-        a.passphrase.push_str("only one");
+        a.passphrase = line::Line::from("only one");
         a.open_store().unwrap();
         drop(a);
 
@@ -3564,7 +3812,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         a.identity = Some(id);
-        a.passphrase.push_str("passphrase");
+        a.passphrase = line::Line::from("passphrase");
         a.open_store().unwrap();
         type_command(&mut a, "peer offer");
 
@@ -3598,7 +3846,7 @@ mod tests {
         std::fs::copy(b.path("peer.card"), a.path("stranger.card")).unwrap();
         let card = a.path("stranger.card").display().to_string();
         type_command(&mut a, &format!("request {card} we met at the thing"));
-        assert!(a.body.contains("request composed"), "{}", a.body);
+        assert!(a.output.contains("request composed"), "{}", a.output);
         assert_eq!(a.store.len(), 1);
 
         // It travels as an ordinary object, so a stick carries it.
@@ -3685,7 +3933,7 @@ mod tests {
         let mut a = ready_node("req-locked");
         a.lock();
         type_command(&mut a, "request anything.card note");
-        assert!(a.body.contains("locked"), "{}", a.body);
+        assert!(a.output.contains("locked"), "{}", a.output);
     }
 
     /// **CRYPTO-REVIEW.md §11.5, wired.** A node that was off for a long gap
@@ -3707,7 +3955,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         a.identity = Some(id);
-        a.passphrase.push_str("passphrase");
+        a.passphrase = line::Line::from("passphrase");
         a.open_store().unwrap();
 
         // A reservoir as the ceremony would have left it, some epochs ago.
@@ -3899,11 +4147,11 @@ mod tests {
         }
         let mut a = ready_node("serial-tty");
         type_command(&mut a, "connect a1b2c3d4 serial /dev/tty.usbserial-XX");
-        assert!(a.body.contains("dial-in"), "{}", a.body);
+        assert!(a.output.contains("dial-in"), "{}", a.output);
         assert!(
-            a.body.contains("cu."),
+            a.output.contains("cu."),
             "the remedy must be in the message: {}",
-            a.body
+            a.output
         );
     }
 
@@ -3913,12 +4161,12 @@ mod tests {
     fn connect_usage_names_a_device_for_this_platform() {
         let mut a = ready_node("serial-usage");
         type_command(&mut a, "connect");
-        assert!(a.body.contains("serial"), "{}", a.body);
-        assert!(a.body.contains("modem"), "{}", a.body);
+        assert!(a.output.contains("serial"), "{}", a.output);
+        assert!(a.output.contains("modem"), "{}", a.output);
         if cfg!(target_os = "windows") {
-            assert!(a.body.contains("COM"), "{}", a.body);
+            assert!(a.output.contains("COM"), "{}", a.output);
         } else {
-            assert!(a.body.contains("/dev/"), "{}", a.body);
+            assert!(a.output.contains("/dev/"), "{}", a.output);
         }
     }
 
@@ -3928,7 +4176,7 @@ mod tests {
     fn a_serial_link_still_requires_a_verified_credential() {
         let mut a = ready_node("serial-nolink");
         type_command(&mut a, "connect a1b2c3d4 serial /dev/cu.nonexistent");
-        assert!(a.body.contains("no peer-link"), "{}", a.body);
+        assert!(a.output.contains("no peer-link"), "{}", a.output);
     }
 
     /// **The negotiated retention is enforced, not decorative.** `evict_to`
@@ -4006,5 +4254,456 @@ mod tests {
             1,
             "a corpus inside its agreement was evicted"
         );
+    }
+
+    /// **Is the interface usable from a cold start?**
+    ///
+    /// Added after the author ran it and reported the command pane did not
+    /// work. It did not: focus began on the list pane, where letters are
+    /// chords, so `init` was four ignored keystrokes and nothing happened.
+    #[test]
+    fn a_fresh_node_can_be_driven_from_the_keyboard() {
+        let mut a = App::default();
+        a.home = temp_home("cold-start");
+
+        // Typing lands in the command line without touching anything first.
+        for c in "keys".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            a.command.as_string(),
+            "keys",
+            "typing did not reach the command line"
+        );
+
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(a.command.is_empty(), "submitting did not clear the line");
+        assert!(
+            a.output.contains("init"),
+            "a fresh node must say what to do: {}",
+            a.output
+        );
+    }
+
+    /// **There must always be a way out.** Before `Ctrl-Q` there was none:
+    /// `q` resolved to `Ignored` in browse mode, and the branch that set
+    /// `quit` was only reachable while typing, where the character went into
+    /// the command instead.
+    #[test]
+    fn ctrl_q_quits_from_every_pane_and_mode() {
+        for pane_cycles in 0..3 {
+            for compose in [false, true] {
+                let mut a = App::default();
+                for _ in 0..pane_cycles {
+                    a.ui.cycle_focus();
+                }
+                if compose {
+                    a.ui.compose();
+                }
+                assert!(!a.quit);
+                a.on_key(KeyCode::Char('q'), KeyModifiers::CONTROL);
+                assert!(a.quit, "no exit from pane {pane_cycles}, compose={compose}");
+            }
+        }
+    }
+
+    /// A bare `q` is a letter, not an exit — otherwise no command containing
+    /// one could be typed.
+    #[test]
+    fn a_bare_q_types_rather_than_quitting() {
+        let mut a = App::default();
+        a.on_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!a.quit);
+        assert_eq!(a.command.as_string(), "q");
+    }
+
+    /// **RFC 8 §3's two lines are two lines of content.** A three-row pane
+    /// with a top rule leaves two; a two-row pane with a full border left
+    /// none, and the command line had nowhere to render.
+    #[test]
+    fn the_command_pane_has_two_usable_lines() {
+        let ui = Ui::default();
+        let screen = layout::Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 40,
+        };
+        let cmd = ui
+            .layout(screen)
+            .into_iter()
+            .find(|(p, _)| *p == layout::Pane::Command)
+            .expect("a command pane")
+            .1;
+        assert_eq!(cmd.h, layout::COMMAND_ROWS);
+        assert_eq!(cmd.h - 1, 2, "one rule plus RFC 8 §3's two content lines");
+        assert_eq!(cmd.w, screen.w, "it spans the width");
+    }
+
+    /// The whole first-run sequence an operator actually types, with nothing
+    /// but the keyboard.
+    #[test]
+    fn the_first_run_sequence_works_end_to_end() {
+        let mut a = App::default();
+        a.home = temp_home("first-run");
+
+        let type_line = |a: &mut App, line: &str| {
+            for c in line.chars() {
+                a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+            }
+            a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        };
+
+        type_line(&mut a, "init");
+        assert!(a.init_step.is_some(), "init did not start: {}", a.output);
+
+        for c in "a passphrase".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(a.passphrase.as_string(), "a passphrase");
+        assert!(
+            a.command.is_empty(),
+            "the passphrase leaked onto the command line"
+        );
+
+        // Enter walks the ceremony; cheap Argon2 so the test is not a minute.
+        a.identity = Some({
+            let mut id = Identity::generate(&mut OsRng);
+            id.kek_params.m_kib = 64;
+            id.kek_params.t = 1;
+            id.kek_params.p = 1;
+            id
+        });
+        for _ in 0..6 {
+            a.advance_init();
+        }
+        assert!(
+            a.epoch_key.is_some(),
+            "the ceremony did not finish: {}",
+            a.output
+        );
+
+        type_line(&mut a, "verify");
+        assert!(
+            a.output.split_whitespace().count() > 8,
+            "verify must print eight words to read aloud: {}",
+            a.output
+        );
+    }
+
+    /// Selecting is idempotent; toggling is not. An operator who cannot see
+    /// which tab they are on cannot toggle their way to certainty, and RFC 8
+    /// §4.1 makes guessing wrong irreversible.
+    #[test]
+    fn ctrl_1_and_ctrl_2_select_tabs_absolutely() {
+        let mut a = App::default();
+        for _ in 0..2 {
+            a.on_key(KeyCode::Char('2'), KeyModifiers::CONTROL);
+            assert_eq!(a.ui.tab(), layout::Tab::Channels);
+        }
+        for _ in 0..2 {
+            a.on_key(KeyCode::Char('1'), KeyModifiers::CONTROL);
+            assert_eq!(a.ui.tab(), layout::Tab::Private);
+        }
+        // And from the command line, where focus starts and `m` is a letter.
+        assert_eq!(a.ui.focus(), layout::Pane::Command);
+        a.on_key(KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "m");
+        assert_eq!(
+            a.ui.tab(),
+            layout::Tab::Private,
+            "`m` typed, it did not switch"
+        );
+        a.on_key(KeyCode::Char('2'), KeyModifiers::CONTROL);
+        assert_eq!(a.ui.tab(), layout::Tab::Channels);
+    }
+
+    /// **What an operator actually sees on a cold start.** Every earlier test
+    /// here asserts on state; this one asserts on pixels, because the command
+    /// pane bug was invisible to state assertions — the command was in the
+    /// string, the string just never reached the screen.
+    #[test]
+    fn the_cold_start_screen_shows_the_prompt_and_both_tabs() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut a = App::default();
+        for c in "init".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("a terminal");
+        let log = a.log.recent(activity_log::CAPACITY);
+        term.draw(|f| render::draw(f, &a.view(&log)))
+            .expect("a frame");
+        let screen: Vec<String> = term
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let all = screen.join("\n");
+
+        assert!(all.contains("Private"), "no private tab:\n{all}");
+        assert!(all.contains("Channels"), "no channels tab:\n{all}");
+        assert!(
+            screen.iter().any(|r| r.contains("> init")),
+            "what was typed never reached the screen:\n{all}"
+        );
+
+        // The command pane's own rows: the rule with the status, and RFC 8
+        // §3's two content lines.
+        let rows = &screen[screen.len() - layout::COMMAND_ROWS as usize..];
+        assert!(rows[0].contains('\u{2500}'), "no rule: {:?}", rows[0]);
+        assert!(
+            rows.iter().any(|r| r.trim_end().ends_with("init")),
+            "the prompt is not in the command pane: {rows:?}"
+        );
+    }
+
+    /// Not an assertion — a way to read the screen. `cargo test -p krab-tui
+    /// dump_the_cold_start_screen -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn dump_the_cold_start_screen() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut a = App::default();
+        for c in "init".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("a terminal");
+        let log = a.log.recent(activity_log::CAPACITY);
+        term.draw(|f| render::draw(f, &a.view(&log)))
+            .expect("a frame");
+        for row in term.backend().buffer().content().chunks(80) {
+            let line: String = row.iter().map(|c| c.symbol()).collect();
+            println!("|{}|", line.trim_end());
+        }
+    }
+
+    /// **Two nodes on one host, over TCP.** The case the author asked about,
+    /// and the case that did not work: `answer` was parsed, passed to
+    /// `establish`, honoured by the serial branch, and dropped by the TCP
+    /// branch — so both ends dialled and neither listened.
+    #[test]
+    fn two_local_nodes_link_over_tcp_when_one_answers() {
+        use krab_fabric::backend::tcp::TcpFabric;
+        use krab_fabric::{profile::LinkProfile, Fabric};
+
+        let mut rng = OsRng;
+        let a = Identity::generate(&mut rng);
+        let b = Identity::generate(&mut rng);
+
+        // The answering end, bound to a port the kernel picks so the test does
+        // not fight whatever is on 40000.
+        let answerer = TcpFabric::new(
+            LinkProfile::tcp(),
+            "127.0.0.1:0",
+            b.noise_bytes(),
+            a.card(Policy::default()).noise_static_pk,
+        );
+        let port = answerer.listen("127.0.0.1:0").expect("a port");
+
+        let b_static = b.card(Policy::default()).noise_static_pk;
+        let dialler = std::thread::spawn(move || {
+            TcpFabric::new(
+                LinkProfile::tcp(),
+                format!("127.0.0.1:{port}"),
+                a.noise_bytes(),
+                b_static,
+            )
+            .connect()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got = None;
+        while std::time::Instant::now() < deadline && got.is_none() {
+            got = answerer.accept().expect("accept must not error");
+            if got.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(got.is_some(), "the answering end never saw the call");
+        dialler
+            .join()
+            .expect("the dialling thread")
+            .expect("a session");
+    }
+
+    /// `Ctrl-O` full-screens whatever has focus, and the command line takes
+    /// the output pane with it.
+    #[test]
+    fn ctrl_o_full_screens_the_focused_pane() {
+        use layout::{Pane, Zoom};
+        for (cycles, want) in [
+            (0, Zoom::Console),         // Command
+            (1, Zoom::One(Pane::List)), // List
+            (2, Zoom::One(Pane::View)), // View
+            (3, Zoom::Console),         // Output
+        ] {
+            let mut a = App::default();
+            for _ in 0..cycles {
+                a.ui.cycle_focus();
+            }
+            a.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+            assert_eq!(a.ui.zoomed(), Some(want), "focus after {cycles} cycles");
+            // And it toggles back.
+            a.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+            assert_eq!(a.ui.zoomed(), None);
+        }
+    }
+
+    /// The console keeps both panes on screen. A zoomed output pane with no
+    /// prompt, or a prompt with its output elsewhere, is neither.
+    #[test]
+    fn the_console_zoom_shows_output_and_the_command_line() {
+        let mut a = App::default();
+        a.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let panes = a.ui.layout(layout::Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        });
+        let kinds: Vec<layout::Pane> = panes.iter().map(|(p, _)| *p).collect();
+        assert_eq!(kinds, vec![layout::Pane::Output, layout::Pane::Command]);
+        assert_eq!(panes[0].1.h + panes[1].1.h, 24, "they fill the screen");
+        assert_eq!(panes[1].1.h, layout::COMMAND_ROWS);
+    }
+
+    /// **Esc goes home from anywhere**, in one keystroke.
+    #[test]
+    fn esc_returns_to_the_default_screen() {
+        let mut a = App::default();
+        // As tangled as the interface gets: a channel, composing, zoomed, on
+        // a body pane, with a half-typed command.
+        a.on_key(KeyCode::Char('2'), KeyModifiers::CONTROL);
+        a.ui.descend();
+        a.ui.compose();
+        a.composer.push_str("a draft");
+        a.ui.cycle_focus();
+        a.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        a.command = line::Line::from("half typed");
+
+        a.on_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(a.ui.zoomed(), None, "unzoomed");
+        assert_eq!(a.ui.mode(), Mode::Browse, "not composing");
+        assert_eq!(a.ui.focus(), layout::Pane::Command, "back at the prompt");
+        assert!(a.command.is_empty(), "the command line is clear");
+        assert!(a.composer.is_empty(), "and the draft is gone");
+    }
+
+    /// Esc must not throw away a key hierarchy that is halfway created.
+    #[test]
+    fn esc_does_not_cancel_the_first_run_ceremony() {
+        let mut a = App::default();
+        a.home = temp_home("esc-init");
+        for c in "init".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        let step = a.init_step;
+        assert!(step.is_some());
+        a.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(a.init_step, step, "the ceremony survived");
+    }
+
+    /// The line editor, through the key path an operator actually uses.
+    #[test]
+    fn the_command_line_can_be_edited() {
+        let mut a = App::default();
+        for c in "conect bob".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        // Back to the typo and fix it, without losing what follows.
+        a.on_key(KeyCode::Home, KeyModifiers::NONE);
+        for _ in 0..3 {
+            a.on_key(KeyCode::Right, KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "connect bob");
+
+        // Word deletion, from the end.
+        a.on_key(KeyCode::End, KeyModifiers::NONE);
+        a.on_key(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(a.command.as_string(), "connect ");
+    }
+
+    /// A masked passphrase is exactly where correcting a typo matters most:
+    /// the KEK is the only root (RFC 7 §4) and nothing on screen shows what
+    /// was typed.
+    #[test]
+    fn the_passphrase_can_be_corrected() {
+        let mut a = App::default();
+        a.home = temp_home("passphrase-edit");
+        for c in "init".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        while a.init_step != Some(InitStep::Passphrase) {
+            a.advance_init();
+        }
+        for c in "hunter3".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+        a.on_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(a.passphrase.as_string(), "hunter2");
+        // And it never reached the command line.
+        assert!(a.command.is_empty());
+    }
+
+    /// `quit` is `Ctrl-Q` in a form that can be discovered by typing `help`.
+    #[test]
+    fn the_quit_verb_leaves() {
+        let mut a = App::default();
+        type_command(&mut a, "quit");
+        assert!(a.quit);
+    }
+
+    /// `help` lists every verb the parser accepts. A verb that exists and is
+    /// not listed cannot be found by an operator who has not read RFC 8.
+    #[test]
+    fn help_lists_every_verb_the_parser_accepts() {
+        let mut a = App::default();
+        type_command(&mut a, "help");
+        for (entry, _) in Command::SYNOPSES {
+            let verb = entry.split_whitespace().next().unwrap();
+            assert!(
+                Command::parse(verb).is_some(),
+                "help lists {verb}, which does not parse"
+            );
+        }
+        for verb in [
+            "init",
+            "peer",
+            "lock",
+            "unlock",
+            "duress",
+            "request",
+            "wipe",
+            "connect",
+            "disconnect",
+            "rollcall",
+            "import",
+            "pack",
+            "send",
+            "keys",
+            "reach",
+            "peers",
+            "verify",
+            "listen",
+            "help",
+            "quit",
+        ] {
+            assert!(
+                a.output.contains(verb),
+                "help does not mention `{verb}`:\n{}",
+                a.output
+            );
+        }
     }
 }

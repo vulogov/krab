@@ -90,6 +90,10 @@ impl SharedStore {
     }
 
     /// Whether the corpus is empty.
+    ///
+    /// Kept alongside `len` because clippy asks for it and because a caller
+    /// that wants it should not reach for `len() == 0` under the lock.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.with(|s| s.is_empty())
     }

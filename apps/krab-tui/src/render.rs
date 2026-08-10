@@ -11,7 +11,7 @@ use crate::layout::{Banner, Level, Mode, Pane, Rect as UiRect, Tab, Ui};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 fn to_rect(r: UiRect) -> Rect {
@@ -36,7 +36,9 @@ pub struct View<'a> {
     /// Body for the view pane, or long command output (RFC 8 §3).
     pub body: &'a str,
     /// The command line's current contents.
-    pub command: &'a str,
+    pub command: &'a crate::line::Line,
+    /// Command output — the output pane.
+    pub output: &'a str,
     /// Composer contents, shown when `ui.mode()` is `Compose`.
     pub composer: &'a str,
     /// Whether the node is locked. A locked node draws no message content.
@@ -86,6 +88,7 @@ pub fn draw(f: &mut Frame, view: &View) {
         match pane {
             Pane::List => draw_list(f, to_rect(rect), view),
             Pane::View => draw_view(f, to_rect(rect), view),
+            Pane::Output => draw_output(f, to_rect(rect), view),
             Pane::Command => draw_command(f, to_rect(rect), view),
         }
     }
@@ -155,6 +158,20 @@ fn draw_view(f: &mut Frame, area: Rect, view: &View) {
     );
 }
 
+/// Command output.
+///
+/// Not subject to RFC 8 §2.2's locked-node blanking: this is what the node
+/// said about itself, not message content, and blanking it would hide the
+/// reason the node is locked from the operator trying to unlock it.
+fn draw_output(f: &mut Frame, area: Rect, view: &View) {
+    f.render_widget(
+        Paragraph::new(view.output)
+            .wrap(Wrap { trim: false })
+            .block(frame_for(view.ui, Pane::Output, " output ".into())),
+        area,
+    );
+}
+
 /// The composer, and the banner that must always accompany it.
 ///
 /// RFC 8 §2.1: *"A zoomed or overlaid composer MUST render its security
@@ -210,15 +227,40 @@ fn draw_composer(f: &mut Frame, area: Rect, view: &View) {
 /// pane or a zoomed command pane rather than scrolling this.
 fn draw_command(f: &mut Frame, area: Rect, view: &View) {
     let status = status_line_with(view.node, view.spinner);
-    let lock = if view.locked { "  🔒" } else { "" };
-    // Two lines unzoomed (RFC 8 §3); the log fills whatever a zoomed pane has.
+    // A quiet node has no status, and an empty rule is a wasted row on the one
+    // pane an operator is always looking at. The chords are what they need
+    // next and cannot otherwise discover without typing `help` first.
+    let status = if status.is_empty() {
+        "Ctrl-Q quit  ·  Ctrl-O full screen  ·  Esc back  ·  help".to_string()
+    } else {
+        status
+    };
+    let lock = if view.locked { "  \u{1f512}" } else { "" };
+    // The status rides on the rule. It has to live somewhere, and the two rows
+    // below are spoken for: RFC 8 §3 gives this pane a prompt and one line of
+    // acknowledgement, and a status line stealing one of them leaves no room
+    // for the acknowledgement to be read.
+    let focused = view.ui.focus() == Pane::Command;
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(format!(" {status}{lock} "))
+        .title_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(if focused {
+            Color::White
+        } else {
+            Color::DarkGray
+        }));
+
+    // Everything the rule and the prompt do not take. Unzoomed that is one
+    // line; zoomed it is the backlog, which is where RFC 8 §3 sends output
+    // too long for two lines.
     let room = area.height.saturating_sub(2) as usize;
     // Length is shown, contents are not: an operator needs to see that keys
     // are registering without the passphrase reaching the screen.
     let shown = if view.masked {
-        "•".repeat(view.command.chars().count())
+        "\u{2022}".repeat(view.command.len())
     } else {
-        view.command.to_string()
+        view.command.as_string()
     };
     let mut lines: Vec<Line> = view
         .log
@@ -234,12 +276,17 @@ fn draw_command(f: &mut Frame, area: Rect, view: &View) {
         })
         .collect();
     lines.push(Line::from(format!("> {shown}")));
-    lines.push(Line::from(Span::styled(
-        format!("{status}{lock}"),
-        Style::default().fg(Color::DarkGray),
-    )));
-    f.render_widget(
-        Paragraph::new(lines).block(frame_for(view.ui, Pane::Command, String::new())),
-        area,
-    );
+    let rows = lines.len() as u16;
+    f.render_widget(Paragraph::new(lines).block(block), area);
+
+    // A visible cursor, because the line editor is only usable if the operator
+    // can see where an insertion will land. `+2` clears the `> ` prompt; the
+    // row is the last line drawn, which is the one holding it.
+    if view.ui.focus() == Pane::Command {
+        let col = area.x + 2 + view.command.cursor() as u16;
+        let row = area.y + rows;
+        if col < area.x + area.width && row < area.y + area.height {
+            f.set_cursor_position((col, row));
+        }
+    }
 }

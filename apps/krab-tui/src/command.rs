@@ -48,6 +48,20 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
+    /// **Not in RFC 8 §5.** Leave. The `Ctrl-Q` chord's discoverable form,
+    /// the same way `lock` is `Ctrl-L`'s.
+    Quit,
+    /// **Not in RFC 8 §5.** Wait for an inbound link on a named address.
+    ///
+    /// §5 has `connect`, which dials. Nothing in it answers — so of two nodes
+    /// both would dial and neither would listen, and a pair on one host could
+    /// not link at all. A bind address is not a dial address and must not be
+    /// spelled like one.
+    Listen,
+    /// **Not in RFC 8 §5.** Every verb, listed. §5 assumes an operator who
+    /// has read it; an operator running a node for the first time has an
+    /// empty screen and a prompt, and no way to find out what to type.
+    Help,
     /// **Not in RFC 8 §5.** First-run ceremony: identity, Noise static,
     /// correspondence key, first prekey batch, KEK — and the mandatory backup.
     Init,
@@ -114,9 +128,72 @@ impl Command {
             "reach" => Command::Reach,
             "peers" => Command::Peers,
             "verify" => Command::Verify,
+            "listen" => Command::Listen,
+            "quit" | "exit" => Command::Quit,
+            "help" | "?" => Command::Help,
             _ => return None,
         })
     }
+
+    /// Every verb, with what it is for. The order is the order an operator
+    /// meets them: set the node up, find a peer, exchange, inspect, and the
+    /// two that end things.
+    pub const SYNOPSES: &'static [(&'static str, &'static str)] = &[
+        ("init", "create this node's key hierarchy — run once, first"),
+        ("keys", "show what key material exists"),
+        ("verify", "print this node's fingerprint, to read aloud"),
+        (
+            "peer offer",
+            "start a peering — writes a card to send to the other end",
+        ),
+        ("peer accept <file>", "take in the card they sent you"),
+        (
+            "peer seal",
+            "finish the peering once both cards are exchanged",
+        ),
+        (
+            "peer pad",
+            "generate a one-time pad for a sneakernet peering",
+        ),
+        ("peer status", "how far along each peering is"),
+        ("peers", "who this node is peered with"),
+        (
+            "listen <peer> [addr]",
+            "wait for that peer to call — e.g. listen bob 127.0.0.1:40000",
+        ),
+        (
+            "connect <peer> tcp <addr>",
+            "dial that peer — e.g. connect alice 127.0.0.1:40000",
+        ),
+        ("disconnect", "close the link"),
+        ("reach", "what this node can reach, and how far"),
+        ("rollcall", "ask peers who is present"),
+        ("send", "compose and queue a sealed message"),
+        ("request", "ask a peer for an object by name"),
+        ("pack <file>", "write queued objects out for a courier"),
+        ("import <file>", "take in what a courier brought"),
+        ("lock", "lock the node now"),
+        ("unlock", "unlock it"),
+        ("duress", "unlock under coercion — opens the duress corpus"),
+        (
+            "wipe",
+            "destroy the key hierarchy — irreversible, asks twice",
+        ),
+        ("help", "this list"),
+        ("quit", "leave — the same as Ctrl-Q"),
+    ];
+
+    /// The chords, which are not typed and so are not in [`Self::SYNOPSES`].
+    pub const CHORDS: &'static [(&'static str, &'static str)] = &[
+        ("Ctrl-Q", "quit"),
+        ("Ctrl-L", "lock immediately"),
+        ("Ctrl-1 / Ctrl-2", "private messages / channels"),
+        ("Tab", "move between panes"),
+        (
+            "z",
+            "zoom the focused pane (for output longer than two lines)",
+        ),
+    ];
 
     /// Whether this verb needs an identity to exist first.
     ///
@@ -126,7 +203,12 @@ impl Command {
     pub fn needs_identity(&self) -> bool {
         !matches!(
             self,
-            Command::Init | Command::Lock | Command::Wipe | Command::Keys
+            Command::Init
+                | Command::Lock
+                | Command::Wipe
+                | Command::Keys
+                | Command::Help
+                | Command::Quit
         )
     }
 
@@ -179,6 +261,9 @@ impl fmt::Display for Command {
             Command::Reach => "reach",
             Command::Peers => "peers",
             Command::Verify => "verify",
+            Command::Listen => "listen",
+            Command::Quit => "quit",
+            Command::Help => "help",
         };
         f.write_str(s)
     }

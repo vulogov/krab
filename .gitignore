@@ -22,3 +22,15 @@ target
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/target/
+
+# Node store artefacts. A running node writes these into its --home; with no
+# --home that is the working directory, and during `cargo test` that is the
+# package root. They are key material — `kek.params` carries the Argon2 salt
+# that `identity.wrapped` was wrapped under — and must never be committed.
+identity.wrapped
+kek.params
+corpus.krab
+ceremony.cbor
+*.link
+*.card
+*.pad
