@@ -1,21 +1,63 @@
 # Moving a pad when you cannot meet — a proposal
 
-**Status: proposal.** Nothing here is implemented. It is written to be argued
-with before it is built.
+**Status: adopted in principle, not yet implemented.**
+
+The framing this document opened with was wrong and is corrected here. It
+argued for a careful exception to a rule. The rule is the problem:
+
+> Controlled push/pull of the pad between nodes, signed and session-encrypted,
+> is more secure than forcing 80% of users onto unsafe channels.
+
+That is the governing judgement. A protocol that offers no network route does
+not prevent network transfer — it exports it to `scp`, a shared drive, or a
+chat app, where it is unauthenticated, unlogged, leaves copies, and where the
+peering records `network` or nothing at all. An in-band exchange over the
+node's own authenticated session is strictly better than every one of those,
+and it is what the software should do by default.
+
+**Sneakernet stays first-class.** `in-person` and `media` remain the strongest
+routes, they keep their post-quantum classification, and nothing here is
+allowed to make them harder to choose or make an operator who chose them feel
+they took the slow path. The point is to stop punishing the 80% who cannot.
 
 ---
 
 ## 1. The problem with the rule we have
 
 `PEERING.md` says: hand the pad over in person, or carry it on media. That is
-correct and it is also a rule that will be broken. Friends who cannot meet will
-peer anyway, and the only route Krab offers them today is `corpus` or
-`network` — which means the reservoir contributes nothing against the adversary
-it exists for.
+the strongest advice and it is also unfollowable for most pairs. A user in
+South America and a user in Africa are not going to meet, and telling them the
+supported options are "meet" or "accept a weak peering" produces a third
+option that Krab never sees: they move the pad over SSH or a shared disk and
+tell each other it was fine.
 
-A rule that is right and unfollowable produces worse outcomes than a mechanism
-that is honest about its assumptions. So: what is the strongest thing we can do
-over a network, and what exactly does it cost?
+That outcome is worse than an in-band transfer on every operational axis:
+
+| | out-of-band `scp` | in-band exchange |
+|---|---|---|
+| Authenticated to the peer's static key | no | yes — RFC 4 §4.1 |
+| Encrypted to that peer specifically | no | yes |
+| Copies left behind | on both hosts, and any relay | shredded after seal |
+| What the link records | `network`, or a lie | the actual route |
+| Operator can get it wrong | in a dozen ways | it is one verb |
+| **Post-quantum** | **no** | **no** |
+
+**That last row is the one that matters, and an earlier draft of this table
+omitted it.** In-band runs over Noise, which is X25519. `scp` runs over
+X25519 or a NIST curve. A quantum adversary who recorded either gets the pad.
+On the single axis the reservoir was invented for, the two are *identical*.
+
+So the argument above is correct and it is not an argument for post-quantum
+credit. In-band transfer is better than `scp` in every way except the one the
+reservoir exists for, where it is the same. Build it, and label it `network`.
+
+Getting this wrong would be the exact failure `AMENDMENTS.md` keeps finding:
+an operator watches Krab move the pad over an authenticated encrypted session,
+concludes they got a strong peering, and is wrong — silently, permanently, and
+in a way nothing tells them about.
+
+There is a real solution, and it is not "make the network transfer stronger".
+It is §3.
 
 ## 2. Why `network` gets no credit
 
@@ -38,119 +80,168 @@ This is why the fix cannot be "use a stronger network protocol". Any
 key-agreement over the wire is the thing in question. The pad has to be
 protected by something the wire never carried.
 
-## 3. The proposal: a spoken transfer key
+## 3. The better solution: bootstrap once, ratchet in-band forever
 
-**Krab generates a 256-bit transfer key, displays it as 32 words, and the two
-operators read it to each other over a live voice call. The pad is encrypted
-under it and then may travel over TCP, email, or anything else.**
+The constraint in §2 is information-theoretic and cannot be designed around:
+**for the root to be post-quantum secret, some component of it must have full
+entropy and must never have crossed a channel the adversary records.** No
+protocol removes that. A short authenticated string does not help — it
+authenticates, it does not keep a secret, and a 30-bit secret is 30 bits to a
+quantum adversary and to a classical one.
 
-The security rests on the voice channel, not the network. That is the same
-shape as `in-person` — an out-of-band channel the operators trust — with
-different, and weaker, properties. §6 says how.
+But the requirement is *once*, not *every time*. That is the whole design.
 
-### Why this is post-quantum
+```
+  ONCE, ever, per peer          →   root_0   (out of band: in person, media,
+                                              or 32 spoken words)
 
-Symmetric. A 256-bit key from a CSPRNG, an AEAD, and a KDF. There is no
-key agreement anywhere in it, so there is nothing for a quantum computer to
-solve. An adversary who recorded the encrypted pad and later builds a quantum
-computer has a 256-bit symmetric ciphertext, which Grover reduces to a ~128-bit
-search that is not a practical attack.
+  thereafter, automatically     →   root_{n+1} =
+                                      HKDF(root_n ‖ dh ‖ fresh_A ‖ fresh_B)
 
-Contrast a PAKE — CPace, SPAKE2, OPAQUE. A PAKE is the textbook answer to
-"bootstrap from a low-entropy shared secret" and it would be the right answer
-if the threat were classical. All the standard ones are Diffie–Hellman based,
-so they fail exactly the adversary we are defending against. **A PAKE here
-would look stronger and be weaker.** Worth stating because it is the first
-thing a reviewer will propose.
+                                    where fresh_A and fresh_B travel IN-BAND,
+                                    encrypted under a chunk of root_n
+```
 
-### Why Krab generates the key and the operator cannot
+`root_n` never crossed the wire. So the transport protecting `fresh_A` and
+`fresh_B` is a symmetric key the adversary has never seen, and the chain stays
+post-quantum **forever, with no further out-of-band steps ever**.
 
-If operators pick the phrase, they will pick something guessable, and an
-offline dictionary attack against the recorded ciphertext recovers the pad.
-That failure is silent — the peering appears to succeed and is worth nothing.
+This inverts the burden. The rule stops being "meet, or accept a weak
+peering," and becomes:
 
-So the key is drawn from the system CSPRNG and displayed. There is no verb that
-accepts an operator-chosen transfer phrase. This is the same reasoning that
-makes the *seal channel* an explicit argument rather than a guess.
+> **Establish one secret out of band, once. Krab maintains it from then on.**
 
-### Why 32 words
+Alice in South America and Bob in Africa do one voice call, ever. Not one per
+rekey, not one a year. One.
+
+### What mixing `dh` buys
+
+Post-compromise security. A pure symmetric ratchet never heals: an adversary
+who reads `root_n` once reads every root after it. Folding a fresh X25519
+exchange into each rekey means that adversary is locked out again at the next
+one — provided they cannot break X25519, which is precisely the *classical*
+adversary a state compromise implies.
+
+The two components cover each other:
+
+| Adversary | Beaten by |
+|---|---|
+| Records everything, breaks X25519 later | `root_n`, which never crossed the wire |
+| Reads the disk once, cannot break X25519 | `dh`, fresh at each rekey |
+| Both, at the same time | nothing — and nothing can |
+
+Neither alone is enough, which is the argument for a hybrid rather than a
+choice.
+
+### It also fixes an exhaustion nobody had noticed
+
+`Reservoir::MAX_ADVANCE` is `2 × EPOCH_WINDOW` — 90 epochs, and an epoch is a
+day. A node offline longer than **90 days cannot catch its ratchet up**, and
+`advance_to` correctly refuses rather than destroying roots on a bad clock. The
+peering is then permanently dead and has to be redone from scratch, out of
+band.
+
+That is the real "the pad ran out" condition — not chunks, which are infinite.
+A rekey exchange re-seats both ends at a common epoch, so a returning node
+recovers instead of losing the friend.
+
+### When to rekey
+
+Anchored to a stated guarantee rather than a comfortable number, per RFC 0's
+editorial rule:
+
+> A reservoir compromised at time *T* stops protecting traffic within
+> `REKEY_EPOCHS` epochs of *T*.
+
+`REKEY_EPOCHS = EPOCH_WINDOW` (45) falls out of it: rekeying faster buys
+nothing, because chunks inside the acceptance window are retained anyway and
+remain derivable from material the adversary already has. Rekeying slower
+directly weakens the stated guarantee. The parameter is the guarantee, not a
+tuning knob.
+
+A rekey is also attempted whenever a link comes up and the peer's ratchet is
+more than `EPOCH_WINDOW` behind ours — the returning-node case above.
+
+### The initial bootstrap, for people who cannot even call
+
+Offer the in-band route, and be honest about it:
+
+```
+> peer seal --in-band network
+
+peer-link signed with <fingerprint>
+
+NOT post-quantum. The pad crossed a channel an adversary can record and
+later break. Everything else about this peering is sound.
+
+Run `peer reseal` the first time you meet, or share media. It upgrades
+this link in place — you will not have to peer again.
+```
+
+`peer reseal` is the property that makes this honest: **a weak peering can be
+upgraded without being redone.** Start where you are, strengthen when you get
+the chance, keep your message history and your peer-link throughout.
+
+### Where the spoken transfer key fits
+
+It is one of three ways to establish `root_0`, and the only one that works at
+intercontinental distance without waiting for a flight:
+
+| Route | Post-quantum | Cost |
+|---|---|---|
+| `in-person` | yes | meet |
+| `media` | yes | post a stick |
+| `spoken` — 32 words on a voice call | yes, if the call is not recorded | one call, ever |
+| `network` — in-band | **no**, upgradable later | one verb |
 
 Krab's word alphabet is 256 words at even positions and 256 at odd — exactly
-8 bits per word, and the encoder already exists (`krab_crypto::words`). It is
-already used for the 8-byte spoken fingerprint and the 64-word identity backup.
+8 bits per word, and the encoder already exists (`krab_crypto::words`), where
+it renders the 8-byte spoken fingerprint and the 64-word identity backup. 32
+words is 256 bits. Position-dependent alphabets make a transposition *audible*:
+swapped words land in the wrong alphabet and `words::parse` rejects them
+instead of silently accepting a different key.
 
-- 32 words = **256 bits**
-- Position-dependent alphabets mean a transposition is *audible* — swapped
-  words land in the wrong alphabet and `words::parse` rejects them rather than
-  silently accepting a different key
+**Krab generates it; the operator cannot choose it.** An operator-chosen
+phrase is guessable, and an offline dictionary attack against the recorded
+ciphertext then recovers the pad — silently, with the peering appearing to
+have succeeded.
 
-32 words is a long thing to read aloud. It is roughly half the identity backup
-an operator already writes down, on a call they are already making to compare
-fingerprints. That seems like the right price.
-
-### The shape
-
-```
-        ALICE                              BOB
-        ─────                              ───
-  1.    peer offer                         peer offer
-                    ── cards, any channel ──▶
-  2.    peer accept bob.card               peer accept alice.card
-
-        ══════════ one voice call, both steps ══════════
-  3.    read fingerprints aloud     ◀══▶   read fingerprints aloud
-  4.    peer wrap alice.pad                (writes to Bob's node)
-        ── read 32 words aloud ──▶         (Bob types them in)
-        ◀── Bob reads his 32 back ──       peer wrap bob.pad
-        ════════════════════════════════════════════════
-
-  5.                ── wrapped pads over TCP ──▶
-                    ◀── wrapped pads over TCP ──
-  6.    peer seal bob.wrapped spoken       peer seal alice.wrapped spoken
-```
-
-Two new verbs, one new channel:
-
-| | |
-|---|---|
-| `peer wrap <dest>` | write the pad encrypted under a fresh transfer key; display the 32 words |
-| `peer seal <file> spoken` | prompt for the 32 words, unwrap, then seal as today |
+Not a PAKE. CPace, SPAKE2 and OPAQUE are the textbook answer to bootstrapping
+from a shared secret, and every standard one is Diffie–Hellman based, so they
+fail exactly the adversary being defended against. **A PAKE here would look
+stronger and be weaker.** Worth stating because it is the first thing a
+reviewer proposes.
 
 ### Construction
 
 ```
-transfer_key   ← CSPRNG, 32 bytes
-displayed as   words::phrase(transfer_key)              // 32 words
+root_0 (spoken)    transfer_key ← CSPRNG(32);  shown as words::phrase(...)
+                   k       ← Argon2id(words::parse(spoken), salt, §4.1 params)
+                   wrapped ← AEAD(k, "krab/pad/spoken/v1", contribution)
 
-salt           ← CSPRNG, 16 bytes
-k              ← Argon2id(words::parse(spoken), salt, RFC 7 §4.1 params)
-wrapped        ← AEAD_seal(k, "krab/pad/spoken/v1", contribution)
-file           ← cbor{ salt, wrapped }
+rekey n→n+1        fresh_X ← CSPRNG(32)                       // each end
+                   carrier ← HKDF(root_n, "krab/rekey/v1" ‖ n)
+                   payload ← AEAD(carrier, "krab/rekey/v1", fresh_X ‖ policy)
+                   signed  ← Ed25519(identity, payload)       // §5
+                   root_n+1← HKDF(root_n ‖ dh ‖ fresh_A ‖ fresh_B ‖ n+1)
 ```
 
-Argon2id is redundant at 256 bits and is there anyway: it is the cost of one
-`unlock`, it costs nothing to include, and it is the only thing standing
-between a future shorter phrase and an offline attack. A construction that is
-safe only because of a parameter chosen elsewhere is the pattern
-`AMENDMENTS.md` keeps finding.
+The rekey payload is signed as well as encrypted, so a peer who has the
+carrier key cannot be impersonated by anyone who does not also hold the
+identity key — the two compromises stay separate.
 
-The transfer key is used once and destroyed. The wrapped pad is shredded after
-`seal`, the same as `peer.pad` is today.
+`fresh_A ‖ fresh_B` is ordered by node id, not by who spoke first, so both
+ends derive the same root without a role negotiation.
 
-**The words and the file must not travel together** — the words by voice, the
-file by network. This is the same discipline as the card and the pad, for the
-same reason, and it is the discipline that is easiest to break by accident.
-See §6.
+### Policy rides the same exchange
 
-### What the link records
-
-`spoken` is a distinct channel, not an alias for `in-person`. The peer-link
-records which was used, and RFC 3 §11.3's classification should place it:
-
-- **with** `in-person` and `media` for post-quantum credit
-- **apart from** them in the caveat the link carries, because the trust
-  assumption is different and an operator reviewing a link months later should
-  be able to see which one they made
+A rekey is a periodic, authenticated, encrypted, peer-to-peer state update.
+So is a policy change. Building two mechanisms for one shape would be a
+mistake — see §7 of `PEERING.md` for the gap this closes: `Policy` is signed
+into the card at peering and **never propagates again**, so a peer who stops
+relaying or shrinks their retention is never heard. Message TTL is not in
+`Policy` at all, and `CarriagePolicy` (RFC 6 §3.6, accepted channels) is
+exported from `krab-crypto` with **zero callers**.
 
 ## 4. When there is no voice channel either
 
