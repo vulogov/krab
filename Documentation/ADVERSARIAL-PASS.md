@@ -343,3 +343,118 @@ is the whole of the difference, and it took 15 694 executions.
 Three passes, nine findings, four severe. Each axis found what the previous
 ones structurally could not: sentences, then time, then a machine that does not
 know what the code is for.
+
+---
+
+# Fourth and fifth passes — 2026-08-09 · axes: **concurrency** and **crash-consistency**
+
+Run together because both concern what happens when something interrupts —
+another thread, or a power cut. **Two findings, both severe, both fixed.**
+
+## 10. SEVERE — reconciliation froze the interface, taking the lock chord with it · **FIXED**
+
+`tick_schedule` ran inside the render loop, between `event::poll` calls, and
+called `reconcile_with` — which does blocking socket I/O.
+
+So an exchange froze the interface for its whole duration. On a serial link at
+RFC 4 §5.3's 11 520 B/s that is **minutes** for a few megabytes, and during it:
+
+- no keystroke is processed,
+- nothing redraws,
+- and **`Ctrl-L` does not lock**, which is the one keystroke an operator might
+  need urgently and the reason `RFC-7-review.md` §9 exists.
+
+A peer trickling bytes could hold the interface hostage deliberately. The
+exchange loop is bounded at 64k *messages* (§2 above), not by time, so a slow
+peer is bounded only by patience.
+
+It also contradicted a stated requirement directly:
+
+> "As TUI is client and 'server in background', send/receive shall be in
+> background regardless frontend user activity."
+
+**Fix.** Exchanges run on their own thread and report back over a channel
+drained on tick. `Session` gained a `Send` bound, `SimSession` moved from
+`Rc<RefCell<…>>` to `Arc<Mutex<…>>`, and `LinkTable::take_session` moves the
+session out rather than lending it — which also prevents two overlapping
+exchanges on one link.
+
+### The trap, which is most of the work
+
+Moving the exchange to a thread is half the fix. The obvious next step is to
+hand that thread a `MutexGuard` on the corpus for the duration — and that
+**rebuilds the freeze through the lock**. The interface then blocks on `lock()`
+instead of on `recv()`, for exactly as long, with an identical symptom and a
+less obvious cause.
+
+`SharedStore` therefore locks **per `Corpus` operation** and never across one.
+The exchange holds no lock while waiting on a socket.
+
+What that admits is stated rather than left to be rediscovered: two calls are
+not a consistent pair. `count` and `entries` may disagree by whatever landed
+between them. That is safe here because RBSR converges as a fixed point rather
+than in a single pass — an interleaved write costs a wasted descent, not a
+wrong answer — and it would not be safe for a protocol needing a snapshot.
+
+A test asserting the *stronger* property failed, which is how the distinction
+got written down. The test now asserts what is actually guaranteed: each single
+call is internally consistent, and one explicit lock gives a consistent pair.
+
+## 11. SEVERE — a crash during any save could destroy the identity · **FIXED**
+
+Every persistent write used `std::fs::write`, which truncates and then writes.
+Between those steps the file is empty; after a partial write it holds a prefix.
+There was no `fsync` and no atomic rename anywhere — 29 write sites, zero
+durable.
+
+For most files that is an inconvenience. For `identity.wrapped` it is
+permanent identity loss, and RFC 7 §11 is explicit:
+
+> "Losing identity means every peer must re-verify out of band, in person, from
+> scratch."
+
+The identity is rewritten on `init` and on any operation touching the key
+hierarchy, so the window is every save rather than a rare one. §11 prescribes
+an offline backup *for* identity loss — it did not anticipate that a routine
+write was among the ways to cause it, and an operator who took the backup and
+then lost the file to a power cut would be recovering from the implementation
+rather than from a disaster.
+
+**Fix.** `atomic::write`: write to `<path>.tmp`, `fsync` it, `rename` over the
+target, `fsync` the directory. A crash at any point leaves either the old file
+or the new one.
+
+The directory sync is the step usually missed: syncing the file makes the
+*contents* durable and leaves the *directory entry pointing at them* possibly
+not, so a crash can undo the rename and orphan the temporary.
+
+The temporary sits beside the target rather than in a system temp directory,
+because `rename` is only atomic within a filesystem and a cross-device rename
+degrades to copy-and-delete — which is the non-atomic write being avoided.
+
+### One place that deliberately is not atomic
+
+`peer pad` writes the reservoir contribution to removable media. An atomic
+write leaves a `.tmp` on failure, and here that file is **the plaintext
+contribution** under a name nothing cleans up, on a medium the operator is
+about to carry away. A partial write is visibly partial and the pad is
+regenerable from the ceremony, so the plain form is safer. Recorded at the call
+site, because it looks like an oversight.
+
+## Running total
+
+Five axes, eleven findings, six severe:
+
+| axis | findings | severe |
+|---|---|---|
+| sentences | 4 | 2 |
+| time | 4 | 2 |
+| fuzzing | 1 | 1 |
+| portability | 2 | 0 |
+| concurrency + crash-consistency | 2 | 2 |
+
+No axis has come back empty, and no axis has found what another would have.
+Finding 10 was a stated requirement violated in code; finding 11 was a class of
+bug nothing else looks for. Neither is reachable by reading the code for
+correctness — one needs the requirement in hand, the other needs someone to ask
+"what if this stops halfway?"

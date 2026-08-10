@@ -33,6 +33,15 @@
 //! the disk is not trusted — RFC 7 §4's whole premise is that it may have been
 //! tampered with while the node was off.
 //!
+//! # Every write here is atomic
+//!
+//! `crate::atomic::write` rather than `std::fs::write`. A crash mid-write to
+//! `identity.wrapped` would otherwise leave a truncated file and destroy the
+//! identity permanently — RFC 7 §11: "losing identity means every peer must
+//! re-verify out of band, in person, from scratch." §11 prescribes an offline
+//! backup for that loss; it did not anticipate that a routine save was one of
+//! the ways to cause it.
+//!
 //! # `kek.params` is plaintext and that is safe
 //!
 //! It holds the Argon2id salt and cost parameters, which RFC 7 §4.1 requires be
@@ -123,7 +132,7 @@ pub fn write_params(path: &Path, p: &KekParams) -> Result<(), Error> {
     w.uint(2).uint(p.t as u64);
     w.uint(3).uint(p.p as u64);
     w.uint(4).bstr(&p.salt);
-    std::fs::write(path, w.finish()).map_err(|_| Error::Io)
+    crate::atomic::write(path, &w.finish()).map_err(|_| Error::Io)
 }
 
 /// Read the KEK parameters.
@@ -166,7 +175,7 @@ pub fn write_identity(
     let sealed = kek
         .seal(CONTEXT_IDENTITY, &plain, rng)
         .map_err(|_| Error::Io)?;
-    std::fs::write(path, sealed).map_err(|_| Error::Io)
+    crate::atomic::write(path, &sealed).map_err(|_| Error::Io)
 }
 
 /// Recover the identity.
@@ -205,11 +214,24 @@ pub fn kek_for(passphrase: &[u8], params: &KekParams) -> Result<Kek, Error> {
 }
 
 /// Write the corpus, in the courier archive format.
+///
+/// Packed to a temporary and renamed, so a crash cannot truncate the corpus.
+/// Objects are recoverable from peers, but a node that lost half its store on a
+/// power cut then spends its next reconciliations re-fetching what it already
+/// had — and on a serial or courier link that is hours or weeks.
 pub fn write_corpus(path: &Path, store: &Store) -> Result<usize, Error> {
     let profile = krab_fabric::profile::LinkProfile::courier();
-    crate::courier::pack(store, path, (0, u32::MAX), &profile)
+    let tmp = crate::atomic::temp_for(path);
+    let n = crate::courier::pack(store, &tmp, (0, u32::MAX), &profile)
         .map(|p| p.objects)
-        .map_err(|_| Error::Io)
+        .map_err(|_| Error::Io)?;
+    std::fs::rename(&tmp, path).map_err(|_| Error::Io)?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(n)
 }
 
 /// Read the corpus back, verifying every object.

@@ -143,7 +143,7 @@ impl<S: Read + Write> StreamSession<S> {
     }
 }
 
-impl<S: Read + Write> crate::Session for StreamSession<S> {
+impl<S: Read + Write + Send> crate::Session for StreamSession<S> {
     fn send(&mut self, msg: &krab_proto::control::Control) -> Result<(), Error> {
         let plain = msg.write();
         self.buf.resize(plain.len() + 16, 0);

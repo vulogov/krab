@@ -25,6 +25,7 @@
 
 mod activity;
 mod activity_log;
+mod atomic;
 mod ceremony;
 mod command;
 mod compose;
@@ -41,6 +42,7 @@ mod reach;
 mod receive;
 mod render;
 mod request;
+mod shared;
 mod shred;
 mod sync;
 // RFC 1 §12's vector file is a test artifact: it is generated and checked by
@@ -127,8 +129,13 @@ struct App {
     home: PathBuf,
     /// Transports. **Holds nothing that can reconcile** — RFC 8 §5.1.
     links: LinkTable,
-    /// The corpus.
-    store: krab_store::index::Store,
+    /// The corpus, reachable from background exchanges.
+    store: shared::SharedStore,
+    /// Finished exchanges, reported back from their threads.
+    exchanges: (
+        std::sync::mpsc::Sender<activity_log::Event>,
+        std::sync::mpsc::Receiver<activity_log::Event>,
+    ),
     /// The reconciliation schedule. Poisson, and blind to everything the user
     /// does — RFC 5 §6.1.
     scheduler: krab_node::scheduler::Scheduler,
@@ -170,7 +177,8 @@ impl Default for App {
             epoch_key: None,
             home: PathBuf::from("."),
             links: LinkTable::new(),
-            store: krab_store::index::Store::new(),
+            store: shared::SharedStore::new(krab_store::index::Store::new()),
+            exchanges: std::sync::mpsc::channel(),
             // Four hours. RFC 5 §6.1 fixes the shape, not the mean; this is a
             // starting point a deployment tunes.
             scheduler: krab_node::scheduler::Scheduler::new(4 * 3_600),
@@ -365,10 +373,12 @@ impl App {
         .due;
         // Provenance for what the schedule did. Aggregates only, no clock —
         // RFC 3 §12, and `activity_log`'s module note on why.
+        self.drain_exchanges();
         for peer in &due {
             let short = short_id(peer);
-            let event = self.reconcile_with(&short);
-            self.log.push(event);
+            if let Some(event) = self.reconcile_with(&short) {
+                self.log.push(event);
+            }
         }
         if !due.is_empty() {
             // Reconciliation itself needs a live session, which arrives with
@@ -421,7 +431,7 @@ impl App {
     /// through `establish`, which returns a session and nothing else. RFC 8
     /// §5.1's guarantee is that a keypress never causes a transfer, and the
     /// separation is that the two paths do not share a function.
-    fn reconcile_with(&mut self, peer: &str) -> activity_log::Event {
+    fn reconcile_with(&mut self, peer: &str) -> Option<activity_log::Event> {
         let window = {
             let now = now_epoch().0 * 1440;
             (
@@ -429,27 +439,62 @@ impl App {
                 now.saturating_add(45 * 1440) + 1,
             )
         };
-        let Some(session) = self.links.session_mut(peer) else {
-            return activity_log::Event::Failed {
+        let Some(session) = self.links.take_session(peer) else {
+            return Some(activity_log::Event::Failed {
                 peer: peer.to_string(),
                 why: "no session — nothing exchanged",
-            };
+            });
         };
-        let mut view = krab_node::node::StoreView(&mut self.store);
-        match krab_node::exchange::initiate(session, &mut view, [0u8; 32], window.0, window.1) {
-            Ok(moved) => activity_log::Event::Reconciled {
-                peer: peer.to_string(),
-                received: moved.received,
-                sent: moved.sent,
-            },
-            Err(_) => {
+
+        // **Off the interface thread.** An exchange on a serial link is
+        // minutes (RFC 4 §5.3), and running it here would freeze the render
+        // loop — taking the lock chord with it, which is the one keystroke an
+        // operator might need urgently.
+        //
+        // `ExchangeView` locks per operation and never across one, so the
+        // interface reads the corpus between the exchange's calls rather than
+        // waiting behind it. Handing the thread a guard instead would rebuild
+        // the freeze through the lock.
+        let view_store = self.store.clone();
+        let done = self.exchanges.0.clone();
+        let name = peer.to_string();
+        std::thread::spawn(move || {
+            let mut session = session;
+            let mut view = shared::ExchangeView::new(view_store, window.0);
+            let event = match krab_node::exchange::initiate(
+                &mut *session,
+                &mut view,
+                [0u8; 32],
+                window.0,
+                window.1,
+            ) {
+                Ok(moved) => activity_log::Event::Reconciled {
+                    peer: name,
+                    received: moved.received,
+                    sent: moved.sent,
+                },
                 // A dead session is ordinary on an intermittent link (I-4).
-                self.links.failed(peer);
-                activity_log::Event::Failed {
-                    peer: peer.to_string(),
+                Err(_) => activity_log::Event::Failed {
+                    peer: name,
                     why: "session ended",
-                }
+                },
+            };
+            let _ = done.send(event);
+        });
+        None
+    }
+
+    /// Drain finished exchanges. Never blocks.
+    fn drain_exchanges(&mut self) {
+        while let Ok(event) = self.exchanges.1.try_recv() {
+            if matches!(event, activity_log::Event::Failed { .. }) {
+                self.links.failed(event.peer());
             }
+            self.log.push(event);
+        }
+        // Mail may have arrived while the interface was doing nothing.
+        if self.identity.is_some() && self.epoch_key.is_some() {
+            self.refresh_inbox();
         }
     }
 
@@ -536,13 +581,9 @@ impl App {
             self.tag_table = Some(receive::TagTable::build(&peers, epoch));
         }
         let table = self.tag_table.as_ref().expect("just built");
-        let scan = receive::Inbox::scan(
-            &self.store,
-            table,
-            &peers,
-            id.correspondence(),
-            (0, u32::MAX),
-        );
+        let scan = self
+            .store
+            .with(|st| receive::Inbox::scan(st, table, &peers, id.correspondence(), (0, u32::MAX)));
 
         self.list = if scan.messages.is_empty() {
             vec![format!(
@@ -575,13 +616,9 @@ impl App {
         // First-contact requests, on our own inbox tag. Shown at the top: a
         // request needs a human decision (RFC 3 §11's ceremony is a deliberate
         // act), and burying it under mail would mean it is never made.
-        let requests = receive::scan_requests(
-            &self.store,
-            id.correspondence(),
-            &id.node_id(),
-            epoch,
-            (0, u32::MAX),
-        );
+        let requests = self.store.with(|st| {
+            receive::scan_requests(st, id.correspondence(), &id.node_id(), epoch, (0, u32::MAX))
+        });
         for inc in &requests {
             let note = inc.request.note.chars().take(40).collect::<String>();
             self.list.insert(
@@ -864,7 +901,9 @@ impl App {
             &mut OsRng,
         )
         .map_err(|e| format!("{e:?}"))?;
-        std::fs::write(self.path("ceremony.cbor"), p.encode(&wrapped))
+        // Atomic: a ceremony is days long, and a crash mid-save would lose the
+        // contribution while the counterparty still holds theirs.
+        atomic::write(&self.path("ceremony.cbor"), &p.encode(&wrapped))
             .map_err(|e| format!("could not write ceremony state: {e}"))
     }
 
@@ -888,6 +927,11 @@ impl App {
             Err(e) => return e,
         };
         let bytes = ceremony::encode_contribution(&pending.my_contribution);
+        // **Deliberately not atomic.** An atomic write leaves a `.tmp` on
+        // failure, and here that file would be the plaintext contribution under
+        // a name nothing cleans up — on removable media the operator is about
+        // to carry away. A partial write is visibly a partial write and the pad
+        // is regenerable from the ceremony, so the plain form is the safer one.
         match std::fs::write(dest, bytes) {
             Err(e) => format!("could not write {dest}: {e}"),
             Ok(()) => format!(
@@ -1000,10 +1044,10 @@ impl App {
         // is what `send` resolves a peer name against — RFC 3 §4 makes the
         // link the durable artifact, not the ceremony.
         let short = short_id(&their_card.node_id());
-        if let Err(e) = std::fs::write(self.path(&format!("{short}.reservoir")), out) {
+        if let Err(e) = atomic::write(&self.path(&format!("{short}.reservoir")), &out) {
             return format!("could not store the reservoir: {e}");
         }
-        if let Err(e) = std::fs::write(self.path(&format!("{short}.link")), their_card.encode()) {
+        if let Err(e) = atomic::write(&self.path(&format!("{short}.link")), &their_card.encode()) {
             return format!("could not store the peer-link: {e}");
         }
         shred::remove(&self.path("ceremony.cbor"), &mut OsRng);
@@ -1132,7 +1176,7 @@ impl App {
         let n = composed.bytes.len();
         match self
             .store
-            .ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX)
+            .with(|s| s.ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX))
         {
             Ok(()) => {
                 let note = if chunk.is_some() {
@@ -1214,7 +1258,7 @@ impl App {
 
         match self
             .store
-            .ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX)
+            .with(|s| s.ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX))
         {
             Ok(()) => {
                 self.save_corpus();
@@ -1260,7 +1304,10 @@ impl App {
             now.saturating_add(MAX_TTL_MIN) + 1,
         );
 
-        match courier::pack(&self.store, &path, window, &profile) {
+        match self
+            .store
+            .with(|s| courier::pack(s, &path, window, &profile))
+        {
             Err(e) => format!("could not write {}: {e}", path.display()),
             Ok(packed) => {
                 let manifest = path.with_extension("MANIFEST.hjson");
@@ -1295,7 +1342,7 @@ impl App {
                  trying — records before {idx} would import."
             );
         }
-        match courier::import(&mut self.store, &path, now) {
+        match self.store.with(|s| courier::import(s, &path, now)) {
             Err(e) => format!("could not read {}: {e}", path.display()),
             Ok(got) => {
                 let msg = format!(
@@ -1538,7 +1585,7 @@ impl App {
         self.identity = None; // Drop runs Zeroize on every private key
         self.epoch_key = None;
         self.tag_table = None;
-        self.store = krab_store::index::Store::new();
+        self.store = shared::SharedStore::new(krab_store::index::Store::new());
         for m in &mut self.messages {
             overwrite(&mut m.body);
         }
@@ -1592,12 +1639,16 @@ impl App {
         if let Some(id) = &self.identity {
             let _ = persist::write_identity(&self.path("identity.wrapped"), id, kek, &mut OsRng);
         }
-        let _ = persist::write_corpus(&self.path("corpus.krab"), &self.store);
+        let _ = self
+            .store
+            .with(|s| persist::write_corpus(&self.path("corpus.krab"), s));
     }
 
     /// Persist just the corpus. Cheap, and needs no key.
     fn save_corpus(&self) {
-        let _ = persist::write_corpus(&self.path("corpus.krab"), &self.store);
+        let _ = self
+            .store
+            .with(|s| persist::write_corpus(&self.path("corpus.krab"), s));
     }
 
     fn identity_params(&self) -> krab_crypto::kek::KekParams {
@@ -1665,7 +1716,7 @@ impl App {
         let sealed = kek
             .seal(persist::CONTEXT_DURESS, b"duress", &mut OsRng)
             .map_err(|e| format!("{e:?}"))?;
-        std::fs::write(self.path("duress.wrapped"), sealed)
+        atomic::write(&self.path("duress.wrapped"), &sealed)
             .map_err(|e| format!("could not store it: {e}"))
     }
 
@@ -1703,7 +1754,9 @@ impl App {
 
         // The corpus goes through the same verification a stranger's archive
         // does. The disk is not trusted (RFC 7 §4).
-        let _ = persist::read_corpus(&self.path("corpus.krab"), &mut self.store, epoch.0 * 1440);
+        let _ = self
+            .store
+            .with(|s| persist::read_corpus(&self.path("corpus.krab"), s, epoch.0 * 1440));
         self.refresh_inbox();
         Ok(())
     }
@@ -1737,7 +1790,7 @@ impl App {
         // wrapped under W_N in the ceremony, so a plaintext copy would be a
         // redundant one — see Documentation/SECURE-DELETE.md. `peer pad
         // <destination>` materialises it onto the medium being carried.
-        if let Err(e) = std::fs::write(self.path("peer.card"), mine.card.encode()) {
+        if let Err(e) = atomic::write(&self.path("peer.card"), &mine.card.encode()) {
             return format!("could not write peer.card: {e}");
         }
         if let Err(e) = self.save_ceremony(&pending) {
@@ -2642,8 +2695,11 @@ mod tests {
         assert_eq!(a.links.up_count(), 0);
 
         // Now read it as B would, from the object alone.
-        let id = *a.store.ids_in_order().next().unwrap();
-        let raw = a.store.get(&id).unwrap();
+        let (id, raw) = a.store.with(|s| {
+            let id = *s.ids_in_order().next().unwrap();
+            (id, s.get(&id).unwrap().to_vec())
+        });
+        let raw = &raw[..];
         let header = krab_core::object::RoutingHeader::parse(raw).unwrap();
         let (env, _) = krab_core::object::decode_envelope(&raw[16..]).unwrap();
 
@@ -2789,8 +2845,11 @@ mod tests {
         assert_eq!(b.store.len(), 1);
 
         // B reads it, having received one file and nothing else.
-        let id = *b.store.ids_in_order().next().unwrap();
-        let raw = b.store.get(&id).unwrap();
+        let (id, raw) = b.store.with(|s| {
+            let id = *s.ids_in_order().next().unwrap();
+            (id, s.get(&id).unwrap().to_vec())
+        });
+        let raw = &raw[..];
         let header = krab_core::object::RoutingHeader::parse(raw).unwrap();
         let (env, _) = krab_core::object::decode_envelope(&raw[16..]).unwrap();
 
@@ -2875,7 +2934,7 @@ mod tests {
             (krab_crypto::object_id(&b), b)
         };
         a.store
-            .ingest(id, bytes, now_epoch().0 * 1440, u32::MAX)
+            .with(|s| s.ingest(id, bytes, now_epoch().0 * 1440, u32::MAX))
             .unwrap();
         type_command(&mut a, "pack out.krab");
 
@@ -2892,16 +2951,18 @@ mod tests {
         // arriving under the original's identifier, which is what would let a
         // courier substitute content for something a peer already wants.
         assert!(
-            !b.store.contains(&id),
+            !b.store.with(|s| s.contains(&id)),
             "tampered content took the original's name"
         );
-        for oid in b.store.ids_in_order() {
-            assert_eq!(
-                krab_crypto::object_id(b.store.get(oid).unwrap()),
-                *oid,
-                "every object in the store hashes to its own identifier"
-            );
-        }
+        b.store.with(|s| {
+            for oid in s.ids_in_order() {
+                assert_eq!(
+                    krab_crypto::object_id(s.get(oid).unwrap()),
+                    *oid,
+                    "every object in the store hashes to its own identifier"
+                );
+            }
+        });
     }
 
     #[test]
@@ -3475,13 +3536,15 @@ mod tests {
         assert_eq!(b.store.len(), 1);
 
         // B recognises it on its own inbox tag, which needs only B's own key.
-        let incoming = receive::scan_requests(
-            &b.store,
-            b.identity.as_ref().unwrap().correspondence(),
-            &b.identity.as_ref().unwrap().node_id(),
-            now_epoch(),
-            (0, u32::MAX),
-        );
+        let incoming = b.store.with(|st| {
+            receive::scan_requests(
+                st,
+                b.identity.as_ref().unwrap().correspondence(),
+                &b.identity.as_ref().unwrap().node_id(),
+                now_epoch(),
+                (0, u32::MAX),
+            )
+        });
         assert_eq!(incoming.len(), 1, "the request was not recognised");
 
         // And it is visible in the interface, at the top, with the caution
@@ -3527,13 +3590,15 @@ mod tests {
         std::fs::copy(a.path("out.krab"), &stick).unwrap();
         type_command(&mut c, &format!("import {}", stick.display()));
 
-        let incoming = receive::scan_requests(
-            &c.store,
-            c.identity.as_ref().unwrap().correspondence(),
-            &c.identity.as_ref().unwrap().node_id(),
-            now_epoch(),
-            (0, u32::MAX),
-        );
+        let incoming = c.store.with(|st| {
+            receive::scan_requests(
+                st,
+                c.identity.as_ref().unwrap().correspondence(),
+                &c.identity.as_ref().unwrap().node_id(),
+                now_epoch(),
+                (0, u32::MAX),
+            )
+        });
         assert!(
             incoming.is_empty(),
             "C must not adopt a request addressed to B"

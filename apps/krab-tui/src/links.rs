@@ -204,6 +204,20 @@ impl LinkTable {
         }
     }
 
+    /// Take the session for a peer whose transport is up.
+    ///
+    /// Moves it out rather than lending it: an exchange runs on another thread
+    /// and cannot borrow from the link table. A peer with an exchange in flight
+    /// therefore has no session here, which is also what stops two overlapping
+    /// exchanges on one link.
+    pub fn take_session(&mut self, peer: &str) -> Option<Box<dyn krab_fabric::Session + 'static>> {
+        let l = self.links.get_mut(peer)?;
+        if l.transport != Transport::Up {
+            return None;
+        }
+        l.session.take()
+    }
+
     /// The session for a peer whose transport is up.
     pub fn session_mut<'a>(
         &'a mut self,

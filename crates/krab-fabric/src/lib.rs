@@ -90,7 +90,12 @@ impl std::error::Error for Error {}
 /// Expressed in **control messages, not bytes or connections**, which is what
 /// lets the courier backend implement it: `send` appends to an archive and
 /// `recv` reads from one.
-pub trait Session {
+///
+/// `Send`, because an exchange must run off the interface thread. RFC 8's node
+/// is also the client, and a reconciliation that blocks the render loop makes
+/// the lock chord unavailable for the duration — which is exactly when an
+/// operator may need it.
+pub trait Session: Send {
     /// Offer a control message toward the peer.
     fn send(&mut self, msg: &Control) -> Result<(), Error>;
 

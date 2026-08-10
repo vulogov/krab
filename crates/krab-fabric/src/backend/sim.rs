@@ -12,9 +12,9 @@
 
 use crate::{Error, Fabric, LinkProfile, Session};
 use krab_proto::control::Control;
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 /// A shared in-memory wire between two ends.
 #[derive(Debug, Default)]
@@ -28,7 +28,7 @@ struct Wire {
 
 /// One end of a simulated link.
 pub struct SimSession {
-    wire: Rc<RefCell<Wire>>,
+    wire: Arc<Mutex<Wire>>,
     /// `true` for the initiating end.
     is_a: bool,
     closed: bool,
@@ -39,7 +39,7 @@ impl Session for SimSession {
         if self.closed {
             return Err(Error::Closed);
         }
-        let mut w = self.wire.borrow_mut();
+        let mut w = self.wire.lock().expect("sim wire poisoned");
         if w.partitioned {
             // I-4: unreachable is normal, not an escalation. The message is
             // lost exactly as it would be on a real intermittent link.
@@ -58,7 +58,7 @@ impl Session for SimSession {
         if self.closed {
             return Err(Error::Closed);
         }
-        let mut w = self.wire.borrow_mut();
+        let mut w = self.wire.lock().expect("sim wire poisoned");
         if w.partitioned {
             return Ok(None);
         }
@@ -78,7 +78,7 @@ impl Session for SimSession {
 /// A simulated link.
 pub struct SimFabric {
     profile: LinkProfile,
-    wire: Rc<RefCell<Wire>>,
+    wire: Arc<Mutex<Wire>>,
 }
 
 impl SimFabric {
@@ -86,7 +86,7 @@ impl SimFabric {
     pub fn new(profile: LinkProfile) -> SimFabric {
         SimFabric {
             profile,
-            wire: Rc::new(RefCell::new(Wire::default())),
+            wire: Arc::new(Mutex::new(Wire::default())),
         }
     }
 
@@ -94,24 +94,24 @@ impl SimFabric {
     pub fn counterpart(&self, profile: LinkProfile) -> SimFabric {
         SimFabric {
             profile,
-            wire: Rc::clone(&self.wire),
+            wire: Arc::clone(&self.wire),
         }
     }
 
     /// Partition the link. Sends are dropped and receives return nothing.
     pub fn partition(&self, on: bool) {
-        self.wire.borrow_mut().partitioned = on;
+        self.wire.lock().expect("sim wire poisoned").partitioned = on;
     }
 
     /// Messages lost to partitions so far.
     pub fn dropped(&self) -> usize {
-        self.wire.borrow().dropped
+        self.wire.lock().expect("sim wire poisoned").dropped
     }
 
     /// A session as the initiating end.
     pub fn end_a(&self) -> SimSession {
         SimSession {
-            wire: Rc::clone(&self.wire),
+            wire: Arc::clone(&self.wire),
             is_a: true,
             closed: false,
         }
@@ -120,7 +120,7 @@ impl SimFabric {
     /// A session as the responding end.
     pub fn end_b(&self) -> SimSession {
         SimSession {
-            wire: Rc::clone(&self.wire),
+            wire: Arc::clone(&self.wire),
             is_a: false,
             closed: false,
         }
@@ -132,13 +132,13 @@ impl Fabric for SimFabric {
         &self.profile
     }
     fn connect(&self) -> Result<Box<dyn Session>, Error> {
-        if self.wire.borrow().partitioned {
+        if self.wire.lock().expect("sim wire poisoned").partitioned {
             return Err(Error::Unreachable);
         }
         Ok(Box::new(self.end_a()))
     }
     fn accept(&self) -> Result<Option<Box<dyn Session>>, Error> {
-        if self.wire.borrow().partitioned {
+        if self.wire.lock().expect("sim wire poisoned").partitioned {
             return Ok(None);
         }
         Ok(Some(Box::new(self.end_b())))
