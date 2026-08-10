@@ -399,7 +399,7 @@ impl App {
 
         match Binding::of(press, interp) {
             // Reachable from every mode, dispatched above every mode branch.
-            Binding::Quit => self.quit = true,
+            Binding::Quit => self.leave(),
             Binding::Lock => self.lock(),
             Binding::CycleFocus => self.ui.cycle_focus(),
             Binding::CycleFocusBack => self.ui.cycle_focus_back(),
@@ -854,7 +854,15 @@ impl App {
             );
             return;
         };
-        match admit(&cmd, self.identity.is_some(), self.locked, self.confirmed) {
+        // **An identity this node has, not an identity it currently holds in
+        // memory.** These are different after a restart: the key hierarchy is
+        // on disk, wrapped, and nothing is in memory until a passphrase
+        // arrives. Passing the in-memory answer here broke both directions —
+        // `unlock` was refused for want of the very thing it exists to
+        // produce, and `init` was *admitted*, which would have generated a
+        // fresh hierarchy and overwritten the stored one.
+        let has_identity = self.identity.is_some() || self.has_stored_identity();
+        match admit(&cmd, has_identity, self.locked, self.confirmed) {
             Err(Refusal::NoIdentity) => {
                 self.output = "no identity yet — run `init` first".into();
             }
@@ -925,7 +933,7 @@ impl App {
                 };
             }
             // RFC 3 §11 step 2, and RFC 8 §5's `verify`.
-            Command::Quit => self.quit = true,
+            Command::Quit => self.leave(),
             Command::Listen => {
                 // An address typed here wins over `--listen`; `--listen` is
                 // the default so the operator does not retype what they
@@ -965,7 +973,10 @@ impl App {
                 for (chord, what) in Command::CHORDS {
                     out.push_str(&format!("  {chord:<20}{what}\n"));
                 }
-                self.output = out;
+                // The view pane, for the same reason as the backup words: two
+                // rows cannot hold it, and RFC 8 §3 says where it goes.
+                self.body = out;
+                self.output = "verbs and keys — see the message pane".into();
             }
             Command::Verify => {
                 self.output = match &self.identity {
@@ -1802,7 +1813,7 @@ impl App {
             _ => "not built — no correspondents, or locked".into(),
         };
         format!(
-            "identity   {}\n\
+            "identity   {}  (this node's address — public, not a secret)\n\
              epochs     {epochs} wrapper{} ({} bytes)\n\
              corpus     {} objects, {} bytes (cap {})\n\
              tags       {table}\n\
@@ -2190,12 +2201,41 @@ impl App {
                         .as_ref()
                         .map(|i| i.backup_phrase())
                         .unwrap_or_default();
-                    self.output = format!("{}\n\n{}", next.prompt(), phrase);
+                    // The words go to the view pane, not the output pane.
+                    // RFC 8 §3: output longer than one line MUST render into
+                    // the message view. Printed into two rows they scrolled
+                    // off, so the ceremony said "write these words down" and
+                    // showed none of them — and the next step asks the
+                    // operator to confirm they wrote down what they never saw.
+                    self.body = format!(
+                        "{}\n\n{phrase}\n\n\
+                         This is the only copy. RFC 7 §11: message history is \
+                         not recoverable from it, but without it every peer \
+                         must re-verify you in person, from scratch.",
+                        next.prompt()
+                    );
+                    self.output = format!("{} — see the message pane", next.prompt());
                 } else if next != InitStep::Generate {
                     self.output = next.prompt().into();
                 }
             }
         }
+    }
+
+    /// Leave.
+    ///
+    /// `Ctrl-Q` and the `quit` verb both arrive here, so they cannot drift
+    /// apart — they had, and one of them left the corpus unwritten.
+    ///
+    /// The corpus is written because it needs no key. The identity and its
+    /// wrapper are already on disk from `init` or `unlock`: the KEK is
+    /// memory-only by RFC 7 §4 and is not held here to re-wrap with, which is
+    /// why quitting mid-ceremony correctly leaves nothing behind.
+    fn leave(&mut self) {
+        if !self.locked && self.epoch_key.is_some() {
+            self.save_corpus();
+        }
+        self.quit = true;
     }
 
     /// Lock: zeroize what the interface holds and drop to the relay role.
@@ -4700,9 +4740,208 @@ mod tests {
             "quit",
         ] {
             assert!(
-                a.output.contains(verb),
+                a.body.contains(verb),
                 "help does not mention `{verb}`:\n{}",
-                a.output
+                a.body
+            );
+        }
+    }
+
+    /// **A restarted node can be unlocked, and cannot be re-initialised.**
+    ///
+    /// Both halves went wrong the same way: `admit` was told whether an
+    /// identity was in *memory*, when what it needed was whether this node
+    /// *has* one. After a restart the hierarchy is on disk and memory is
+    /// empty, so `unlock` was refused for want of the thing it produces —
+    /// and `init` was admitted, which would have generated a new hierarchy
+    /// over the stored one and made every existing message unreadable.
+    ///
+    /// Existing restart coverage called `open_with` directly and so could not
+    /// see this. It is reached only through `submit`.
+    #[test]
+    fn a_restarted_node_unlocks_and_refuses_to_reinitialise() {
+        let home = temp_home("restart-verbs");
+
+        // A node with a store on disk.
+        let mut a = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        let mut id = Identity::generate(&mut OsRng);
+        id.kek_params.m_kib = 64;
+        id.kek_params.t = 1;
+        id.kek_params.p = 1;
+        let fingerprint = id.short_id();
+        a.identity = Some(id);
+        a.passphrase = line::Line::from("a passphrase");
+        a.open_store().expect("the store opens");
+        assert!(a.has_stored_identity(), "something must be on disk");
+
+        // Restart: same directory, nothing in memory.
+        let mut b = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        assert!(b.identity.is_none());
+
+        // `init` must not be offered a second time — it would overwrite the
+        // hierarchy that is already there.
+        type_command(&mut b, "init");
+        assert!(
+            b.output.contains("already has an identity"),
+            "init was admitted over an existing store: {}",
+            b.output
+        );
+        assert!(b.init_step.is_none(), "and did not start the ceremony");
+
+        // `unlock` must be admitted, then take the passphrase.
+        type_command(&mut b, "unlock");
+        assert!(
+            !b.output.contains("no identity yet"),
+            "unlock was refused for want of what it produces: {}",
+            b.output
+        );
+        assert_eq!(
+            b.init_step,
+            Some(InitStep::Passphrase),
+            "unlock must ask for a passphrase: {}",
+            b.output
+        );
+
+        for c in "a passphrase".chars() {
+            b.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        b.advance_init();
+        assert!(b.identity.is_some(), "the store did not open: {}", b.output);
+        assert_eq!(
+            b.identity.as_ref().unwrap().short_id(),
+            fingerprint,
+            "and it is the same identity, not a new one"
+        );
+        assert!(b.epoch_key.is_some(), "with its epoch key");
+    }
+
+    /// **The backup words must be on screen when the ceremony asks whether
+    /// they were written down.** They were printed into the two-row output
+    /// pane, where they scrolled off — so the next step asked the operator to
+    /// confirm they had recorded something they had never seen.
+    #[test]
+    fn the_backup_words_are_shown_where_they_fit() {
+        let mut a = App::default();
+        a.home = temp_home("backup-words");
+        type_command(&mut a, "init");
+        while a.init_step != Some(InitStep::ShowBackup) {
+            if a.init_step == Some(InitStep::Passphrase) {
+                a.passphrase = line::Line::from("a passphrase");
+            }
+            a.advance_init();
+        }
+
+        let phrase = a
+            .identity
+            .as_ref()
+            .expect("the ceremony generated an identity")
+            .backup_phrase();
+        assert!(phrase.split_whitespace().count() > 8, "a real word list");
+        assert!(
+            a.body.contains(&phrase),
+            "the words are not on screen:\n{}",
+            a.body
+        );
+        // And the two-row pane says where to look rather than truncating them.
+        assert!(!a.output.contains(&phrase));
+        assert!(a.output.contains("message pane"), "{}", a.output);
+    }
+
+    /// `Ctrl-Q` and `quit` must do the same thing. They did not: one wrote the
+    /// corpus out and the other did not.
+    #[test]
+    fn the_two_ways_out_both_persist_the_corpus() {
+        let make = |tag: &str| {
+            let mut a = App {
+                home: temp_home(tag),
+                ..App::default()
+            };
+            let mut id = Identity::generate(&mut OsRng);
+            id.kek_params.m_kib = 64;
+            id.kek_params.t = 1;
+            id.kek_params.p = 1;
+            a.identity = Some(id);
+            a.passphrase = line::Line::from("a passphrase");
+            a.open_store().expect("the store opens");
+            std::fs::remove_file(a.path("corpus.krab")).expect("start without one");
+            a
+        };
+
+        let mut chord = make("quit-chord");
+        chord.on_key(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(chord.quit);
+        assert!(
+            chord.path("corpus.krab").exists(),
+            "Ctrl-Q left the corpus unwritten"
+        );
+
+        let mut verb = make("quit-verb");
+        type_command(&mut verb, "quit");
+        assert!(verb.quit);
+        assert!(
+            verb.path("corpus.krab").exists(),
+            "`quit` left the corpus unwritten"
+        );
+    }
+
+    /// **The quickstarts must not go stale.** Every verb shown at a `>`
+    /// prompt in `INIT.md` and `PEERING.md` has to still parse, and every
+    /// `peer` subverb has to still exist. Renaming a verb without touching
+    /// the documentation fails here rather than at an operator's terminal.
+    #[test]
+    fn the_documented_verbs_all_exist() {
+        for doc in [
+            "../../Documentation/INIT.md",
+            "../../Documentation/PEERING.md",
+        ] {
+            let text = std::fs::read_to_string(doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+            let mut checked = 0;
+            let mut fenced = false;
+            for line in text.lines() {
+                if line.starts_with("```") {
+                    fenced = !fenced;
+                    continue;
+                }
+                // Prompt lines inside the fenced examples. Outside them `> `
+                // is a Markdown blockquote, which is prose.
+                if !fenced {
+                    continue;
+                }
+                let Some(rest) = line.strip_prefix("> ") else {
+                    continue;
+                };
+                let rest = rest.trim();
+                // `> (Enter)` and blockquote prose are not commands.
+                if rest.starts_with('(') || rest.starts_with("**") || rest.is_empty() {
+                    continue;
+                }
+                let verb = rest.split_whitespace().next().unwrap();
+                // The screen mockups draw a cursor after the prompt.
+                if !verb.chars().all(|c| c.is_ascii_lowercase()) {
+                    continue;
+                }
+                assert!(
+                    Command::parse(verb).is_some(),
+                    "{doc} documents `{verb}`, which no longer parses"
+                );
+                if verb == "peer" {
+                    let sub = rest.strip_prefix("peer").unwrap_or("");
+                    assert!(
+                        Peering::parse(sub).is_some(),
+                        "{doc} documents `{rest}`, which no longer parses"
+                    );
+                }
+                checked += 1;
+            }
+            assert!(
+                checked >= 5,
+                "{doc}: only {checked} commands found — did the format change?"
             );
         }
     }
