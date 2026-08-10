@@ -42,6 +42,7 @@ mod persist;
 mod reach;
 mod receive;
 mod rekey;
+mod rekey_run;
 mod render;
 mod request;
 mod shared;
@@ -88,6 +89,32 @@ const TICK: Duration = Duration::from_millis(250);
 /// Bounded because the wait is on the UI thread: an unbounded accept is a hung
 /// interface with no way to cancel it.
 const ANSWER_WAIT_S: u64 = 30;
+
+/// Why a re-key stopped, in words an operator can act on.
+fn rekey_failure(peer: &str, e: rekey_run::Error) -> String {
+    use rekey_run::Error;
+    match e {
+        Error::Link => format!("the link to {peer} failed mid-re-key — nothing changed"),
+        Error::Protocol => format!("{peer} sent something unexpected — nothing changed"),
+        Error::Undecipherable => format!(
+            "{peer} is working from a different reservoir. Usually one end \
+             re-keyed and the other did not; try again once both are up."
+        ),
+        // The one that is not an accident.
+        Error::Forged => format!(
+            "the re-key from {peer} was sealed correctly and signed by someone \
+             else. Someone holding their reservoir tried to steer this peering. \
+             Nothing changed. Do not re-key again until you have spoken to them."
+        ),
+        Error::Diverged => {
+            format!("{peer} derived a different root — nothing changed on either side")
+        }
+        Error::WrongIndex => format!(
+            "{peer} is re-keying to a different index. Clocks disagree across an \
+             epoch boundary; try again."
+        ),
+    }
+}
 
 /// How long the panic chord stays armed.
 ///
@@ -434,7 +461,6 @@ impl App {
                         PANIC_WINDOW.as_secs()
                     );
                 }
-                return;
             }
             Binding::Quit => self.leave(),
             Binding::Lock => self.lock(),
@@ -960,6 +986,7 @@ impl App {
                     Some(Peering::Seal) => self.peer_seal(arg(rest, 1), arg(rest, 2)),
                     Some(Peering::Pad) => self.peer_pad(arg(rest, 1)),
                     Some(Peering::Status) => self.peer_status(),
+                    Some(Peering::Rekey) => self.peer_rekey(arg(rest, 1)),
                     None => format!("unknown: peer{rest}"),
                 };
             }
@@ -1344,6 +1371,150 @@ impl App {
             msg.push_str("\n\nfingerprints were never compared. Recorded on the link.");
         }
         msg
+    }
+
+    /// Mix fresh entropy into a live peering.
+    ///
+    /// See `Documentation/PAD-OVER-NETWORK.md` §3 and `krab_crypto::rekey`.
+    /// The new entropy crosses the link, and that is sound because the key
+    /// protecting it is derived from a root that never has.
+    ///
+    /// # Nothing is written until both ends agree
+    ///
+    /// A re-key that half-completes is worse than one that fails: the two
+    /// ends' tags stop matching and RFC 0 §6 guarantees nobody is told. So the
+    /// reservoir is rewritten only after the exchange has confirmed, and a
+    /// failure anywhere leaves the old root exactly where it was.
+    fn peer_rekey(&mut self, peer: Option<&str>) -> String {
+        let Some(peer) = peer else {
+            return "usage: peer rekey <peer>\n\n\
+                    Mixes fresh entropy into an established peering, so a \
+                    compromise stops mattering and a long absence does not \
+                    kill the link. Needs the link up — `connect` or `listen` \
+                    first."
+                .into();
+        };
+        let (Some(id), Some(w)) = (&self.identity, self.epoch_key) else {
+            return "locked — unlock first".into();
+        };
+
+        // Their card, from disk. RFC 4 §4.1's rule: the key a signature is
+        // checked against comes from the stored link, never from the wire.
+        let card = match std::fs::read(self.peer_path(peer, "link"))
+            .ok()
+            .and_then(|b| peering::Card::decode(&b).ok())
+            .filter(|c| c.verify())
+        {
+            Some(c) => c,
+            None => return format!("no verifying peer-link for {peer} — peer with them first"),
+        };
+
+        // The reservoir, and where its ratchet has reached.
+        let sealed = match std::fs::read(self.peer_path(peer, "reservoir")) {
+            Ok(b) => b,
+            Err(_) => return format!("no reservoir for {peer}"),
+        };
+        let (root_n, stored_epoch) =
+            match krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed)
+                .ok()
+                .and_then(|r| persist::decode_reservoir(&r).ok())
+            {
+                Some(v) => v,
+                None => return format!("the reservoir for {peer} did not open"),
+            };
+
+        // The index both ends must arrive at independently. `now_epoch` is the
+        // only value both hold without another round trip; if their clocks
+        // straddle a day boundary the exchange refuses with `WrongIndex`
+        // rather than seating two different roots, and the next attempt
+        // succeeds.
+        let index = now_epoch().0.max(stored_epoch.0);
+
+        let mine = rekey::Payload {
+            contribution: OsRng.next_32(),
+            index,
+            policy: Policy::default(),
+            // RFC 6 §3.6's default: carrying nothing. There is no verb to
+            // change it yet, and sending the default is still the honest
+            // answer to "what do you carry" — it is what this node does.
+            carriage: krab_crypto::CarriagePolicy::default(),
+            max_ttl_minutes: krab_core::tag::MAX_TTL_DAYS * 1440,
+        };
+        let my_node = id.node_id();
+        let signing = id.signing_key();
+
+        let Some(link) = self.links.get_mut(peer) else {
+            return format!("no link to {peer} — `connect {peer} tcp <addr>` first");
+        };
+        let Some(session) = link.session.as_mut() else {
+            return format!("the link to {peer} is not up");
+        };
+
+        let outcome = match rekey_run::run(
+            session.as_mut(),
+            signing,
+            &my_node,
+            &card,
+            &root_n,
+            index,
+            mine,
+            &mut OsRng,
+        ) {
+            Ok(o) => o,
+            Err(e) => return rekey_failure(peer, e),
+        };
+
+        // Adopt, then persist. `rekey` refuses to seat a root in the past, so
+        // a clock that has gone backwards since the index was chosen fails
+        // here rather than making one epoch derivable from two chains.
+        let mut res = krab_crypto::reservoir::Reservoir::new(root_n, stored_epoch);
+        if !res.rekey(outcome.new_root, krab_core::tag::Epoch(outcome.index)) {
+            return "the new root landed before the ratchet — nothing changed".into();
+        }
+        let record = persist::encode_reservoir(
+            &res.root_bytes().expect("just seated"),
+            krab_core::tag::Epoch(outcome.index),
+        );
+        let out = match krab_crypto::kek::seal_under(&w, b"krab/reservoir", &record, &mut OsRng) {
+            Ok(o) => o,
+            Err(_) => return "could not seal the new reservoir — nothing changed".into(),
+        };
+        if let Err(e) = atomic::write(&self.peer_path(peer, "reservoir"), &out) {
+            return format!("could not store the new reservoir: {e} — nothing changed");
+        }
+        // Their terms, which until now propagated once at peering and never
+        // again. Written beside the link so a locked node still shows them.
+        let _ = atomic::write(&self.peer_path(peer, "policy"), &outcome.theirs.encode());
+
+        self.log.push(activity_log::Event::Rekeyed {
+            peer: peer.to_string(),
+            index: outcome.index,
+        });
+
+        let t = &outcome.theirs;
+        format!(
+            "re-keyed {peer} at index {}\n\n\
+             This peering now survives a compromise of everything either node \
+             held before it, and it is post-quantum if the original pad was.\n\n\
+             their terms: buckets to {}, {}, {} retained, TTL {} days{}",
+            outcome.index,
+            t.policy.max_bucket,
+            if t.policy.relay {
+                "relaying for others"
+            } else {
+                "NOT relaying"
+            },
+            t.policy.retention_bytes,
+            t.max_ttl_minutes / 1440,
+            if t.carriage.enabled {
+                format!(
+                    ", carrying channels at {} shard bits",
+                    t.carriage.shard_bits
+                )
+            } else {
+                ", carrying no channels".into()
+            }
+        )
     }
 
     /// RFC 8 §5's `send` — compose, seal, and place in the store.
@@ -2498,6 +2669,84 @@ mod tests {
         a.passphrase = line::Line::from("a passphrase");
         a.open_store().expect("store opens");
         a
+    }
+
+    /// Two nodes with a completed peering, and the short id each uses for the
+    /// other. The sneakernet path, because that is the one that keeps the
+    /// post-quantum property and so is the interesting starting point.
+    fn peered_pair(tag: &str) -> (App, App, String, String) {
+        let mut a = ready_node(&format!("{tag}-a"));
+        let mut b = ready_node(&format!("{tag}-b"));
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+
+        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+            let bytes = std::fs::read(from.path(name)).expect("artifact exists");
+            let dest = to.path(as_name);
+            std::fs::write(&dest, bytes).expect("delivered");
+            dest.to_string_lossy().into_owned()
+        };
+        let a_card = carry(&a, &b, "peer.card", "from-a.card");
+        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        type_command(&mut a, &format!("peer accept {b_card}"));
+        type_command(&mut b, &format!("peer accept {a_card}"));
+
+        let a_pad = pad_onto(&mut a, &b.path("from-a.pad"));
+        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
+        type_command(&mut a, &format!("peer seal {b_pad} media"));
+        type_command(&mut b, &format!("peer seal {a_pad} media"));
+        assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
+        assert!(b.output.starts_with("peer-link signed"), "{}", b.output);
+
+        let a_id = short_id(&a.identity.as_ref().unwrap().node_id());
+        let b_id = short_id(&b.identity.as_ref().unwrap().node_id());
+        (a, b, a_id, b_id)
+    }
+
+    /// The short id `n` files its counterparty under — the one peer directory
+    /// it has.
+    fn a_id_of(n: &App) -> String {
+        n.peer_ids().first().cloned().expect("one peering")
+    }
+
+    /// The reservoir root `n` currently holds for `peer`.
+    fn stored_root(n: &App, peer: &str) -> [u8; 32] {
+        let sealed = std::fs::read(n.peer_path(peer, "reservoir")).expect("a reservoir");
+        let raw = krab_crypto::kek::open_under(&n.epoch_key.unwrap(), b"krab/reservoir", &sealed)
+            .expect("it opens");
+        persist::decode_reservoir(&raw).expect("it decodes").0
+    }
+
+    /// A pair of in-process sessions, standing in for a link that is up.
+    /// The exchange is transport-agnostic by construction, and a socket here
+    /// would test the socket.
+    fn session_pair() -> (TestSession, TestSession) {
+        use std::sync::mpsc::channel;
+        let (a_tx, b_rx) = channel();
+        let (b_tx, a_rx) = channel();
+        (
+            TestSession { tx: a_tx, rx: a_rx },
+            TestSession { tx: b_tx, rx: b_rx },
+        )
+    }
+
+    struct TestSession {
+        tx: std::sync::mpsc::Sender<krab_proto::control::Control>,
+        rx: std::sync::mpsc::Receiver<krab_proto::control::Control>,
+    }
+
+    impl krab_fabric::Session for TestSession {
+        fn send(&mut self, msg: &krab_proto::control::Control) -> Result<(), krab_fabric::Error> {
+            self.tx
+                .send(msg.clone())
+                .map_err(|_| krab_fabric::Error::Frame)
+        }
+        fn recv(&mut self) -> Result<Option<krab_proto::control::Control>, krab_fabric::Error> {
+            Ok(self.rx.recv().ok())
+        }
+        fn close(&mut self) -> Result<(), krab_fabric::Error> {
+            Ok(())
+        }
     }
 
     /// Materialise a node's contribution onto a "medium" — the new `peer pad`
@@ -5140,5 +5389,68 @@ mod tests {
                 "ctrl={ctrl} alt={alt} shift={shift} reached the panic wipe"
             );
         }
+    }
+
+    /// **Two nodes re-key through the typed verb**, over a real pair of
+    /// sessions, and end up holding the same root.
+    ///
+    /// The exchange itself is covered in `rekey_run`; this covers the wiring
+    /// around it — reading the reservoir, seating the new root, and writing it
+    /// back — which is where a mechanism with no caller usually turns out to
+    /// have none.
+    #[test]
+    fn two_nodes_rekey_through_the_command_pane() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("rekey-verb");
+
+        let before_a = stored_root(&a, &b_id);
+        let before_b = stored_root(&b, &a_id);
+        assert_eq!(before_a, before_b, "the peering must start in agreement");
+
+        // A pair of in-process sessions standing in for a link that is up.
+        let (sa, sb) = session_pair();
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+        a.links.established(&b_id, Some(Box::new(sa)));
+        b.links.connect(&a_id, profile_named("tcp").unwrap());
+        b.links.established(&a_id, Some(Box::new(sb)));
+
+        let b_id2 = b_id.clone();
+        let handle = std::thread::spawn(move || {
+            let out = b.peer_rekey(Some(&a_id_of(&b)));
+            (b, out)
+        });
+        let out_a = a.peer_rekey(Some(&b_id2));
+        let (b, out_b) = handle.join().expect("B's thread");
+
+        assert!(out_a.contains("re-keyed"), "A: {out_a}");
+        assert!(out_b.contains("re-keyed"), "B: {out_b}");
+
+        let after_a = stored_root(&a, &b_id2);
+        let after_b = stored_root(&b, &a_id_of(&b));
+        assert_eq!(after_a, after_b, "the two ends hold different roots");
+        assert_ne!(after_a, before_a, "the root did not move");
+
+        // And the peer's terms landed, which they never did before: `Policy`
+        // was signed into the card at peering and never propagated again.
+        assert!(
+            a.peer_path(&b_id2, "policy").exists(),
+            "their policy was not recorded"
+        );
+    }
+
+    /// Re-keying without a link says so, rather than failing somewhere deeper.
+    #[test]
+    fn rekey_without_a_link_is_refused_up_front() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("rekey-nolink");
+        let out = a.peer_rekey(Some(&b_id));
+        assert!(out.contains("no link"), "{out}");
+    }
+
+    /// A peer we never peered with has no card to check a signature against,
+    /// and RFC 4 §4.1 forbids taking one from the wire.
+    #[test]
+    fn rekey_with_a_stranger_is_refused() {
+        let mut a = ready_node("rekey-stranger");
+        let out = a.peer_rekey(Some("deadbeef"));
+        assert!(out.contains("no verifying peer-link"), "{out}");
     }
 }

@@ -58,6 +58,16 @@ pub enum Event {
         /// Transport kind, as displayed.
         kind: &'static str,
     },
+    /// A peering mixed fresh entropy — `krab_crypto::rekey`.
+    ///
+    /// Worth a line: it is the event that makes a past compromise stop
+    /// mattering, and an operator watching for one wants to see it happen.
+    Rekeyed {
+        /// Short peer identifier.
+        peer: String,
+        /// The ratchet index adopted.
+        index: u32,
+    },
     /// A transport went down or failed.
     LinkDown {
         /// Short peer identifier.
@@ -95,6 +105,7 @@ impl Event {
     pub fn peer(&self) -> &str {
         match self {
             Event::LinkUp { peer, .. }
+            | Event::Rekeyed { peer, .. }
             | Event::LinkDown { peer }
             | Event::Reconciled { peer, .. }
             | Event::Failed { peer, .. } => peer,
@@ -109,6 +120,7 @@ impl Event {
     pub fn line(&self) -> String {
         match self {
             Event::LinkUp { peer, kind } => format!("{peer}  link up ({kind})"),
+            Event::Rekeyed { peer, index } => format!("{peer}  re-keyed at {index}"),
             Event::LinkDown { peer } => format!("{peer}  link down"),
             Event::Reconciled {
                 peer,

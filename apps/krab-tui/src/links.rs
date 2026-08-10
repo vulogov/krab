@@ -256,6 +256,11 @@ impl LinkTable {
         self.links.get(peer)
     }
 
+    /// A link, mutably — for a verb that needs to talk on its session.
+    pub fn get_mut(&mut self, peer: &str) -> Option<&mut LinkState> {
+        self.links.get_mut(peer)
+    }
+
     /// Every link, in stable order.
     pub fn iter(&self) -> impl Iterator<Item = &LinkState> {
         self.links.values()

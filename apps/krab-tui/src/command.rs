@@ -156,6 +156,10 @@ impl Command {
             "generate a one-time pad for a sneakernet peering",
         ),
         ("peer status", "how far along each peering is"),
+        (
+            "peer rekey <peer>",
+            "mix fresh entropy into a live peering — needs a link up",
+        ),
         ("peers", "who this node is peered with"),
         (
             "listen <peer> [addr]",
@@ -302,6 +306,12 @@ pub enum Peering {
     Seal,
     /// Show the state of an in-progress ceremony.
     Status,
+    /// Mix fresh entropy into an established peering — `krab_crypto::rekey`.
+    ///
+    /// Needs a live link, because the two ends must agree before either
+    /// adopts anything. Not part of RFC 3 §11's ceremony: that establishes a
+    /// reservoir, and this is what keeps one alive.
+    Rekey,
 }
 
 impl Peering {
@@ -313,6 +323,7 @@ impl Peering {
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,
             "status" => Peering::Status,
+            "rekey" => Peering::Rekey,
             _ => return None,
         })
     }
