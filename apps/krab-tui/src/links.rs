@@ -218,18 +218,6 @@ impl LinkTable {
         l.session.take()
     }
 
-    /// The session for a peer whose transport is up.
-    pub fn session_mut<'a>(
-        &'a mut self,
-        peer: &str,
-    ) -> Option<&'a mut (dyn krab_fabric::Session + 'static)> {
-        let l = self.links.get_mut(peer)?;
-        if l.transport != Transport::Up {
-            return None;
-        }
-        l.session.as_deref_mut()
-    }
-
     /// Tear a link down — RFC 8 §5's `disconnect`.
     ///
     /// Returns whether a link was there. RFC 3 §6.2's quota reduction is a

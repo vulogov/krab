@@ -39,3 +39,14 @@ opt-level = 3
 lto = true
 # RFC 0 §4.3 / RFC 7: no core dumps carrying key material.
 panic = "abort"
+# Reproducible builds are `build-reproducible.sh`, not a profile key.
+#
+# Cargo's own `trim-paths` would be the right mechanism and is not stable in
+# 1.94.1 — it needs nightly, and RFC 0 §9's whole argument is that a user must
+# be able to verify the binary without trusting the author, which a nightly
+# requirement makes harder rather than easier.
+#
+# So the remapping is applied by the build script, which computes the prefixes
+# from the checkout rather than hard-coding them. A `--remap-path-prefix` in
+# `.cargo/config.toml` cannot do that: it would have to name *this* machine's
+# directory and would silently do nothing on anyone else's.

@@ -1602,6 +1602,7 @@ impl App {
         format!(
             "identity   {}\n\
              epochs     {epochs} wrapper{} ({} bytes)\n\
+             corpus     {} objects, {} bytes (cap {})\n\
              tags       {table}\n\
              activity   {} line{} held, cleared on lock (RFC 3 §12)\n\
              backup     shown once at init and never again (RFC 7 §11)\n\
@@ -1611,6 +1612,9 @@ impl App {
             id.short_id(),
             if epochs == 1 { "" } else { "s" },
             id.hierarchy.stored_bytes(),
+            self.store.len(),
+            self.store.with(|s| s.bytes()),
+            peering::Policy::default().retention_bytes,
             self.log.len(),
             if self.log.len() == 1 { "" } else { "s" },
         )

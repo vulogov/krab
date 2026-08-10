@@ -80,7 +80,9 @@ which is also unmet and unlikely to be met.
 > exists to avoid.
 >
 > This is now the **only** verifiable claim in this section, which raises
-> rather than lowers its importance.
+> rather than lowers its importance. `./build-reproducible.sh --verify` builds
+> twice from two directories and compares; the procedure and its limits are in
+> `Documentation/REPRODUCIBLE-BUILDS.md`.
 
 ## And RFC 1 §12
 

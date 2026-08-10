@@ -1,0 +1,19 @@
+# Pinned for reproducible builds — RFC 0 §9.
+#
+# A build is only verifiable if it is reproducible, and a floating toolchain
+# makes it neither: rustc's codegen, its inlining decisions and the standard
+# library it links all change between releases, so two people on "stable" build
+# different binaries from identical sources and neither can tell whether the
+# difference is the compiler or the code.
+#
+# Bump deliberately, in its own commit, so a diff in the artefact has a diff in
+# the repository to point at.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-gnu",
+    "aarch64-apple-darwin",
+]
+profile = "minimal"
