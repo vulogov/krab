@@ -2768,7 +2768,7 @@ mod tests {
         assert_eq!(a.links.up_count(), 0);
 
         // Now read it as B would, from the object alone.
-        let (id, raw) = a.store.with(|s| {
+        let (_id, raw) = a.store.with(|s| {
             let id = *s.ids_in_order().next().unwrap();
             (id, s.get(&id).unwrap().to_vec())
         });

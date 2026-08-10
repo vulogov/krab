@@ -31,7 +31,7 @@
 //! Implemented: hashing and content addressing, Ed25519 identity ([`sign`]),
 //! X25519 agreement ([`dh`]), tag derivation ([`kdf`]), the Argon2id key
 //! hierarchy ([`kek`]), three-tier [`prekey`]s, the epoch-chunked
-//! [`reservoir`], and HPKE [`seal`]ing.
+//! [`reservoir`], single-author [`channel`]s, and HPKE [`seal`]ing.
 //!
 //! **[`seal`] implements the construction `CRYPTO-REVIEW.md` §1 recommends,
 //! not RFC 7 §6 as written** — §6 marks its own derivation defective and says
@@ -74,6 +74,7 @@
 
 extern crate alloc;
 
+pub mod channel;
 pub mod dh;
 pub mod hash;
 pub mod kdf;
@@ -86,6 +87,7 @@ pub mod secret;
 pub mod sign;
 pub mod words;
 
+pub use channel::{CarriagePolicy, Channel, Post};
 pub use dh::{agree, PublicKey, SecretKey, Shared};
 pub use hash::{channel_id, channel_tag, node_id, object_id, Fingerprint};
 pub use kdf::{inbox_tag, pairwise_tag, pairwise_window};
