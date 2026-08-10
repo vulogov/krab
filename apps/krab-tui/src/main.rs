@@ -91,8 +91,29 @@ fn main() -> io::Result<()> {
     // Which verb this run needs. A node that has been restarted has a store it
     // cannot read until a passphrase arrives, and saying so is the difference
     // between "empty" and "locked" — which look identical otherwise.
+    // A leftover `.tmp` means a previous run was interrupted mid-write. The
+    // file it protected is intact — that is what `atomic::write` guarantees —
+    // but the operator should know the machine stopped abruptly.
+    let interrupted = [
+        "identity.wrapped",
+        "kek.params",
+        "corpus.krab",
+        "ceremony.cbor",
+    ]
+    .iter()
+    .filter(|n| atomic::clear_stale(&app.home.join(n)))
+    .count();
+
     app.body = if app.has_stored_identity() {
-        "a store is here. `unlock` to open it.".into()
+        if interrupted > 0 {
+            format!(
+                "a store is here. `unlock` to open it.\n\n\
+                 {interrupted} write(s) were interrupted by a previous shutdown. \
+                 Nothing was lost — each file holds its last complete version."
+            )
+        } else {
+            "a store is here. `unlock` to open it.".into()
+        }
     } else {
         "no identity. `init` to create one.".into()
     };
@@ -358,6 +379,7 @@ impl App {
     /// later without the change being visible (RFC 5 §6.1, RFC 0 I-5).
     fn tick_schedule(&mut self) {
         self.shred_expired_epochs();
+        self.enforce_retention();
         let now_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -396,6 +418,45 @@ impl App {
             .filter_map(|l| l.next_sync_min)
             .min()
             .map(|m| m * 60);
+    }
+
+    /// Keep the corpus inside the retention this node agreed to — RFC 3 §6.
+    ///
+    /// **Nothing called `evict_to` before**, so the corpus grew without bound
+    /// and `Policy::retention_bytes` — negotiated in the peer-link, signed by
+    /// both parties — was decorative. A node agreeing to hold a gigabyte would
+    /// hold whatever arrived, which on a fast link is a disk-filling attack
+    /// requiring no more than a generous peer.
+    ///
+    /// Expiry runs first: RFC 5 §3 evicts under *capacity* pressure and RFC 1
+    /// §11's I2 drops objects under *time* pressure, and dropping what is
+    /// already dead is free where evicting what is live raises the watermark
+    /// and costs the network a copy.
+    ///
+    /// Tombstones are pruned here too, past `expiry + MAX_TTL` — the horizon
+    /// beyond which no honest peer still offers the object (RFC 5 §8).
+    fn enforce_retention(&mut self) {
+        let now_min = now_epoch().0 * 1440;
+        const MAX_TTL_MIN: u32 = 45 * 1440;
+        let cap = peering::Policy::default().retention_bytes;
+
+        let (expired, evicted) = self.store.with(|s| {
+            let expired = s.expire(now_min);
+            s.prune_tombstones(now_min, MAX_TTL_MIN);
+            let evicted = if s.bytes() > cap { s.evict_to(cap) } else { 0 };
+            (expired, evicted)
+        });
+
+        if evicted > 0 {
+            // Eviction raises the watermark, so the objects cannot return
+            // (RFC 5 §8) — worth saying, because it is not recoverable by
+            // reconnecting.
+            self.log.push(activity_log::Event::Failed {
+                peer: "local".into(),
+                why: "corpus at capacity — oldest objects evicted",
+            });
+        }
+        let _ = expired;
     }
 
     /// Destroy epoch wrapper keys past the retention window — RFC 7 §4.
@@ -455,6 +516,13 @@ impl App {
         // interface reads the corpus between the exchange's calls rather than
         // waiting behind it. Handing the thread a guard instead would rebuild
         // the freeze through the lock.
+        // Varies which sub-range is advertised, so a corpus larger than one
+        // manifest is covered over successive exchanges rather than syncing a
+        // prefix and stopping. Poisson scheduling supplies the variation, and
+        // RFC 5 §6.2 already requires reconciliation be randomised.
+        let mut salt = [0u8; 8];
+        OsRng.fill(&mut salt);
+        let salt = u64::from_le_bytes(salt);
         let view_store = self.store.clone();
         let done = self.exchanges.0.clone();
         let name = peer.to_string();
@@ -467,6 +535,7 @@ impl App {
                 [0u8; 32],
                 window.0,
                 window.1,
+                salt,
             ) {
                 Ok(moved) => activity_log::Event::Reconciled {
                     peer: name,
@@ -3856,5 +3925,82 @@ mod tests {
         let mut a = ready_node("serial-nolink");
         type_command(&mut a, "connect a1b2c3d4 serial /dev/cu.nonexistent");
         assert!(a.body.contains("no peer-link"), "{}", a.body);
+    }
+
+    /// **The negotiated retention is enforced, not decorative.** `evict_to`
+    /// had no caller, so a node agreeing to hold a gigabyte held whatever
+    /// arrived — a disk-filling attack needing no more than a generous peer.
+    #[test]
+    fn the_corpus_is_held_inside_its_agreed_retention() {
+        let mut a = ready_node("retention");
+        let cap = peering::Policy::default().retention_bytes;
+
+        // Well past the cap, in objects the store will accept.
+        let now = now_epoch().0 * 1440;
+        a.store.with(|s| {
+            let mut salt = 0u32;
+            while s.bytes() <= cap + 100_000 {
+                let h = krab_core::object::RoutingHeader {
+                    version: 1,
+                    class: 0,
+                    size_bucket: 5,
+                    flags: 0,
+                    expiry_min: now + 1_000 + (salt % 60_000),
+                    tag: krab_core::object::Tag((salt as u64).to_le_bytes()),
+                };
+                let b = krab_core::object::canonical_bytes(&h, &[7u8; 40]).unwrap();
+                let _ = s.ingest(krab_crypto::object_id(&b), b, now, u32::MAX);
+                salt += 1;
+                if salt > 20_000 {
+                    break;
+                }
+            }
+            assert!(s.bytes() > cap, "the test did not exceed the cap");
+        });
+
+        a.enforce_retention();
+        a.store.with(|s| {
+            assert!(
+                s.bytes() <= cap,
+                "the corpus stayed at {} bytes against a {cap}-byte agreement",
+                s.bytes()
+            );
+            // Eviction raised the watermark, so what went cannot come back.
+            assert!(
+                s.watermark() > 0,
+                "eviction must raise the watermark (RFC 5 §8)"
+            );
+        });
+        assert!(
+            a.log.recent(4).iter().any(|l| l.contains("capacity")),
+            "eviction is not recoverable by reconnecting and must be said"
+        );
+    }
+
+    /// A corpus inside its agreement is left alone — enforcement must not
+    /// evict on every tick.
+    #[test]
+    fn a_small_corpus_is_not_evicted() {
+        let mut a = ready_node("retention-small");
+        let now = now_epoch().0 * 1440;
+        a.store.with(|s| {
+            let h = krab_core::object::RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags: 0,
+                expiry_min: now + 40_000,
+                tag: krab_core::object::Tag([3; 8]),
+            };
+            let b = krab_core::object::canonical_bytes(&h, &[3u8; 40]).unwrap();
+            s.ingest(krab_crypto::object_id(&b), b, now, u32::MAX)
+                .unwrap();
+        });
+        a.enforce_retention();
+        assert_eq!(
+            a.store.len(),
+            1,
+            "a corpus inside its agreement was evicted"
+        );
     }
 }

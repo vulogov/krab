@@ -8,7 +8,7 @@ use crate::segment::{bucket_of, Segment};
 use crate::Error;
 use krab_core::object::{ObjectId, RoutingHeader, TRUNC_LEN};
 use krab_crypto::Fingerprint;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Where an object lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +64,21 @@ pub enum Reject {
 pub struct Store {
     segments: BTreeMap<u32, Segment>,
     index: BTreeMap<(u32, ObjectId), Location>,
-    /// `(expiry_min, id)` — the expiry is kept so `prune_tombstones` can bound
-    /// the set by `MAX_TTL` rather than letting it grow forever.
-    tombstones: BTreeSet<(u32, ObjectId)>,
+    /// Truncated identifier → full identifier.
+    ///
+    /// `recon::wanted` tests every manifest row against this, so a linear scan
+    /// here is `O(rows × corpus)` per exchange — about nine million truncations
+    /// for a 3 000-row manifest against a 3 000-object corpus, and quadratic in
+    /// the corpus after that. It was a scan until this index existed.
+    by_trunc: BTreeMap<[u8; TRUNC_LEN], ObjectId>,
+    /// `id → expiry_min`.
+    ///
+    /// A map keyed by identifier, not a set of pairs. Membership is checked on
+    /// **every ingest** and pruning runs once a tick, so the lookup must be
+    /// logarithmic and the scan may be linear — the reverse of what a
+    /// `BTreeSet<(expiry, id)>` gives. That shape was a regression introduced
+    /// when the expiry was added to permit pruning at all.
+    tombstones: BTreeMap<ObjectId, u32>,
     min_expiry_min: u32,
 }
 
@@ -175,7 +187,7 @@ impl Store {
         if expiry < self.min_expiry_min {
             return Err(Reject::BelowWatermark);
         }
-        if self.tombstones.iter().any(|(_, t)| *t == id) {
+        if self.tombstones.contains_key(&id) {
             return Err(Reject::Tombstoned);
         }
         // RFC 0 I-1 — duplicate suppression follows from content addressing
@@ -189,6 +201,7 @@ impl Store {
             .entry(bucket)
             .or_insert_with(|| Segment::new(bucket))
             .append(id, bytes);
+        self.by_trunc.insert(id.truncated(), id);
         self.index.insert(
             (expiry, id),
             Location {
@@ -232,7 +245,7 @@ impl Store {
     pub fn prune_tombstones(&mut self, now_min: u32, max_ttl_min: u32) -> usize {
         let before = self.tombstones.len();
         let horizon = now_min.saturating_sub(max_ttl_min);
-        self.tombstones.retain(|(expiry, _)| *expiry >= horizon);
+        self.tombstones.retain(|_, expiry| *expiry >= horizon);
         before - self.tombstones.len()
     }
 
@@ -266,17 +279,13 @@ impl Store {
     /// Valid only inside an agreed reconciliation scope, which the caller has
     /// already established.
     pub fn get_truncated(&self, trunc: &[u8; TRUNC_LEN]) -> Option<&[u8]> {
-        let id = self
-            .index
-            .keys()
-            .find(|(_, i)| &i.truncated() == trunc)
-            .map(|(_, i)| *i)?;
+        let id = *self.by_trunc.get(trunc)?;
         self.get(&id)
     }
 
     /// Whether a truncated identifier is held.
     pub fn has_truncated(&self, trunc: &[u8; TRUNC_LEN]) -> bool {
-        self.index.keys().any(|(_, i)| &i.truncated() == trunc)
+        self.by_trunc.contains_key(trunc)
     }
 
     /// Identifiers in `(expiry, id)` order — the ordering RBSR descends
@@ -339,7 +348,8 @@ impl Store {
                 // pruning early would let an evicted object return.
                 let bound = (b + 1) * crate::segment::BUCKET_MINUTES;
                 for id in seg.ids() {
-                    self.tombstones.insert((bound, *id));
+                    self.by_trunc.remove(&id.truncated());
+                    self.tombstones.insert(*id, bound);
                     n += 1;
                 }
             }
@@ -372,7 +382,8 @@ impl Store {
             };
             let bound = (oldest + 1) * crate::segment::BUCKET_MINUTES;
             for id in seg.ids() {
-                self.tombstones.insert((bound, *id));
+                self.by_trunc.remove(&id.truncated());
+                self.tombstones.insert(*id, bound);
                 dropped += 1;
             }
             let floor = (oldest + 1) * crate::segment::BUCKET_MINUTES;
@@ -586,6 +597,31 @@ mod tests {
             s.ingest(ObjectId([0; 32]), vec![0u8; 4], 0, MAX_TTL),
             Err(Reject::Malformed)
         );
+    }
+
+    /// **The truncated index tracks removal, not just insertion.** A stale
+    /// entry would make `has_truncated` claim an object the store dropped, and
+    /// `wanted` would then stop asking for it — the same permanent silent
+    /// suppression RFC 1 §9.3's width was raised to prevent, arrived at from
+    /// the other direction.
+    #[test]
+    fn the_truncated_index_is_maintained_on_expiry_and_eviction() {
+        let mut s = store_with(0, &[(DAY, 1), (2 * DAY, 2), (30 * DAY, 3)]);
+        let (id, _) = object(DAY, 1);
+        let t = id.truncated();
+        assert!(s.has_truncated(&t));
+        assert!(s.get_truncated(&t).is_some());
+
+        s.expire(2 * DAY);
+        assert!(!s.has_truncated(&t), "an expired object is still claimed");
+        assert!(s.get_truncated(&t).is_none());
+
+        // And eviction, which is the other removal path.
+        let (id3, _) = object(30 * DAY, 3);
+        let t3 = id3.truncated();
+        assert!(s.has_truncated(&t3));
+        s.evict_to(0);
+        assert!(!s.has_truncated(&t3), "an evicted object is still claimed");
     }
 
     /// **RFC 5 §8's tombstones stay bounded.** Past `expiry + MAX_TTL` no

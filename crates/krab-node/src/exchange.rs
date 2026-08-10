@@ -32,7 +32,7 @@
 //! `Store::ingest`, which applies RFC 1 §11's `I1`–`I6`. A peer that offers a
 //! manifest entry and then sends different bytes fails `I5`.
 
-use krab_fabric::{Error, Session};
+use krab_fabric::{frame, Error, Session};
 use krab_proto::control::{Control, Entry, TRUNC};
 use krab_proto::recon::{wanted, Corpus};
 
@@ -58,13 +58,83 @@ pub struct Moved {
 /// gives it then.
 pub const MAX_MESSAGES: usize = 64 * 1024;
 
-/// Cap on objects offered in one exchange.
+/// Manifest rows that fit one frame — RFC 4 §4.2, RFC 1 §9.3.
 ///
-/// Not a quota — RFC 3 §6's quota is the receiver's business, and a sender
-/// cannot enforce it. This bounds a single session so one exchange cannot
-/// occupy a link indefinitely, which matters on a constrained one where RFC 4
-/// §4.1 requires sessions be held open across cycles.
-pub const MAX_PER_EXCHANGE: usize = 4_096;
+/// **Derived, not chosen.** A manifest is one `Control::Manifest` and therefore
+/// one frame, capped at [`frame::MAX_FRAME`] (65 535 bytes). A row is 22 bytes
+/// as CBOR, and the message also carries a 32-byte filter digest.
+///
+/// An earlier version set this to 4 096 by choice. That is about 90 KB, which
+/// **does not fit a frame** — so a node holding more than ~3 000 objects in the
+/// window produced a manifest that could not be sent, and reconciliation failed
+/// for every peer, reported only as "session ended". RFC 1 §9.3's own table
+/// sizes corpora at 10 000, 100 000 and 500 000 objects, so the limit sat below
+/// the smallest figure the design contemplates. No test reached it: SIM-2 used
+/// 900 objects and the courier gate used five.
+pub const MAX_PER_EXCHANGE: usize = (frame::MAX_FRAME - MANIFEST_OVERHEAD) / MANIFEST_ROW;
+
+/// Bytes a manifest row costs on the wire, as CBOR.
+const MANIFEST_ROW: usize = 22;
+
+/// Fixed cost of a `Manifest` message. Generous: underestimating it is the bug
+/// above.
+const MANIFEST_OVERHEAD: usize = 128;
+
+/// Choose the sub-range to advertise when the window holds more than one
+/// manifest can carry.
+///
+/// **Truncating instead does not work, and looks as though it does.**
+/// `entries` returns `(expiry, id)` order, so taking the first N yields the
+/// same rows every round: the tail is never advertised and the corpus
+/// converges on a prefix and stops. Silently, and permanently.
+///
+/// So the window is bisected on expiry — the ordering both sides share without
+/// coordination (RFC 5 §4.4: expiry is absolute and inside the identifier
+/// hash) — and one half is chosen by `salt`. Successive exchanges use different
+/// salts, so over rounds the whole window is covered. Poisson scheduling
+/// (RFC 5 §6.1) supplies the variation for free, and RFC 5 §6.2 already
+/// requires reconciliation be "randomised in order and interval".
+pub fn advertised_range<C: Corpus + ?Sized>(corpus: &C, lo: u32, hi: u32, salt: u64) -> (u32, u32) {
+    let (mut a, mut b) = (lo, hi);
+    let mut s = salt;
+    // Bisect until the range fits, or until it cannot be split further —
+    // everything at one expiry minute is a degenerate corpus, and truncating
+    // there beats not terminating.
+    for _ in 0..64 {
+        if corpus.count(a, b) as usize <= MAX_PER_EXCHANGE || b.saturating_sub(a) <= 1 {
+            break;
+        }
+        let mid = a + (b - a) / 2;
+
+        // **Descend into a half that has objects.** A blind bisection of a
+        // wide window walks into empty space: expiries occupy a narrow band
+        // near `now + MAX_TTL`, so most of a `(0, u32::MAX)` range holds
+        // nothing, and taking the empty half terminates immediately on a range
+        // with zero rows — advertising nothing, every round, for ever.
+        let (low_n, high_n) = (corpus.count(a, mid), corpus.count(mid, b));
+        let take_low = match (low_n == 0, high_n == 0) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => {
+                // Both populated: the salt chooses, and **only here is a bit
+                // spent**. Consuming one on every step exhausts the salt during
+                // the long forced descent through empty space — a window of
+                // `(0, u32::MAX)` takes about twenty halvings to reach the band
+                // where expiries live, by which point every salt has shifted to
+                // zero and every exchange picks the same range.
+                let pick = s & 1 == 0;
+                s >>= 1;
+                pick
+            }
+        };
+        if take_low {
+            b = mid;
+        } else {
+            a = mid;
+        }
+    }
+    (a, b)
+}
 
 /// Drive an exchange as the initiator.
 ///
@@ -87,10 +157,15 @@ pub fn initiate<C: Corpus + ?Sized>(
     filter_digest: [u8; 32],
     lo: u32,
     hi: u32,
+    salt: u64,
 ) -> Result<Moved, Error> {
     let mut moved = Moved::default();
 
-    // Offer what we hold.
+    // Offer what we hold, from a sub-range that fits a frame. Which sub-range
+    // varies per exchange, so the whole window is covered over rounds — see
+    // `advertised_range` on why truncating instead silently syncs a prefix and
+    // stops.
+    let (lo, hi) = advertised_range(corpus, lo, hi, salt);
     let mine: Vec<Entry> = corpus
         .entries(lo, hi)
         .into_iter()
@@ -137,6 +212,11 @@ pub fn respond_to<C: Corpus + ?Sized>(
     lo: u32,
     hi: u32,
 ) -> Result<Moved, Error> {
+    // The responder answers whatever range the initiator advertised, inferred
+    // from the rows it sent — the manifest carries no bounds of its own
+    // (RFC 5's `Manifest` is a digest and rows). Falls back to the full window
+    // when the initiator had nothing in its chosen range.
+    let (mut lo, mut hi) = (lo, hi);
     let mut moved = Moved::default();
     let (mut offered, mut served) = (false, false);
 
@@ -149,6 +229,19 @@ pub fn respond_to<C: Corpus + ?Sized>(
                 let Some(want) = accept_manifest(corpus, theirs, filter_digest, &entries) else {
                     return Err(Error::Frame);
                 };
+                // The responder picks its **own** sub-range, not the
+                // initiator's. Mirroring the initiator's span looks tidier and
+                // is wrong: it would offer only what overlaps, so anything the
+                // responder holds outside that span never ships in this
+                // direction at all.
+                //
+                // The salt comes from the initiator's rows, so it varies as the
+                // initiator varies — different sub-ranges over successive
+                // exchanges, with no state kept on either side.
+                let salt = entries.first().map(|e| e.expiry_min as u64).unwrap_or(0);
+                let (a, b) = advertised_range(corpus, lo, hi, salt);
+                lo = a;
+                hi = b;
                 session.send(&Control::Want(want))?;
                 if !offered {
                     let mine: Vec<Entry> = corpus
@@ -286,6 +379,10 @@ mod tests {
     /// sees an empty pipe, reads `None`, and finishes before the responder has
     /// spoken. A protocol with two halves has to have both running.
     fn exchange(a: &mut Store, b: &mut Store) -> (Moved, Moved) {
+        exchange_salted(a, b, 0)
+    }
+
+    fn exchange_salted(a: &mut Store, b: &mut Store, salt: u64) -> (Moved, Moved) {
         use krab_fabric::backend::tcp::{generate_static, TcpFabric};
         use krab_fabric::Fabric;
 
@@ -313,7 +410,7 @@ mod tests {
         let initiator = TcpFabric::new(LinkProfile::tcp(), format!("127.0.0.1:{port}"), a_sk, b_pk);
         let mut session = initiator.connect().expect("handshake");
         let mut va = StoreView(a);
-        let ma = initiate(&mut *session, &mut va, [0; 32], 0, u32::MAX).unwrap_or_default();
+        let ma = initiate(&mut *session, &mut va, [0; 32], 0, u32::MAX, salt).unwrap_or_default();
         let _ = session.close();
 
         let (returned, mb) = handle.join().unwrap();
@@ -396,6 +493,75 @@ mod tests {
             "a mismatched filter must not have its rows trusted"
         );
         let _ = &mut view;
+    }
+
+    /// **A full manifest must fit a frame**, or it cannot be sent at all and
+    /// the failure is reported only as a dead session.
+    #[test]
+    fn a_maximal_manifest_fits_one_frame() {
+        use krab_proto::control::Entry;
+        let entries: Vec<Entry> = (0..MAX_PER_EXCHANGE)
+            .map(|i| Entry {
+                expiry_min: 29_999_999,
+                id: [(i % 251) as u8; TRUNC],
+            })
+            .collect();
+        let encoded = Control::Manifest {
+            filter_digest: [0xAB; 32],
+            entries,
+        }
+        .write();
+        assert!(
+            encoded.len() <= frame::MAX_FRAME,
+            "a full manifest is {} bytes; the frame limit is {}",
+            encoded.len(),
+            frame::MAX_FRAME
+        );
+        let mut sink = Vec::new();
+        assert!(
+            frame::write_bytes(&mut sink, &encoded).is_ok(),
+            "it must actually frame"
+        );
+    }
+
+    /// **Truncation is not resumption.** `entries` is ordered, so taking the
+    /// first N yields the same rows every round and the tail never ships. The
+    /// advertised range must vary.
+    #[test]
+    fn the_advertised_range_varies_with_the_salt() {
+        let store = store_with(0..(MAX_PER_EXCHANGE as u32 * 3));
+        let view = StoreView(&mut { store });
+        let mut seen = std::collections::BTreeSet::new();
+        for salt in 0..8u64 {
+            let r = advertised_range(&view, 0, u32::MAX, salt);
+            assert!(
+                view.count(r.0, r.1) as usize <= MAX_PER_EXCHANGE,
+                "salt {salt} chose a range of {} rows",
+                view.count(r.0, r.1)
+            );
+            seen.insert(r);
+        }
+        assert!(seen.len() > 1, "every salt chose the same range: {seen:?}");
+    }
+
+    /// A corpus far larger than one manifest converges over rounds, because
+    /// each round advertises a different part of the window.
+    #[test]
+    fn a_corpus_larger_than_one_manifest_converges_over_rounds() {
+        let total = MAX_PER_EXCHANGE as u32 + 800;
+        let mut a = store_with(0..total);
+        let mut b = Store::new();
+        for salt in 0..40u64 {
+            exchange_salted(&mut a, &mut b, salt);
+            if b.len() == a.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            b.len(),
+            a.len(),
+            "a corpus above one manifest did not converge"
+        );
     }
 
     /// **The loop terminates against a peer that never stops talking.** RFC 3

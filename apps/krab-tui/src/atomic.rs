@@ -99,8 +99,8 @@ pub fn temp_for(path: &Path) -> std::path::PathBuf {
 /// Remove a stale temporary left by a crash.
 ///
 /// Not automatic on read: a leftover `.tmp` means a write did not complete, and
-/// silently deleting it discards the only evidence. Callers sweep at startup,
-/// where it can be reported.
+/// silently deleting it discards the only evidence. Swept at startup, where it
+/// can be reported.
 pub fn clear_stale(path: &Path) -> bool {
     std::fs::remove_file(temp_for(path)).is_ok()
 }

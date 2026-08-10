@@ -458,3 +458,104 @@ Finding 10 was a stated requirement violated in code; finding 11 was a class of
 bug nothing else looks for. Neither is reachable by reading the code for
 correctness — one needs the requirement in hand, the other needs someone to ask
 "what if this stops halfway?"
+
+---
+
+# Sixth pass — 2026-08-10 · axis: **resource exhaustion**
+
+What a hostile or merely generous peer can make this node spend. **Four
+findings, three severe, all fixed** — and the first two are the same bug seen
+from two sides.
+
+## 12. CRITICAL — reconciliation broke entirely above ~3 000 objects · **FIXED**
+
+`MAX_PER_EXCHANGE` was 4 096 by choice. A manifest is one `Control::Manifest`
+and therefore one frame, capped at `MAX_FRAME` (65 535 bytes), and a row costs
+22 bytes as CBOR. 4 096 rows is about 90 KB.
+
+**So a manifest of a full window could not be sent.** A node holding more than
+~3 000 objects in the reconciliation range produced a message that failed to
+frame, the session died, and the operator saw "session ended" — for every peer,
+every time, permanently.
+
+RFC 1 §9.3's own table sizes corpora at 10 000, 100 000 and 500 000 objects.
+The limit sat below the smallest figure the design contemplates, and nothing
+reached it: SIM-2 used 900 objects, the courier gate used five, and every unit
+test a handful.
+
+**Fix.** `MAX_PER_EXCHANGE` is now derived from `MAX_FRAME` and the row cost,
+with a test that encodes a maximal manifest and frames it. A constant that must
+satisfy an arithmetic relationship should be computed from the relationship.
+
+## 13. CRITICAL — a corpus above one manifest never converged · **FIXED**
+
+Underneath the first, and worse. `entries(lo, hi).take(N)` returns `(expiry,
+id)` order, so truncating takes **the same first N rows every round**. The tail
+is never advertised, the corpus converges on a prefix, and it stops.
+
+Not slowly — permanently. Measured directly: a 3 773-object corpus shipped
+2 973 objects in the first exchange and **zero in every exchange after**, across
+forty rounds.
+
+Truncation reads like graceful degradation. It is silent, total, and looks
+identical to a peer having nothing new.
+
+**Fix.** `advertised_range` bisects the window on expiry — the ordering both
+sides share without coordination (RFC 5 §4.4) — and picks a sub-range that
+fits, varying with a per-exchange salt. The responder chooses its own sub-range
+salted by the initiator's rows, so both directions advance without either
+keeping state.
+
+Three things had to be right, and each was wrong first:
+
+- **Descend into a populated half.** A blind bisection of a `(0, u32::MAX)`
+  window walks into empty space, terminating on a range with no rows —
+  advertising nothing, for ever.
+- **Spend a salt bit only on a free choice.** Consuming one per step exhausts
+  the salt during the ~20 forced halvings needed to reach the band where
+  expiries live, after which every salt picks the same range.
+- **The responder must not mirror the initiator's span.** Doing so offers only
+  the overlap, so anything it holds outside never ships in that direction. That
+  version passed the large-corpus test and broke a 40-object one.
+
+## 14. SEVERE — the negotiated retention was decorative · **FIXED**
+
+`Store::evict_to` existed, was tested, and **had no caller** outside tests and
+SIM-2. `Policy::retention_bytes` is negotiated in the peer-link and signed by
+both parties; nothing enforced it. A node agreeing to hold a gigabyte held
+whatever arrived, which on a fast link is a disk-filling attack requiring no
+more than a generous peer.
+
+This is the third instance of one shape: **a correct, tested mechanism with no
+caller** — after `shred_epoch` (§6) and alongside it. Coverage measures whether
+a function works, never whether anything calls it.
+
+**Fix.** `enforce_retention` runs on the tick. Expiry first, then tombstone
+pruning, then eviction if still over — dropping what is already dead is free,
+where evicting what is live raises the watermark and costs the network a copy.
+
+## 15. Quadratic lookups, one of them a regression I introduced · **FIXED**
+
+- `has_truncated` scanned the whole index per call, and `recon::wanted` calls it
+  once per manifest row: `O(rows × corpus)`, about nine million truncations for
+  a 3 000-row manifest against a 3 000-object corpus, and quadratic after that.
+  Now a `BTreeMap<[u8; 16], ObjectId>`, maintained on insert **and on removal** —
+  a stale entry would make the store claim an object it dropped, which is the
+  same silent suppression §3 was fixed to prevent, arrived at from the other
+  side.
+- Tombstone membership was `O(t)` per ingest. It had been `O(log t)` until I
+  changed the set to `(expiry, id)` pairs two passes ago to permit pruning.
+  Now a `BTreeMap<ObjectId, u32>`: membership is checked on every ingest and
+  pruning runs once a tick, so the lookup must be logarithmic and the scan may
+  be linear — the reverse of what the pair-set gave.
+
+## Running total
+
+Six axes, fifteen findings, nine severe. The two worst in this pass were
+reachable only by asking what happens **at scale**, and every test in the
+project had used a corpus three orders of magnitude below the design's own
+smallest tabulated size.
+
+That is the lesson worth keeping: the tests were not wrong, they were small.
+A property that holds for five objects and fails for five thousand is invisible
+to every one of them.
