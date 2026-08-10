@@ -59,7 +59,7 @@ use std::path::Path;
 ///
 /// **Never treat a `true` return as a guarantee the data is unrecoverable.**
 /// See the module documentation.
-pub fn remove(path: &Path, rng: &mut impl Rng) -> bool {
+pub fn remove(path: &Path, rng: &mut dyn Rng) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
@@ -75,7 +75,7 @@ pub fn remove(path: &Path, rng: &mut impl Rng) -> bool {
 /// The length is preserved deliberately: writing fewer bytes leaves the tail,
 /// and writing more may allocate new blocks and leave the original untouched —
 /// which would be worse than doing nothing, because it looks like success.
-fn overwrite(path: &Path, len: u64, rng: &mut impl Rng) {
+fn overwrite(path: &Path, len: u64, rng: &mut dyn Rng) {
     let Ok(mut f) = OpenOptions::new().write(true).open(path) else {
         return;
     };
@@ -102,21 +102,38 @@ fn overwrite(path: &Path, len: u64, rng: &mut impl Rng) {
 
 /// Remove every file in a directory whose name matches, shredding each.
 ///
-/// Used by `wipe`, which must not leave a peer-link or a wrapped reservoir
-/// behind — those are useless without the KEK, but a list of who this node
-/// peered with is not nothing.
+/// **Recurses.** Used by `wipe`, which must not leave a peer-link or a wrapped
+/// reservoir behind — those are useless without the KEK, but a list of who
+/// this node peered with is not nothing.
+///
+/// It did not recurse, and per-peer state moved into `peers/<id>/`
+/// subdirectories underneath it. A flat scan would have walked straight past
+/// every peering the node had, which is exactly the list `wipe` exists to
+/// destroy. Emptied directories are removed too, since a directory named for
+/// a peer discloses the peer whether or not anything is left inside it.
 pub fn remove_matching(dir: &Path, pred: impl Fn(&str) -> bool, rng: &mut impl Rng) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut n = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if pred(&name) && remove(&entry.path(), rng) {
-            n += 1;
+    // `&dyn` rather than a generic: recursing with `&pred` re-instantiates the
+    // function at `&F`, then `&&F`, without end.
+    fn walk(dir: &Path, pred: &dyn Fn(&str) -> bool, rng: &mut dyn Rng) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut n = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                n += walk(&path, pred, rng);
+                let _ = std::fs::remove_dir(&path);
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if pred(&name) && remove(&path, rng) {
+                n += 1;
+            }
         }
+        n
     }
-    n
+    walk(dir, &pred, rng)
 }
 
 #[cfg(test)]

@@ -691,16 +691,10 @@ impl App {
         // Correspondents come from the peer-links on disk, so the set is
         // exactly who a ceremony was completed with.
         let mut peers = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.home) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("link") {
-                    continue;
-                }
-                let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let Ok(bytes) = std::fs::read(&path) else {
+        {
+            for name in self.peer_ids() {
+                let name = name.as_str();
+                let Ok(bytes) = std::fs::read(self.peer_path(name, "link")) else {
                     continue;
                 };
                 let Ok(card) = peering::Card::decode(&bytes) else {
@@ -718,7 +712,7 @@ impl App {
                 // resumes at the right index and advances to today. A node
                 // returning after a gap derives every chunk it missed on the
                 // way, and destroys each intermediate root (RFC 7 §6).
-                let reservoir = std::fs::read(self.path(&format!("{name}.reservoir")))
+                let reservoir = std::fs::read(self.peer_path(name, "reservoir"))
                     .ok()
                     .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/reservoir", &s).ok())
                     .and_then(|r| persist::decode_reservoir(&r).ok())
@@ -1056,6 +1050,37 @@ impl App {
         self.home.join(name)
     }
 
+    /// Everything belonging to one peer, under one directory.
+    ///
+    /// `<home>/peers/<short-id>/<name>`. Flat files named `<short>.link` and
+    /// `<short>.reservoir` worked while a peer had two artifacts; continuous
+    /// re-keying gives each peer mutable state of its own, and state that
+    /// belongs together should be removable together — a peering that ends
+    /// should be one directory to shred, not a pattern to glob.
+    fn peer_path(&self, peer: impl AsRef<str>, name: &str) -> PathBuf {
+        self.home.join("peers").join(peer.as_ref()).join(name)
+    }
+
+    /// Create a peer's directory. Called before the first write into it.
+    fn ensure_peer_dir(&self, peer: &str) -> Result<(), String> {
+        let d = self.home.join("peers").join(peer);
+        std::fs::create_dir_all(&d).map_err(|e| format!("could not create {}: {e}", d.display()))
+    }
+
+    /// Every peer this node has a link for.
+    fn peer_ids(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.home.join("peers")) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().join("link").exists())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Load the ceremony in progress, unwrapping the contribution.
     ///
     /// Requires the epoch key, so a locked node cannot read its own ceremony
@@ -1235,10 +1260,13 @@ impl App {
         // is what `send` resolves a peer name against — RFC 3 §4 makes the
         // link the durable artifact, not the ceremony.
         let short = short_id(&their_card.node_id());
-        if let Err(e) = atomic::write(&self.path(&format!("{short}.reservoir")), &out) {
+        if let Err(e) = self.ensure_peer_dir(&short) {
+            return e;
+        }
+        if let Err(e) = atomic::write(&self.peer_path(&short, "reservoir"), &out) {
             return format!("could not store the reservoir: {e}");
         }
-        if let Err(e) = atomic::write(&self.path(&format!("{short}.link")), &their_card.encode()) {
+        if let Err(e) = atomic::write(&self.peer_path(&short, "link"), &their_card.encode()) {
             return format!("could not store the peer-link: {e}");
         }
         shred::remove(&self.path("ceremony.cbor"), &mut OsRng);
@@ -1303,7 +1331,7 @@ impl App {
             return "locked — unlock to compose".into();
         };
 
-        let card_bytes = match std::fs::read(self.path(&format!("{peer}.link"))) {
+        let card_bytes = match std::fs::read(self.peer_path(peer, "link")) {
             Ok(b) => b,
             Err(_) => {
                 return format!(
@@ -1322,7 +1350,7 @@ impl App {
         // error: `mode_auth` is correct and simply lacks the post-quantum
         // property (RFC 7 §5 makes the reservoir a conditional tier).
         let epoch = now_epoch();
-        let reservoir = std::fs::read(self.path(&format!("{peer}.reservoir")))
+        let reservoir = std::fs::read(self.peer_path(peer, "reservoir"))
             .ok()
             .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
             .and_then(|raw| persist::decode_reservoir(&raw).ok())
@@ -1648,7 +1676,7 @@ impl App {
         // The expected static comes from the stored peer-link, which is signed.
         // There is no path that dials without one, and no prompt: RFC 4 §4.1
         // requires a mismatch be "a hard failure, never a TOFU prompt".
-        let card_bytes = std::fs::read(self.path(&format!("{peer}.link")))
+        let card_bytes = std::fs::read(self.peer_path(peer, "link"))
             .map_err(|_| format!("no peer-link for {peer} — complete a peering first"))?;
         let card = peering::Card::decode(&card_bytes)
             .ok()
@@ -1892,7 +1920,11 @@ impl App {
         let n = shred::remove_matching(
             &self.home,
             |name| {
-                name.ends_with(".link")
+                // Bare `link` and `reservoir` live in `peers/<id>/`; the
+                // suffixed forms are what older layouts left behind.
+                name == "link"
+                    || name == "reservoir"
+                    || name.ends_with(".link")
                     || name.ends_with(".reservoir")
                     || name.ends_with(".krab")
                     || matches!(
@@ -2712,7 +2744,7 @@ mod tests {
         // other up by identifier.
         let reservoir = |n: &App, other: &App| {
             let peer = short_id(&other.identity.as_ref().unwrap().node_id());
-            let sealed = std::fs::read(n.path(&format!("{peer}.reservoir"))).unwrap();
+            let sealed = std::fs::read(n.peer_path(peer, "reservoir")).unwrap();
             krab_crypto::kek::open_under(&n.epoch_key.unwrap(), b"krab/reservoir", &sealed).unwrap()
         };
         assert_eq!(
@@ -3039,7 +3071,7 @@ mod tests {
 
         // The peer-link is durable, and named by the peer's identifier.
         let peer = short_id(&b.identity.as_ref().unwrap().node_id());
-        assert!(a.path(&format!("{peer}.link")).exists());
+        assert!(a.peer_path(&peer, "link").exists());
 
         type_command(&mut a, &format!("send {peer} meet me at the usual place"));
         assert!(a.output.contains("composed"), "{}", a.output);
@@ -3092,7 +3124,7 @@ mod tests {
         let record = krab_crypto::kek::open_under(
             &a.epoch_key.unwrap(),
             b"krab/reservoir",
-            &std::fs::read(a.path(&format!("{peer}.reservoir"))).unwrap(),
+            &std::fs::read(a.peer_path(peer, "reservoir")).unwrap(),
         )
         .unwrap();
         let (r, stored_epoch) = persist::decode_reservoir(&record).unwrap();
@@ -3230,7 +3262,7 @@ mod tests {
         let record = krab_crypto::kek::open_under(
             &a.epoch_key.unwrap(),
             b"krab/reservoir",
-            &std::fs::read(a.path(&format!("{peer}.reservoir"))).unwrap(),
+            &std::fs::read(a.peer_path(peer, "reservoir")).unwrap(),
         )
         .unwrap();
         let (r, stored_epoch) = persist::decode_reservoir(&record).unwrap();
@@ -3645,7 +3677,7 @@ mod tests {
         assert_eq!(b.store.len(), 1, "the corpus came back");
         assert!(b.epoch_key.is_some());
         // And the peer-link is still there, so tags still derive.
-        assert!(b.path(&format!("{peer}.link")).exists());
+        assert!(b.peer_path(peer, "link").exists());
     }
 
     /// The wrong passphrase opens nothing, and says nothing about how wrong.
@@ -4944,5 +4976,56 @@ mod tests {
                 "{doc}: only {checked} commands found — did the format change?"
             );
         }
+    }
+
+    /// **`wipe` must reach into the peer directories.**
+    ///
+    /// Per-peer state moved from flat `<id>.link` files into `peers/<id>/`,
+    /// and the shredder did not recurse. A flat scan walks straight past every
+    /// peering the node has — which is exactly the list `wipe` exists to
+    /// destroy. The files are useless without the KEK; a list of who this node
+    /// peered with is not.
+    #[test]
+    fn wipe_destroys_peer_directories_not_just_the_top_level() {
+        let mut a = ready_node("wipe-peers");
+        let peer = "deadbeef";
+        a.ensure_peer_dir(peer).expect("a peer directory");
+        std::fs::write(a.peer_path(peer, "link"), b"a card").unwrap();
+        std::fs::write(a.peer_path(peer, "reservoir"), b"sealed").unwrap();
+
+        a.confirmed = true;
+        type_command(&mut a, "wipe");
+
+        assert!(
+            !a.peer_path(peer, "link").exists(),
+            "the peer-link survived the wipe"
+        );
+        assert!(
+            !a.peer_path(peer, "reservoir").exists(),
+            "the reservoir survived the wipe"
+        );
+        assert!(
+            !a.home.join("peers").join(peer).exists(),
+            "the directory name alone discloses the peer"
+        );
+    }
+
+    /// Each peer's state lives together, under its own directory.
+    #[test]
+    fn peer_state_is_grouped_per_peer() {
+        let a = ready_node("peer-layout");
+        for id in ["aaaa1111", "bbbb2222"] {
+            a.ensure_peer_dir(id).unwrap();
+            std::fs::write(a.peer_path(id, "link"), b"card").unwrap();
+        }
+        assert_eq!(a.peer_ids(), vec!["aaaa1111", "bbbb2222"]);
+        assert_eq!(
+            a.peer_path("aaaa1111", "reservoir"),
+            a.home.join("peers").join("aaaa1111").join("reservoir")
+        );
+        // A directory without a link is not a peer — a half-written one must
+        // not be reported as peered.
+        a.ensure_peer_dir("cccc3333").unwrap();
+        assert_eq!(a.peer_ids(), vec!["aaaa1111", "bbbb2222"]);
     }
 }

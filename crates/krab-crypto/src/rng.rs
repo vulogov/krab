@@ -44,6 +44,17 @@ pub trait Rng {
     }
 }
 
+/// A mutable borrow of a generator is a generator.
+///
+/// Needed so a `&mut dyn Rng` can be passed to anything taking `impl Rng` —
+/// which is what a recursive walk needs, since recursing with a generic
+/// closure re-instantiates the function at each reference depth without end.
+impl<R: Rng + ?Sized> Rng for &mut R {
+    fn fill(&mut self, out: &mut [u8]) {
+        (**self).fill(out)
+    }
+}
+
 /// A deterministic generator, for tests and for nothing else.
 ///
 /// ChaCha8, seeded explicitly. It is exported rather than hidden behind
