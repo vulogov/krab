@@ -107,6 +107,11 @@ is exactly what a store-and-forward adversary is recording against later.
 **`in-person` or `media` if you can.** If you cannot, `corpus` still works and
 Krab will tell you what you got.
 
+Neither route practical? There is a proposal for moving a pad over a network
+without giving up the post-quantum property — a transfer key read aloud over a
+voice call, with all the warnings that implies. It is **not implemented**; see
+`PAD-OVER-NETWORK.md`.
+
 ---
 
 ## 4. Writing the pad: `peer pad <destination>`
