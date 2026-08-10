@@ -20,6 +20,10 @@ use crate::layout::Mode;
 /// A key press, as crossterm reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyPress {
+    /// Alt/Option. Only the panic chord uses it, which is why it is here at
+    /// all: three modifiers is a chord an operator might reach by accident on
+    /// some layout, and four is not.
+    pub alt: bool,
     /// The character, or a named key.
     pub code: Key,
     /// Whether Ctrl was held.
@@ -38,6 +42,7 @@ impl KeyPress {
         KeyPress {
             code: Key::Char(c),
             ctrl: false,
+            alt: false,
             shift: false,
         }
     }
@@ -47,6 +52,7 @@ impl KeyPress {
         KeyPress {
             code: Key::Char(c),
             ctrl: true,
+            alt: false,
             shift: false,
         }
     }
@@ -56,6 +62,7 @@ impl KeyPress {
         KeyPress {
             code: k,
             ctrl: false,
+            alt: false,
             shift: false,
         }
     }
@@ -90,6 +97,13 @@ pub enum Binding {
     Quit,
     /// **Lock immediately.** Reachable from every mode.
     Lock,
+    /// **Destroy the key hierarchy.** `Ctrl-Alt-Shift-W`, twice.
+    ///
+    /// RFC 7 §10's wipe without the typing. The `wipe` verb asks for
+    /// confirmation and that is right for a deliberate decision; it is wrong
+    /// when the operator has seconds. `duress` covers being watched. This
+    /// covers not having time.
+    PanicWipe,
     /// Redraw. Displaced from `Ctrl-L`.
     Redraw,
     /// Cycle pane focus forwards.
@@ -150,6 +164,13 @@ pub enum Edit {
 impl Binding {
     /// Resolve a key press in a mode.
     pub fn of(key: KeyPress, mode: Mode) -> Binding {
+        // The panic chord, before everything — including lock, since locking
+        // is recoverable and this is not, and an operator reaching for it has
+        // already decided. Four modifiers so it cannot be struck by accident;
+        // the caller requires it twice, so a single misfire destroys nothing.
+        if key.ctrl && key.alt && key.shift && key.code == Key::Char('W') {
+            return Binding::PanicWipe;
+        }
         // Lock first, unconditionally. Every other branch is below this line,
         // so no mode can shadow it and no future mode can either.
         if key.ctrl && key.code == Key::Char('l') {
@@ -310,6 +331,7 @@ mod tests {
             let shift_tab = KeyPress {
                 code: Key::Tab,
                 ctrl: false,
+                alt: false,
                 shift: true,
             };
             assert_eq!(Binding::of(shift_tab, mode), Binding::CycleFocusBack);
@@ -352,6 +374,7 @@ mod tests {
                     let k = KeyPress {
                         code: Key::Char(c),
                         ctrl,
+                        alt: false,
                         shift: false,
                     };
                     let b = Binding::of(k, mode);
@@ -375,6 +398,7 @@ mod tests {
                 let press = KeyPress {
                     code: Key::Char(c),
                     ctrl: true,
+                    alt: false,
                     shift: false,
                 };
                 assert_eq!(Binding::of(press, mode), Binding::SelectTab(tab));

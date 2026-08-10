@@ -187,6 +187,10 @@ impl Command {
     pub const CHORDS: &'static [(&'static str, &'static str)] = &[
         ("Ctrl-Q", "quit"),
         ("Ctrl-L", "lock immediately"),
+        (
+            "Ctrl-Alt-Shift-W ×2",
+            "PANIC — destroy every key on this node, no confirmation",
+        ),
         ("Ctrl-1 / Ctrl-2", "private messages / channels"),
         ("Tab", "move between panes"),
         (

@@ -88,6 +88,13 @@ const TICK: Duration = Duration::from_millis(250);
 /// interface with no way to cancel it.
 const ANSWER_WAIT_S: u64 = 30;
 
+/// How long the panic chord stays armed.
+///
+/// Long enough to press twice under stress, short enough that an armed node
+/// left alone disarms itself rather than waiting to be triggered by whoever
+/// is at the keyboard next.
+const PANIC_WINDOW: Duration = Duration::from_secs(3);
+
 /// Where a node keeps its store when `--home` is not given.
 ///
 /// Under test this is a scratch directory, not the working directory. It was
@@ -217,6 +224,9 @@ struct App {
     init_step: Option<InitStep>,
     /// Whether the passphrase prompt is unlocking rather than initialising.
     unlocking: bool,
+    /// When the panic chord was first pressed, if it is armed. See
+    /// [`Binding::PanicWipe`].
+    panic_armed: Option<Instant>,
 }
 
 impl Default for App {
@@ -255,6 +265,7 @@ impl Default for App {
             confirmed: false,
             init_step: None,
             unlocking: false,
+            panic_armed: None,
         }
     }
 }
@@ -367,6 +378,10 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // Anything that is not the second half of the chord disarms it. An
+        // armed node that stays armed while the operator does something else
+        // is a node that destroys itself on an unrelated keystroke later.
+        let was_armed = self.panic_armed.take();
         let press = KeyPress {
             code: match code {
                 KeyCode::Tab | KeyCode::BackTab => Key::Tab,
@@ -382,6 +397,7 @@ impl App {
                 _ => return,
             },
             ctrl: mods.contains(KeyModifiers::CONTROL),
+            alt: mods.contains(KeyModifiers::ALT),
             shift: mods.contains(KeyModifiers::SHIFT) || code == KeyCode::BackTab,
         };
 
@@ -399,6 +415,26 @@ impl App {
 
         match Binding::of(press, interp) {
             // Reachable from every mode, dispatched above every mode branch.
+            // **RFC 7 §10 without the typing.** Two presses, because a single
+            // misfire on an irreversible action is not acceptable and a second
+            // deliberate press costs about a second — which an operator
+            // reaching for this has, or they would already have lost the node.
+            Binding::PanicWipe => {
+                let now = Instant::now();
+                let armed = was_armed.is_some_and(|t| now.duration_since(t) < PANIC_WINDOW);
+                if armed {
+                    self.panic_armed = None;
+                    self.output = self.panic_wipe();
+                } else {
+                    self.panic_armed = Some(now);
+                    self.output = format!(
+                        "ARMED — press again within {}s to destroy every key on this node. \
+                         Anything else cancels.",
+                        PANIC_WINDOW.as_secs()
+                    );
+                }
+                return;
+            }
             Binding::Quit => self.leave(),
             Binding::Lock => self.lock(),
             Binding::CycleFocus => self.ui.cycle_focus(),
@@ -5027,5 +5063,81 @@ mod tests {
         // not be reported as peered.
         a.ensure_peer_dir("cccc3333").unwrap();
         assert_eq!(a.peer_ids(), vec!["aaaa1111", "bbbb2222"]);
+    }
+
+    /// **The panic chord.** RFC 7 §10's wipe for an operator who does not have
+    /// time to type. `duress` covers being watched; this covers having
+    /// seconds.
+    #[test]
+    fn the_panic_chord_needs_two_presses_and_destroys_everything() {
+        let mut a = ready_node("panic-chord");
+        assert!(a.identity.is_some() && a.epoch_key.is_some());
+
+        let chord = |a: &mut App| {
+            a.on_key(
+                KeyCode::Char('W'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+            )
+        };
+
+        // One press arms and destroys nothing.
+        chord(&mut a);
+        assert!(a.identity.is_some(), "one press must not destroy anything");
+        assert!(a.output.contains("ARMED"), "{}", a.output);
+
+        // The second finishes it.
+        chord(&mut a);
+        assert!(a.identity.is_none(), "the hierarchy survived");
+        assert!(a.epoch_key.is_none());
+        assert!(!a.path("identity.wrapped").exists(), "the store survived");
+    }
+
+    /// An armed node that stays armed destroys itself on an unrelated
+    /// keystroke later. Anything else disarms it.
+    #[test]
+    fn any_other_key_disarms_the_panic_chord() {
+        let mut a = ready_node("panic-disarm");
+        a.on_key(
+            KeyCode::Char('W'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert!(a.panic_armed.is_some());
+
+        a.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(a.panic_armed.is_none(), "still armed after another key");
+
+        // So a later press only arms again, it does not fire.
+        a.on_key(
+            KeyCode::Char('W'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert!(a.identity.is_some(), "it fired without a second press");
+        assert!(a.output.contains("ARMED"));
+    }
+
+    /// Four modifiers, and every subset of them is something else. A chord an
+    /// operator can strike by accident is not a panic chord.
+    #[test]
+    fn no_lesser_chord_reaches_the_panic_wipe() {
+        use keys::{Binding, Key, KeyPress};
+        for (ctrl, alt, shift) in [
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (false, true, true),
+            (false, false, true),
+        ] {
+            let press = KeyPress {
+                code: Key::Char('W'),
+                ctrl,
+                alt,
+                shift,
+            };
+            assert_ne!(
+                Binding::of(press, Mode::Browse),
+                Binding::PanicWipe,
+                "ctrl={ctrl} alt={alt} shift={shift} reached the panic wipe"
+            );
+        }
     }
 }
