@@ -30,7 +30,8 @@
 //!
 //! Implemented: hashing and content addressing, Ed25519 identity ([`sign`]),
 //! X25519 agreement ([`dh`]), tag derivation ([`kdf`]), the Argon2id key
-//! hierarchy ([`kek`]), the epoch-chunked [`reservoir`], and HPKE [`seal`]ing.
+//! hierarchy ([`kek`]), three-tier [`prekey`]s, the epoch-chunked
+//! [`reservoir`], and HPKE [`seal`]ing.
 //!
 //! **[`seal`] implements the construction `CRYPTO-REVIEW.md` §1 recommends,
 //! not RFC 7 §6 as written** — §6 marks its own derivation defective and says
@@ -77,6 +78,7 @@ pub mod dh;
 pub mod hash;
 pub mod kdf;
 pub mod kek;
+pub mod prekey;
 pub mod reservoir;
 pub mod rng;
 pub mod seal;
@@ -88,6 +90,7 @@ pub use dh::{agree, PublicKey, SecretKey, Shared};
 pub use hash::{channel_id, channel_tag, node_id, object_id, Fingerprint};
 pub use kdf::{inbox_tag, pairwise_tag, pairwise_window};
 pub use kek::{Hierarchy, Kek, KekParams};
+pub use prekey::{index_for, PrekeyBatch, Ring, SignedPrekey};
 pub use reservoir::{Chunk, Reservoir};
 pub use rng::Rng;
 pub use seal::{info_for, open, seal, Sealed};
