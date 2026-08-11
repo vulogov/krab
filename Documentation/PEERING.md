@@ -10,51 +10,99 @@ makes a static-key mismatch a hard failure and never a prompt.
 
 ---
 
-## The shape of it
+## The shape of it, A to B
 
-Peering is **symmetric**. Both ends run the same four verbs. Each end produces
-two artifacts and needs two from the other:
+Peering is **symmetric** — Alice and Bob run the same five verbs, in the same
+order, each producing artifacts the other consumes. Nobody is the initiator.
 
-| Artifact | Secret? | How it travels |
-|---|---|---|
-| `peer.card` | **No** — public and signed | any channel you like |
-| `peer.pad` | **Yes** — half a shared secret, in plaintext | see §4 |
+```
+        ALICE  (a1b2c3d4)                    BOB  (fed356f2)
+        ─────────────────                    ────────────────
+  1.    peer offer                           peer offer
+          writes peer.card                     writes peer.card
+                        ── peer.card ──▶
+                        ◀── peer.card ──
+  2.    peer accept from-bob.card            peer accept from-alice.card
+          prints both fingerprints             prints both fingerprints
 
-The card and the pad **must not travel together**. Anyone who has both has
-what they need; the whole point of splitting them is that no single channel
-carries the peering.
+  3.    ═══════════ ONE VOICE CALL, BOTH DIRECTIONS ═══════════
+        read your 8 words aloud       ◀══▶   read your 8 words aloud
+        they must match what step 2 printed at the other end
 
----
+  4.    peer pad /media/alice.pad           peer pad /media/bob.pad
+          NOW the secret half exists          NOW the secret half exists
+                        ══ carried ══▶
+                        ◀══ carried ══
+  5.    peer seal bob.pad media             peer seal alice.pad media
+          writes peers/fed356f2/…             writes peers/a1b2c3d4/…
+```
+
+Each end produces exactly two artifacts, and they must not travel together:
+
+| Artifact | Written by | Secret? | How it travels |
+|---|---|---|---|
+| `peer.card` | `peer offer`, into your `--home` | **No** — public and signed | any channel you like |
+| your pad | `peer pad <dest>`, **where you say** | **Yes** — half a shared secret, plaintext | in person or on media |
+
+Anyone holding both has what they need. That is the whole reason for splitting
+them across two channels.
+
+> **`peer offer` does not write your pad.** It writes only `peer.card`. The
+> contribution stays wrapped inside the ceremony until step 4, because a
+> plaintext secret that exists for two minutes is better than one that exists
+> for two weeks. If you go looking for `peer.pad` after step 1, it is not
+> there and that is correct.
 
 > **After a restart, `unlock` first.** Every `peer` verb needs an unlocked
-> node: the contribution is held wrapped inside the ceremony, and sealing the
-> reservoir needs the epoch wrapper. A locked node is a relay — it reconciles
-> and cannot read.
+> node: the contribution is wrapped inside the ceremony, and sealing needs the
+> epoch wrapper. A locked node is a relay — it reconciles and cannot read.
+
+**Lost track?** `peer status` names the step you are on and the verb that comes
+next. `peers` lists completed peerings, which survive restarts and failed
+connections — those are on disk, not in memory.
+
+---
 
 ## 1. Both ends: `peer offer`
 
 ```
 > peer offer
-peer.card  — publishable; send it any way you like
-peer.pad   — SECRET; hand over in person or on media
+wrote /home/alice/krab/peer.card
 
-your fingerprint, to read aloud:
+This is your card. It is public and signed — send it any way you like.
+
+your fingerprint — eight words that stand for your identity key:
 
   <eight words>
+
+At step 3 you read these to them over a voice call, and they read theirs
+back. Both must match what `peer accept` printed. If they do not, stop:
+someone is between you. Nothing else in the ceremony establishes who you
+are talking to.
+
+next, in order:
+  1. send them peer.card, and get theirs
+  2. peer accept <their.card>
+  3. compare fingerprints aloud
+  4. peer pad <destination>   — writes your SECRET half
+  5. exchange pads, then: peer seal <their.pad> <channel>
+
+Your pad does not exist yet. Step 4 creates it, where you tell it to — on
+the medium you are carrying, not in this directory.
 ```
 
-This writes `peer.card` into your `--home` and opens a ceremony that survives
-a restart.
+### What the eight words are for
 
-**`peer.pad` is not written yet.** The contribution is held wrapped inside the
-ceremony. It becomes a plaintext file only when you ask for it, with
-`peer pad`, onto the medium you are carrying — see §4. That is deliberate: it
-is the one artifact Krab cannot protect once it exists, so it exists for as
-short a time as possible.
+They are your **fingerprint** — a spoken form of your identity public key,
+using a word alphabet where each word carries 8 bits and the even and odd
+positions draw from different lists, so a transposition is audible.
 
-Send your `peer.card` to the other end. Email, chat, a web page, a QR code —
-it is signed, so tampering is detectable, and public, so exposure costs
-nothing.
+You use them exactly once, at step 3, and never again. They are not a
+password, not a secret, and not something to write down: they are a value you
+*say out loud* so your friend can check that the card they received is the
+card you sent.
+
+The card proves *a key* signed it. Only the voice call proves *whose* key.
 
 ---
 
@@ -173,15 +221,68 @@ is written.
 
 ---
 
+## 5b. Where policy comes from
+
+You never type a policy. There is no policy file — Krab reads no
+configuration (`NO-CONFIG.md`).
+
+**At peering**, each end's `Policy` is signed *into the card*, so `peer offer`
+publishes yours and `peer accept` takes in theirs. `peer seal` reports the
+agreed terms, which are the **lower** of the two on every field, since a link
+is only as capable as its least capable end (RFC 4 §5.4):
+
+```
+agreed: buckets to 5, relaying for others, 1073741824 retained
+```
+
+| Field | Means |
+|---|---|
+| `max_bucket` | largest object size accepted, as an RFC 1 §8.1 bucket index |
+| `relay` | whether this node carries objects not addressed to it |
+| `retention_bytes` | how much it holds for the shared corpus |
+| `shard_bits` | RFC 2 §6 sharding — divides your load *and your anonymity set* |
+
+Today these are the defaults: full participation, no sharding, 1 GB, all
+buckets. There is no verb to change them yet.
+
+**After peering**, terms travel on each re-key (`peer rekey`, and the
+automatic one). That payload also carries what the card cannot: the node's
+`CarriagePolicy` (RFC 6 §3.6 — whether it hosts channel content at all) and
+its accepted TTL. The peer's current terms land in `peers/<their-id>/policy`,
+and `peers` shows whether you are holding terms as of peering or terms as of
+the last re-key.
+
+Before re-keying existed, a policy was agreed once and never spoken of again:
+a peer who stopped relaying had no way to say so.
+
+---
+
 ## 6. Check: `peer status` and `peers`
 
 ```
-> peer status     how far along each ceremony is
-> peers           who this node is peered with
+> peer status
+step 3 of 5 — their card is recorded.
+
+theirs:  <eight words>
+yours:   <eight words>
+
+compare those two aloud, then: peer pad <destination>
+         (your SECRET half — write it onto the medium you carry)
+
+then:    peer seal <their.pad> <in-person|media|corpus|network>
 ```
 
-`peer status` is what to run if you lose track — the ceremony survives
+`peer status` names the step and the next verb. The ceremony survives
 restarts, so you can start a peering, quit, and finish it tomorrow.
+
+```
+> peers
+fed356f2  peered  ·  not connected  ·  terms as of peering
+```
+
+`peers` lists **peerings**, which live on disk — they survive restarts and
+failed connections. A dial that fails takes the link down and leaves the
+peering untouched.
 
 ---
 
@@ -198,11 +299,18 @@ never meet.
 > connect 7b1e04ff tcp 127.0.0.1:40000
 ```
 
-With `--listen` given at launch, the address may be omitted: `listen 3f9a2c01`.
+With `--listen` given at launch, the address may be omitted: `listen fed356f2`.
 
-`listen` waits 30 seconds, then hands the prompt back. It does not run in the
-background — that wait is on the UI thread, and an unbounded one would be a
-hung interface.
+> **`--listen` does not bind on its own.** It supplies the default address for
+> the `listen` verb and nothing more. A node accepts a call only while
+> `listen <peer>` is actually waiting, so **both operators must be at their
+> keyboards**: one types `listen`, the other types `connect` within 30
+> seconds. If you pass `--listen` and the other end reports *connection
+> refused*, this is why — nothing was bound.
+>
+> `listen` waits 30 seconds and hands the prompt back, because that wait is on
+> the UI thread and an unbounded one is a hung interface. Accepting in the
+> background is not built yet.
 
 **A peer with no stored `.link` cannot be connected to at all.** `establish`
 reads the card to learn which static key to expect, and RFC 4 §4.1 forbids

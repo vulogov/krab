@@ -133,7 +133,17 @@ const PANIC_WINDOW: Duration = Duration::from_secs(3);
 fn default_home() -> PathBuf {
     #[cfg(test)]
     {
-        std::env::temp_dir().join(format!("krab-test-default-{}", std::process::id()))
+        // A *fresh* directory per call, not one per process. Sharing one
+        // meant every `App::default()` in the suite wrote into the same
+        // store, so a test that ran `init` made every later test's `init`
+        // refuse — a race whose outcome depended on thread scheduling.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "krab-test-default-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
     }
     #[cfg(not(test))]
     {
@@ -165,6 +175,15 @@ fn main() -> io::Result<()> {
     .filter(|n| atomic::clear_stale(&app.home.join(n)))
     .count();
 
+    if app.listen_hint {
+        let addr = app.listen.clone().unwrap_or_default();
+        app.output = format!(
+            "--listen {addr} recorded.\n\n\
+             It does not bind by itself. To accept a call, type:  listen <peer>\n\
+             The other end dials with:  connect <you> tcp {addr}\n\
+             Both ends must be at the keyboard — nothing accepts in the background yet."
+        );
+    }
     app.body = if app.has_stored_identity() {
         if interrupted > 0 {
             format!(
@@ -221,6 +240,11 @@ struct App {
     /// Where inbound links arrive, from `--listen`. `None` means this node
     /// only dials.
     listen: Option<String>,
+    /// Whether to say, on the first screen, that `--listen` does not bind by
+    /// itself. An operator who passes the flag reasonably expects a socket,
+    /// and finding out by way of "connection refused" at the other end is the
+    /// worst possible time.
+    listen_hint: bool,
     /// Transports. **Holds nothing that can reconcile** — RFC 8 §5.1.
     links: LinkTable,
     /// The corpus, reachable from background exchanges.
@@ -280,6 +304,7 @@ impl Default for App {
             epoch_key: None,
             home: default_home(),
             listen: None,
+            listen_hint: false,
             links: LinkTable::new(),
             store: shared::SharedStore::new(krab_store::index::Store::new()),
             exchanges: std::sync::mpsc::channel(),
@@ -311,10 +336,11 @@ impl App {
             "krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>]\n\n\
              krab reads no configuration file. Everything else is set by a \
              command-pane verb during the session.\n\n\
-             --listen names the address inbound links arrive on. It is a \
-             startup option because a listening socket is a property of how \
-             this node was launched, and because two nodes on one host must be \
-             told apart before either is typed into.";
+             --listen names the address inbound links arrive on, and is the \
+             default for the `listen` verb. It does NOT bind on its own: a \
+             node accepts a call only while `listen <peer>` is waiting, so \
+             both ends must be at their keyboards. Nothing accepts in the \
+             background yet.";
 
         let mut app = App::default();
         let mut args = args.peekable();
@@ -333,6 +359,7 @@ impl App {
                         .next()
                         .ok_or_else(|| format!("--listen {addr}: resolves to no address"))?;
                     app.listen = Some(addr);
+                    app.listen_hint = true;
                 }
                 "--sync-interval" => {
                     let secs: u64 = args
@@ -360,7 +387,7 @@ impl App {
     /// the same frame an operator gets. The command pane defect that prompted
     /// this was invisible to every state assertion in this file: the typed
     /// command was in the string, the string just had no rows to render into.
-    fn view<'a>(&'a self, log: &'a [String]) -> render::View<'a> {
+    fn view<'a>(&'a self, log: &'a [String], me: Option<&'a str>) -> render::View<'a> {
         let masked = self.init_step == Some(InitStep::Passphrase);
         render::View {
             ui: &self.ui,
@@ -380,6 +407,7 @@ impl App {
             locked: self.locked,
             log,
             masked,
+            me,
         }
     }
 
@@ -387,7 +415,8 @@ impl App {
         let mut last = Instant::now();
         while !self.quit {
             let log_lines = self.log.recent(activity_log::CAPACITY);
-            term.draw(|f| render::draw(f, &self.view(&log_lines)))?;
+            let me = self.identity.as_ref().map(|i| i.short_id());
+            term.draw(|f| render::draw(f, &self.view(&log_lines, me.as_deref())))?;
 
             if event::poll(TICK)? {
                 if let Event::Key(k) = event::read()? {
@@ -570,6 +599,13 @@ impl App {
         self.drain_exchanges();
         for peer in &due {
             let short = short_id(peer);
+            // Re-key before reconciling. A peering whose ratchet has fallen
+            // too far behind cannot derive the chunks the other end is using
+            // (`Reservoir::MAX_ADVANCE`), so reconciling first would spend the
+            // link on an exchange that cannot open anything.
+            if let Some(event) = self.rekey_if_due(&short) {
+                self.log.push(event);
+            }
             if let Some(event) = self.reconcile_with(&short) {
                 self.log.push(event);
             }
@@ -1031,10 +1067,7 @@ impl App {
                 for (chord, what) in Command::CHORDS {
                     out.push_str(&format!("  {chord:<20}{what}\n"));
                 }
-                // The view pane, for the same reason as the backup words: two
-                // rows cannot hold it, and RFC 8 §3 says where it goes.
-                self.body = out;
-                self.output = "verbs and keys — see the message pane".into();
+                self.output = out;
             }
             Command::Verify => {
                 self.output = match &self.identity {
@@ -1235,11 +1268,22 @@ impl App {
         };
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
-            Err(e) => return format!("could not read {path}: {e}"),
+            Err(e) => {
+                return format!(
+                    "could not read {path}: {e}\n\n\
+                     Give the path to the card THEY sent you."
+                )
+            }
         };
         let card = match peering::Card::decode(&bytes) {
             Ok(c) => c,
-            Err(e) => return format!("not a card: {e:?}"),
+            Err(e) => {
+                return format!(
+                    "not a card: {e:?}\n\n\
+                     `peer accept` takes THEIR card — the peer.card file they \
+                     sent you. A pad is not a card."
+                )
+            }
         };
         if let Err(e) = pending.accept_card(card) {
             return match e {
@@ -1258,9 +1302,19 @@ impl App {
             return e;
         }
         format!(
-            "card accepted. Now read these eight words aloud and hear the same back:\n\n  \
-             {}\n\nthen: peer seal <their.pad> <channel>",
-            pending.their_fingerprint().unwrap_or_default()
+            "card accepted.\n\n\
+             their fingerprint, from the card you just took in:\n\n\x20 {}\n\n\
+             yours, for them to check:\n\n\x20 {}\n\n\
+             Call them. Read yours; they read theirs. **Both must match.** This \
+             is the only step that establishes who is on the other end — the \
+             card itself proves a key signed it, not whose key it is.\n\n\
+             then:  peer pad <destination>     — your SECRET half\n\
+             \x20      peer seal <their.pad> <in-person|media|corpus|network>",
+            pending.their_fingerprint().unwrap_or_default(),
+            self.identity
+                .as_ref()
+                .map(|i| i.fingerprint())
+                .unwrap_or_default()
         )
     }
 
@@ -1286,7 +1340,14 @@ impl App {
         };
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
-            Err(e) => return format!("could not read {path}: {e}"),
+            Err(e) => {
+                return format!(
+                    "could not read {path}: {e}\n\n\
+                     This should be the pad THEY gave you, not one of yours. \
+                     Yours is written by `peer pad <destination>` and is the \
+                     half you hand over — you never seal with your own."
+                )
+            }
         };
         let theirs = match ceremony::decode_contribution(&bytes) {
             Ok(c) => c,
@@ -1371,6 +1432,68 @@ impl App {
             msg.push_str("\n\nfingerprints were never compared. Recorded on the link.");
         }
         msg
+    }
+
+    /// Re-key `peer` if the schedule says it is time, or if it must.
+    ///
+    /// Two triggers, and they are different in kind:
+    ///
+    /// - **Age.** `REKEY_EPOCHS` since the reservoir was last seated. This is
+    ///   the stated guarantee — a reservoir compromised at time *T* stops
+    ///   protecting traffic within `REKEY_EPOCHS` of *T* — and a guarantee
+    ///   that depends on an operator remembering to type a verb is not one.
+    /// - **Distance.** The ratchet is further behind than it can advance in
+    ///   one step (`Reservoir::MAX_ADVANCE`, 90 days). Past that the peering
+    ///   is dead and only a re-key revives it, so this is a repair rather than
+    ///   a rotation.
+    ///
+    /// Returns `None` when nothing was due, when the link is down, or when the
+    /// attempt failed — a failed re-key changes nothing and will be due again
+    /// on the next tick, which is the correct behaviour for a link that is
+    /// flapping.
+    fn rekey_if_due(&mut self, peer: &str) -> Option<activity_log::Event> {
+        // Cheap checks first: this runs on every scheduled peer, every tick.
+        if self
+            .links
+            .get(peer)
+            .and_then(|l| l.session.as_ref())
+            .is_none()
+        {
+            return None;
+        }
+        let w = self.epoch_key?;
+        let sealed = std::fs::read(self.peer_path(peer, "reservoir")).ok()?;
+        let (_, seated) = krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed)
+            .ok()
+            .and_then(|r| persist::decode_reservoir(&r).ok())?;
+
+        let age = now_epoch().0.saturating_sub(seated.0);
+        let stale = age >= krab_crypto::REKEY_EPOCHS;
+        let unreachable = age > krab_crypto::reservoir::Reservoir::MAX_ADVANCE;
+        if !stale && !unreachable {
+            return None;
+        }
+
+        let out = self.peer_rekey(Some(peer));
+        // `peer_rekey` writes its own report to the caller; here the schedule
+        // is what ran, so the operator learns about it through the activity
+        // log rather than by having their output pane overwritten by something
+        // they did not ask for.
+        if out.starts_with("re-keyed") {
+            Some(activity_log::Event::Rekeyed {
+                peer: peer.to_string(),
+                index: now_epoch().0,
+            })
+        } else {
+            Some(activity_log::Event::Failed {
+                peer: peer.to_string(),
+                why: if unreachable {
+                    "re-key needed to revive the peering"
+                } else {
+                    "scheduled re-key"
+                },
+            })
+        }
     }
 
     /// Mix fresh entropy into a live peering.
@@ -1977,13 +2100,39 @@ impl App {
         // construction (RFC 3 §12), which is the part that had to be right
         // before anything populated it.
         let rows: Vec<peers::Row> = Vec::new();
-        if self.links.up_count() == 0 && rows.is_empty() {
+
+        // **Peerings, from disk — not links, from memory.** A peering is the
+        // durable artifact (RFC 3 §4); a link is a socket that was open a
+        // moment ago. Reporting only links meant a restarted node said "no
+        // peers" while its peer-links sat on disk beside it, and told an
+        // operator whose ceremony had completed to start another one.
+        let peerings = self.peer_ids();
+        if peerings.is_empty() && self.links.up_count() == 0 {
             return peers::render(&rows, peers::DISCONNECT_KEY);
         }
+
         let mut out = String::new();
+        for id in &peerings {
+            let link = match self.links.get(id) {
+                Some(l) if l.session.is_some() => "link up",
+                Some(_) => "link down",
+                None => "not connected",
+            };
+            let policy = if self.peer_path(id, "policy").exists() {
+                "terms current"
+            } else {
+                "terms as of peering"
+            };
+            out.push_str(&format!("{id}  peered  ·  {link}  ·  {policy}\n"));
+        }
+        // Links to nodes we have no peering with cannot exist — `establish`
+        // refuses without a stored card — but a half-built one can, and
+        // hiding it would hide the failure.
         for l in self.links.iter() {
-            out.push_str(&l.status_line());
-            out.push('\n');
+            if !peerings.iter().any(|p| p == &l.peer) {
+                out.push_str(&l.status_line());
+                out.push('\n');
+            }
         }
         out.push_str("\nno accountability metrics yet — nothing has reconciled.");
         if !recent.is_empty() {
@@ -2071,16 +2220,51 @@ impl App {
 
     /// Report where a ceremony has reached.
     fn peer_status(&self) -> String {
-        match self.load_ceremony() {
-            Err(e) => e,
-            Ok(p) => match p.their_fingerprint() {
-                None => "offer made; waiting for their card. Next: peer accept <their.card>".into(),
-                Some(f) => format!(
-                    "their card recorded: {f}\n\ncompare those aloud, then: \
-                     peer seal <their.pad> <channel>"
-                ),
-            },
-        }
+        let done = self.peer_ids();
+        let ceremony = match self.load_ceremony() {
+            Err(e) => {
+                if done.is_empty() {
+                    return format!("{e}\n\nStart one with `peer offer`.");
+                }
+                format!(
+                    "no ceremony in progress.\n\npeered with: {}",
+                    done.join(", ")
+                )
+            }
+            Ok(p) => {
+                // Where in the five steps, and what to type next. An operator
+                // who has lost track reaches for this verb, so it has to
+                // answer "what now" rather than only "what happened".
+                let pad = self.path("peer.pad").exists();
+                match p.their_fingerprint() {
+                    None => format!(
+                        "step 1 of 5 — your card is written, theirs has not arrived.\n\n\
+                         wrote:  {}\n\n\
+                         next:   send them that file, then `peer accept <their.card>`",
+                        self.path("peer.card").display()
+                    ),
+                    Some(f) => format!(
+                        "step {} of 5 — their card is recorded.\n\n\
+                         theirs:  {f}\n\
+                         yours:   {}\n\n\
+                         {}\n\n\
+                         then:    peer seal <their.pad> <in-person|media|corpus|network>",
+                        if pad { 4 } else { 3 },
+                        self.identity
+                            .as_ref()
+                            .map(|i| i.fingerprint())
+                            .unwrap_or_default(),
+                        if pad {
+                            "your pad is written. Exchange pads with them."
+                        } else {
+                            "compare those two aloud, then: peer pad <destination>\n\
+                             \x20        (your SECRET half — write it onto the medium you carry)"
+                        }
+                    ),
+                }
+            }
+        };
+        ceremony
     }
 
     /// RFC 7 §10's panic wipe.
@@ -2353,12 +2537,30 @@ impl App {
         // The card is publishable; the contribution is half a shared secret,
         // and the two must not travel together. See `peering`'s module docs
         // and `RFC-7-review.md` §10 for why the channel matters.
+        // What was written, and what to do next. This used to list `peer.pad`
+        // alongside `peer.card` as though both existed. Only the card does —
+        // the contribution stays wrapped inside the ceremony until `peer pad`
+        // materialises it — so an operator went looking for a file that was
+        // never there, and reached `peer seal` with nothing to give it.
         format!(
-            "peer.card  — publishable; send it any way you like\n\
-             peer.pad   — SECRET; hand over in person or on media\n\n\
-             your fingerprint, to read aloud:\n\n  {}\n\n\
-             a pad sent through the corpus still works and is not \
-             post-quantum. `peer seal` will record which you used.",
+            "wrote {}\n\n\
+             This is your card. It is public and signed — send it any way you \
+             like.\n\n\
+             your fingerprint — eight words that stand for your identity key:\n\n\
+             \x20 {}\n\n\
+             At step 3 you read these to them over a voice call, and they read \
+             theirs back. Both must match what `peer accept` printed. If they \
+             do not, stop: someone is between you. Nothing else in the \
+             ceremony establishes who you are talking to.\n\n\
+             next, in order:\n\
+             \x20 1. send them peer.card, and get theirs\n\
+             \x20 2. peer accept <their.card>\n\
+             \x20 3. compare fingerprints aloud\n\
+             \x20 4. peer pad <destination>   — writes your SECRET half\n\
+             \x20 5. exchange pads, then: peer seal <their.pad> <channel>\n\n\
+             Your pad does not exist yet. Step 4 creates it, where you tell it \
+             to — on the medium you are carrying, not in this directory.",
+            self.path("peer.card").display(),
             mine.card.fingerprint()
         )
     }
@@ -2441,20 +2643,18 @@ impl App {
                         .as_ref()
                         .map(|i| i.backup_phrase())
                         .unwrap_or_default();
-                    // The words go to the view pane, not the output pane.
-                    // RFC 8 §3: output longer than one line MUST render into
-                    // the message view. Printed into two rows they scrolled
-                    // off, so the ceremony said "write these words down" and
-                    // showed none of them — and the next step asks the
-                    // operator to confirm they wrote down what they never saw.
-                    self.body = format!(
+                    // The output pane, which scrolls to the newest line and
+                    // full-screens with Ctrl-O. **Not** the message pane: that
+                    // one is rebuilt from the inbox on every scheduler tick,
+                    // so anything written there is erased within a second.
+                    self.output = format!(
                         "{}\n\n{phrase}\n\n\
                          This is the only copy. RFC 7 §11: message history is \
                          not recoverable from it, but without it every peer \
-                         must re-verify you in person, from scratch.",
+                         must re-verify you in person, from scratch.\n\n\
+                         Ctrl-O full-screens this pane if the list is cut off.",
                         next.prompt()
                     );
-                    self.output = format!("{} — see the message pane", next.prompt());
                 } else if next != InitStep::Generate {
                     self.output = next.prompt().into();
                 }
@@ -2851,21 +3051,6 @@ mod tests {
     }
 
     #[test]
-    fn peer_offer_names_both_files_and_marks_which_is_secret() {
-        let mut a = ready_node("offer-names");
-        type_command(&mut a, "peer offer");
-        assert!(
-            a.output.contains("peer.card") && a.output.contains("peer.pad"),
-            "{}",
-            a.output
-        );
-        assert!(
-            a.output.contains("SECRET"),
-            "the unforwardable half is marked"
-        );
-    }
-
-    #[test]
     fn an_unknown_command_is_reported_not_swallowed() {
         let mut a = App::default();
         type_command(&mut a, "frobnicate");
@@ -2985,13 +3170,13 @@ mod tests {
         // Step 1 (receive) and step 2. Each side sees the other's words.
         type_command(&mut a, &format!("peer accept {b_card}"));
         assert!(
-            a.output.contains("read these eight words aloud"),
+            a.output.contains("Read yours; they read theirs"),
             "{}",
             a.output
         );
         type_command(&mut b, &format!("peer accept {a_card}"));
         assert!(
-            b.output.contains("read these eight words aloud"),
+            b.output.contains("Read yours; they read theirs"),
             "{}",
             b.output
         );
@@ -3118,7 +3303,7 @@ mod tests {
 
         let p1 = a.path("first.card").display().to_string();
         type_command(&mut a, &format!("peer accept {p1}"));
-        assert!(a.output.contains("eight words"), "{}", a.output);
+        assert!(a.output.contains("their fingerprint"), "{}", a.output);
 
         let p2 = a.path("second.card").display().to_string();
         type_command(&mut a, &format!("peer accept {p2}"));
@@ -3779,7 +3964,11 @@ mod tests {
         // is inherited, so a parent process would choose unseen.
         std::env::set_var("KRAB_HOME", "/tmp/should-be-ignored");
         let b = App::from_args(std::iter::empty()).unwrap();
-        assert_eq!(b.home, default_home(), "the environment must not decide");
+        assert_ne!(
+            b.home,
+            PathBuf::from("/tmp/should-be-ignored"),
+            "the environment must not decide"
+        );
         std::env::remove_var("KRAB_HOME");
     }
 
@@ -4791,7 +4980,8 @@ mod tests {
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("a terminal");
         let log = a.log.recent(activity_log::CAPACITY);
-        term.draw(|f| render::draw(f, &a.view(&log)))
+        let me = a.identity.as_ref().map(|i| i.short_id());
+        term.draw(|f| render::draw(f, &a.view(&log, me.as_deref())))
             .expect("a frame");
         let screen: Vec<String> = term
             .backend()
@@ -4831,7 +5021,8 @@ mod tests {
         }
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("a terminal");
         let log = a.log.recent(activity_log::CAPACITY);
-        term.draw(|f| render::draw(f, &a.view(&log)))
+        let me = a.identity.as_ref().map(|i| i.short_id());
+        term.draw(|f| render::draw(f, &a.view(&log, me.as_deref())))
             .expect("a frame");
         for row in term.backend().buffer().content().chunks(80) {
             let line: String = row.iter().map(|c| c.symbol()).collect();
@@ -5058,9 +5249,9 @@ mod tests {
             "quit",
         ] {
             assert!(
-                a.body.contains(verb),
+                a.output.contains(verb),
                 "help does not mention `{verb}`:\n{}",
-                a.body
+                a.output
             );
         }
     }
@@ -5162,13 +5353,20 @@ mod tests {
             .backup_phrase();
         assert!(phrase.split_whitespace().count() > 8, "a real word list");
         assert!(
-            a.body.contains(&phrase),
+            a.output.contains(&phrase),
             "the words are not on screen:\n{}",
-            a.body
+            a.output
         );
-        // And the two-row pane says where to look rather than truncating them.
-        assert!(!a.output.contains(&phrase));
-        assert!(a.output.contains("message pane"), "{}", a.output);
+        // **And a scheduler tick must not erase them.** The message pane is
+        // rebuilt from the inbox on every tick, so anything written there
+        // vanishes within a second — which is what happened when these words
+        // were routed to it.
+        a.tick_schedule();
+        assert!(
+            a.output.contains(&phrase),
+            "a tick erased the backup words:\n{}",
+            a.output
+        );
     }
 
     /// `Ctrl-Q` and `quit` must do the same thing. They did not: one wrote the
@@ -5452,5 +5650,273 @@ mod tests {
         let mut a = ready_node("rekey-stranger");
         let out = a.peer_rekey(Some("deadbeef"));
         assert!(out.contains("no verifying peer-link"), "{out}");
+    }
+
+    /// Re-seat `peer`'s stored reservoir at `epoch`, to stand in for time
+    /// passing. The root is unchanged; only where the ratchet claims to be.
+    fn backdate_reservoir(n: &App, peer: &str, epoch: u32) {
+        let sealed = std::fs::read(n.peer_path(peer, "reservoir")).unwrap();
+        let raw = krab_crypto::kek::open_under(&n.epoch_key.unwrap(), b"krab/reservoir", &sealed)
+            .unwrap();
+        let (root, _) = persist::decode_reservoir(&raw).unwrap();
+        let record = persist::encode_reservoir(&root, krab_core::tag::Epoch(epoch));
+        let out = krab_crypto::kek::seal_under(
+            &n.epoch_key.unwrap(),
+            b"krab/reservoir",
+            &record,
+            &mut OsRng,
+        )
+        .unwrap();
+        atomic::write(&n.peer_path(peer, "reservoir"), &out).unwrap();
+    }
+
+    /// **The guarantee must not depend on someone remembering to type.**
+    ///
+    /// `REKEY_EPOCHS` states that a reservoir compromised at time *T* stops
+    /// protecting traffic within that many epochs of *T*. A re-key mechanism
+    /// that only runs when an operator invokes it does not deliver that, and
+    /// `REKEY_EPOCHS` had no caller outside its own module until this.
+    #[test]
+    fn an_aged_reservoir_rekeys_itself_on_the_schedule() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("auto-rekey");
+        let (sa, sb) = session_pair();
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+        a.links.established(&b_id, Some(Box::new(sa)));
+        b.links.connect(&a_id, profile_named("tcp").unwrap());
+        b.links.established(&a_id, Some(Box::new(sb)));
+
+        // Nothing is due on a reservoir seated today.
+        assert!(
+            a.rekey_if_due(&b_id).is_none(),
+            "a fresh reservoir re-keyed anyway"
+        );
+
+        // Age both ends past the interval.
+        let old = now_epoch().0 - krab_crypto::REKEY_EPOCHS;
+        backdate_reservoir(&a, &b_id, old);
+        backdate_reservoir(&b, &a_id, old);
+        let before = stored_root(&a, &b_id);
+
+        let b_peer = a_id.clone();
+        let handle = std::thread::spawn(move || {
+            let e = b.rekey_if_due(&b_peer);
+            (b, e)
+        });
+        let ev_a = a.rekey_if_due(&b_id);
+        let (b, ev_b) = handle.join().expect("B's thread");
+
+        assert!(
+            matches!(ev_a, Some(activity_log::Event::Rekeyed { .. })),
+            "A did not re-key: {ev_a:?}"
+        );
+        assert!(
+            matches!(ev_b, Some(activity_log::Event::Rekeyed { .. })),
+            "B did not re-key: {ev_b:?}"
+        );
+        assert_ne!(stored_root(&a, &b_id), before, "the root did not move");
+        assert_eq!(
+            stored_root(&a, &b_id),
+            stored_root(&b, &a_id),
+            "the two ends diverged"
+        );
+    }
+
+    /// **The 90-day death is repairable.** Past `MAX_ADVANCE` the ratchet
+    /// cannot be caught up and the peering is dead; a re-key is the only thing
+    /// that revives it, so the trigger must fire there too and not merely on
+    /// the rotation interval.
+    #[test]
+    fn a_peering_past_max_advance_is_revived_rather_than_lost() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("auto-revive");
+        let (sa, sb) = session_pair();
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+        a.links.established(&b_id, Some(Box::new(sa)));
+        b.links.connect(&a_id, profile_named("tcp").unwrap());
+        b.links.established(&a_id, Some(Box::new(sb)));
+
+        let dead = now_epoch().0 - krab_crypto::reservoir::Reservoir::MAX_ADVANCE - 10;
+        backdate_reservoir(&a, &b_id, dead);
+        backdate_reservoir(&b, &a_id, dead);
+
+        // The ratchet genuinely cannot close that gap on its own.
+        let mut r = krab_crypto::reservoir::Reservoir::new(
+            stored_root(&a, &b_id),
+            krab_core::tag::Epoch(dead),
+        );
+        assert!(!r.advance_to(now_epoch()), "the gap must be uncloseable");
+
+        let b_peer = a_id.clone();
+        let handle = std::thread::spawn(move || {
+            let e = b.rekey_if_due(&b_peer);
+            (b, e)
+        });
+        let ev = a.rekey_if_due(&b_id);
+        let (b, _) = handle.join().expect("B's thread");
+
+        assert!(
+            matches!(ev, Some(activity_log::Event::Rekeyed { .. })),
+            "a dead peering was not revived: {ev:?}"
+        );
+        assert_eq!(stored_root(&a, &b_id), stored_root(&b, &a_id));
+        // And it is usable again from today.
+        let mut r = krab_crypto::reservoir::Reservoir::new(stored_root(&a, &b_id), now_epoch());
+        assert!(r.chunk(now_epoch()).is_some());
+    }
+
+    /// A peer with no link up is not attempted. The scheduler runs over every
+    /// due peer on every tick, and reading a reservoir off disk for each one
+    /// that cannot be talked to is work with no possible outcome.
+    #[test]
+    fn nothing_is_attempted_without_a_live_link() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("auto-nolink");
+        backdate_reservoir(&a, &b_id, now_epoch().0 - krab_crypto::REKEY_EPOCHS);
+        assert!(a.rekey_if_due(&b_id).is_none(), "it tried without a link");
+    }
+
+    /// **`peer offer` must not name a file it did not write.**
+    ///
+    /// It listed `peer.pad` beside `peer.card` as though both existed. Only
+    /// the card does — the contribution stays wrapped in the ceremony until
+    /// `peer pad` materialises it — so an operator went looking for a file
+    /// that was never there and reached `peer seal` with nothing to give it.
+    #[test]
+    fn peer_offer_names_only_the_file_it_wrote() {
+        let mut a = ready_node("offer-honest");
+        type_command(&mut a, "peer offer");
+
+        assert!(a.path("peer.card").exists(), "the card was not written");
+        assert!(
+            !a.path("peer.pad").exists(),
+            "the pad must not be written into the node's own storage"
+        );
+        assert!(
+            !a.output.contains("peer.pad  "),
+            "it lists a file it did not write:\n{}",
+            a.output
+        );
+        // And it says how to get one.
+        assert!(
+            a.output.contains("peer pad"),
+            "it never mentions the verb that creates the pad:\n{}",
+            a.output
+        );
+        assert!(
+            a.output.contains("does not exist yet"),
+            "it does not say the pad is missing:\n{}",
+            a.output
+        );
+    }
+
+    /// `peer status` is what an operator reaches for when lost, so it has to
+    /// answer "what now", not only "what happened".
+    #[test]
+    fn peer_status_names_the_step_and_the_next_verb() {
+        let mut a = ready_node("status-steps");
+        let mut b = ready_node("status-steps-b");
+
+        type_command(&mut a, "peer status");
+        assert!(a.output.contains("peer offer"), "{}", a.output);
+
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+        type_command(&mut a, "peer status");
+        assert!(a.output.contains("step 1 of 5"), "{}", a.output);
+        assert!(a.output.contains("peer accept"), "{}", a.output);
+
+        let b_card = {
+            let bytes = std::fs::read(b.path("peer.card")).unwrap();
+            let dest = a.path("from-b.card");
+            std::fs::write(&dest, bytes).unwrap();
+            dest.to_string_lossy().into_owned()
+        };
+        type_command(&mut a, &format!("peer accept {b_card}"));
+        type_command(&mut a, "peer status");
+        assert!(a.output.contains("step 3 of 5"), "{}", a.output);
+        assert!(
+            a.output.contains("peer pad"),
+            "step 3 must point at the pad verb:\n{}",
+            a.output
+        );
+    }
+
+    /// Sealing with a path that is not there says which file was wanted.
+    /// "No such file or directory" alone does not tell an operator that the
+    /// pad they are missing is the one their friend has to hand them.
+    #[test]
+    fn a_missing_pad_says_whose_pad_it_wanted() {
+        let mut a = ready_node("seal-missing");
+        type_command(&mut a, "peer offer");
+        let mut b = ready_node("seal-missing-b");
+        type_command(&mut b, "peer offer");
+        let b_card = {
+            let bytes = std::fs::read(b.path("peer.card")).unwrap();
+            let dest = a.path("from-b.card");
+            std::fs::write(&dest, bytes).unwrap();
+            dest.to_string_lossy().into_owned()
+        };
+        type_command(&mut a, &format!("peer accept {b_card}"));
+
+        type_command(&mut a, "peer seal /nonexistent/their.pad media");
+        assert!(
+            a.output.contains("pad THEY gave you"),
+            "the error does not say whose pad:\n{}",
+            a.output
+        );
+    }
+
+    /// **A restart must not lose the peerings.** `peers` reported the
+    /// in-memory link table, which is empty on every start, so a node whose
+    /// ceremony had completed said "no peers" and told the operator to run
+    /// `peer offer` again — over the top of a peering that already existed.
+    #[test]
+    fn peers_survive_a_restart() {
+        let (a, _b, _a_id, b_id) = peered_pair("peers-restart");
+
+        // Restart: same directory, nothing in memory.
+        let mut fresh = App {
+            home: a.home.clone(),
+            ..App::default()
+        };
+        fresh.passphrase = line::Line::from("a passphrase");
+        fresh.unlock(b"a passphrase").expect("it reopens");
+
+        type_command(&mut fresh, "peers");
+        assert!(
+            fresh.output.contains(&b_id),
+            "the peering vanished across a restart:\n{}",
+            fresh.output
+        );
+        assert!(
+            !fresh.output.contains("no peers"),
+            "it told the operator to peer again:\n{}",
+            fresh.output
+        );
+        assert!(
+            fresh.output.contains("not connected"),
+            "it must distinguish peered-but-offline from not peered:\n{}",
+            fresh.output
+        );
+    }
+
+    /// A failed connection must not unpeer anybody. The link goes down; the
+    /// peering is a signed artifact on disk and is unaffected.
+    #[test]
+    fn a_failed_connection_leaves_the_peering_intact() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("peers-failed-connect");
+
+        // Nothing is listening on this port.
+        type_command(&mut a, &format!("connect {b_id} tcp 127.0.0.1:1"));
+        assert!(
+            a.output.contains("could not establish") || a.output.contains("refused"),
+            "{}",
+            a.output
+        );
+
+        type_command(&mut a, "peers");
+        assert!(
+            a.output.contains(&b_id) && !a.output.contains("no peers"),
+            "a failed dial unpeered them:\n{}",
+            a.output
+        );
     }
 }

@@ -39,6 +39,8 @@ pub struct View<'a> {
     pub command: &'a crate::line::Line,
     /// Command output — the output pane.
     pub output: &'a str,
+    /// This node's short id, or `None` before `init`.
+    pub me: Option<&'a str>,
     /// Composer contents, shown when `ui.mode()` is `Compose`.
     pub composer: &'a str,
     /// Whether the node is locked. A locked node draws no message content.
@@ -164,10 +166,28 @@ fn draw_view(f: &mut Frame, area: Rect, view: &View) {
 /// said about itself, not message content, and blanking it would hide the
 /// reason the node is locked from the operator trying to unlock it.
 fn draw_output(f: &mut Frame, area: Rect, view: &View) {
+    // Scrolled to the end. Output longer than the pane is normal — `help`,
+    // `peers`, the backup word list — and the newest line is the one the
+    // operator just asked for. Showing the top would mean a verb whose reply
+    // runs long appears to have printed nothing.
+    let rows = area.height.saturating_sub(2) as usize;
+    let lines: Vec<&str> = view.output.lines().collect();
+    let from = lines.len().saturating_sub(rows.max(1));
+    let shown = lines[from..].join("\n");
+    // This node's own short id, on the frame of the pane the operator is
+    // always looking at. It is public — it is in every card handed out and is
+    // the name a peer types into `connect` — and being asked "what is my id"
+    // should not require a verb.
+    let me = view.me.unwrap_or("no identity");
+    let title = if from > 0 {
+        format!(" {me} — output, {from} more above (Ctrl-O) ")
+    } else {
+        format!(" {me} — output ")
+    };
     f.render_widget(
-        Paragraph::new(view.output)
+        Paragraph::new(shown)
             .wrap(Wrap { trim: false })
-            .block(frame_for(view.ui, Pane::Output, " output ".into())),
+            .block(frame_for(view.ui, Pane::Output, title)),
         area,
     );
 }
