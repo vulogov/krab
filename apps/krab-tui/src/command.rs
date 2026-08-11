@@ -195,7 +195,10 @@ impl Command {
             "Ctrl-Alt-Shift-W ×2",
             "PANIC — destroy every key on this node, no confirmation",
         ),
-        ("Ctrl-1 / Ctrl-2", "private messages / channels"),
+        (
+            "Ctrl-M / Ctrl-G",
+            "messages / groups (channels). F1/F2 and Ctrl-1/Ctrl-2 also work",
+        ),
         ("Tab", "move between panes"),
         (
             "z",

@@ -44,6 +44,8 @@ pub struct View<'a> {
     /// Whether anything is going out, and whether anything is coming in.
     pub sending: bool,
     pub receiving: bool,
+    /// Lines the output pane is scrolled back from the newest.
+    pub scroll: usize,
     /// Composer contents, shown when `ui.mode()` is `Compose`.
     pub composer: &'a str,
     /// Whether the node is locked. A locked node draws no message content.
@@ -175,8 +177,14 @@ fn draw_output(f: &mut Frame, area: Rect, view: &View) {
     // runs long appears to have printed nothing.
     let rows = area.height.saturating_sub(2) as usize;
     let lines: Vec<&str> = view.output.lines().collect();
-    let from = lines.len().saturating_sub(rows.max(1));
-    let shown = lines[from..].join("\n");
+    // The window ends `scroll` lines above the newest, so a fresh command
+    // lands at the bottom and PgUp walks backwards from there. Anchoring to
+    // the top instead would put every reply's first line on screen and hide
+    // its result, which is the part the operator asked for.
+    let end = lines.len().saturating_sub(view.scroll);
+    let from = end.saturating_sub(rows.max(1));
+    let shown = lines[from..end].join("\n");
+    let below = lines.len() - end;
     // This node's own short id, on the frame of the pane the operator is
     // always looking at. It is public — it is in every card handed out and is
     // the name a peer types into `connect` — and being asked "what is my id"
@@ -185,10 +193,11 @@ fn draw_output(f: &mut Frame, area: Rect, view: &View) {
     // Two directions, so a still glyph means "nothing is moving" rather than
     // "the interface froze".
     let (out, inn) = view.spinner.duplex(view.sending, view.receiving);
-    let title = if from > 0 {
-        format!(" {me}  {out}\u{2191} {inn}\u{2193}  {from} more above (Ctrl-O) ")
-    } else {
-        format!(" {me}  {out}\u{2191} {inn}\u{2193} ")
+    let title = match (from, below) {
+        (0, 0) => format!(" {me}  {out}\u{2191} {inn}\u{2193} "),
+        (a, 0) => format!(" {me}  {out}\u{2191} {inn}\u{2193}  \u{2191}{a} PgUp "),
+        (0, b) => format!(" {me}  {out}\u{2191} {inn}\u{2193}  \u{2193}{b} PgDn "),
+        (a, b) => format!(" {me}  {out}\u{2191} {inn}\u{2193}  \u{2191}{a} \u{2193}{b} PgUp/PgDn "),
     };
     f.render_widget(
         Paragraph::new(shown)

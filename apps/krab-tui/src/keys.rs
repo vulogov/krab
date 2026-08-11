@@ -87,6 +87,12 @@ pub enum Key {
     Right,
     Home,
     End,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    /// A function key, `F(1)`..`F(12)`.
+    F(u8),
 }
 
 /// What a key press means.
@@ -134,6 +140,11 @@ pub enum Binding {
     Input(char),
     /// An edit to the line being typed. See [`crate::line::Line`].
     Edit(Edit),
+    /// Walk the command history. Newer is `+1`.
+    History(i8),
+    /// Scroll the output pane. **`+1` is further back**, toward older
+    /// output — the direction PgUp moves, not the direction the eye moves.
+    Scroll(i8),
     /// Nothing.
     Ignored,
 }
@@ -194,13 +205,32 @@ impl Binding {
         if key.ctrl && key.code == Key::Char('o') {
             return Binding::ToggleFullScreen;
         }
-        if key.ctrl {
-            if key.code == Key::Char('1') {
-                return Binding::SelectTab(crate::layout::Tab::Private);
+        // **Ctrl-M for Messages, Ctrl-G for Groups.** Letters, so they have a
+        // control encoding every terminal sends. `Ctrl-1` does not: the
+        // control range is built from `@` through `_`, and a digit is not in
+        // it, so the keystroke arrives as a bare `1` or as nothing at all.
+        // F1/F2 and Ctrl-1/Ctrl-2 stay for the terminals that do send them.
+        match key.code {
+            Key::F(1) => return Binding::SelectTab(crate::layout::Tab::Private),
+            Key::F(2) => return Binding::SelectTab(crate::layout::Tab::Channels),
+            Key::Char('m' | 'M' | '1') if key.ctrl || key.alt => {
+                return Binding::SelectTab(crate::layout::Tab::Private)
             }
-            if key.code == Key::Char('2') {
-                return Binding::SelectTab(crate::layout::Tab::Channels);
+            Key::Char('g' | 'G' | '2') if key.ctrl || key.alt => {
+                return Binding::SelectTab(crate::layout::Tab::Channels)
             }
+            _ => {}
+        }
+
+        // History and scrolling, before mode, for the same reason as editing:
+        // an operator recalling their last command or looking further up the
+        // output is doing the same thing whatever pane has focus.
+        match key.code {
+            Key::Up => return Binding::History(-1),
+            Key::Down => return Binding::History(1),
+            Key::PageUp => return Binding::Scroll(1),
+            Key::PageDown => return Binding::Scroll(-1),
+            _ => {}
         }
 
         // Editing, before mode. A line being typed is a line being typed, and

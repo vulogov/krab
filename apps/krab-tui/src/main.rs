@@ -48,6 +48,7 @@ mod request;
 mod shared;
 mod shred;
 mod sync;
+mod words;
 // RFC 1 §12's vector file is a test artifact: it is generated and checked by
 // the test suite and no runtime path consults it.
 #[cfg(test)]
@@ -122,6 +123,19 @@ fn rekey_failure(peer: &str, e: rekey_run::Error) -> String {
 /// left alone disarms itself rather than waiting to be triggered by whoever
 /// is at the keyboard next.
 const PANIC_WINDOW: Duration = Duration::from_secs(3);
+
+/// Lines PgUp/PgDn move the output pane.
+///
+/// A fixed step rather than a screenful: the pane is four rows unzoomed and
+/// full-screen zoomed, and a step that changes size with the zoom means the
+/// same keystroke moves a different distance depending on state.
+const OUTPUT_SCROLL_LINES: usize = 8;
+
+/// How many ticks an activity glyph keeps turning after bytes move.
+///
+/// Long enough to be seen at a glance, short enough that it stops well before
+/// an operator could mistake it for continuous traffic.
+const ACTIVITY_GLYPH_TICKS: u8 = 20;
 
 /// Where a node keeps its store when `--home` is not given.
 ///
@@ -228,6 +242,32 @@ struct App {
     epoch_key: Option<[u8; 32]>,
     /// Where cards, pads and ceremony state live.
     home: PathBuf,
+    /// Commands submitted this session, oldest first.
+    ///
+    /// **In memory only.** A history file would be a record of who this node
+    /// talks to and what it was asked to do, sitting unencrypted next to a
+    /// store that is not — and `NO-CONFIG.md` gives the reason a file cannot
+    /// be trusted to be there or to be genuine.
+    history: Vec<String>,
+    /// Position while walking [`App::history`]; `len()` means "not walking".
+    history_at: usize,
+    /// Lines the output pane is scrolled back by. Zero is the newest line.
+    output_scroll: i64,
+    /// Ticks remaining on the inbound and outbound indicators.
+    ///
+    /// Set when bytes actually move and counted down, so each glyph stops on
+    /// its own. Earlier versions tied them to *configuration* — a bound
+    /// listener, a non-empty queue — which meant they turned on a node that
+    /// had merely been set up, and kept turning after the peer had quit.
+    /// An indicator that reports traffic which is not there is worse than no
+    /// indicator: it is a claim, and it is false.
+    ///
+    /// RFC 8 §5.1 forbids a "syncing now" display, and this is not one: it
+    /// says *something moved*, after the fact, for a second or two. It does
+    /// not count down to the next reconciliation, and nothing an operator
+    /// does makes it fire.
+    inbound_ticks: u8,
+    outbound_ticks: u8,
     /// Where inbound links arrive, from `--listen`. `None` means this node
     /// only dials.
     listen: Option<String>,
@@ -296,6 +336,11 @@ impl Default for App {
             epoch_key: None,
             home: default_home(),
             listen: None,
+            history: Vec::new(),
+            history_at: 0,
+            output_scroll: 0,
+            inbound_ticks: 0,
+            outbound_ticks: 0,
             inbound: None,
             allowed: krab_fabric::backend::listener::Allowed::default(),
             links: LinkTable::new(),
@@ -399,13 +444,19 @@ impl App {
             log,
             masked,
             me,
-            // Outbound is anything queued and a link to carry it; inbound is
-            // a listener with peers that may call. Neither claims a transfer
-            // is in progress — RFC 8 §5.1 forbids a "syncing now" indicator,
-            // because when a node reconciles is not the operator's business
-            // to watch and is not theirs to leak either.
-            sending: self.node.queued > 0 && self.links.up_count() > 0,
-            receiving: self.inbound.is_some() && self.links.up_count() > 0,
+            // **Both are about things that actually happened**, not about
+            // state that merely exists. "A listener is bound" is not
+            // receiving, and a link table that still lists a peer who quit is
+            // not a link — that was the defect: the inbound glyph kept
+            // turning after the other node was gone, because nothing had
+            // noticed the session die.
+            //
+            // Neither claims a transfer is in progress. RFC 8 §5.1 forbids a
+            // "syncing now" indicator: when a node reconciles is not the
+            // operator's business to watch and is not theirs to leak.
+            sending: self.outbound_ticks > 0,
+            receiving: self.inbound_ticks > 0,
+            scroll: self.output_scroll.max(0) as usize,
         }
     }
 
@@ -448,6 +499,11 @@ impl App {
                 KeyCode::Right => Key::Right,
                 KeyCode::Home => Key::Home,
                 KeyCode::End => Key::End,
+                KeyCode::Up => Key::Up,
+                KeyCode::Down => Key::Down,
+                KeyCode::PageUp => Key::PageUp,
+                KeyCode::PageDown => Key::PageDown,
+                KeyCode::F(n) => Key::F(n),
                 KeyCode::Char(c) => Key::Char(c),
                 _ => return,
             },
@@ -497,6 +553,21 @@ impl App {
             Binding::SwitchTab => self.ui.switch_tab(),
             Binding::SelectTab(t) => self.ui.select_tab(t),
             Binding::ToggleFullScreen => self.ui.toggle_full_screen(),
+            // **History.** Typed commands only, never the passphrase — see
+            // `push_history`.
+            Binding::History(d) => {
+                if self.init_step == Some(InitStep::Passphrase) {
+                    return;
+                }
+                self.recall(d);
+            }
+            // **Scroll the output pane.** By screens, so a long `help` or
+            // `peers` can be read without zooming.
+            Binding::Scroll(d) => {
+                let step = OUTPUT_SCROLL_LINES as i64;
+                let n = self.output.lines().count() as i64;
+                self.output_scroll = (self.output_scroll + d as i64 * step).clamp(0, n);
+            }
             Binding::Compose if !self.locked => self.ui.compose(),
 
             // Editing goes to whichever line is being typed into. The
@@ -733,6 +804,12 @@ impl App {
         let view_store = self.store.clone();
         let done = self.exchanges.0.clone();
         let name = peer.to_string();
+        // An exchange is about to put bytes on the link in both directions.
+        // Set here rather than on completion: the thread runs for minutes on
+        // a serial link, and an indicator that only lights up at the end
+        // reports the one moment nothing is moving.
+        self.outbound_ticks = ACTIVITY_GLYPH_TICKS;
+        self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
         std::thread::spawn(move || {
             let mut session = session;
             let mut view = shared::ExchangeView::new(view_store, window.0);
@@ -936,9 +1013,54 @@ impl App {
         }
     }
 
+    /// Walk the command history. `-1` is older, `+1` is newer.
+    ///
+    /// Stepping past the newest entry returns an empty line rather than
+    /// wrapping to the oldest — wrapping means an operator holding a key ends
+    /// up running something from the start of the session.
+    fn recall(&mut self, dir: i8) {
+        if self.history.is_empty() {
+            return;
+        }
+        let at = self.history_at as i64 + dir as i64;
+        let at = at.clamp(0, self.history.len() as i64) as usize;
+        self.history_at = at;
+        self.command = match self.history.get(at) {
+            Some(h) => line::Line::from(h.as_str()),
+            None => line::Line::default(),
+        };
+    }
+
+    /// Record a submitted line.
+    ///
+    /// Consecutive duplicates are collapsed, so holding Enter does not fill
+    /// the history with one command. Nothing here ever sees a passphrase:
+    /// the passphrase step has its own buffer and its own key handling.
+    fn push_history(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if self.history.last().map(String::as_str) != Some(line) {
+            self.history.push(line.to_string());
+        }
+        self.history_at = self.history.len();
+    }
+
     /// Run whatever is on the command line.
     fn submit(&mut self) {
         let line = self.command.take();
+        // Tokenise once, up front, so a malformed line is refused with the
+        // reason rather than reaching a verb that sees a truncated argument
+        // and reports a file that does not exist.
+        self.push_history(&line);
+        // A new command's output starts at the newest line, not wherever the
+        // operator had scrolled to.
+        self.output_scroll = 0;
+        if let Err(e) = words::split(&line) {
+            self.output = format!("{e}");
+            return;
+        }
         let Some(cmd) = Command::parse(&line) else {
             self.output = format!(
                 "unknown command: {}\n\nType `help` for the verbs, or Ctrl-Q to quit.",
@@ -1017,12 +1139,38 @@ impl App {
                 self.output = match Peering::parse(rest) {
                     // `offer` writes two files on purpose — see `peering`.
                     Some(Peering::Offer) => self.peer_offer(),
-                    Some(Peering::Accept) => self.peer_accept(arg(rest, 1)),
-                    Some(Peering::Seal) => self.peer_seal(arg(rest, 1), arg(rest, 2)),
-                    Some(Peering::Pad) => self.peer_pad(arg(rest, 1)),
+                    Some(Peering::Accept) => self.peer_accept(arg(rest, 1).as_deref()),
+                    Some(Peering::Seal) => {
+                        self.peer_seal(arg(rest, 1).as_deref(), arg(rest, 2).as_deref())
+                    }
+                    Some(Peering::Pad) => self.peer_pad(arg(rest, 1).as_deref()),
                     Some(Peering::Status) => self.peer_status(),
-                    Some(Peering::Rekey) => self.peer_rekey(arg(rest, 1)),
-                    None => format!("unknown: peer{rest}"),
+                    Some(Peering::Rekey) => self.peer_rekey(arg(rest, 1).as_deref()),
+                    None => {
+                        let sub = arg(rest, 0).unwrap_or_default();
+                        // `peer connect` is the likely typo, because
+                        // `connect` is a top-level verb and `peer` reads like
+                        // a namespace. Saying "unknown" and stopping leaves
+                        // the operator with a correct command they cannot
+                        // find.
+                        if Command::parse(&sub).is_some() {
+                            format!(
+                                "`{sub}` is a command on its own, not a `peer` step.\n\n\
+                                 Try:  {}",
+                                rest.trim()
+                            )
+                        } else {
+                            format!(
+                                "unknown: peer {sub}\n\n\
+                                 peer offer                  start a peering\n\
+                                 peer accept <their.card>    take in their card\n\
+                                 peer pad <destination>      write your SECRET half\n\
+                                 peer seal <their.pad> <ch>  finish it\n\
+                                 peer rekey <peer>           mix in fresh entropy\n\
+                                 peer status                 where you are"
+                            )
+                        }
+                    }
                 };
             }
             // RFC 3 §11 step 2, and RFC 8 §5's `verify`.
@@ -1031,7 +1179,17 @@ impl App {
                 // An address typed here wins over `--listen`; `--listen` is
                 // the default so the operator does not retype what they
                 // launched with.
-                let typed = arg(line, 2).map(str::to_string);
+                // A bare number is a port on loopback. `listen bob 40000` is
+                // what an operator reaches for, and refusing it because it is
+                // not `127.0.0.1:40000` is pedantry with no security content.
+                let typed =
+                    words::split(line)
+                        .ok()
+                        .and_then(|w| w.get(2).cloned())
+                        .map(|w| match w.int() {
+                            Some(p) if (1..=65535).contains(&p) => format!("127.0.0.1:{p}"),
+                            _ => w.text(),
+                        });
                 let addr = typed.or_else(|| self.listen.clone());
                 let (Some(peer), Some(addr)) = (arg(line, 1), addr.as_deref()) else {
                     self.output = format!(
@@ -1053,7 +1211,7 @@ impl App {
                 } else {
                     "serial"
                 };
-                self.dispatch_connect(peer, kind, Some(addr), true, line);
+                self.dispatch_connect(&peer, kind, Some(addr), true, line);
             }
             Command::Help => {
                 // Into the body pane: RFC 8 §3 forbids scrolling output
@@ -1080,7 +1238,9 @@ impl App {
             // RFC 8 §5.1: establishes a transport and MUST NOT sync. The
             // guarantee is structural -- `LinkTable` has no reconciler to call.
             Command::Connect => {
-                let (Some(peer), kind) = (arg(line, 1), arg(line, 2).unwrap_or("tcp")) else {
+                let (Some(peer), kind) =
+                    (arg(line, 1), arg(line, 2).unwrap_or_else(|| "tcp".into()))
+                else {
                     self.output = format!(
                         "usage: connect <peer> <transport> [address]\n\n  \
                          tcp      host:port\n  \
@@ -1096,22 +1256,22 @@ impl App {
                 // and an operator may have it in their fingers, but `listen`
                 // is the verb that says what it does.
                 let answer = line.split_whitespace().any(|t| t == "answer");
-                self.dispatch_connect(peer, kind, arg(line, 3), answer, line);
+                self.dispatch_connect(&peer, &kind, arg(line, 3).as_deref(), answer, line);
             }
             Command::Disconnect => {
                 let Some(peer) = arg(line, 1) else {
                     self.output = "usage: disconnect <peer>".into();
                     return;
                 };
-                if let Some(id) = sync::peer_id_of(peer) {
+                if let Some(id) = sync::peer_id_of(&peer) {
                     self.scheduler.remove(&id);
                 }
-                if self.links.get(peer).is_some() {
+                if self.links.get(&peer).is_some() {
                     self.log.push(activity_log::Event::LinkDown {
                         peer: peer.to_string(),
                     });
                 }
-                self.output = if self.links.disconnect(peer) {
+                self.output = if self.links.disconnect(&peer) {
                     // RFC 3 §6.2's quota reduction is deliberately not bundled:
                     // making disconnect a punishment discourages using it, and
                     // RFC 8 §5.3 needs operators to act.
@@ -1616,6 +1776,9 @@ impl App {
             peer: peer.to_string(),
             index: outcome.index,
         });
+        // A re-key is four messages over the session, in both directions.
+        self.outbound_ticks = ACTIVITY_GLYPH_TICKS;
+        self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
 
         let t = &outcome.theirs;
         format!(
@@ -1665,7 +1828,7 @@ impl App {
             return "locked — unlock to compose".into();
         };
 
-        let card_bytes = match std::fs::read(self.peer_path(peer, "link")) {
+        let card_bytes = match std::fs::read(self.peer_path(&peer, "link")) {
             Ok(b) => b,
             Err(_) => {
                 return format!(
@@ -1684,7 +1847,7 @@ impl App {
         // error: `mode_auth` is correct and simply lacks the post-quantum
         // property (RFC 7 §5 makes the reservoir a conditional tier).
         let epoch = now_epoch();
-        let reservoir = std::fs::read(self.peer_path(peer, "reservoir"))
+        let reservoir = std::fs::read(self.peer_path(&peer, "reservoir"))
             .ok()
             .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
             .and_then(|raw| persist::decode_reservoir(&raw).ok())
@@ -1764,16 +1927,17 @@ impl App {
                     each other (RFC 2 §4.2)."
                 .into();
         };
-        let note = line
-            .splitn(3, char::is_whitespace)
-            .nth(2)
-            .unwrap_or("")
-            .trim();
+        // Free text, tokenised — so a note containing a quoted phrase keeps
+        // it, rather than the quotes becoming part of the message.
+        let note = words::split(line)
+            .map(|w| words::rest(&w, 2))
+            .unwrap_or_default();
+        let note = note.trim();
         let (Some(id), Some(_)) = (&self.identity, self.epoch_key) else {
             return "locked — unlock to compose".into();
         };
 
-        let Ok(bytes) = std::fs::read(card_path) else {
+        let Ok(bytes) = std::fs::read(&card_path) else {
             return format!("could not read {card_path}");
         };
         let card = match peering::Card::decode(&bytes) {
@@ -1834,7 +1998,7 @@ impl App {
     /// author's composition schedule, which is the correlation RFC 5 §6.1
     /// forbids on the network arriving by another route.
     fn pack(&self, line: &str) -> String {
-        let out = arg(line, 1).unwrap_or("krab-archive.krab");
+        let out = arg(line, 1).unwrap_or_else(|| "krab-archive.krab".into());
         let kind = arg_value(line, "--for").unwrap_or("courier");
         let Some(profile) = profile_named(kind) else {
             return format!("unknown transport {kind:?}");
@@ -1842,7 +2006,7 @@ impl App {
         let path = if out.contains('/') {
             PathBuf::from(out)
         } else {
-            self.path(out)
+            self.path(&out)
         };
 
         // MAX_TTL back from now, not "since last time". RFC 1 §2 sets the TTL
@@ -2437,8 +2601,13 @@ impl App {
 
     /// Install anything the listener has accepted since the last tick.
     fn drain_inbound(&mut self) {
+        self.inbound_ticks = self.inbound_ticks.saturating_sub(1);
+        self.outbound_ticks = self.outbound_ticks.saturating_sub(1);
         let Some(rx) = &self.inbound else { return };
         let arrived: Vec<_> = rx.try_iter().collect();
+        if !arrived.is_empty() {
+            self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
+        }
         for (session, static_pk) in arrived {
             // Which peering this is. The listener verified the static against
             // the set; this maps it back to the directory it belongs to.
@@ -2866,9 +3035,16 @@ fn arg_value<'a>(line: &'a str, flag: &str) -> Option<&'a str> {
     None
 }
 
-/// The `n`th whitespace-separated argument of a command line.
-fn arg(line: &str, n: usize) -> Option<&str> {
-    line.split_whitespace().nth(n)
+/// The `n`th argument of a command line, respecting quotes.
+///
+/// Returns an owned `String` rather than a borrow because a quoted word is
+/// not a slice of the input — `"/Volumes/My Disk"` has no contiguous
+/// representation in the line the operator typed once the quotes are gone.
+///
+/// A line that cannot be tokenised yields nothing, and [`App::submit`] refuses
+/// it with the reason before any verb sees it.
+fn arg(line: &str, n: usize) -> Option<String> {
+    words::split(line).ok().and_then(|w| words::nth(&w, n))
 }
 
 /// The current epoch, RFC 1 §2 — days since the Unix epoch.
@@ -6119,5 +6295,253 @@ mod tests {
             differed |= o != i;
         }
         assert!(differed, "the two spinners are indistinguishable");
+    }
+
+    /// **A path with a space must survive.** Removable media is where pads
+    /// and cards travel, and it is mounted under names people gave it.
+    /// `split_whitespace` truncated silently, so `peer accept
+    /// /Volumes/My Disk/bob.card` read from `/Volumes/My` and the operator
+    /// was told the file did not exist.
+    #[test]
+    fn a_quoted_path_reaches_the_verb_intact() {
+        let mut a = ready_node("quoted-path");
+        type_command(&mut a, "peer offer");
+
+        // A card, at a path with a space in it.
+        let dir = a.home.join("My Disk");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut b = ready_node("quoted-path-b");
+        type_command(&mut b, "peer offer");
+        let card = dir.join("bob.card");
+        std::fs::copy(b.path("peer.card"), &card).unwrap();
+
+        type_command(&mut a, &format!("peer accept \"{}\"", card.display()));
+        assert!(
+            a.output.contains("card accepted"),
+            "the quoted path did not reach the verb:\n{}",
+            a.output
+        );
+
+        // Unquoted, the same path is truncated — and the operator is told
+        // about the truncated name, not a name they typed.
+        type_command(&mut a, &format!("peer accept {}", card.display()));
+        assert!(a.output.contains("could not read"), "{}", a.output);
+    }
+
+    /// An unterminated quote is refused before any verb runs, with the reason.
+    #[test]
+    fn an_unbalanced_quote_is_refused_with_its_reason() {
+        let mut a = ready_node("bad-quote");
+        type_command(&mut a, "peer accept \"oops");
+        assert!(a.output.contains("unterminated quote"), "{}", a.output);
+        assert!(
+            !a.output.contains("could not read"),
+            "it ran the verb anyway:\n{}",
+            a.output
+        );
+    }
+
+    /// A bare port number is a port on loopback — what an operator reaches
+    /// for, and refusing it would be pedantry with no security content.
+    #[test]
+    fn listen_accepts_a_bare_port_number() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("bare-port");
+        type_command(&mut a, &format!("listen {b_id} 1"));
+        // Port 1 on loopback is reserved, so this fails — but it must fail
+        // having tried 127.0.0.1:1, not having tried to open a serial device
+        // called "1".
+        assert!(
+            !a.output.contains("dial-in") && !a.output.contains("device"),
+            "a bare number was taken for a device path:\n{}",
+            a.output
+        );
+    }
+
+    /// Up and down walk what was typed, and stepping past the newest gives an
+    /// empty line rather than wrapping — wrapping means an operator holding a
+    /// key runs something from the start of the session.
+    #[test]
+    fn the_command_history_walks_and_does_not_wrap() {
+        let mut a = ready_node("history");
+        for cmd in ["keys", "peers", "verify"] {
+            type_command(&mut a, cmd);
+        }
+
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "verify");
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "peers");
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "keys");
+        // Older than the oldest stays put.
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "keys");
+
+        for expect in ["peers", "verify", ""] {
+            a.on_key(KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(a.command.as_string(), expect);
+        }
+        // And newer than the newest stays empty, rather than wrapping round.
+        a.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "");
+    }
+
+    /// **A passphrase must never enter the history.** It is masked on screen,
+    /// and an Up-arrow that reveals it would undo that.
+    #[test]
+    fn the_passphrase_never_reaches_the_history() {
+        let mut a = App::default();
+        a.home = temp_home("history-passphrase");
+        type_command(&mut a, "init");
+        assert_eq!(a.init_step, Some(InitStep::Passphrase));
+        for c in "hunter2".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        // Up is inert while the passphrase is being taken.
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(a.passphrase.as_string(), "hunter2", "history moved it");
+        assert!(a.command.is_empty(), "history put something on the line");
+        assert!(
+            !a.history.iter().any(|h| h.contains("hunter2")),
+            "the passphrase is in the history: {:?}",
+            a.history
+        );
+    }
+
+    /// Repeating a command does not fill the history with copies of it.
+    #[test]
+    fn consecutive_duplicates_collapse() {
+        let mut a = ready_node("history-dupes");
+        for _ in 0..5 {
+            type_command(&mut a, "peers");
+        }
+        assert_eq!(a.history, vec!["peers"]);
+    }
+
+    /// **Output does not start at the top of the screen for every command.**
+    /// A reply's first line is rarely the answer; the last one usually is.
+    #[test]
+    fn the_output_pane_shows_the_newest_lines_and_scrolls_back() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut a = ready_node("output-scroll");
+        a.output = (1..=40)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let screen = |a: &App| {
+            let mut term = Terminal::new(TestBackend::new(80, 24)).expect("a terminal");
+            let log = a.log.recent(activity_log::CAPACITY);
+            let me = a.identity.as_ref().map(|i| i.short_id());
+            term.draw(|f| render::draw(f, &a.view(&log, me.as_deref())))
+                .expect("a frame");
+            term.backend()
+                .buffer()
+                .content()
+                .chunks(80)
+                .map(|r| r.iter().map(|c| c.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let bottom = screen(&a);
+        assert!(bottom.contains("line 40"), "the newest line is not shown");
+        assert!(!bottom.contains("line 1 "), "it anchored to the top");
+        assert!(bottom.contains("PgUp"), "no hint that more is above");
+
+        // PgUp walks back.
+        a.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+        let up = screen(&a);
+        assert!(!up.contains("line 40"), "PgUp did not move");
+        assert!(up.contains("PgDn"), "no hint that more is below");
+
+        // PgDn returns, and cannot go past the newest line.
+        for _ in 0..10 {
+            a.on_key(KeyCode::PageDown, KeyModifiers::NONE);
+        }
+        assert!(screen(&a).contains("line 40"), "PgDn overshot");
+
+        // A new command resets to the newest, wherever the operator was.
+        a.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+        type_command(&mut a, "peers");
+        assert_eq!(a.output_scroll, 0, "a new reply was left scrolled away");
+    }
+
+    /// `peer connect` is the likely typo, because `connect` is a top-level
+    /// verb and `peer` reads like a namespace. "unknown" alone leaves the
+    /// operator holding a correct command they cannot find.
+    #[test]
+    fn a_top_level_verb_typed_after_peer_is_redirected() {
+        let mut a = ready_node("peer-typo");
+        type_command(&mut a, "peer connect 70913ef6 tcp 127.0.0.1:40001");
+        assert!(a.output.contains("is a command on its own"), "{}", a.output);
+        assert!(
+            a.output.contains("connect 70913ef6 tcp 127.0.0.1:40001"),
+            "it does not show the command that works:\n{}",
+            a.output
+        );
+
+        // And a genuinely unknown subverb lists the real ones.
+        type_command(&mut a, "peer frobnicate");
+        assert!(a.output.contains("peer offer"), "{}", a.output);
+        assert!(a.output.contains("peer seal"), "{}", a.output);
+    }
+
+    /// **The indicators report traffic, not configuration.** A node that is
+    /// merely set up — listener bound, peers on disk, something queued — is
+    /// not sending or receiving, and a glyph that turns anyway is a false
+    /// claim rather than a harmless one.
+    #[test]
+    fn the_activity_glyphs_are_still_on_a_configured_but_idle_node() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("glyphs-idle");
+        a.listen = Some("127.0.0.1:0".into());
+        a.start_listener().expect("it starts");
+        a.node.queued = 3;
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+
+        let log = a.log.recent(activity_log::CAPACITY);
+        let v = a.view(&log, None);
+        assert!(!v.sending, "a queue is not a transfer in progress");
+        assert!(!v.receiving, "a bound listener is not a transfer");
+    }
+
+    /// And they stop on their own, so a peer that quits does not leave one
+    /// turning forever.
+    #[test]
+    fn an_activity_glyph_stops_by_itself() {
+        let mut a = ready_node("glyphs-decay");
+        a.inbound_ticks = 2;
+        a.outbound_ticks = 2;
+        for _ in 0..2 {
+            a.drain_inbound();
+        }
+        let log = a.log.recent(activity_log::CAPACITY);
+        let v = a.view(&log, None);
+        assert!(!v.sending && !v.receiving, "a glyph is still turning");
+    }
+
+    /// **Ctrl-M and Ctrl-G reach the tabs.** `Ctrl-1` has no encoding in the
+    /// terminal control range — which is `@` through `_`, and a digit is not
+    /// in it — so it arrives as a bare `1` or as nothing.
+    #[test]
+    fn ctrl_m_and_ctrl_g_select_the_tabs() {
+        let mut a = App::default();
+        a.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(a.ui.tab(), layout::Tab::Channels);
+        a.on_key(KeyCode::Char('m'), KeyModifiers::CONTROL);
+        assert_eq!(a.ui.tab(), layout::Tab::Private);
+
+        // F-keys too, for terminals that bind Ctrl-M to Return.
+        a.on_key(KeyCode::F(2), KeyModifiers::NONE);
+        assert_eq!(a.ui.tab(), layout::Tab::Channels);
+        a.on_key(KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(a.ui.tab(), layout::Tab::Private);
+
+        // Unmodified, they are still letters — a command containing `m` or
+        // `g` has to be typeable.
+        a.on_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "g");
+        assert_eq!(a.ui.tab(), layout::Tab::Private);
     }
 }
