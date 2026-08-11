@@ -175,15 +175,6 @@ fn main() -> io::Result<()> {
     .filter(|n| atomic::clear_stale(&app.home.join(n)))
     .count();
 
-    if app.listen_hint {
-        let addr = app.listen.clone().unwrap_or_default();
-        app.output = format!(
-            "--listen {addr} recorded.\n\n\
-             It does not bind by itself. To accept a call, type:  listen <peer>\n\
-             The other end dials with:  connect <you> tcp {addr}\n\
-             Both ends must be at the keyboard — nothing accepts in the background yet."
-        );
-    }
     app.body = if app.has_stored_identity() {
         if interrupted > 0 {
             format!(
@@ -240,11 +231,12 @@ struct App {
     /// Where inbound links arrive, from `--listen`. `None` means this node
     /// only dials.
     listen: Option<String>,
-    /// Whether to say, on the first screen, that `--listen` does not bind by
-    /// itself. An operator who passes the flag reasonably expects a socket,
-    /// and finding out by way of "connection refused" at the other end is the
-    /// worst possible time.
-    listen_hint: bool,
+    /// Inbound sessions accepted by the background listener, waiting to be
+    /// installed. Drained on each tick.
+    inbound: Option<std::sync::mpsc::Receiver<(Box<dyn krab_fabric::Session>, [u8; 32])>>,
+    /// The set of statics the listener will accept, kept in step with the
+    /// peerings on disk.
+    allowed: krab_fabric::backend::listener::Allowed,
     /// Transports. **Holds nothing that can reconcile** — RFC 8 §5.1.
     links: LinkTable,
     /// The corpus, reachable from background exchanges.
@@ -304,7 +296,8 @@ impl Default for App {
             epoch_key: None,
             home: default_home(),
             listen: None,
-            listen_hint: false,
+            inbound: None,
+            allowed: krab_fabric::backend::listener::Allowed::default(),
             links: LinkTable::new(),
             store: shared::SharedStore::new(krab_store::index::Store::new()),
             exchanges: std::sync::mpsc::channel(),
@@ -336,11 +329,10 @@ impl App {
             "krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>]\n\n\
              krab reads no configuration file. Everything else is set by a \
              command-pane verb during the session.\n\n\
-             --listen names the address inbound links arrive on, and is the \
-             default for the `listen` verb. It does NOT bind on its own: a \
-             node accepts a call only while `listen <peer>` is waiting, so \
-             both ends must be at their keyboards. Nothing accepts in the \
-             background yet.";
+             --listen binds one socket and accepts calls from any node this \
+             one has peered with. There is no port per peer: that would \
+             publish the size of the operator's friend list to a port \
+             scanner.";
 
         let mut app = App::default();
         let mut args = args.peekable();
@@ -359,7 +351,6 @@ impl App {
                         .next()
                         .ok_or_else(|| format!("--listen {addr}: resolves to no address"))?;
                     app.listen = Some(addr);
-                    app.listen_hint = true;
                 }
                 "--sync-interval" => {
                     let secs: u64 = args
@@ -408,6 +399,13 @@ impl App {
             log,
             masked,
             me,
+            // Outbound is anything queued and a link to carry it; inbound is
+            // a listener with peers that may call. Neither claims a transfer
+            // is in progress — RFC 8 §5.1 forbids a "syncing now" indicator,
+            // because when a node reconciles is not the operator's business
+            // to watch and is not theirs to leak either.
+            sending: self.node.queued > 0 && self.links.up_count() > 0,
+            receiving: self.inbound.is_some() && self.links.up_count() > 0,
         }
     }
 
@@ -579,6 +577,7 @@ impl App {
     /// the only caller — so there is no place for one to be threaded through
     /// later without the change being visible (RFC 5 §6.1, RFC 0 I-5).
     fn tick_schedule(&mut self) {
+        self.drain_inbound();
         self.shred_expired_epochs();
         self.enforce_retention();
         let now_s = std::time::SystemTime::now()
@@ -1401,6 +1400,10 @@ impl App {
         // disk — the one file in the layout that is neither signed nor sealed,
         // and therefore the one where overwriting is the only tool available.
         shred::remove(&self.path("peer.pad"), &mut OsRng);
+        // A peering completed while the listener runs must be accepted at
+        // once — requiring a restart to talk to someone you just peered with
+        // is a rule nothing states.
+        self.refresh_allowed();
 
         // RFC 3 §4: the peer-link is a contract, so the terms both ends agreed
         // to belong on it. `negotiate` takes the lower bucket ceiling, since a
@@ -2365,6 +2368,96 @@ impl App {
             .map_err(|e| at("corpus.krab", e))
     }
 
+    /// Start accepting calls, if `--listen` was given.
+    ///
+    /// One socket for every peer. The accept loop runs on its own thread
+    /// because the alternative is an accept on the UI thread, which is either
+    /// blocking — a hung interface — or polled, which puts a socket's latency
+    /// on a redraw timer.
+    ///
+    /// Idempotent: called after `init` and after `unlock`, since neither is
+    /// the only way a node arrives at having an identity.
+    fn start_listener(&mut self) -> Option<String> {
+        let addr = self.listen.clone()?;
+        if self.inbound.is_some() {
+            return None;
+        }
+        let id = self.identity.as_ref()?;
+        self.refresh_allowed();
+
+        let (l, port) = match krab_fabric::backend::listener::Listener::bind(
+            &addr,
+            id.noise_bytes(),
+            self.allowed.clone(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return Some(format!("could not listen on {addr}: {e:?}")),
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Ends when the receiver is dropped, which happens when the App
+            // does. Nothing else needs to signal it.
+            loop {
+                match l.accept() {
+                    Ok(Some(pair)) => {
+                        if tx.send(pair).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                    Err(_) => std::thread::sleep(Duration::from_millis(500)),
+                }
+            }
+        });
+        self.inbound = Some(rx);
+        Some(format!(
+            "listening on {addr} (port {port}) for any peered node.\n\n\
+             Nothing else is needed at this end. The other end dials with:\n\
+             \x20 connect {} tcp {addr}",
+            self.identity
+                .as_ref()
+                .map(|i| i.short_id())
+                .unwrap_or_default()
+        ))
+    }
+
+    /// Tell the listener which statics to accept — every completed peering.
+    fn refresh_allowed(&self) {
+        let keys: Vec<[u8; 32]> = self
+            .peer_ids()
+            .iter()
+            .filter_map(|p| std::fs::read(self.peer_path(p, "link")).ok())
+            .filter_map(|b| peering::Card::decode(&b).ok())
+            .filter(|c| c.verify())
+            .map(|c| c.noise_static_pk)
+            .collect();
+        self.allowed.set(keys);
+    }
+
+    /// Install anything the listener has accepted since the last tick.
+    fn drain_inbound(&mut self) {
+        let Some(rx) = &self.inbound else { return };
+        let arrived: Vec<_> = rx.try_iter().collect();
+        for (session, static_pk) in arrived {
+            // Which peering this is. The listener verified the static against
+            // the set; this maps it back to the directory it belongs to.
+            let who = self.peer_ids().into_iter().find(|p| {
+                std::fs::read(self.peer_path(p, "link"))
+                    .ok()
+                    .and_then(|b| peering::Card::decode(&b).ok())
+                    .is_some_and(|c| c.noise_static_pk == static_pk)
+            });
+            let Some(who) = who else { continue };
+            self.links.connect(&who, profile_named("tcp").expect("tcp"));
+            self.links.established(&who, Some(session));
+            self.log.push(activity_log::Event::LinkUp {
+                peer: who.clone(),
+                kind: "tcp",
+            });
+        }
+    }
+
     /// Make sure `--home` exists before anything tries to write into it.
     ///
     /// Created here rather than at each write: the operator names the
@@ -2596,6 +2689,11 @@ impl App {
             self.init_step = None;
             self.unlocking = false;
             self.node.unlocking = false;
+            // A restarted node reaches an identity through here, not through
+            // the ceremony, so the listener has to start from both.
+            if let Some(note) = self.start_listener() {
+                self.output.push_str(&format!("\n\n{note}"));
+            }
             return;
         }
 
@@ -2628,6 +2726,9 @@ impl App {
                 self.init_step = None;
                 // The passphrase has done its work and must not linger (§9).
                 self.passphrase.clear();
+                if let Some(note) = self.start_listener() {
+                    self.output.push_str(&format!("\n\n{note}"));
+                }
             }
             Some(next) => {
                 if next == InitStep::Generate {
@@ -5918,5 +6019,105 @@ mod tests {
             "a failed dial unpeered them:\n{}",
             a.output
         );
+    }
+
+    /// **`--listen` starts the receive service.** It used to be only a default
+    /// address for the `listen` verb, so a node launched with it bound
+    /// nothing and the other end got "connection refused" — with no
+    /// indication why.
+    #[test]
+    fn listen_binds_automatically_and_accepts_a_peer() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("auto-listen");
+
+        // B accepts, on one socket, for anyone it has peered with.
+        b.listen = Some("127.0.0.1:0".into());
+        let note = b.start_listener().expect("it starts");
+        assert!(note.contains("listening on"), "{note}");
+        assert!(
+            note.contains("any peered node"),
+            "it must not imply a port per peer: {note}"
+        );
+        let port = note
+            .split("port ")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .and_then(|s| s.parse::<u16>().ok())
+            .expect("it reports the port it took");
+
+        // A dials, with no `listen` typed at the other end.
+        type_command(&mut a, &format!("connect {b_id} tcp 127.0.0.1:{port}"));
+        assert!(
+            a.output.contains("link up") || a.output.contains("tcp"),
+            "the dial failed: {}",
+            a.output
+        );
+
+        // And B installs it on its next tick, without anyone typing there.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            b.drain_inbound();
+            if b.links
+                .get(&a_id)
+                .and_then(|l| l.session.as_ref())
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            b.links
+                .get(&a_id)
+                .and_then(|l| l.session.as_ref())
+                .is_some(),
+            "the accepted session never reached the link table"
+        );
+    }
+
+    /// One socket, not one per peer — a port per peer would publish the size
+    /// of the operator's friend list to a port scanner.
+    #[test]
+    fn the_listener_accepts_every_peering_on_one_socket() {
+        let (a, _b, _a_id, b_id) = peered_pair("listen-one-socket");
+        a.refresh_allowed();
+
+        // The set is the peerings, whatever their number.
+        let mut n = App {
+            home: a.home.clone(),
+            ..App::default()
+        };
+        n.passphrase = line::Line::from("a passphrase");
+        n.unlock(b"a passphrase").expect("reopens");
+        n.refresh_allowed();
+        assert_eq!(n.peer_ids(), vec![b_id]);
+        // And `--listen` names one address, never a range.
+        assert!(!n.listen.iter().any(|a| a.contains('-')));
+    }
+
+    /// The two glyphs are distinguishable, and a still one means idle rather
+    /// than frozen.
+    #[test]
+    fn the_duplex_spinners_show_each_direction_separately() {
+        let mut s = activity::Spinner::default();
+        let idle = s.duplex(false, false);
+        assert_eq!(idle.0, idle.1, "both idle glyphs are the same");
+
+        let (out, inn) = s.duplex(true, true);
+        assert_ne!(out, idle.0, "sending did not animate");
+        assert_ne!(inn, idle.1, "receiving did not animate");
+
+        // One direction at a time is legible on its own.
+        assert_eq!(s.duplex(true, false).1, idle.1);
+        assert_eq!(s.duplex(false, true).0, idle.0);
+
+        // They advance in opposite directions, so two adjacent animations do
+        // not read as one.
+        let mut differed = false;
+        for _ in 0..8 {
+            s.tick();
+            let (o, i) = s.duplex(true, true);
+            differed |= o != i;
+        }
+        assert!(differed, "the two spinners are indistinguishable");
     }
 }

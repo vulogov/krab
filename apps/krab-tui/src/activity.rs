@@ -213,10 +213,37 @@ pub struct Spinner {
 /// Braille frames: one cell wide, so the status line never reflows.
 const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠇'];
 
+/// Shown when a direction is idle. One cell wide, like the frames, so the
+/// title does not reflow as traffic starts and stops.
+const IDLE: char = '⠿';
+
 impl Spinner {
     /// Advance one render tick.
     pub fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// A pair of glyphs for the output pane's frame: outbound, then inbound.
+    ///
+    /// Each turns only while that direction is doing something, so a still
+    /// glyph means "nothing is moving" rather than "the interface froze" —
+    /// two states that look identical when only one spinner exists.
+    ///
+    /// The directions turn **opposite ways**: this is the one place in the
+    /// interface where two animations sit adjacent, and the same animation
+    /// twice is harder to read at a glance than two that differ.
+    pub fn duplex(&self, sending: bool, receiving: bool) -> (char, char) {
+        let out = if sending {
+            FRAMES[self.frame % FRAMES.len()]
+        } else {
+            IDLE
+        };
+        let inn = if receiving {
+            FRAMES[FRAMES.len() - 1 - (self.frame % FRAMES.len())]
+        } else {
+            IDLE
+        };
+        (out, inn)
     }
 
     /// The glyph to draw for `activity`, or `None` when nothing is in flight.

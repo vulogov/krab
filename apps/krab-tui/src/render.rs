@@ -41,6 +41,9 @@ pub struct View<'a> {
     pub output: &'a str,
     /// This node's short id, or `None` before `init`.
     pub me: Option<&'a str>,
+    /// Whether anything is going out, and whether anything is coming in.
+    pub sending: bool,
+    pub receiving: bool,
     /// Composer contents, shown when `ui.mode()` is `Compose`.
     pub composer: &'a str,
     /// Whether the node is locked. A locked node draws no message content.
@@ -179,10 +182,13 @@ fn draw_output(f: &mut Frame, area: Rect, view: &View) {
     // the name a peer types into `connect` — and being asked "what is my id"
     // should not require a verb.
     let me = view.me.unwrap_or("no identity");
+    // Two directions, so a still glyph means "nothing is moving" rather than
+    // "the interface froze".
+    let (out, inn) = view.spinner.duplex(view.sending, view.receiving);
     let title = if from > 0 {
-        format!(" {me} — output, {from} more above (Ctrl-O) ")
+        format!(" {me}  {out}\u{2191} {inn}\u{2193}  {from} more above (Ctrl-O) ")
     } else {
-        format!(" {me} — output ")
+        format!(" {me}  {out}\u{2191} {inn}\u{2193} ")
     };
     f.render_widget(
         Paragraph::new(shown)

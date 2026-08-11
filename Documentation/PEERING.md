@@ -301,16 +301,20 @@ never meet.
 
 With `--listen` given at launch, the address may be omitted: `listen fed356f2`.
 
-> **`--listen` does not bind on its own.** It supplies the default address for
-> the `listen` verb and nothing more. A node accepts a call only while
-> `listen <peer>` is actually waiting, so **both operators must be at their
-> keyboards**: one types `listen`, the other types `connect` within 30
-> seconds. If you pass `--listen` and the other end reports *connection
-> refused*, this is why — nothing was bound.
+> **`--listen` starts the receive service.** Given at launch, it binds one
+> socket and accepts calls from **any node this one has peered with** — no
+> verb to type, nobody at the keyboard. A peering completed while it runs is
+> accepted at once, without a restart.
 >
-> `listen` waits 30 seconds and hands the prompt back, because that wait is on
-> the UI thread and an unbounded one is a hung interface. Accepting in the
-> background is not built yet.
+> One socket, never one per peer: a port per peer publishes the size of your
+> friend list to anyone who runs a port scan.
+>
+> An unknown caller is refused and not logged. RFC 4 §4.1 makes a mismatch a
+> hard failure and never a prompt, and making it a log line would let anyone
+> fill your activity log from outside.
+>
+> The `listen <peer>` verb still exists for a one-off, and waits 30 seconds
+> before handing the prompt back.
 
 **A peer with no stored `.link` cannot be connected to at all.** `establish`
 reads the card to learn which static key to expect, and RFC 4 §4.1 forbids

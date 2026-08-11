@@ -13,6 +13,7 @@ pub mod courier;
 pub mod serial;
 
 #[cfg(feature = "tcp")]
+pub mod listener;
 pub mod tcp;
 
 pub mod sim;

@@ -118,6 +118,59 @@ pub fn handshake_responder<S: Read + Write>(
     hs.into_transport_mode().map_err(|_| Error::Frame)
 }
 
+/// Respond to whoever calls, provided they are someone we know.
+///
+/// Returns the static key the caller presented, so the listener can tell which
+/// peering the session belongs to.
+///
+/// # Why this is not a weaker check
+///
+/// RFC 4 §4.1 forbids trust-on-first-use, and this does not introduce it. The
+/// caller's static must appear in `allowed`, which is built from the
+/// peer-links on disk — every entry is a peering an operator completed
+/// deliberately, out of band. What changes is only *when* the set is narrowed:
+/// [`handshake_responder`] is told one key before the call arrives,
+/// this one is told every acceptable key and reports which called.
+///
+/// A node with one socket cannot know who is dialling before they dial, and
+/// the alternative — a port per peer — publishes the size of the operator's
+/// friend list to a port scanner.
+pub fn handshake_responder_any<S: Read + Write>(
+    stream: &mut S,
+    local_static: &[u8; 32],
+    allowed: &[[u8; 32]],
+) -> Result<(TransportState, [u8; 32]), Error> {
+    let mut hs = Builder::new(NOISE_PARAMS.parse().map_err(|_| Error::Frame)?)
+        .local_private_key(local_static)
+        .map_err(|_| Error::Frame)?
+        .build_responder()
+        .map_err(|_| Error::Frame)?;
+
+    let mut buf = [0u8; 1024];
+    let msg1 = crate::frame::read_bytes(stream)?.ok_or(Error::Frame)?;
+    hs.read_message(&msg1, &mut buf).map_err(|_| Error::Frame)?;
+
+    // IK puts the initiator's static inside message 1, encrypted to us. This
+    // is the first moment anyone could know who called, and it is before a
+    // single byte of theirs has been acted on.
+    let remote: [u8; 32] = hs
+        .get_remote_static()
+        .and_then(|r| r.try_into().ok())
+        .ok_or(Error::Frame)?;
+    // Constant-time is not needed: `allowed` is derived from public keys and
+    // the caller already proved possession of the matching private key.
+    if !allowed.contains(&remote) {
+        // A hard failure, the same as a mismatch in `handshake_responder`.
+        // Never a prompt, and indistinguishable from a framing error to the
+        // caller — an unknown dialler learns only that it did not work.
+        return Err(Error::Frame);
+    }
+
+    let n = hs.write_message(&[], &mut buf).map_err(|_| Error::Frame)?;
+    crate::frame::write_bytes(stream, &buf[..n])?;
+    Ok((hs.into_transport_mode().map_err(|_| Error::Frame)?, remote))
+}
+
 /// A `Session` over any byte stream, once the handshake has completed.
 pub struct StreamSession<S: Read + Write> {
     stream: S,
