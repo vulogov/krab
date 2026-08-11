@@ -26,6 +26,7 @@
 mod activity;
 mod activity_log;
 mod atomic;
+mod bulletin;
 mod ceremony;
 mod command;
 mod compose;
@@ -39,6 +40,7 @@ mod links;
 mod peering;
 mod peers;
 mod persist;
+mod prekeys;
 mod reach;
 mod receive;
 mod rekey;
@@ -273,7 +275,7 @@ struct App {
     listen: Option<String>,
     /// Inbound sessions accepted by the background listener, waiting to be
     /// installed. Drained on each tick.
-    inbound: Option<std::sync::mpsc::Receiver<(Box<dyn krab_fabric::Session>, [u8; 32])>>,
+    inbound: Option<std::sync::mpsc::Receiver<krab_fabric::backend::listener::Accepted>>,
     /// The set of statics the listener will accept, kept in step with the
     /// peerings on disk.
     allowed: krab_fabric::backend::listener::Allowed,
@@ -928,9 +930,14 @@ impl App {
             self.tag_table = Some(receive::TagTable::build(&peers, epoch));
         }
         let table = self.tag_table.as_ref().expect("just built");
+        // **Every private key this node holds**, in a fixed order: the
+        // correspondence key, the signed prekey, and every one-time prekey not
+        // yet retired. RFC 1 §6.3 requires the full set be attempted, and a
+        // message encapsulated to a prekey opens under none of the others.
+        let opening_keys = self.opening_keys();
         let scan = self
             .store
-            .with(|st| receive::Inbox::scan(st, table, &peers, id.correspondence(), (0, u32::MAX)));
+            .with(|st| receive::Inbox::scan(st, table, &peers, &opening_keys, (0, u32::MAX)));
 
         self.list = if scan.messages.is_empty() {
             vec![format!(
@@ -1000,6 +1007,69 @@ impl App {
         }
         self.messages = scan.messages;
         self.show_selected();
+    }
+
+    /// The prekey to encapsulate to for `node`, from their published batch.
+    ///
+    /// `None` when they have published none, which is the correct degradation:
+    /// the message is sealed to their correspondence key, exactly as before
+    /// prekeys existed. A sender that *failed* instead would make a peer
+    /// unreachable for the sake of a property that is a bonus.
+    fn prekey_for(&self, node: &[u8; 32]) -> Option<krab_crypto::dh::PublicKey> {
+        let me = self.identity.as_ref()?.node_id();
+        // The newest batch this node holds from them. Bulletins are flooded
+        // and old ones linger, so "latest" is by epoch and not by arrival.
+        let mut best: Option<(u32, prekeys::Published)> = None;
+        self.store.with(|s| {
+            for (_, id) in s.entries_in_range(0, u32::MAX) {
+                let Some(bytes) = s.get(&id) else { continue };
+                // `from_object` returns nothing unless the bulletin verifies,
+                // so an unauthenticated payload cannot be parsed by
+                // forgetting to check.
+                let Some(b) = bulletin::from_object(bytes) else {
+                    continue;
+                };
+                if b.kind != bulletin::Kind::Prekeys || &b.node_id() != node {
+                    continue;
+                }
+                let Some(p) = prekeys::Published::decode(&b.payload) else {
+                    continue;
+                };
+                // And the tier itself, which the bulletin's signature does not
+                // cover on its own — a forged fallback key would otherwise
+                // ride inside a genuine bulletin.
+                if !p.verify_signed_prekey(&b.author) {
+                    continue;
+                }
+                if best.as_ref().map(|(e, _)| b.epoch > *e).unwrap_or(true) {
+                    best = Some((b.epoch, p));
+                }
+            }
+        });
+        best.map(|(_, p)| p.key_for(&me))
+    }
+
+    /// Every private key an inbound object might be encapsulated to.
+    ///
+    /// The correspondence key first, then the prekey ring. Order is fixed and
+    /// does not depend on which key last worked — an order that adapts is an
+    /// order that leaks which key is in use.
+    fn opening_keys(&self) -> Vec<krab_crypto::dh::SecretKey> {
+        let mut out = Vec::new();
+        if let Some(id) = &self.identity {
+            out.push(krab_crypto::dh::SecretKey::from_bytes(
+                id.correspondence().to_bytes(),
+            ));
+        }
+        if let (Some(w), Ok(sealed)) = (self.epoch_key, std::fs::read(self.path("prekeys.ring"))) {
+            if let Some(keys) = krab_crypto::kek::open_under(&w, b"krab/prekeys", &sealed)
+                .ok()
+                .and_then(|raw| prekeys::stored_candidates(&raw))
+            {
+                out.extend(keys);
+            }
+        }
+        out
     }
 
     /// Put the selected message in the view pane.
@@ -1616,14 +1686,7 @@ impl App {
     /// flapping.
     fn rekey_if_due(&mut self, peer: &str) -> Option<activity_log::Event> {
         // Cheap checks first: this runs on every scheduled peer, every tick.
-        if self
-            .links
-            .get(peer)
-            .and_then(|l| l.session.as_ref())
-            .is_none()
-        {
-            return None;
-        }
+        self.links.get(peer).and_then(|l| l.session.as_ref())?;
         let w = self.epoch_key?;
         let sealed = std::fs::read(self.peer_path(peer, "reservoir")).ok()?;
         let (_, seated) = krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed)
@@ -1847,6 +1910,12 @@ impl App {
         // error: `mode_auth` is correct and simply lacks the post-quantum
         // property (RFC 7 §5 makes the reservoir a conditional tier).
         let epoch = now_epoch();
+        // **Their prekey, if they have published one.** Encapsulating to a
+        // key that expires is the whole of RFC 7 §5: without it every message
+        // is sealed to a permanent correspondence key, and an adversary who
+        // obtains that key opens everything ever sent to it, including
+        // ciphertext recorded years earlier.
+        let their_prekey = self.prekey_for(&card.node_id());
         let reservoir = std::fs::read(self.peer_path(&peer, "reservoir"))
             .ok()
             .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
@@ -1864,12 +1933,18 @@ impl App {
         let Some(shared) = id.agree_with(&their_pk) else {
             return "that peer's correspondence key is low-order and cannot be used".into();
         };
+        // **The tag stays pairwise, from the correspondence keys.** Only the
+        // *encapsulation* target moves to the prekey. Deriving the tag from a
+        // prekey instead would make it change whenever they republished, and a
+        // recipient scans by tag before it has decrypted anything — so the
+        // mail would become unreadable at the moment it was most needed.
         let tag = krab_crypto::pairwise_tag(&shared, epoch);
+        let to = their_prekey.unwrap_or(their_pk);
 
         let composed = match compose::seal_to(
             id.correspondence(),
             &compose::Recipient::Known {
-                correspondence: &their_pk,
+                correspondence: &to,
                 tag,
                 chunk: chunk.as_ref(),
             },
@@ -1895,10 +1970,11 @@ impl App {
             .with(|s| s.ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX))
         {
             Ok(()) => {
-                let note = if chunk.is_some() {
-                    ", post-quantum"
-                } else {
-                    ", no reservoir"
+                let note = match (chunk.is_some(), their_prekey.is_some()) {
+                    (true, true) => ", post-quantum, to a prekey",
+                    (true, false) => ", post-quantum, to their permanent key",
+                    (false, true) => ", no reservoir, to a prekey",
+                    (false, false) => ", no reservoir, to their permanent key",
                 };
                 let bucket = composed.bucket;
                 self.save_corpus();
@@ -2755,6 +2831,60 @@ impl App {
     }
 
     /// Derive the KEK and open the current epoch, RFC 7 §4.
+    /// Create the prekey ring if there is none, publish a batch, and store
+    /// both. RFC 7 §5.
+    ///
+    /// The batch is a signed `bulletin` in this node's own corpus, so it
+    /// floods on the next reconciliation — the corpus is the prekey server,
+    /// which is X3DH with no infrastructure.
+    fn publish_prekeys(&mut self) -> Option<String> {
+        let w = self.epoch_key?;
+        let id = self.identity.as_ref()?;
+        let epoch = now_epoch();
+
+        // A fresh ring each time this runs. `Ring::rotate` exists for keeping
+        // one across a signed-prekey rotation, and is not reached until there
+        // is a schedule to drive it — noted rather than half-wired.
+        let signed = krab_crypto::prekey::SignedPrekey::create(id.signing_key(), epoch, &mut OsRng);
+        let mut ring = krab_crypto::prekey::Ring::new(signed);
+        let published = prekeys::publish(&mut ring, epoch, &mut OsRng);
+
+        // Private halves, sealed under the epoch key exactly as the reservoir
+        // is. Never written in the clear: a prekey ring is decryption keys.
+        let sealed = krab_crypto::kek::seal_under(
+            &w,
+            b"krab/prekeys",
+            &prekeys::encode_ring(&ring),
+            &mut OsRng,
+        )
+        .ok()?;
+        atomic::write(&self.path("prekeys.ring"), &sealed).ok()?;
+
+        let b = bulletin::Bulletin::create(
+            bulletin::Kind::Prekeys,
+            id.signing_key(),
+            epoch.0,
+            published.encode(),
+        );
+        // A bulletin is not an object until it has a routing header, and an
+        // `ingest` whose error is discarded looks exactly like one that
+        // worked — which is how a published batch reaches nobody while the
+        // node reports success. It reached nobody, first time round.
+        let now_min = epoch.0 * 1440;
+        let ttl = krab_core::tag::MAX_TTL_DAYS * 1440;
+        let (oid, bytes) = bulletin::into_object(&b, now_min, ttl)?;
+        if let Err(e) = self.store.with(|s| s.ingest(oid, bytes, now_min, u32::MAX)) {
+            return Some(format!("could not publish prekeys: {e:?}"));
+        }
+        self.save_corpus();
+        Some(format!(
+            "published {} one-time prekeys. They flood as a signed bulletin, \
+             so a correspondent encapsulates to a key that expires rather than \
+             to your permanent one (RFC 7 §5).",
+            published.keys.len()
+        ))
+    }
+
     fn open_store(&mut self) -> Result<(), String> {
         self.ensure_home()?;
         let Some(id) = &mut self.identity else {
@@ -2895,6 +3025,9 @@ impl App {
                 self.init_step = None;
                 // The passphrase has done its work and must not linger (§9).
                 self.passphrase.clear();
+                if let Some(note) = self.publish_prekeys() {
+                    self.output.push_str(&format!("\n\n{note}"));
+                }
                 if let Some(note) = self.start_listener() {
                     self.output.push_str(&format!("\n\n{note}"));
                 }
@@ -6036,7 +6169,7 @@ mod tests {
         );
         assert_eq!(stored_root(&a, &b_id), stored_root(&b, &a_id));
         // And it is usable again from today.
-        let mut r = krab_crypto::reservoir::Reservoir::new(stored_root(&a, &b_id), now_epoch());
+        let r = krab_crypto::reservoir::Reservoir::new(stored_root(&a, &b_id), now_epoch());
         assert!(r.chunk(now_epoch()).is_some());
     }
 
@@ -6543,5 +6676,153 @@ mod tests {
         a.on_key(KeyCode::Char('g'), KeyModifiers::NONE);
         assert_eq!(a.command.as_string(), "g");
         assert_eq!(a.ui.tab(), layout::Tab::Private);
+    }
+
+    /// **A message sealed to a prekey opens at the other end.** The whole
+    /// point of RFC 7 §5: the recipient's permanent correspondence key is no
+    /// longer the key an adversary needs.
+    #[test]
+    fn a_message_encapsulated_to_a_prekey_is_readable() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("prekey-send");
+
+        // B publishes, and the batch reaches A the way any object does.
+        let note = b.publish_prekeys().expect("B published nothing");
+        assert!(note.contains("published"), "publish failed: {note}");
+        assert!(
+            !b.store.is_empty(),
+            "publish said {note}, and stored nothing"
+        );
+        let carried: Vec<(krab_core::object::ObjectId, Vec<u8>)> = b.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, id)| s.get(&id).map(|x| (id, x.to_vec())))
+                .collect()
+        });
+        let now_min = now_epoch().0 * 1440;
+        for (id, bytes) in carried {
+            a.store
+                .with(|s| s.ingest(id, bytes, now_min, u32::MAX))
+                .expect("the batch is a well-formed object");
+        }
+
+        // Diagnose before asserting: which of publish, carry, or lookup?
+        let n_objects = a.store.with(|s| s.entries_in_range(0, u32::MAX).len());
+        let n_bulletins = a.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter(|(_, id)| s.get(id).and_then(bulletin::from_object).is_some())
+                .count()
+        });
+        assert!(n_objects > 0, "nothing was carried");
+        assert!(
+            n_bulletins > 0,
+            "{n_objects} objects carried, none a bulletin"
+        );
+
+        // A now finds a prekey for B, and it is not B's correspondence key.
+        let b_node = b.identity.as_ref().unwrap().node_id();
+        let chosen = a.prekey_for(&b_node).expect("A found no prekey for B");
+        assert_ne!(
+            chosen.0,
+            b.identity.as_ref().unwrap().correspondence().public().0,
+            "it fell back to the permanent key"
+        );
+
+        type_command(&mut a, &format!("send {b_id} bring the good coffee"));
+        assert!(a.output.contains("to a prekey"), "{}", a.output);
+
+        // Carry it to B and open it.
+        let objects: Vec<(krab_core::object::ObjectId, Vec<u8>)> = a.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, id)| s.get(&id).map(|x| (id, x.to_vec())))
+                .collect()
+        });
+        for (id, bytes) in objects {
+            let _ = b.store.with(|s| s.ingest(id, bytes, now_min, u32::MAX));
+        }
+        b.refresh_inbox();
+        assert!(
+            b.messages.iter().any(|m| m.body.contains("good coffee")),
+            "a message sealed to a prekey did not open: {:?}",
+            b.messages.iter().map(|m| &m.body).collect::<Vec<_>>()
+        );
+        let _ = a_id;
+    }
+
+    /// A peer who has published nothing still receives mail, sealed to their
+    /// permanent key. Failing instead would make prekeys a way to become
+    /// unreachable.
+    #[test]
+    fn a_peer_without_prekeys_is_still_reachable() {
+        let (mut a, mut b, _a_id, b_id) = peered_pair("prekey-absent");
+        let b_node = b.identity.as_ref().unwrap().node_id();
+        assert!(a.prekey_for(&b_node).is_none(), "B published nothing");
+
+        type_command(&mut a, &format!("send {b_id} still arrives"));
+        assert!(a.output.contains("permanent key"), "{}", a.output);
+
+        let objects: Vec<(krab_core::object::ObjectId, Vec<u8>)> = a.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, id)| s.get(&id).map(|x| (id, x.to_vec())))
+                .collect()
+        });
+        for (id, bytes) in objects {
+            let _ = b.store.with(|s| s.ingest(id, bytes, 0, u32::MAX));
+        }
+        b.refresh_inbox();
+        assert!(b.messages.iter().any(|m| m.body.contains("still arrives")));
+    }
+
+    /// **A forged batch is refused.** A bulletin is flooded from anyone, so
+    /// its signature is the only thing standing between a sender and
+    /// encapsulating to an attacker's key.
+    #[test]
+    fn a_prekey_batch_with_a_broken_signature_is_ignored() {
+        let (mut a, mut b, _a_id, _b_id) = peered_pair("prekey-forged");
+        assert!(b.publish_prekeys().is_some());
+
+        let mut tampered: Vec<(krab_core::object::ObjectId, Vec<u8>)> = b.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, id)| s.get(&id).map(|x| (id, x.to_vec())))
+                .collect()
+        });
+        // Swap a key inside an otherwise genuine bulletin, and re-wrap it as
+        // a valid object — so the store accepts it and only the *signature*
+        // stands between A and an attacker's key.
+        let now_min = now_epoch().0 * 1440;
+        let mut swapped = 0;
+        for (id, bytes) in tampered.iter_mut() {
+            let Some(mut bl) = bulletin::from_object(bytes) else {
+                continue;
+            };
+            if bl.kind != bulletin::Kind::Prekeys {
+                continue;
+            }
+            let mut p = prekeys::Published::decode(&bl.payload).expect("a batch");
+            p.keys[0] = [9u8; 32];
+            bl.payload = p.encode();
+            let (new_id, new_bytes) =
+                bulletin::into_object(&bl, now_min, krab_core::tag::MAX_TTL_DAYS * 1440)
+                    .expect("it re-wraps");
+            *id = new_id;
+            *bytes = new_bytes;
+            swapped += 1;
+        }
+        assert_eq!(swapped, 1, "the test tampered with nothing");
+
+        for (id, bytes) in tampered {
+            a.store
+                .with(|s| s.ingest(id, bytes, now_min, u32::MAX))
+                .expect("the tampered object is still well-formed");
+        }
+
+        let b_node = b.identity.as_ref().unwrap().node_id();
+        assert!(
+            a.prekey_for(&b_node).is_none(),
+            "a tampered batch was accepted"
+        );
     }
 }

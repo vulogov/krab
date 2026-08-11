@@ -84,7 +84,7 @@ impl Listener {
     /// A caller that fails the handshake is dropped and also reported as
     /// `Ok(None)`: an unknown dialler is not an event the operator needs, and
     /// making it one would let anyone fill the activity log from outside.
-    pub fn accept(&self) -> Result<Option<(Box<dyn Session>, [u8; 32])>, Error> {
+    pub fn accept(&self) -> Result<Option<Accepted>, Error> {
         let mut stream = match self.inner.accept() {
             Ok((s, _)) => s,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
@@ -121,6 +121,9 @@ impl Listener {
 /// stays silent would otherwise stop every other peer from ever getting in,
 /// at a cost to the attacker of one open socket.
 pub const HANDSHAKE_TIMEOUT_S: u64 = 10;
+
+/// A session, and the static key of the peer it belongs to.
+pub type Accepted = (Box<dyn Session>, [u8; 32]);
 
 /// A `TcpStream` is what `accept` yields; named so callers need not import it.
 pub type Stream = TcpStream;

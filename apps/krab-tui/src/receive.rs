@@ -248,7 +248,7 @@ impl Inbox {
         store: &Store,
         table: &TagTable,
         correspondents: &[Correspondent],
-        ours: &SecretKey,
+        ours: &[SecretKey],
         window: (u32, u32),
     ) -> Scan {
         let mut out = Scan {
@@ -297,7 +297,7 @@ impl Inbox {
         header: &RoutingHeader,
         candidates: &[(usize, Epoch)],
         correspondents: &[Correspondent],
-        ours: &SecretKey,
+        ours: &[SecretKey],
     ) -> Option<(String, Epoch, String, bool)> {
         let (env, _) = decode_envelope(&bytes[ROUTING_HEADER_LEN..]).ok()?;
         if env.enc.len() != ENC_LEN {
@@ -309,6 +309,9 @@ impl Inbox {
         // RFC 1 §6.1's AAD, from the one definition the sender also uses.
         let aad = crate::compose::aad_for(header, &env);
         let info = info_for(header.class);
+        // Held rather than returned, so the loops below run to completion —
+        // see the note on RFC 1 §6.3 further down.
+        let mut opened: Option<(String, Epoch, String, bool)> = None;
 
         for (idx, tag_epoch) in candidates {
             let c = correspondents.get(*idx)?;
@@ -330,16 +333,29 @@ impl Inbox {
                 if n == 1 && chunk.is_none() {
                     break;
                 }
-                let Ok(mut ctx) = begin_open(mode, ours, &c.correspondence, &enc, &info) else {
-                    continue;
-                };
-                if let Ok(pt) = ctx.open(env.ciphertext, &aad) {
-                    let body = String::from_utf8_lossy(&pt).into_owned();
-                    return Some((c.name.clone(), epoch, body, n == 0 && chunk.is_some()));
+                // **Every private key, and no early exit.** RFC 1 §6.3:
+                // "Implementations MUST attempt the full set and MUST NOT stop
+                // at first success; early exit leaks index position, which
+                // correlates with prekey consumption and is a volume signal."
+                //
+                // So the loop runs to the end and the first success is kept
+                // rather than returned. `krab_crypto::prekey::Ring` has no
+                // method that returns one key for the same reason: an API that
+                // can return early eventually does.
+                for ours in ours {
+                    let Ok(mut ctx) = begin_open(mode, ours, &c.correspondence, &enc, &info) else {
+                        continue;
+                    };
+                    if let Ok(pt) = ctx.open(env.ciphertext, &aad) {
+                        if opened.is_none() {
+                            let body = String::from_utf8_lossy(&pt).into_owned();
+                            opened = Some((c.name.clone(), epoch, body, n == 0 && chunk.is_some()));
+                        }
+                    }
                 }
             }
         }
-        None
+        opened
     }
 }
 
@@ -422,7 +438,7 @@ mod tests {
 
         let peers = [correspondent("alice", &bob, &alice, Some(root))];
         let table = TagTable::build(&peers, NOW);
-        let scan = Inbox::scan(&store, &table, &peers, &bob, WINDOW);
+        let scan = Inbox::scan(&store, &table, &peers, std::slice::from_ref(&bob), WINDOW);
 
         assert_eq!(scan.messages.len(), 1, "{} examined", scan.examined);
         assert_eq!(scan.messages[0].body, "meet me thursday");
@@ -441,7 +457,7 @@ mod tests {
 
         let peers = [correspondent("alice", &bob, &alice, None)];
         let table = TagTable::build(&peers, NOW);
-        let scan = Inbox::scan(&store, &table, &peers, &bob, WINDOW);
+        let scan = Inbox::scan(&store, &table, &peers, std::slice::from_ref(&bob), WINDOW);
 
         assert_eq!(scan.messages.len(), 0);
         assert_eq!(scan.tag_match_decrypt_fail, 0, "no tag matched at all");
@@ -471,7 +487,7 @@ mod tests {
             Epoch(NOW.0 - 45),
         );
         assert_eq!(
-            Inbox::scan(&inside, &table, &peers, &bob, WINDOW)
+            Inbox::scan(&inside, &table, &peers, std::slice::from_ref(&bob), WINDOW)
                 .messages
                 .len(),
             1
@@ -487,7 +503,7 @@ mod tests {
             "too late",
             Epoch(NOW.0 - EPOCH_WINDOW - 1),
         );
-        let scan = Inbox::scan(&outside, &table, &peers, &bob, WINDOW);
+        let scan = Inbox::scan(&outside, &table, &peers, std::slice::from_ref(&bob), WINDOW);
         assert_eq!(scan.messages.len(), 0, "never computed that tag");
         assert_eq!(
             scan.tag_match_decrypt_fail, 0,
@@ -533,7 +549,13 @@ mod tests {
             correspondent("alice", &bob, &alice, None),
             correspondent("carol", &bob, &carol, None),
         ];
-        let scan = Inbox::scan(&store, &TagTable::build(&peers, NOW), &peers, &bob, WINDOW);
+        let scan = Inbox::scan(
+            &store,
+            &TagTable::build(&peers, NOW),
+            &peers,
+            std::slice::from_ref(&bob),
+            WINDOW,
+        );
         let bodies: Vec<&str> = scan.messages.iter().map(|m| m.body.as_str()).collect();
         assert_eq!(bodies, vec!["newest", "middle", "older"]);
         assert_eq!(scan.messages[0].from, "carol");
@@ -549,7 +571,13 @@ mod tests {
 
         // The recipient has a reservoir configured; the sender did not use it.
         let peers = [correspondent("alice", &bob, &alice, Some([1; 32]))];
-        let scan = Inbox::scan(&store, &TagTable::build(&peers, NOW), &peers, &bob, WINDOW);
+        let scan = Inbox::scan(
+            &store,
+            &TagTable::build(&peers, NOW),
+            &peers,
+            std::slice::from_ref(&bob),
+            WINDOW,
+        );
         assert_eq!(scan.messages.len(), 1);
         assert!(!scan.messages[0].post_quantum, "and it says so");
     }
@@ -578,7 +606,7 @@ mod tests {
             &tampered,
             &TagTable::build(&peers, NOW),
             &peers,
-            &bob,
+            std::slice::from_ref(&bob),
             WINDOW,
         );
         assert_eq!(scan.messages.len(), 0);
@@ -625,7 +653,13 @@ mod tests {
             .unwrap();
 
         let peers = [correspondent("alice", &bob, &alice, None)];
-        let scan = Inbox::scan(&store2, &TagTable::build(&peers, NOW), &peers, &bob, WINDOW);
+        let scan = Inbox::scan(
+            &store2,
+            &TagTable::build(&peers, NOW),
+            &peers,
+            std::slice::from_ref(&bob),
+            WINDOW,
+        );
         assert_eq!(scan.messages.len(), 0, "a re-declared epoch must not open");
     }
 
@@ -635,7 +669,13 @@ mod tests {
         let bob = sk(20);
         let table = TagTable::build(&[], NOW);
         assert!(table.is_empty());
-        let scan = Inbox::scan(&Store::new(), &table, &[], &bob, WINDOW);
+        let scan = Inbox::scan(
+            &Store::new(),
+            &table,
+            &[],
+            std::slice::from_ref(&bob),
+            WINDOW,
+        );
         assert_eq!(scan.messages.len(), 0);
         assert_eq!(scan.examined, 0);
     }
