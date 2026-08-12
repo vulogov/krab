@@ -165,11 +165,25 @@ pub fn write_identity(
     kek: &Kek,
     rng: &mut impl Rng,
 ) -> Result<(), Error> {
+    // **The epoch hierarchy travels with the identity.** It did not, and
+    // `open_epoch` therefore minted a fresh `W_N` on every start — so the
+    // reservoir of every peering, the prekey ring, and the channel roster all
+    // became unreadable on restart, silently, with no error anywhere. The
+    // module note above has always listed `hierarchy.cbor`; nothing wrote it.
+    let mut h = Writer::new();
+    let records = id.hierarchy.records();
+    h.array(records.len() * 2);
+    for (epoch, record) in records {
+        h.uint(epoch.0 as u64).bstr(record);
+    }
+    let hierarchy = h.finish();
+
     let mut w = Writer::new();
-    w.map(3);
+    w.map(4);
     w.uint(1).bstr(&id.signing_seed());
     w.uint(2).bstr(&id.noise_bytes());
     w.uint(3).bstr(&id.correspondence_bytes());
+    w.uint(4).bstr(&hierarchy);
     let plain = w.finish();
 
     let sealed = kek
@@ -188,20 +202,49 @@ pub fn read_identity(path: &Path, kek: &Kek, params: KekParams) -> Result<Identi
     let mut r = Reader::new(&plain);
     let mut m = r.map().map_err(|_| Error::Malformed)?;
     let (mut sign, mut noise, mut corr) = (None, None, None);
+    let mut hierarchy = Vec::new();
     while let Some(key) = m.key().map_err(|_| Error::Malformed)? {
         match (key, m.value().map_err(|_| Error::Malformed)?) {
             (1, Item::Bstr(b)) => sign = <[u8; 32]>::try_from(b).ok(),
             (2, Item::Bstr(b)) => noise = <[u8; 32]>::try_from(b).ok(),
             (3, Item::Bstr(b)) => corr = <[u8; 32]>::try_from(b).ok(),
+            // Absent in a store written before the hierarchy was persisted.
+            // Such a node has already lost its epoch keys and cannot be given
+            // them back; reading it as empty is the honest outcome, and it
+            // still opens.
+            (4, Item::Bstr(b)) => hierarchy = read_hierarchy(b),
             _ => return Err(Error::Malformed),
         }
     }
-    Ok(Identity::from_parts(
+    let mut id = Identity::from_parts(
         &sign.ok_or(Error::Malformed)?,
         noise.ok_or(Error::Malformed)?,
         corr.ok_or(Error::Malformed)?,
         params,
-    ))
+    );
+    id.hierarchy = krab_crypto::kek::Hierarchy::from_records(hierarchy);
+    Ok(id)
+}
+
+/// Wrapped epoch keys, as stored. Ciphertext throughout.
+///
+/// A malformed run yields what parsed before it: this is the operator's own
+/// disk, and dropping an entire hierarchy because its tail is damaged would
+/// lose every epoch to save the ones already read.
+fn read_hierarchy(bytes: &[u8]) -> Vec<(krab_core::tag::Epoch, Vec<u8>)> {
+    let mut r = Reader::new(bytes);
+    let mut out = Vec::new();
+    let Ok(Item::Array(n)) = r.item() else {
+        return out;
+    };
+    for _ in 0..n / 2 {
+        let (Ok(Item::Uint(e)), Ok(Item::Bstr(rec))) = (r.item(), r.item()) else {
+            break;
+        };
+        let Ok(e) = u32::try_from(e) else { break };
+        out.push((krab_core::tag::Epoch(e), rec.to_vec()));
+    }
+    out
 }
 
 /// Derive the KEK from a passphrase.

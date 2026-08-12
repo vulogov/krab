@@ -291,6 +291,33 @@ impl Hierarchy {
         Ok(w)
     }
 
+    /// The wrapped epoch keys, for storage.
+    ///
+    /// **Already ciphertext** — each record is `W_N` sealed under the KEK, so
+    /// this discloses nothing to a reader without the passphrase. It exists
+    /// because a hierarchy that is not persisted is a hierarchy that is
+    /// regenerated on every start, and everything sealed under the old `W_N`
+    /// — reservoirs, prekey rings, channel rosters — becomes permanently
+    /// unreadable without a single error being raised.
+    pub fn records(&self) -> &[(Epoch, Vec<u8>)] {
+        &self.records
+    }
+
+    /// Adopt stored records.
+    ///
+    /// Refuses duplicates for one epoch: two wrappers for the same epoch mean
+    /// `epoch_key` returns whichever is first, and which one that is would
+    /// depend on the order a file happened to be written in.
+    pub fn from_records(records: Vec<(Epoch, Vec<u8>)>) -> Hierarchy {
+        let mut out: Vec<(Epoch, Vec<u8>)> = Vec::with_capacity(records.len());
+        for (e, r) in records {
+            if !out.iter().any(|(seen, _)| *seen == e) {
+                out.push((e, r));
+            }
+        }
+        Hierarchy { records: out }
+    }
+
     /// Recover `W_N`.
     pub fn epoch_key(&self, kek: &Kek, epoch: Epoch) -> Result<[u8; 32], Error> {
         let (_, record) = self

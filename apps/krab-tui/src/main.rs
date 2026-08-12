@@ -28,6 +28,7 @@ mod activity_log;
 mod atomic;
 mod bulletin;
 mod ceremony;
+mod channels;
 mod command;
 mod compose;
 mod courier;
@@ -244,6 +245,8 @@ struct App {
     epoch_key: Option<[u8; 32]>,
     /// Where cards, pads and ceremony state live.
     home: PathBuf,
+    /// Channels owned and followed — RFC 6.
+    roster: channels::Roster,
     /// Commands submitted this session, oldest first.
     ///
     /// **In memory only.** A history file would be a record of who this node
@@ -338,6 +341,7 @@ impl Default for App {
             epoch_key: None,
             home: default_home(),
             listen: None,
+            roster: channels::Roster::default(),
             history: Vec::new(),
             history_at: 0,
             output_scroll: 0,
@@ -553,7 +557,12 @@ impl App {
             Binding::CycleFocusBack => self.ui.cycle_focus_back(),
             Binding::ToggleZoom => self.ui.toggle_zoom(),
             Binding::SwitchTab => self.ui.switch_tab(),
-            Binding::SelectTab(t) => self.ui.select_tab(t),
+            Binding::SelectTab(t) => {
+                self.ui.select_tab(t);
+                // Rebuild the pane for the tab being entered. Without this the
+                // Channels tab showed the message list, or nothing at all.
+                self.refresh_inbox();
+            }
             Binding::ToggleFullScreen => self.ui.toggle_full_screen(),
             // **History.** Typed commands only, never the passphrase — see
             // `push_history`.
@@ -1006,6 +1015,12 @@ impl App {
             ));
         }
         self.messages = scan.messages;
+        // The Channels tab lists channels, not mail. Both are rebuilt here,
+        // so switching tabs shows what is there rather than what was there
+        // when the tab was last opened.
+        if self.ui.tab() == layout::Tab::Channels {
+            self.list = self.channel_rows();
+        }
         self.show_selected();
     }
 
@@ -1072,9 +1087,94 @@ impl App {
         out
     }
 
+    /// The channel list, for the Channels tab.
+    ///
+    /// The tab rendered an empty pane: it was drawn, selectable and
+    /// advertised, and nothing ever put anything in it.
+    fn channel_rows(&self) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut counts: Vec<([u8; 32], usize)> = Vec::new();
+        self.store.with(|s| {
+            for (_, id) in s.entries_in_range(0, u32::MAX) {
+                if let Some(p) = s.get(&id).and_then(channels::from_object) {
+                    let c = p.channel_id();
+                    match counts.iter_mut().find(|(k, _)| *k == c) {
+                        Some((_, n)) => *n += 1,
+                        None => counts.push((c, 1)),
+                    }
+                }
+            }
+        });
+        if let Some(mine) = self.roster.mine.as_ref() {
+            let n = counts
+                .iter()
+                .find(|(k, _)| *k == mine.id())
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            rows.push(format!(
+                "{} (yours)  {n} posts",
+                channels::short(&mine.id())
+            ));
+        }
+        for c in &self.roster.following {
+            let n = counts
+                .iter()
+                .find(|(k, _)| k == c)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            rows.push(format!("{}  {n} posts", channels::short(c)));
+        }
+        if rows.is_empty() {
+            rows.push("(no channels — `channel new`, or `channel follow <id>`)".into());
+        }
+        rows
+    }
+
+    /// Posts in a channel, newest first.
+    fn channel_posts(&self, id: &[u8; 32]) -> Vec<String> {
+        let mut out: Vec<(u64, String)> = Vec::new();
+        self.store.with(|s| {
+            for (_, oid) in s.entries_in_range(0, u32::MAX) {
+                if let Some(p) = s.get(&oid).and_then(channels::from_object) {
+                    if p.channel_id() == *id {
+                        out.push((p.sequence, String::from_utf8_lossy(&p.payload).into_owned()));
+                    }
+                }
+            }
+        });
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out.into_iter().map(|(n, t)| format!("{n}. {t}")).collect()
+    }
+
     /// Put the selected message in the view pane.
     fn show_selected(&mut self) {
         overwrite(&mut self.body);
+        if self.ui.tab() == layout::Tab::Channels {
+            let ids: Vec<[u8; 32]> = self
+                .roster
+                .mine
+                .as_ref()
+                .map(|c| c.id())
+                .into_iter()
+                .chain(self.roster.following.iter().copied())
+                .collect();
+            self.body = match ids.get(self.selected) {
+                Some(id) => {
+                    let posts = self.channel_posts(id);
+                    if posts.is_empty() {
+                        format!("channel {}\n\nno posts yet", channels::short(id))
+                    } else {
+                        format!(
+                            "channel {}  — PUBLIC, SIGNED, PERMANENT\n\n{}",
+                            channels::short(id),
+                            posts.join("\n")
+                        )
+                    }
+                }
+                None => "no channel selected".into(),
+            };
+            return;
+        }
         match self.messages.get(self.selected) {
             Some(m) => {
                 self.body = format!("from {}\n\n{}", m.from, m.body);
@@ -1245,6 +1345,29 @@ impl App {
             }
             // RFC 3 §11 step 2, and RFC 8 §5's `verify`.
             Command::Quit => self.leave(),
+            Command::Channel => {
+                let sub = arg(line, 1).unwrap_or_default();
+                self.output = match sub.as_str() {
+                    "new" => self.channel_new(),
+                    "post" => {
+                        let text = words::split(line)
+                            .map(|w| words::rest(&w, 2))
+                            .unwrap_or_default();
+                        self.channel_post(text.trim())
+                    }
+                    "follow" => self.channel_follow(arg(line, 2).as_deref(), true),
+                    "unfollow" => self.channel_follow(arg(line, 2).as_deref(), false),
+                    "list" | "" => self.channel_list(),
+                    other => format!(
+                        "unknown: channel {other}\n\n\
+                         channel new                create one you can post to\n\
+                         channel post <text>        PUBLIC, SIGNED, PERMANENT\n\
+                         channel follow <id>        read one\n\
+                         channel unfollow <id>      stop reading it\n\
+                         channel list               what you own and follow"
+                    ),
+                };
+            }
             Command::Listen => {
                 // An address typed here wins over `--listen`; `--listen` is
                 // the default so the operator does not retype what they
@@ -1720,6 +1843,223 @@ impl App {
                 },
             })
         }
+    }
+
+    /// Create the channel this node can post to — RFC 6 §3.1.
+    fn channel_new(&mut self) -> String {
+        if let Some(c) = self.roster.mine.as_ref() {
+            return format!(
+                "this node already has a channel: {}\n\n\
+                 A second would need a second key, and RFC 6 gives a node one \
+                 posting identity.",
+                channels::short(&c.id())
+            );
+        }
+        let c = krab_crypto::channel::Channel::create(&mut OsRng);
+        let id = c.id();
+        self.roster.mine = Some(c);
+        if let Some(e) = self.save_roster() {
+            return e;
+        }
+        format!(
+            "channel {} created.\n\n\
+             Give that identifier to anyone who should read it — it is public.\n\
+             Posts are PUBLIC, SIGNED and PERMANENT: they carry your channel's \
+             signature, every carrying node archives them, and RFC 3 §6.1 \
+             forbids any recall mechanism. There is no delete.",
+            channels::short(&id)
+        )
+    }
+
+    /// Publish — the one irreversible thing an operator does routinely.
+    fn channel_post(&mut self, text: &str) -> String {
+        if text.is_empty() {
+            return "usage: channel post <text>\n\n\
+                    PUBLIC, SIGNED, PERMANENT. There is no recall."
+                .into();
+        }
+        let Some(c) = self.roster.mine.as_ref() else {
+            return "no channel — `channel new` first".into();
+        };
+        // **RFC 8 §4.2 requirement 2.** The first post of a session is
+        // confirmed explicitly. Per session, not per node: the confirmation is
+        // a reminder of what publishing means, and a reminder given once a
+        // year is not one.
+        if !self.roster.first_post_confirmed {
+            self.roster.first_post_confirmed = true;
+            return format!(
+                "PUBLIC — SIGNED — PERMANENT\n\n\
+                 This will be signed with channel {}, flooded to every peer, \
+                 and archived by every node that carries the channel. RFC 3 \
+                 §6.1 forbids a recall mechanism, so it cannot be deleted, \
+                 edited, or made unreadable later — unlike a sealed message, \
+                 which expires with its epoch key.\n\n\
+                 Type the same command again to publish it.",
+                channels::short(&c.id())
+            );
+        }
+
+        let seq = self.next_sequence();
+        let post = c.post(seq, "text/plain", text.as_bytes());
+        let now_min = now_epoch().0 * 1440;
+        let Some((id, bytes)) =
+            channels::into_object(&post, now_min, krab_core::tag::MAX_TTL_DAYS * 1440)
+        else {
+            return "too long for one object — split it".into();
+        };
+        if let Err(e) = self.store.with(|s| s.ingest(id, bytes, now_min, u32::MAX)) {
+            return format!("the store refused it: {e:?}");
+        }
+        self.save_corpus();
+        self.refresh_inbox();
+        format!(
+            "published post {seq} to channel {}.\n\n\
+             It leaves on a scheduled reconciliation, and it is now permanent.",
+            channels::short(&post.channel_id())
+        )
+    }
+
+    /// The next sequence number for this node's channel.
+    ///
+    /// From the posts already held, so a restart does not restart the
+    /// numbering — a repeated sequence number is two different posts claiming
+    /// the same position, which no reader can resolve.
+    fn next_sequence(&self) -> u64 {
+        let Some(mine) = self.roster.mine.as_ref().map(|c| c.id()) else {
+            return 1;
+        };
+        let mut max = 0;
+        self.store.with(|s| {
+            for (_, id) in s.entries_in_range(0, u32::MAX) {
+                if let Some(p) = s.get(&id).and_then(channels::from_object) {
+                    if p.channel_id() == mine {
+                        max = max.max(p.sequence);
+                    }
+                }
+            }
+        });
+        max + 1
+    }
+
+    /// Follow or unfollow a channel.
+    fn channel_follow(&mut self, id: Option<&str>, follow: bool) -> String {
+        let verb = if follow { "follow" } else { "unfollow" };
+        let Some(hex) = id else {
+            return format!("usage: channel {verb} <id>");
+        };
+        // A short id is what an operator reads and types; the full identifier
+        // is 32 bytes and nobody transcribes those.
+        let Some(full) = self.channel_by_short(hex) else {
+            return format!(
+                "no channel {hex} in this corpus.\n\n\
+                 A channel appears once one of its posts has arrived — there is \
+                 no directory to look it up in."
+            );
+        };
+        let changed = if follow {
+            self.roster.follow(full)
+        } else {
+            self.roster.unfollow(&full)
+        };
+        if let Some(e) = self.save_roster() {
+            return e;
+        }
+        self.refresh_inbox();
+        match (follow, changed) {
+            (true, true) => format!("following {hex}."),
+            (true, false) => format!("already following {hex}."),
+            (false, true) => format!(
+                "no longer following {hex}.\n\n\
+                 Posts already held are kept: RFC 3 §6.1 forbids a recall \
+                 mechanism, and a node that erased an archive on unfollowing \
+                 would be a selective one."
+            ),
+            (false, false) => format!("not following {hex}."),
+        }
+    }
+
+    /// Resolve a short identifier against the channels in the corpus.
+    fn channel_by_short(&self, hex: &str) -> Option<[u8; 32]> {
+        let mut found = None;
+        self.store.with(|s| {
+            for (_, id) in s.entries_in_range(0, u32::MAX) {
+                if let Some(p) = s.get(&id).and_then(channels::from_object) {
+                    if channels::short(&p.channel_id()) == hex {
+                        found = Some(p.channel_id());
+                    }
+                }
+            }
+        });
+        found.or_else(|| {
+            self.roster
+                .mine
+                .as_ref()
+                .map(|c| c.id())
+                .filter(|c| channels::short(c) == hex)
+        })
+    }
+
+    /// What this node owns and follows.
+    fn channel_list(&self) -> String {
+        let mut out = String::new();
+        match self.roster.mine.as_ref() {
+            Some(c) => out.push_str(&format!(
+                "yours:      {}  (you hold the key; you can post)\n",
+                channels::short(&c.id())
+            )),
+            None => out.push_str("yours:      none — `channel new` creates one\n"),
+        }
+        if self.roster.following.is_empty() {
+            out.push_str("following:  none\n");
+        } else {
+            for c in &self.roster.following {
+                out.push_str(&format!("following:  {}\n", channels::short(c)));
+            }
+        }
+        // What is in the corpus but unfollowed — RFC 6 §3.6's decision made
+        // visible, rather than a channel silently carried and never read.
+        let mut seen: Vec<[u8; 32]> = Vec::new();
+        self.store.with(|s| {
+            for (_, id) in s.entries_in_range(0, u32::MAX) {
+                if let Some(p) = s.get(&id).and_then(channels::from_object) {
+                    let c = p.channel_id();
+                    if !self.roster.follows(&c) && !seen.contains(&c) {
+                        seen.push(c);
+                    }
+                }
+            }
+        });
+        if !seen.is_empty() {
+            out.push_str("\nin the corpus, not followed:\n");
+            for c in &seen {
+                out.push_str(&format!("  {}\n", channels::short(c)));
+            }
+        }
+        out
+    }
+
+    /// Read the roster back. Absent is not an error — a node that has never
+    /// touched a channel has none.
+    fn load_roster(&mut self) {
+        let Some(w) = self.epoch_key else { return };
+        if let Some(r) = std::fs::read(self.path("channels.roster"))
+            .ok()
+            .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/roster", &sealed).ok())
+            .and_then(|raw| channels::Roster::decode(&raw))
+        {
+            self.roster = r;
+        }
+    }
+
+    /// Persist the roster. It holds a posting key, so it is sealed.
+    fn save_roster(&self) -> Option<String> {
+        let w = self.epoch_key?;
+        let sealed =
+            krab_crypto::kek::seal_under(&w, b"krab/roster", &self.roster.encode(), &mut OsRng)
+                .ok()?;
+        atomic::write(&self.path("channels.roster"), &sealed)
+            .err()
+            .map(|e| format!("could not store the roster: {e}"))
     }
 
     /// Mix fresh entropy into a live peering.
@@ -2826,6 +3166,11 @@ impl App {
         let _ = self
             .store
             .with(|s| persist::read_corpus(&self.path("corpus.krab"), s, epoch.0 * 1440));
+        // Both are sealed under the epoch key, so this is the first moment
+        // either can be read — and a restarted node that could not find its
+        // own channel key would restart its post numbering, which is two
+        // posts claiming one position and no reader can resolve that.
+        self.load_roster();
         self.refresh_inbox();
         Ok(())
     }
@@ -3025,6 +3370,7 @@ impl App {
                 self.init_step = None;
                 // The passphrase has done its work and must not linger (§9).
                 self.passphrase.clear();
+                self.load_roster();
                 if let Some(note) = self.publish_prekeys() {
                     self.output.push_str(&format!("\n\n{note}"));
                 }
@@ -6780,7 +7126,7 @@ mod tests {
     /// encapsulating to an attacker's key.
     #[test]
     fn a_prekey_batch_with_a_broken_signature_is_ignored() {
-        let (mut a, mut b, _a_id, _b_id) = peered_pair("prekey-forged");
+        let (a, mut b, _a_id, _b_id) = peered_pair("prekey-forged");
         assert!(b.publish_prekeys().is_some());
 
         let mut tampered: Vec<(krab_core::object::ObjectId, Vec<u8>)> = b.store.with(|s| {
@@ -6823,6 +7169,193 @@ mod tests {
         assert!(
             a.prekey_for(&b_node).is_none(),
             "a tampered batch was accepted"
+        );
+    }
+
+    /// **The Channels tab is no longer empty.** It was drawn, selectable and
+    /// advertised, and nothing ever put anything in it.
+    #[test]
+    fn a_channel_can_be_created_posted_to_and_read() {
+        let mut a = ready_node("channel-basic");
+
+        type_command(&mut a, "channel list");
+        assert!(a.output.contains("none"), "{}", a.output);
+
+        type_command(&mut a, "channel new");
+        assert!(a.output.contains("created"), "{}", a.output);
+        let id = channels::short(&a.roster.mine.as_ref().unwrap().id());
+        assert!(a.output.contains(&id));
+
+        // **RFC 8 §4.2 requirement 2** — the first post of a session confirms.
+        type_command(&mut a, "channel post the meeting is moved");
+        assert!(
+            a.output.contains("PUBLIC — SIGNED — PERMANENT"),
+            "no confirmation banner:\n{}",
+            a.output
+        );
+        assert_eq!(
+            a.channel_posts(&a.roster.mine.as_ref().unwrap().id()).len(),
+            0
+        );
+
+        type_command(&mut a, "channel post the meeting is moved");
+        assert!(a.output.contains("published post 1"), "{}", a.output);
+
+        let posts = a.channel_posts(&a.roster.mine.as_ref().unwrap().id());
+        assert_eq!(posts.len(), 1);
+        assert!(posts[0].contains("the meeting is moved"));
+
+        // And the tab shows it.
+        a.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(
+            a.list.iter().any(|r| r.contains(&id)),
+            "the Channels tab is still empty: {:?}",
+            a.list
+        );
+        assert!(
+            a.body.contains("PUBLIC, SIGNED, PERMANENT"),
+            "the security context is not on screen:\n{}",
+            a.body
+        );
+    }
+
+    /// A second post in the same session does not re-confirm — the friction is
+    /// a reminder, not an obstacle to every line.
+    #[test]
+    fn only_the_first_post_of_a_session_confirms() {
+        let mut a = ready_node("channel-confirm-once");
+        type_command(&mut a, "channel new");
+        type_command(&mut a, "channel post one");
+        type_command(&mut a, "channel post one");
+        type_command(&mut a, "channel post two");
+        assert!(a.output.contains("published post 2"), "{}", a.output);
+    }
+
+    /// **Sequence numbers do not restart.** Two posts claiming one position is
+    /// something no reader can resolve.
+    #[test]
+    fn sequence_numbers_survive_a_restart() {
+        let mut a = ready_node("channel-seq");
+        type_command(&mut a, "channel new");
+        type_command(&mut a, "channel post first");
+        type_command(&mut a, "channel post first");
+        type_command(&mut a, "channel post second");
+
+        let mut fresh = App {
+            home: a.home.clone(),
+            ..App::default()
+        };
+        fresh.passphrase = line::Line::from("a passphrase");
+        fresh.unlock(b"a passphrase").expect("reopens");
+        assert_eq!(fresh.epoch_key, a.epoch_key, "the epoch key changed");
+        let sealed = std::fs::read(fresh.path("channels.roster")).unwrap();
+        let raw = krab_crypto::kek::open_under(&fresh.epoch_key.unwrap(), b"krab/roster", &sealed)
+            .expect("the roster opens");
+        assert!(
+            channels::Roster::decode(&raw).is_some(),
+            "it does not decode"
+        );
+        assert!(fresh.roster.mine.is_some(), "the channel key was lost");
+        assert_eq!(fresh.next_sequence(), 3, "numbering restarted");
+
+        // And the confirmation is asked again, because it is a session
+        // property and a reminder given once a year is not one.
+        assert!(!fresh.roster.first_post_confirmed);
+    }
+
+    /// A post from a channel this node does not follow is still carried, and
+    /// still readable once followed — but it is not in the list until then.
+    #[test]
+    fn a_channel_is_followed_before_it_is_listed() {
+        let mut a = ready_node("channel-follow-a");
+        let mut b = ready_node("channel-follow-b");
+        type_command(&mut b, "channel new");
+        type_command(&mut b, "channel post hello");
+        type_command(&mut b, "channel post hello");
+        let id = channels::short(&b.roster.mine.as_ref().unwrap().id());
+
+        let now_min = now_epoch().0 * 1440;
+        let carried: Vec<(krab_core::object::ObjectId, Vec<u8>)> = b.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|x| (i, x.to_vec())))
+                .collect()
+        });
+        for (i, bytes) in carried {
+            let _ = a.store.with(|s| s.ingest(i, bytes, now_min, u32::MAX));
+        }
+
+        type_command(&mut a, "channel list");
+        assert!(
+            a.output.contains("not followed"),
+            "an unfollowed channel is invisible:\n{}",
+            a.output
+        );
+
+        type_command(&mut a, &format!("channel follow {id}"));
+        assert!(a.output.contains("following"), "{}", a.output);
+        assert!(a.roster.follows(&b.roster.mine.as_ref().unwrap().id()));
+        assert!(a.channel_posts(&b.roster.mine.as_ref().unwrap().id())[0].contains("hello"));
+
+        // Unfollowing keeps the archive — RFC 3 §6.1 forbids a recall
+        // mechanism, and a selective one is worse.
+        type_command(&mut a, &format!("channel unfollow {id}"));
+        assert!(
+            !a.channel_posts(&b.roster.mine.as_ref().unwrap().id())
+                .is_empty(),
+            "unfollowing erased the archive"
+        );
+    }
+
+    /// Posting needs a channel, and there is no way to post to someone else's.
+    #[test]
+    fn posting_without_a_channel_is_refused() {
+        let mut a = ready_node("channel-none");
+        type_command(&mut a, "channel post nothing to post to");
+        assert!(a.output.contains("channel new"), "{}", a.output);
+        type_command(&mut a, "channel new");
+        type_command(&mut a, "channel new");
+        assert!(a.output.contains("already has a channel"), "{}", a.output);
+    }
+
+    /// **The epoch hierarchy must survive a restart.**
+    ///
+    /// It did not. `write_identity` stored three seeds and not the wrapped
+    /// epoch keys, so `open_epoch` minted a fresh `W_N` on every start — and
+    /// everything sealed under the old one became unreadable. Silently: no
+    /// error, no warning, and a peering that looked intact in `peers` while
+    /// its reservoir could no longer be opened.
+    ///
+    /// This is the failure RFC 0 §6 guarantees nobody is told about, in the
+    /// one place where it costs a peering rather than a message.
+    #[test]
+    fn the_epoch_hierarchy_survives_a_restart() {
+        let (a, _b, _a_id, b_id) = peered_pair("hierarchy-restart");
+        let before = a.epoch_key.expect("an epoch key");
+        let reservoir_before = stored_root(&a, &b_id);
+
+        let mut fresh = App {
+            home: a.home.clone(),
+            ..App::default()
+        };
+        fresh.passphrase = line::Line::from("a passphrase");
+        fresh.unlock(b"a passphrase").expect("it reopens");
+
+        assert_eq!(
+            fresh.epoch_key,
+            Some(before),
+            "a fresh W_N was minted, so everything sealed under the old one is gone"
+        );
+        assert_eq!(
+            stored_root(&fresh, &b_id),
+            reservoir_before,
+            "the peering's reservoir did not survive the restart"
+        );
+
+        // And the identity itself is unchanged, so this is not a new node.
+        assert_eq!(
+            fresh.identity.as_ref().unwrap().short_id(),
+            a.identity.as_ref().unwrap().short_id()
         );
     }
 }

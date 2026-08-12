@@ -48,6 +48,12 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
+    /// **Not in RFC 8 §5.** Channels — RFC 6.
+    ///
+    /// §5's verbs are all about private mail. Channels are the other half of
+    /// the interface and had no verb at all, which is why the tab rendered an
+    /// empty pane.
+    Channel,
     /// **Not in RFC 8 §5.** Leave. The `Ctrl-Q` chord's discoverable form,
     /// the same way `lock` is `Ctrl-L`'s.
     Quit,
@@ -130,6 +136,7 @@ impl Command {
             "verify" => Command::Verify,
             "listen" => Command::Listen,
             "quit" | "exit" => Command::Quit,
+            "channel" | "chan" => Command::Channel,
             "help" | "?" => Command::Help,
             _ => return None,
         })
@@ -185,6 +192,14 @@ impl Command {
         ),
         ("help", "this list"),
         ("quit", "leave — the same as Ctrl-Q"),
+        ("channel new", "create a channel you can post to"),
+        (
+            "channel post <text>",
+            "PUBLIC, SIGNED, PERMANENT — cannot be recalled",
+        ),
+        ("channel follow <id>", "read a channel"),
+        ("channel unfollow <id>", "stop reading it"),
+        ("channel list", "channels you own or follow"),
     ];
 
     /// The chords, which are not typed and so are not in [`Self::SYNOPSES`].
@@ -274,6 +289,7 @@ impl fmt::Display for Command {
             Command::Verify => "verify",
             Command::Listen => "listen",
             Command::Quit => "quit",
+            Command::Channel => "channel",
             Command::Help => "help",
         };
         f.write_str(s)

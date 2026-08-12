@@ -87,6 +87,14 @@ impl Channel {
         Channel { signing }
     }
 
+    /// The signing seed, for storing a posting credential at rest.
+    ///
+    /// This is the channel's private half: whoever holds it can post, which is
+    /// the whole of RFC 6's authorisation model, so a caller seals it.
+    pub fn signing_seed(&self) -> [u8; 32] {
+        self.signing.to_seed()
+    }
+
     /// `channel_id = BLAKE3("krab/chan/v1" ‖ ed25519_pk)`, RFC 6 §3.1.
     pub fn id(&self) -> [u8; 32] {
         channel_id(&self.signing.verifying_key().to_bytes())
@@ -121,6 +129,7 @@ impl Channel {
 /// Signed, **not encrypted**, third-party verifiable. That is the whole
 /// difference from a `sealed` object and the reason a channel costs what it
 /// costs.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Post {
     /// The channel's Ed25519 public key. RFC 1 §5.2 key 0.
     pub author: [u8; 32],
