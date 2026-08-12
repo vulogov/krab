@@ -130,6 +130,16 @@ pub struct Roster {
     pub following: Vec<[u8; 32]>,
     /// The channel this node owns, if it has made one.
     pub mine: Option<Channel>,
+    /// Whether this node hosts public content — RFC 6 §3.6.
+    ///
+    /// **Off by default**, and RFC 8 §4.3 requires the warning at the moment
+    /// of enabling. Stored, because it is a standing decision about what the
+    /// node is, unlike the per-session post confirmation below.
+    pub carriage: krab_crypto::CarriagePolicy,
+    /// Whether `channel carry on` has been typed once already this session.
+    /// Not stored: the second confirmation must follow the warning, and a
+    /// warning acknowledged last month is not one.
+    pub carriage_armed: bool,
     /// **RFC 8 §4.2 requirement 2.** Whether the operator has confirmed a
     /// channel post this session.
     ///
@@ -178,13 +188,19 @@ impl Roster {
             .as_ref()
             .map(|c| c.signing_seed())
             .unwrap_or([0u8; 32]);
-        w.map(3)
+        w.map(6)
             .uint(1)
             .bstr(&flat)
             .uint(2)
             .bool(self.mine.is_some())
             .uint(3)
-            .bstr(&mine);
+            .bstr(&mine)
+            .uint(4)
+            .bool(self.carriage.enabled)
+            .uint(5)
+            .uint(self.carriage.shard_bits as u64)
+            .uint(6)
+            .uint(self.carriage.shard);
         w.finish()
     }
 
@@ -194,7 +210,7 @@ impl Roster {
     pub fn decode(bytes: &[u8]) -> Option<Roster> {
         let mut r = cbor::Reader::new(bytes);
         let mut m = r.map().ok()?;
-        if m.left() != 3 {
+        if m.left() != 6 {
             return None;
         }
         let flat = bstr_at(&mut m, 1)?;
@@ -207,10 +223,26 @@ impl Roster {
             .collect();
         let has_mine = bool_at(&mut m, 2)?;
         let seed: [u8; 32] = bstr_at(&mut m, 3)?.try_into().ok()?;
+        let enabled = bool_at(&mut m, 4)?;
+        let shard_bits = u8::try_from(uint_at(&mut m, 5)?).ok()?;
+        // RFC 6 §3.4's channel space is 32 bits; wider divides the anonymity
+        // set by a number with no meaning.
+        if shard_bits > 32 {
+            return None;
+        }
+        let shard = uint_at(&mut m, 6)?;
         Some(Roster {
             following,
             mine: has_mine
                 .then(|| Channel::from_key(krab_crypto::sign::SigningKey::from_seed(&seed))),
+            carriage: krab_crypto::CarriagePolicy {
+                enabled,
+                shard_bits,
+                shard,
+            },
+            // Not stored: the second confirmation must follow the warning, and
+            // a warning acknowledged last month is not one.
+            carriage_armed: false,
             first_post_confirmed: false,
         })
     }
@@ -338,11 +370,24 @@ mod tests {
         let r = Roster {
             following: vec![[7u8; 32], [8u8; 32]],
             mine: Some(c),
+            carriage: krab_crypto::CarriagePolicy {
+                enabled: true,
+                shard_bits: 4,
+                shard: 3,
+            },
+            carriage_armed: true,
             first_post_confirmed: true,
         };
         let back = Roster::decode(&r.encode()).expect("decodes");
         assert_eq!(back.following, r.following);
         assert_eq!(back.mine.as_ref().map(|c| c.id()), Some(id));
+        assert!(back.carriage.enabled, "carriage is a standing decision");
+        assert_eq!(back.carriage.shard_bits, 4);
+        assert_eq!(back.carriage.shard, 3);
+        assert!(
+            !back.carriage_armed,
+            "the carriage warning was pre-acknowledged across a restart"
+        );
         assert!(
             !back.first_post_confirmed,
             "the confirmation survived a restart — RFC 8 §4.2 wants it asked again"

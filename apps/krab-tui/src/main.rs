@@ -33,6 +33,7 @@ mod command;
 mod compose;
 mod courier;
 mod entropy;
+mod groups;
 mod identity;
 mod keys;
 mod layout;
@@ -245,8 +246,10 @@ struct App {
     epoch_key: Option<[u8; 32]>,
     /// Where cards, pads and ceremony state live.
     home: PathBuf,
-    /// Channels owned and followed — RFC 6.
+    /// Channels owned and followed — RFC 6 §3.
     roster: channels::Roster,
+    /// Groups — RFC 6 §2. Closed rosters, sealed per member.
+    groups: Vec<groups::Group>,
     /// Commands submitted this session, oldest first.
     ///
     /// **In memory only.** A history file would be a record of who this node
@@ -342,6 +345,7 @@ impl Default for App {
             home: default_home(),
             listen: None,
             roster: channels::Roster::default(),
+            groups: Vec::new(),
             history: Vec::new(),
             history_at: 0,
             output_scroll: 0,
@@ -580,6 +584,22 @@ impl App {
                 self.output_scroll = (self.output_scroll + d as i64 * step).clamp(0, n);
             }
             Binding::Compose if !self.locked => self.ui.compose(),
+            // **RFC 8 §4.2 requirement 3.** In the channels tab `r` is
+            // ambiguous between "privately message the author" and "publish a
+            // response to my own channel". It resolves to the private
+            // message, always: pressing reply must never publish.
+            //
+            // `P` publishes, and it is a different key. Not a modifier on the
+            // same key — a modifier missed is the wrong action taken, and this
+            // is the action RFC 8 §4.1 calls the highest-severity item in the
+            // design.
+            Binding::Reply if !self.locked => self.reply_privately(),
+            Binding::Publish if !self.locked => {
+                self.output = "publishing is `channel post <text>`.\n\n\
+                     It is a separate action from reply on purpose (RFC 8 §4.2): \
+                     a channel post is PUBLIC, SIGNED and PERMANENT."
+                    .into();
+            }
 
             // Editing goes to whichever line is being typed into. The
             // passphrase gets the same vocabulary as the command line: it is
@@ -1087,6 +1107,311 @@ impl App {
         out
     }
 
+    /// Create a group — RFC 6 §2.
+    fn group_new(&mut self, name: Option<&str>) -> String {
+        let Some(name) = name else {
+            return "usage: group new <name>\n\n\
+                    A group is PRIVATE: each message is sealed once per member. \
+                    A channel is PUBLIC and permanent. They are opposite models \
+                    and this is the one that is not."
+                .into();
+        };
+        if self.groups.iter().any(|g| g.name == name) {
+            return format!("a group called {name} already exists");
+        }
+        let Some(me) = self.identity.as_ref().map(|i| i.node_id()) else {
+            return "no identity".into();
+        };
+        // Creator-only by default, and it cannot be changed afterwards —
+        // RFC 6 §2.6: a change to the authority model is indistinguishable
+        // from a compromise of it.
+        self.groups
+            .push(groups::Group::new(name, me, groups::Authority::CreatorOnly));
+        if let Some(e) = self.save_groups() {
+            return e;
+        }
+        format!(
+            "group \"{name}\" created, with you as its only member.\n\n\
+             PRIVATE — each message is sealed once per member, so one \
+             compromised member exposes one member. That costs (G−1)× a single \
+             message, which is why the size limits exist.\n\n\
+             Authority is creator-only and cannot be changed: a change to the \
+             authority model is indistinguishable from a compromise of it \
+             (RFC 6 §2.6)."
+        )
+    }
+
+    /// Add or remove a member, with RFC 6 §5 requirement 5's warnings **at
+    /// this moment** rather than when a send later fails.
+    fn group_member(&mut self, name: Option<&str>, peer: Option<&str>, add: bool) -> String {
+        let verb = if add { "add" } else { "remove" };
+        let (Some(name), Some(peer)) = (name, peer) else {
+            return format!("usage: group {verb} <name> <peer>");
+        };
+        // The peer must be one this node has peered with: a group member who
+        // cannot be sealed to is a member who silently receives nothing.
+        let Some(card) = std::fs::read(self.peer_path(peer, "link"))
+            .ok()
+            .and_then(|b| peering::Card::decode(&b).ok())
+            .filter(|c| c.verify())
+        else {
+            return format!(
+                "no peer-link for {peer}.\n\n\
+                 A group member has to be someone you have peered with — fan-out \
+                 seals to each member individually, and a member you cannot seal \
+                 to would silently receive nothing."
+            );
+        };
+        let node = card.node_id();
+        let Some(i) = self.groups.iter().position(|g| g.name == name) else {
+            return format!("no group called {name}");
+        };
+
+        if !add {
+            let removed = self.groups[i].remove(&node);
+            if let Some(e) = self.save_groups() {
+                return e;
+            }
+            if removed {
+                self.publish_roster(&self.groups[i].clone());
+            }
+            return if removed {
+                format!(
+                    "{peer} removed from \"{name}\", now at roster epoch {}.\n\n\
+                     They keep every message already sent: RFC 3 §6.1 forbids a \
+                     recall mechanism.",
+                    self.groups[i].epoch
+                )
+            } else {
+                format!("{peer} was not in \"{name}\"")
+            };
+        }
+
+        // **The warnings, before the change.** RFC 6 §5 requirement 5 puts
+        // them at join time precisely so they arrive while the decision is
+        // still open.
+        let prospective = self.groups[i].members.len() + 1;
+        let mut notes = String::new();
+        if let Some(w) = groups::Group::prekey_warning(
+            prospective,
+            prekeys::BATCH_KEYS,
+            krab_crypto::REKEY_EPOCHS,
+        ) {
+            notes.push_str(&format!("\n\n{w}"));
+        }
+
+        match self.groups[i].add(node) {
+            groups::SizeVerdict::Refuse(why) => format!("refused. {why}"),
+            groups::SizeVerdict::Warn(why) => {
+                if let Some(e) = self.save_groups() {
+                    return e;
+                }
+                self.publish_roster(&self.groups[i].clone());
+                format!(
+                    "{peer} added to \"{name}\", now at roster epoch {}.\n\n{why}{notes}",
+                    self.groups[i].epoch
+                )
+            }
+            groups::SizeVerdict::Fine => {
+                if let Some(e) = self.save_groups() {
+                    return e;
+                }
+                self.publish_roster(&self.groups[i].clone());
+                format!(
+                    "{peer} added to \"{name}\", now {} members at roster epoch {}.{notes}",
+                    self.groups[i].members.len(),
+                    self.groups[i].epoch
+                )
+            }
+        }
+    }
+
+    /// Publish this node's view of a roster — RFC 6 §2.6's "ordinary signed
+    /// group message".
+    ///
+    /// Signed by identity, because divergence is meaningless without knowing
+    /// *whose* view differs.
+    fn publish_roster(&self, g: &groups::Group) {
+        let Some(id) = self.identity.as_ref() else {
+            return;
+        };
+        let epoch = now_epoch();
+        let b = bulletin::Bulletin::create(
+            bulletin::Kind::Roster,
+            id.signing_key(),
+            epoch.0,
+            g.encode(),
+        );
+        let now_min = epoch.0 * 1440;
+        if let Some((oid, bytes)) =
+            bulletin::into_object(&b, now_min, krab_core::tag::MAX_TTL_DAYS * 1440)
+        {
+            let _ = self.store.with(|s| s.ingest(oid, bytes, now_min, u32::MAX));
+        }
+    }
+
+    /// Rosters other members have published that differ from ours.
+    ///
+    /// **Reported, never merged.** RFC 6 §2.6: a member added without your
+    /// knowledge and a roster you have not yet received are indistinguishable,
+    /// so resolving silently hides the one event that tells them apart.
+    fn roster_divergences(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let me = self.identity.as_ref().map(|i| i.node_id());
+        self.store.with(|s| {
+            for (_, oid) in s.entries_in_range(0, u32::MAX) {
+                let Some(b) = s.get(&oid).and_then(bulletin::from_object) else {
+                    continue;
+                };
+                if b.kind != bulletin::Kind::Roster || Some(b.node_id()) == me {
+                    continue;
+                }
+                let Some(theirs) = groups::Group::decode(&b.payload) else {
+                    continue;
+                };
+                // Only groups this node is actually in. A roster for a group
+                // we do not have is somebody else's business, and rendering it
+                // would turn a flooded object into a notification anyone can
+                // send us.
+                for mine in self.groups.iter().filter(|g| g.name == theirs.name) {
+                    if !mine.members.contains(&b.node_id()) {
+                        continue;
+                    }
+                    if let Some(report) = mine.divergence(&theirs) {
+                        out.push(format!("from {}:\n{report}", groups::short(&b.node_id())));
+                    }
+                }
+            }
+        });
+        out
+    }
+
+    /// Groups, their rosters, and any divergence recorded against them.
+    fn group_list(&self) -> String {
+        if self.groups.is_empty() {
+            return "no groups. `group new <name>` creates one.\n\n\
+                    A group is PRIVATE and sealed per member; a channel is \
+                    PUBLIC and permanent."
+                .into();
+        }
+        let mut out = String::new();
+        for g in &self.groups {
+            out.push_str(&format!(
+                "{}  epoch {}  {} member(s)\n",
+                g.name,
+                g.epoch,
+                g.members.len()
+            ));
+            for m in &g.members {
+                out.push_str(&format!("    {}\n", groups::short(m)));
+            }
+            match groups::Group::size_verdict(g.members.len()) {
+                groups::SizeVerdict::Warn(w) => out.push_str(&format!("  ! {w}\n")),
+                groups::SizeVerdict::Refuse(w) => out.push_str(&format!("  !! {w}\n")),
+                groups::SizeVerdict::Fine => {}
+            }
+        }
+        // RFC 8 §4.2 requirement 4 — shown, and never silently merged.
+        for d in self.roster_divergences() {
+            out.push_str(&format!("\n{d}\n"));
+        }
+        out
+    }
+
+    /// Persist the groups. A roster is a membership disclosure, so it is
+    /// sealed like everything else that names correspondents.
+    fn save_groups(&self) -> Option<String> {
+        let w = self.epoch_key?;
+        let mut blob = Vec::new();
+        for g in &self.groups {
+            let e = g.encode();
+            blob.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            blob.extend_from_slice(&e);
+        }
+        let sealed = krab_crypto::kek::seal_under(&w, b"krab/groups", &blob, &mut OsRng).ok()?;
+        atomic::write(&self.path("groups.sealed"), &sealed)
+            .err()
+            .map(|e| format!("could not store the groups: {e}"))
+    }
+
+    /// Read the groups back.
+    fn load_groups(&mut self) {
+        let Some(w) = self.epoch_key else { return };
+        let Some(blob) = std::fs::read(self.path("groups.sealed"))
+            .ok()
+            .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/groups", &s).ok())
+        else {
+            return;
+        };
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at + 4 <= blob.len() {
+            let n = u32::from_le_bytes(blob[at..at + 4].try_into().expect("4 bytes")) as usize;
+            at += 4;
+            if at + n > blob.len() {
+                break;
+            }
+            if let Some(g) = groups::Group::decode(&blob[at..at + n]) {
+                out.push(g);
+            }
+            at += n;
+        }
+        self.groups = out;
+    }
+
+    /// Reply — **privately, to a person, never to a channel.**
+    ///
+    /// The author of a channel post is a channel key, not an identity, so
+    /// replying needs a peer to address. When the channel is not one this node
+    /// can map to a peering, the honest answer is to say so: the alternative
+    /// is either publishing (forbidden here) or silently doing nothing.
+    fn reply_privately(&mut self) {
+        if self.ui.tab() != layout::Tab::Channels {
+            // Private mail already: reply to the selected message's sender.
+            match self.messages.get(self.selected) {
+                Some(m) => {
+                    self.command = line::Line::from(format!("send {} ", m.from).as_str());
+                    self.ui.focus_command();
+                    self.output = format!("replying privately to {}.", m.from);
+                }
+                None => self.output = "no message selected".into(),
+            }
+            return;
+        }
+
+        let ids: Vec<[u8; 32]> = self
+            .roster
+            .mine
+            .as_ref()
+            .map(|c| c.id())
+            .into_iter()
+            .chain(self.roster.following.iter().copied())
+            .collect();
+        let Some(channel) = ids.get(self.selected) else {
+            self.output = "no channel selected".into();
+            return;
+        };
+        if self
+            .roster
+            .mine
+            .as_ref()
+            .is_some_and(|c| c.id() == *channel)
+        {
+            self.output = "that is your own channel. To add to it: `channel post <text>`\n\n\
+                 Reply never publishes (RFC 8 §4.2)."
+                .into();
+            return;
+        }
+        self.output = format!(
+            "reply is a PRIVATE message and never a post.\n\n\
+             Channel {} is signed by a channel key, which is not a peering — \
+             there is nobody to address until you know which of your peers \
+             holds it. Ask them, then: send <peer> <text>\n\n\
+             To add to your own channel instead: channel post <text>",
+            channels::short(channel)
+        );
+    }
+
     /// The channel list, for the Channels tab.
     ///
     /// The tab rendered an empty pane: it was drawn, selectable and
@@ -1345,6 +1670,26 @@ impl App {
             }
             // RFC 3 §11 step 2, and RFC 8 §5's `verify`.
             Command::Quit => self.leave(),
+            Command::Group => {
+                let sub = arg(line, 1).unwrap_or_default();
+                self.output = match sub.as_str() {
+                    "new" => self.group_new(arg(line, 2).as_deref()),
+                    "add" => {
+                        self.group_member(arg(line, 2).as_deref(), arg(line, 3).as_deref(), true)
+                    }
+                    "remove" => {
+                        self.group_member(arg(line, 2).as_deref(), arg(line, 3).as_deref(), false)
+                    }
+                    "list" | "" => self.group_list(),
+                    other => format!(
+                        "unknown: group {other}\n\n\
+                         group new <name>              a closed roster, sealed per member\n\
+                         group add <name> <peer>       add a member\n\
+                         group remove <name> <peer>    remove one\n\
+                         group list                    rosters and epochs"
+                    ),
+                };
+            }
             Command::Channel => {
                 let sub = arg(line, 1).unwrap_or_default();
                 self.output = match sub.as_str() {
@@ -1357,6 +1702,7 @@ impl App {
                     }
                     "follow" => self.channel_follow(arg(line, 2).as_deref(), true),
                     "unfollow" => self.channel_follow(arg(line, 2).as_deref(), false),
+                    "carry" => self.channel_carry(arg(line, 2).as_deref()),
                     "list" | "" => self.channel_list(),
                     other => format!(
                         "unknown: channel {other}\n\n\
@@ -1364,6 +1710,7 @@ impl App {
                          channel post <text>        PUBLIC, SIGNED, PERMANENT\n\
                          channel follow <id>        read one\n\
                          channel unfollow <id>      stop reading it\n\
+                         channel carry on|off       host public content (default off)\n\
                          channel list               what you own and follow"
                     ),
                 };
@@ -1842,6 +2189,59 @@ impl App {
                     "scheduled re-key"
                 },
             })
+        }
+    }
+
+    /// Enable or disable channel carriage — RFC 6 §3.6, RFC 8 §4.3.
+    ///
+    /// **Default off, and the warning fires at the point of enabling.** RFC 8
+    /// §4.3 forbids it being documentation-only: carrying channels moves a
+    /// node from private relay to host of public content, and that is a
+    /// change in what the node *is*, with consequences that depend on where
+    /// the operator lives.
+    fn channel_carry(&mut self, arg: Option<&str>) -> String {
+        let current = if self.roster.carriage.enabled {
+            "on"
+        } else {
+            "off"
+        };
+        match arg {
+            None => format!(
+                "channel carriage is {current}.\n\n\
+                 `channel carry on` hosts public content; `channel carry off` \
+                 stops. Off is the default (RFC 6 §3.6)."
+            ),
+            Some("off") => {
+                self.roster.carriage.enabled = false;
+                if let Some(e) = self.save_roster() {
+                    return e;
+                }
+                "channel carriage off. This node relays only ciphertext again, \
+                 for people you chose."
+                    .into()
+            }
+            Some("on") => {
+                if self.roster.carriage.enabled {
+                    return "channel carriage is already on.".into();
+                }
+                // Two steps, like the first post and like `wipe`: this changes
+                // what the node is, and RFC 8 §4.3 requires the warning at the
+                // moment of enabling rather than in a document nobody reads.
+                if !self.roster.carriage_armed {
+                    self.roster.carriage_armed = true;
+                    return format!(
+                        "{}\n\nType `channel carry on` again to enable it.",
+                        krab_crypto::CarriagePolicy::enabling_notice()
+                    );
+                }
+                self.roster.carriage_armed = false;
+                self.roster.carriage.enabled = true;
+                if let Some(e) = self.save_roster() {
+                    return e;
+                }
+                "channel carriage ON. This node now hosts public content.".into()
+            }
+            Some(other) => format!("usage: channel carry on|off (not {other:?})"),
         }
     }
 
@@ -3171,6 +3571,7 @@ impl App {
         // own channel key would restart its post numbering, which is two
         // posts claiming one position and no reader can resolve that.
         self.load_roster();
+        self.load_groups();
         self.refresh_inbox();
         Ok(())
     }
@@ -7006,8 +7407,13 @@ mod tests {
     #[test]
     fn ctrl_m_and_ctrl_g_select_the_tabs() {
         let mut a = App::default();
-        a.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        assert_eq!(a.ui.tab(), layout::Tab::Channels);
+        // Several chords reach Channels, because every candidate is stolen by
+        // something somewhere — Ctrl-G by Google's terminals and by emacs.
+        for c in ['t', 'g', 'c'] {
+            a.ui.select_tab(layout::Tab::Private);
+            a.on_key(KeyCode::Char(c), KeyModifiers::CONTROL);
+            assert_eq!(a.ui.tab(), layout::Tab::Channels, "Ctrl-{c} did not work");
+        }
         a.on_key(KeyCode::Char('m'), KeyModifiers::CONTROL);
         assert_eq!(a.ui.tab(), layout::Tab::Private);
 
@@ -7206,7 +7612,7 @@ mod tests {
         assert!(posts[0].contains("the meeting is moved"));
 
         // And the tab shows it.
-        a.on_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        a.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert!(
             a.list.iter().any(|r| r.contains(&id)),
             "the Channels tab is still empty: {:?}",
@@ -7356,6 +7762,248 @@ mod tests {
         assert_eq!(
             fresh.identity.as_ref().unwrap().short_id(),
             a.identity.as_ref().unwrap().short_id()
+        );
+    }
+
+    /// **RFC 8 §4.2 requirement 3.** Pressing reply must never publish.
+    #[test]
+    fn reply_never_publishes_and_publish_is_a_separate_key() {
+        let mut a = ready_node("reply-private");
+        type_command(&mut a, "channel new");
+        type_command(&mut a, "channel post hello");
+        type_command(&mut a, "channel post hello");
+        let before = a.channel_posts(&a.roster.mine.as_ref().unwrap().id()).len();
+
+        a.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        // Onto the list pane: on the command line `r` is a letter, which is
+        // what makes a command containing one typeable.
+        a.ui.cycle_focus();
+        a.on_key(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(
+            a.channel_posts(&a.roster.mine.as_ref().unwrap().id()).len(),
+            before,
+            "reply published"
+        );
+        assert!(
+            a.output.contains("never publishes") || a.output.contains("PRIVATE"),
+            "{}",
+            a.output
+        );
+
+        // And `P` does not publish either — it names the verb that does, so
+        // publishing is always something typed in full.
+        a.on_key(KeyCode::Char('P'), KeyModifiers::SHIFT);
+        assert_eq!(
+            a.channel_posts(&a.roster.mine.as_ref().unwrap().id()).len(),
+            before,
+            "the publish key published without a command"
+        );
+        assert!(a.output.contains("channel post"), "{}", a.output);
+    }
+
+    /// In private mail, reply addresses the sender — the same key, the same
+    /// meaning, no ambiguity to resolve.
+    #[test]
+    fn reply_in_private_mail_addresses_the_sender() {
+        let mut a = ready_node("reply-mail");
+        a.messages.push(receive::Message {
+            id: krab_crypto::hash::object_id(b"x"),
+            from: "deadbeef".into(),
+            epoch: now_epoch(),
+            body: "hello".into(),
+            post_quantum: false,
+        });
+        a.selected = 0;
+        a.ui.cycle_focus();
+        a.on_key(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "send deadbeef ");
+        // And focus returned to the command line, so the reply can be typed.
+        assert_eq!(a.ui.focus(), layout::Pane::Command);
+    }
+
+    /// **RFC 8 §4.2 requirement 5.** The warnings arrive while the decision is
+    /// still open, not when a send later fails.
+    #[test]
+    fn group_size_and_prekey_warnings_arrive_at_join_time() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("group-warn");
+        type_command(&mut a, "group new friends");
+        assert!(a.output.contains("PRIVATE"), "{}", a.output);
+
+        type_command(&mut a, &format!("group add friends {b_id}"));
+        assert!(a.output.contains("2 members"), "{}", a.output);
+
+        // A member who is not a peer cannot be added: fan-out seals to each
+        // member, and one that cannot be sealed to receives nothing silently.
+        type_command(&mut a, "group add friends cafebabe");
+        assert!(a.output.contains("no peer-link"), "{}", a.output);
+
+        // The thresholds themselves, without needing fifty real peerings.
+        let i = a.groups.iter().position(|g| g.name == "friends").unwrap();
+        for n in 0..25u8 {
+            a.groups[i].members.push([n; 32]);
+        }
+        type_command(&mut a, "group list");
+        assert!(
+            a.output.contains("above the recommended"),
+            "no size warning at 27:\n{}",
+            a.output
+        );
+    }
+
+    /// **RFC 8 §4.2 requirement 4.** Divergence is shown and never merged
+    /// silently — a member added without your knowledge and a roster you have
+    /// not received look identical.
+    #[test]
+    fn roster_divergence_is_surfaced_and_not_merged() {
+        let mine = groups::Group::new("g", [1u8; 32], groups::Authority::CreatorOnly);
+        let mut theirs = mine.clone();
+        theirs.add([2u8; 32]);
+
+        let before = mine.clone();
+        let report = mine.divergence(&theirs).expect("they diverge");
+        assert_eq!(mine, before, "comparing merged them");
+        assert!(report.contains("do not know about"), "{report}");
+        assert!(report.contains("NOT resolved automatically"), "{report}");
+    }
+
+    /// A group survives a restart, roster and epoch intact — a roster that
+    /// reset would report a divergence against every member forever.
+    #[test]
+    fn groups_survive_a_restart() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("group-restart");
+        type_command(&mut a, "group new friends");
+        type_command(&mut a, &format!("group add friends {b_id}"));
+        let epoch = a.groups[0].epoch;
+
+        let mut fresh = App {
+            home: a.home.clone(),
+            ..App::default()
+        };
+        fresh.passphrase = line::Line::from("a passphrase");
+        fresh.unlock(b"a passphrase").expect("reopens");
+        assert_eq!(fresh.groups.len(), 1, "the group was lost");
+        assert_eq!(fresh.groups[0].name, "friends");
+        assert_eq!(fresh.groups[0].epoch, epoch, "the roster epoch reset");
+        assert_eq!(fresh.groups[0].members.len(), 2);
+    }
+
+    /// **RFC 8 §4.3.** The warning fires at the point of enabling, states the
+    /// change in what the node *is*, and carriage defaults to off.
+    #[test]
+    fn channel_carriage_defaults_off_and_warns_before_enabling() {
+        let mut a = ready_node("carry");
+        assert!(!a.roster.carriage.enabled, "carriage must default to off");
+
+        type_command(&mut a, "channel carry");
+        assert!(a.output.contains("is off"), "{}", a.output);
+
+        // First `on` warns and changes nothing.
+        type_command(&mut a, "channel carry on");
+        assert!(
+            a.output.contains("host of public content"),
+            "the warning does not say what the node becomes:\n{}",
+            a.output
+        );
+        assert!(
+            !a.roster.carriage.enabled,
+            "carriage was enabled by the keystroke that warned about it"
+        );
+
+        // Second enables.
+        type_command(&mut a, "channel carry on");
+        assert!(a.roster.carriage.enabled, "{}", a.output);
+
+        // And it is a standing decision: it survives a restart, unlike the
+        // warning's acknowledgement.
+        let mut fresh = App {
+            home: a.home.clone(),
+            ..App::default()
+        };
+        fresh.passphrase = line::Line::from("a passphrase");
+        fresh.unlock(b"a passphrase").expect("reopens");
+        assert!(fresh.roster.carriage.enabled, "the decision was lost");
+        assert!(
+            !fresh.roster.carriage_armed,
+            "the warning was pre-acknowledged across a restart"
+        );
+
+        type_command(&mut fresh, "channel carry off");
+        assert!(!fresh.roster.carriage.enabled);
+    }
+
+    /// **RFC 8 §4.2 requirement 4, end to end.** A member's published roster
+    /// reaches us, differs, and is *shown* — not merged.
+    #[test]
+    fn a_divergent_roster_from_a_member_is_surfaced_not_merged() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("divergence");
+
+        // Both are in a group of the same name, and B knows about someone A
+        // does not — the routine case RFC 6 §2.6 describes.
+        type_command(&mut a, "group new friends");
+        type_command(&mut a, &format!("group add friends {b_id}"));
+        type_command(&mut b, "group new friends");
+        type_command(&mut b, &format!("group add friends {a_id}"));
+        b.groups[0].add([0x99; 32]);
+        b.publish_roster(&b.groups[0].clone());
+
+        let mine_before = a.groups[0].clone();
+        let now_min = now_epoch().0 * 1440;
+        let carried: Vec<(krab_core::object::ObjectId, Vec<u8>)> = b.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|x| (i, x.to_vec())))
+                .collect()
+        });
+        for (i, bytes) in carried {
+            let _ = a.store.with(|s| s.ingest(i, bytes, now_min, u32::MAX));
+        }
+
+        type_command(&mut a, "group list");
+        assert!(
+            a.output.contains("roster divergence"),
+            "the divergence was not shown:\n{}",
+            a.output
+        );
+        assert!(
+            a.output.contains("do not know about"),
+            "it does not say what differs:\n{}",
+            a.output
+        );
+        assert_eq!(
+            a.groups[0], mine_before,
+            "the roster was silently merged — RFC 6 §2.6 forbids exactly this"
+        );
+    }
+
+    /// A roster from someone who is not in the group is not a notification we
+    /// have to render. Otherwise a flooded object is a way to write on
+    /// anyone's screen.
+    #[test]
+    fn a_roster_from_a_stranger_is_ignored() {
+        let (mut a, mut b, _a_id, b_id) = peered_pair("divergence-stranger");
+        type_command(&mut a, "group new friends");
+        // B is NOT added to A's group.
+        type_command(&mut b, "group new friends");
+        b.groups[0].add([0x99; 32]);
+        b.publish_roster(&b.groups[0].clone());
+
+        let now_min = now_epoch().0 * 1440;
+        let carried: Vec<(krab_core::object::ObjectId, Vec<u8>)> = b.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|x| (i, x.to_vec())))
+                .collect()
+        });
+        for (i, bytes) in carried {
+            let _ = a.store.with(|s| s.ingest(i, bytes, now_min, u32::MAX));
+        }
+        let _ = b_id;
+
+        type_command(&mut a, "group list");
+        assert!(
+            !a.output.contains("roster divergence"),
+            "a stranger wrote on the screen:\n{}",
+            a.output
         );
     }
 }

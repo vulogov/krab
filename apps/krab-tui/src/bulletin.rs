@@ -43,6 +43,13 @@ pub enum Kind {
     Prekeys = 1,
     /// A channel post — RFC 6.
     Post = 2,
+    /// A group roster, as one member sees it — RFC 6 §2.6.
+    ///
+    /// "A change is an ordinary signed group message." Signed by the sending
+    /// member's identity, so a reader knows whose view of the roster this is
+    /// — which is the whole point: divergence is meaningless without knowing
+    /// who diverges.
+    Roster = 3,
 }
 
 impl Kind {
@@ -50,6 +57,7 @@ impl Kind {
         match b {
             1 => Some(Kind::Prekeys),
             2 => Some(Kind::Post),
+            3 => Some(Kind::Roster),
             _ => None,
         }
     }
@@ -60,6 +68,7 @@ impl Kind {
         match self {
             Kind::Prekeys => b"krab/bulletin/prekeys/v1",
             Kind::Post => b"krab/bulletin/post/v1",
+            Kind::Roster => b"krab/bulletin/roster/v1",
         }
     }
 }

@@ -48,6 +48,12 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
+    /// **Not in RFC 8 §5.** Groups — RFC 6 §2.
+    ///
+    /// A closed roster with fan-out. The opposite security model from a
+    /// channel, presented in the same interface, which RFC 6 §5 names as the
+    /// worst failure the system can produce.
+    Group,
     /// **Not in RFC 8 §5.** Channels — RFC 6.
     ///
     /// §5's verbs are all about private mail. Channels are the other half of
@@ -137,6 +143,7 @@ impl Command {
             "listen" => Command::Listen,
             "quit" | "exit" => Command::Quit,
             "channel" | "chan" => Command::Channel,
+            "group" => Command::Group,
             "help" | "?" => Command::Help,
             _ => return None,
         })
@@ -200,6 +207,16 @@ impl Command {
         ("channel follow <id>", "read a channel"),
         ("channel unfollow <id>", "stop reading it"),
         ("channel list", "channels you own or follow"),
+        (
+            "group new <name>",
+            "a closed roster — sealed per member, PRIVATE",
+        ),
+        (
+            "group add <name> <peer>",
+            "add a member; warns above 25, refuses above 50",
+        ),
+        ("group remove <name> <peer>", "remove a member"),
+        ("group list", "groups, their rosters and their epochs"),
     ];
 
     /// The chords, which are not typed and so are not in [`Self::SYNOPSES`].
@@ -211,8 +228,8 @@ impl Command {
             "PANIC — destroy every key on this node, no confirmation",
         ),
         (
-            "Ctrl-M / Ctrl-G",
-            "messages / groups (channels). F1/F2 and Ctrl-1/Ctrl-2 also work",
+            "Ctrl-M / Ctrl-T",
+            "messages / channels. F1/F2, Ctrl-1/Ctrl-2, Alt-M/Alt-C also work",
         ),
         ("Tab", "move between panes"),
         (
@@ -290,6 +307,7 @@ impl fmt::Display for Command {
             Command::Listen => "listen",
             Command::Quit => "quit",
             Command::Channel => "channel",
+            Command::Group => "group",
             Command::Help => "help",
         };
         f.write_str(s)

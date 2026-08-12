@@ -216,7 +216,12 @@ impl Binding {
             Key::Char('m' | 'M' | '1') if key.ctrl || key.alt => {
                 return Binding::SelectTab(crate::layout::Tab::Private)
             }
-            Key::Char('g' | 'G' | '2') if key.ctrl || key.alt => {
+            // `Ctrl-T` for channels. Not `Ctrl-G`: Google's terminal apps
+            // take it, emacs uses it for abort, and a chord an operator's
+            // environment intercepts is a chord that does not exist. Several
+            // alternatives are accepted for the same reason — every one of
+            // them is stolen by something, somewhere.
+            Key::Char('t' | 'T' | 'g' | 'G' | 'c' | 'C' | '2') if key.ctrl || key.alt => {
                 return Binding::SelectTab(crate::layout::Tab::Channels)
             }
             _ => {}
