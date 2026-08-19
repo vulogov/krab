@@ -33,6 +33,7 @@ mod command;
 mod compose;
 mod courier;
 mod entropy;
+mod fanout;
 mod groups;
 mod identity;
 mod keys;
@@ -119,6 +120,14 @@ fn rekey_failure(peer: &str, e: rekey_run::Error) -> String {
              epoch boundary; try again."
         ),
     }
+}
+
+/// Seconds since the Unix epoch, or zero if the clock is before it.
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// How long the panic chord stays armed.
@@ -250,6 +259,13 @@ struct App {
     roster: channels::Roster,
     /// Groups — RFC 6 §2. Closed rosters, sealed per member.
     groups: Vec<groups::Group>,
+    /// Fan-out copies waiting for their release time — RFC 6 §2.7.
+    pending: Vec<fanout::Pending>,
+    /// Objects seen arriving from peers, and over how long, for the stagger
+    /// window. Not persisted: a rate measured last month is not an
+    /// observation of this network now.
+    observed_arrivals: u64,
+    observed_hours: f64,
     /// Commands submitted this session, oldest first.
     ///
     /// **In memory only.** A history file would be a record of who this node
@@ -346,6 +362,9 @@ impl Default for App {
             listen: None,
             roster: channels::Roster::default(),
             groups: Vec::new(),
+            pending: Vec::new(),
+            observed_arrivals: 0,
+            observed_hours: 0.0,
             history: Vec::new(),
             history_at: 0,
             output_scroll: 0,
@@ -680,6 +699,7 @@ impl App {
     /// later without the change being visible (RFC 5 §6.1, RFC 0 I-5).
     fn tick_schedule(&mut self) {
         self.drain_inbound();
+        self.release_pending();
         self.shred_expired_epochs();
         self.enforce_retention();
         let now_s = std::time::SystemTime::now()
@@ -873,6 +893,12 @@ impl App {
         while let Ok(event) = self.exchanges.1.try_recv() {
             if matches!(event, activity_log::Event::Failed { .. }) {
                 self.links.failed(event.peer());
+            }
+            // The background arrival rate RFC 6 §2.7's stagger window is
+            // derived from. Counted from what reconciliation actually brought
+            // in, because that is the traffic a fan-out would be hiding among.
+            if let activity_log::Event::Reconciled { received, .. } = &event {
+                self.observed_arrivals += *received as u64;
             }
             self.log.push(event);
         }
@@ -1224,6 +1250,171 @@ impl App {
                 )
             }
         }
+    }
+
+    /// Seal one message to one peer, without placing it in the corpus.
+    ///
+    /// The path `send` takes, factored out so a group copy is the same object
+    /// a private message is — a second sealing path would be a second place to
+    /// get the AAD, the mode, or the prekey selection wrong.
+    fn seal_one(&self, peer: &str, text: &str) -> Option<(krab_core::object::ObjectId, Vec<u8>)> {
+        let id = self.identity.as_ref()?;
+        let w = self.epoch_key?;
+        let card = std::fs::read(self.peer_path(peer, "link"))
+            .ok()
+            .and_then(|b| peering::Card::decode(&b).ok())
+            .filter(|c| c.verify())?;
+
+        let epoch = now_epoch();
+        let their_prekey = self.prekey_for(&card.node_id());
+        let reservoir = std::fs::read(self.peer_path(peer, "reservoir"))
+            .ok()
+            .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
+            .and_then(|raw| persist::decode_reservoir(&raw).ok())
+            .and_then(|(root, stored)| {
+                let mut r = krab_crypto::reservoir::Reservoir::new(root, stored);
+                if stored != epoch && !r.advance_to(epoch) {
+                    return None;
+                }
+                Some(r)
+            });
+        let chunk = reservoir.and_then(|r| r.chunk(epoch));
+
+        let their_pk = krab_crypto::dh::PublicKey(card.correspondence_pk);
+        let shared = id.agree_with(&their_pk)?;
+        let tag = krab_crypto::pairwise_tag(&shared, epoch);
+        let to = their_prekey.unwrap_or(their_pk);
+
+        let composed = compose::seal_to(
+            id.correspondence(),
+            &compose::Recipient::Known {
+                correspondence: &to,
+                tag,
+                chunk: chunk.as_ref(),
+            },
+            epoch,
+            0,
+            expiry_for(epoch),
+            text.as_bytes(),
+            &mut OsRng,
+        )
+        .ok()?;
+        Some((composed.id, composed.bytes))
+    }
+
+    /// Send to a group — RFC 6 §2's fan-out.
+    ///
+    /// One sealed copy per member, to that member. There is no shared group
+    /// key, so a compromised member exposes **that member** and nobody else —
+    /// which is the whole reason to pay `(G−1)×` for it.
+    ///
+    /// Emission is staggered (RFC 6 §2.7). The copies do not enter the corpus
+    /// now; they are held and released over a window derived from the observed
+    /// background rate, because `G−1` objects appearing together in one size
+    /// bucket announces both the fan-out and its size.
+    fn group_send(&mut self, name: Option<&str>, text: &str) -> String {
+        let (Some(name), false) = (name, text.is_empty()) else {
+            return "usage: group send <name> <text>".into();
+        };
+        let Some(g) = self.groups.iter().find(|g| g.name == name).cloned() else {
+            return format!("no group called {name}");
+        };
+        let me = match self.identity.as_ref().map(|i| i.node_id()) {
+            Some(m) => m,
+            None => return "no identity".into(),
+        };
+        // Everyone but us. A copy addressed to ourselves is one we would then
+        // have to filter out of our own inbox.
+        let others: Vec<[u8; 32]> = g.members.iter().copied().filter(|m| *m != me).collect();
+        if others.is_empty() {
+            return format!("\"{name}\" has no members but you. `group add {name} <peer>` first.");
+        }
+
+        // Seal each copy through the same path a private message takes, so a
+        // group message is not a second kind of object with its own bugs.
+        let mut sealed = Vec::new();
+        let mut refused = Vec::new();
+        for member in &others {
+            let short = short_id(member);
+            match self.seal_one(&short, text) {
+                Some((id, bytes)) => sealed.push((id, bytes)),
+                None => refused.push(short),
+            }
+        }
+        if sealed.is_empty() {
+            return format!(
+                "nothing could be sealed for \"{name}\". Members must be peers \
+                 you hold a link for: {}",
+                refused.join(", ")
+            );
+        }
+
+        let window = fanout::window_seconds(g.members.len(), self.background_rate());
+        let offsets = fanout::offsets(g.members.len(), self.background_rate(), &mut OsRng);
+        let now_s = now_seconds();
+        for ((id, bytes), off) in sealed.iter().zip(offsets.iter()) {
+            self.pending.push(fanout::Pending {
+                release_at_s: now_s + off,
+                id: *id,
+                bytes: bytes.clone(),
+            });
+        }
+
+        let mut out = format!(
+            "{} copy(ies) sealed for \"{name}\", one per member.\n\n\
+             They are held and released over about {:.1} hours (RFC 6 §2.7): \
+             {} objects appearing together in one size bucket would announce \
+             both the fan-out and how many people are in it.",
+            sealed.len(),
+            window as f64 / 3600.0,
+            sealed.len()
+        );
+        if !refused.is_empty() {
+            out.push_str(&format!(
+                "\n\nNOT sent to {} — no peer-link. They will not receive this, \
+                 and nothing will tell them so.",
+                refused.join(", ")
+            ));
+        }
+        out
+    }
+
+    /// Release any fan-out copies whose time has come.
+    fn release_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let now_s = now_seconds();
+        let now_min = now_epoch().0 * 1440;
+        let mut still = Vec::new();
+        for p in std::mem::take(&mut self.pending) {
+            if p.release_at_s > now_s {
+                still.push(p);
+                continue;
+            }
+            let _ = self
+                .store
+                .with(|s| s.ingest(p.id, p.bytes, now_min, u32::MAX));
+        }
+        let released = !still.is_empty() || !self.pending.is_empty();
+        self.pending = still;
+        if released {
+            self.save_corpus();
+        }
+    }
+
+    /// Objects per hour arriving from the network, as this node has observed
+    /// them.
+    ///
+    /// **Observed, never assumed** — RFC 6 §2.7 forbids a constant. With
+    /// nothing observed yet, `fanout` substitutes the quietest network the RFC
+    /// publishes, which widens the window rather than narrowing it.
+    fn background_rate(&self) -> f64 {
+        let hours = self.observed_hours;
+        if hours <= 0.0 {
+            return 0.0;
+        }
+        self.observed_arrivals as f64 / hours
     }
 
     /// Publish this node's view of a roster — RFC 6 §2.6's "ordinary signed
@@ -1680,12 +1871,19 @@ impl App {
                     "remove" => {
                         self.group_member(arg(line, 2).as_deref(), arg(line, 3).as_deref(), false)
                     }
+                    "send" => {
+                        let text = words::split(line)
+                            .map(|w| words::rest(&w, 3))
+                            .unwrap_or_default();
+                        self.group_send(arg(line, 2).as_deref(), text.trim())
+                    }
                     "list" | "" => self.group_list(),
                     other => format!(
                         "unknown: group {other}\n\n\
                          group new <name>              a closed roster, sealed per member\n\
                          group add <name> <peer>       add a member\n\
                          group remove <name> <peer>    remove one\n\
+                         group send <name> <text>      seal one copy per member\n\
                          group list                    rosters and epochs"
                     ),
                 };
@@ -3424,6 +3622,10 @@ impl App {
         if !arrived.is_empty() {
             self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
         }
+        // RFC 6 §2.7's window is derived from the *observed* rate. Every tick
+        // is a sample of elapsed time whether or not anything arrived — a rate
+        // measured only when busy is not a background rate.
+        self.observed_hours += TICK.as_secs_f64() / 3600.0;
         for (session, static_pk) in arrived {
             // Which peering this is. The listener verified the static against
             // the set; this maps it back to the directory it belongs to.
@@ -8005,5 +8207,123 @@ mod tests {
             "a stranger wrote on the screen:\n{}",
             a.output
         );
+    }
+
+    /// **A group message reaches every member.** One sealed copy each, opened
+    /// with each member's own key — there is no shared group key, which is
+    /// what makes one compromised member expose one member.
+    #[test]
+    fn a_group_message_is_sealed_once_per_member_and_opens() {
+        let (mut a, mut b, _a_id, b_id) = peered_pair("group-send");
+        type_command(&mut a, "group new friends");
+        type_command(&mut a, &format!("group add friends {b_id}"));
+
+        type_command(&mut a, "group send friends the meeting is moved");
+        assert!(a.output.contains("1 copy"), "{}", a.output);
+        assert!(
+            a.output.contains("released over"),
+            "the stagger is not reported:\n{}",
+            a.output
+        );
+
+        // **Nothing is in the corpus yet.** RFC 6 §2.7: the copies are held.
+        assert_eq!(a.pending.len(), 1, "the copy was not held for staggering");
+
+        // Release, carry, and read.
+        for p in std::mem::take(&mut a.pending) {
+            let now_min = now_epoch().0 * 1440;
+            a.store
+                .with(|s| s.ingest(p.id, p.bytes, now_min, u32::MAX))
+                .expect("a well-formed object");
+        }
+        let now_min = now_epoch().0 * 1440;
+        let carried: Vec<(krab_core::object::ObjectId, Vec<u8>)> = a.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|x| (i, x.to_vec())))
+                .collect()
+        });
+        for (i, bytes) in carried {
+            let _ = b.store.with(|s| s.ingest(i, bytes, now_min, u32::MAX));
+        }
+        b.refresh_inbox();
+        assert!(
+            b.messages
+                .iter()
+                .any(|m| m.body.contains("meeting is moved")),
+            "the member never received it: {:?}",
+            b.messages.iter().map(|m| &m.body).collect::<Vec<_>>()
+        );
+    }
+
+    /// **RFC 6 §2.7.** Copies are held, not emitted together, and they are
+    /// released as their times come rather than all at once.
+    #[test]
+    fn fan_out_copies_are_staggered_rather_than_emitted_together() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("group-stagger");
+        type_command(&mut a, "group new friends");
+        type_command(&mut a, &format!("group add friends {b_id}"));
+        // Enough members to make a window worth measuring; only one is a real
+        // peer, so only one copy seals — the rest are reported as unreachable.
+        let i = a.groups.iter().position(|g| g.name == "friends").unwrap();
+        for n in 0..8u8 {
+            a.groups[i].members.push([n; 32]);
+        }
+        type_command(&mut a, "group send friends hello");
+        assert!(
+            a.output.contains("NOT sent to"),
+            "members with no peer-link must be named:\n{}",
+            a.output
+        );
+
+        // Held, with a release time in the future.
+        assert_eq!(a.pending.len(), 1);
+        assert!(
+            a.pending[0].release_at_s > now_seconds(),
+            "the copy was released immediately, which is the burst §2.7 forbids"
+        );
+        let store_before = a.store.len();
+        a.release_pending();
+        assert_eq!(a.store.len(), store_before, "it was released early");
+        assert_eq!(a.pending.len(), 1, "it was dropped rather than held");
+
+        // Once due, it goes in.
+        a.pending[0].release_at_s = 0;
+        a.release_pending();
+        assert!(a.pending.is_empty());
+        assert_eq!(a.store.len(), store_before + 1);
+    }
+
+    /// The window is derived from what this node has observed, never from a
+    /// constant — RFC 6 §2.7 says so in exactly those words.
+    #[test]
+    fn the_stagger_window_follows_the_observed_rate() {
+        let mut a = ready_node("group-rate");
+        assert_eq!(
+            a.background_rate(),
+            0.0,
+            "an unobserved rate is not a number"
+        );
+
+        a.observed_hours = 10.0;
+        a.observed_arrivals = 500;
+        assert!((a.background_rate() - 50.0).abs() < 0.001);
+
+        // Busier network, narrower window.
+        let busy = fanout::window_seconds(20, a.background_rate());
+        a.observed_arrivals = 50;
+        let quiet = fanout::window_seconds(20, a.background_rate());
+        assert!(quiet > busy, "a quieter network must stagger for longer");
+    }
+
+    /// A group of one has nobody to send to, and says so rather than sealing
+    /// a copy to its own author.
+    #[test]
+    fn a_group_with_only_you_refuses_to_send() {
+        let mut a = ready_node("group-alone");
+        type_command(&mut a, "group new alone");
+        type_command(&mut a, "group send alone nobody there");
+        assert!(a.output.contains("no members but you"), "{}", a.output);
+        assert!(a.pending.is_empty());
     }
 }
