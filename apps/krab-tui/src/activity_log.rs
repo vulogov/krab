@@ -68,6 +68,14 @@ pub enum Event {
         /// The ratchet index adopted.
         index: u32,
     },
+    /// A prekey batch was republished — RFC 7 §5.1's rotation.
+    ///
+    /// Worth a line: it is the event that bounds worst-case exposure, and an
+    /// operator who never sees one has a node whose exposure is unbounded.
+    Republished {
+        /// How many keys were published.
+        keys: String,
+    },
     /// A transport went down or failed.
     LinkDown {
         /// Short peer identifier.
@@ -104,6 +112,7 @@ impl Event {
     #[allow(dead_code)]
     pub fn peer(&self) -> &str {
         match self {
+            Event::Republished { .. } => "self",
             Event::LinkUp { peer, .. }
             | Event::Rekeyed { peer, .. }
             | Event::LinkDown { peer }
@@ -121,6 +130,7 @@ impl Event {
         match self {
             Event::LinkUp { peer, kind } => format!("{peer}  link up ({kind})"),
             Event::Rekeyed { peer, index } => format!("{peer}  re-keyed at {index}"),
+            Event::Republished { keys } => format!("published {keys} prekeys"),
             Event::LinkDown { peer } => format!("{peer}  link down"),
             Event::Reconciled {
                 peer,

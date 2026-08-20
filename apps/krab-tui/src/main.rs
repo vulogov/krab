@@ -150,6 +150,23 @@ const OUTPUT_SCROLL_LINES: usize = 8;
 /// an operator could mistake it for continuous traffic.
 const ACTIVITY_GLYPH_TICKS: u8 = 20;
 
+/// Epochs between signed-prekey rotations — RFC 7 §5.1's "weekly to monthly",
+/// and RFC 6 §2.8's "members of large groups MUST republish weekly".
+///
+/// Seven, the shorter end. The signed prekey is the fallback every sender
+/// reaches when a batch is exhausted, so it is the key most likely to be in
+/// use for longest, and RFC 7 §5's claim is that exposure is bounded by *this*
+/// period. Choosing the monthly end would quadruple that bound to save six
+/// bulletins a month.
+const SIGNED_PREKEY_EPOCHS: u32 = 7;
+
+/// How often a node republishes a batch, in epochs.
+///
+/// Also weekly. RFC 6 §2.8 requires it for large groups and there is no reason
+/// for a small node to be different: a batch that is never replenished is one
+/// that eventually exhausts, and exhaustion degrades forward secrecy silently.
+const REPUBLISH_EPOCHS: u32 = 7;
+
 /// Where a node keeps its store when `--home` is not given.
 ///
 /// Under test this is a scratch directory, not the working directory. It was
@@ -700,6 +717,7 @@ impl App {
     fn tick_schedule(&mut self) {
         self.drain_inbound();
         self.release_pending();
+        self.republish_prekeys_if_due();
         self.shred_expired_epochs();
         self.enforce_retention();
         let now_s = std::time::SystemTime::now()
@@ -815,6 +833,56 @@ impl App {
         }
     }
 
+    /// Answer a reconciliation a peer opened.
+    ///
+    /// **This had no caller.** `reconcile_with` initiates; nothing responded,
+    /// so a node that accepted a session installed it and then never spoke.
+    /// An exchange has two halves and only one was wired, which meant
+    /// reconciliation could not complete in either direction — the property
+    /// every other feature in this program assumes.
+    ///
+    /// Runs on the same thread pattern as `reconcile_with`, for the same
+    /// reason: an exchange over serial is minutes (RFC 4 §5.3) and holding the
+    /// render loop would take the lock chord with it.
+    fn answer_reconciliation(&mut self, peer: &str) -> Option<()> {
+        let window = {
+            let now = now_epoch().0 * 1440;
+            (
+                now.saturating_sub(45 * 1440),
+                now.saturating_add(45 * 1440) + 1,
+            )
+        };
+        let session = self.links.take_session(peer)?;
+        let view_store = self.store.clone();
+        let carriage = self.roster.carriage;
+        let done = self.exchanges.0.clone();
+        let name = peer.to_string();
+        self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
+        std::thread::spawn(move || {
+            let mut session = session;
+            let mut view = shared::ExchangeView::new(view_store, window.0, carriage);
+            let event = match krab_node::exchange::respond_to(
+                &mut *session,
+                &mut view,
+                [0u8; 32],
+                window.0,
+                window.1,
+            ) {
+                Ok(moved) => activity_log::Event::Reconciled {
+                    peer: name,
+                    received: moved.received,
+                    sent: moved.sent,
+                },
+                Err(_) => activity_log::Event::Failed {
+                    peer: name,
+                    why: "the exchange did not complete",
+                },
+            };
+            let _ = done.send(event);
+        });
+        Some(())
+    }
+
     /// Reconcile with one peer over its established session.
     ///
     /// **Called only from the schedule.** `connect` cannot reach this: it goes
@@ -853,6 +921,9 @@ impl App {
         OsRng.fill(&mut salt);
         let salt = u64::from_le_bytes(salt);
         let view_store = self.store.clone();
+        // Captured before the thread starts: what this node is willing to host
+        // is a decision the operator made, not one the exchange makes.
+        let carriage = self.roster.carriage;
         let done = self.exchanges.0.clone();
         let name = peer.to_string();
         // An exchange is about to put bytes on the link in both directions.
@@ -863,7 +934,7 @@ impl App {
         self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
         std::thread::spawn(move || {
             let mut session = session;
-            let mut view = shared::ExchangeView::new(view_store, window.0);
+            let mut view = shared::ExchangeView::new(view_store, window.0, carriage);
             let event = match krab_node::exchange::initiate(
                 &mut *session,
                 &mut view,
@@ -1249,6 +1320,43 @@ impl App {
                     self.groups[i].epoch
                 )
             }
+        }
+    }
+
+    /// Republish a prekey batch when the cadence says to.
+    ///
+    /// **RFC 7 §5's claim depends on this running.** "Worst-case exposure is
+    /// the signed-prekey rotation period rather than for ever" is only true if
+    /// something rotates it; `publish_prekeys` had exactly one caller, at the
+    /// end of `init`, so the period was in fact for ever and the property the
+    /// interface reported was not the one being delivered.
+    ///
+    /// Reads the epoch off the last batch this node published rather than
+    /// keeping a timer, so a node that was off for a month republishes on its
+    /// next tick instead of waiting another week.
+    fn republish_prekeys_if_due(&mut self) {
+        if self.identity.is_none() || self.epoch_key.is_none() {
+            return;
+        }
+        let me = self.identity.as_ref().map(|i| i.node_id());
+        let mut newest = 0u32;
+        self.store.with(|s| {
+            for (_, oid) in s.entries_in_range(0, u32::MAX) {
+                if let Some(b) = s.get(&oid).and_then(bulletin::from_object) {
+                    if b.kind == bulletin::Kind::Prekeys && Some(b.node_id()) == me {
+                        newest = newest.max(b.epoch);
+                    }
+                }
+            }
+        });
+        let now = now_epoch().0;
+        if newest != 0 && now.saturating_sub(newest) < REPUBLISH_EPOCHS {
+            return;
+        }
+        if let Some(note) = self.publish_prekeys() {
+            self.log.push(activity_log::Event::Republished {
+                keys: note.split_whitespace().nth(1).unwrap_or("?").to_string(),
+            });
         }
     }
 
@@ -3642,6 +3750,10 @@ impl App {
                 peer: who.clone(),
                 kind: "tcp",
             });
+            // The caller dialled in order to say something. Answering is not a
+            // transfer this node chose to start — RFC 8 §5.1's rule is that a
+            // *keypress* never causes one, and nobody pressed anything here.
+            self.answer_reconciliation(&who);
         }
     }
 
@@ -3790,19 +3902,53 @@ impl App {
         let id = self.identity.as_ref()?;
         let epoch = now_epoch();
 
-        // A fresh ring each time this runs. `Ring::rotate` exists for keeping
-        // one across a signed-prekey rotation, and is not reached until there
-        // is a schedule to drive it — noted rather than half-wired.
-        let signed = krab_crypto::prekey::SignedPrekey::create(id.signing_key(), epoch, &mut OsRng);
-        let mut ring = krab_crypto::prekey::Ring::new(signed);
-        let published = prekeys::publish(&mut ring, epoch, &mut OsRng);
+        // **Rotate, never replace.** An earlier version built a fresh ring on
+        // every call, which discarded the private halves of the previous batch
+        // — so any message already encapsulated to one of those prekeys became
+        // unreadable. It was only ever called once, at `init`, which is why
+        // that did not show.
+        let mut ring = std::fs::read(self.path("prekeys.ring"))
+            .ok()
+            .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/prekeys", &sealed).ok())
+            .and_then(|raw| prekeys::decode_ring(&raw));
 
-        // Private halves, sealed under the epoch key exactly as the reservoir
-        // is. Never written in the clear: a prekey ring is decryption keys.
+        let rotated = match &mut ring {
+            Some(r) => {
+                // RFC 7 §5.1's tier rotates weekly-to-monthly. Rotating the
+                // signed prekey is what bounds worst-case exposure to the
+                // rotation period rather than for ever, which is the whole
+                // claim §5 makes.
+                let due = epoch.0.saturating_sub(r.signed().epoch.0) >= SIGNED_PREKEY_EPOCHS;
+                if due {
+                    r.rotate(krab_crypto::prekey::SignedPrekey::create(
+                        id.signing_key(),
+                        epoch,
+                        &mut OsRng,
+                    ));
+                }
+                due
+            }
+            None => {
+                ring = Some(krab_crypto::prekey::Ring::new(
+                    krab_crypto::prekey::SignedPrekey::create(id.signing_key(), epoch, &mut OsRng),
+                ));
+                true
+            }
+        };
+        let ring = ring.as_mut()?;
+
+        // Retire batches older than the acceptance window — RFC 7 §5.2:
+        // **on a schedule, never on use.** The floor is `EPOCH_WINDOW`
+        // because RFC 1 §6.2 gives an object that long to arrive, so a key
+        // dropped sooner strands mail that is still legitimately in flight.
+        let keep_from = krab_core::tag::Epoch(epoch.0.saturating_sub(krab_core::tag::EPOCH_WINDOW));
+        let retired = ring.retire(keep_from);
+
+        let published = prekeys::publish(ring, epoch, &mut OsRng);
         let sealed = krab_crypto::kek::seal_under(
             &w,
             b"krab/prekeys",
-            &prekeys::encode_ring(&ring),
+            &prekeys::encode_ring(ring),
             &mut OsRng,
         )
         .ok()?;
@@ -3814,10 +3960,6 @@ impl App {
             epoch.0,
             published.encode(),
         );
-        // A bulletin is not an object until it has a routing header, and an
-        // `ingest` whose error is discarded looks exactly like one that
-        // worked — which is how a published batch reaches nobody while the
-        // node reports success. It reached nobody, first time round.
         let now_min = epoch.0 * 1440;
         let ttl = krab_core::tag::MAX_TTL_DAYS * 1440;
         let (oid, bytes) = bulletin::into_object(&b, now_min, ttl)?;
@@ -3825,12 +3967,28 @@ impl App {
             return Some(format!("could not publish prekeys: {e:?}"));
         }
         self.save_corpus();
-        Some(format!(
+
+        let mut out = format!(
             "published {} one-time prekeys. They flood as a signed bulletin, \
              so a correspondent encapsulates to a key that expires rather than \
              to your permanent one (RFC 7 §5).",
             published.keys.len()
-        ))
+        );
+        if rotated {
+            out.push_str(
+                "\n\nThe signed prekey rotated. Worst-case exposure is now \
+                 bounded by the rotation period rather than by the life of the \
+                 identity key.",
+            );
+        }
+        if retired > 0 {
+            out.push_str(&format!(
+                "\n\n{retired} batch(es) retired — on schedule, never on use \
+                 (RFC 7 §5.2), and only past the window mail is allowed to \
+                 arrive in."
+            ));
+        }
+        Some(out)
     }
 
     fn open_store(&mut self) -> Result<(), String> {
@@ -5288,15 +5446,30 @@ mod tests {
         type_command(&mut a, "connect a1b2c3d4 tcp");
         a.composer.push_str("a draft in progress");
         a.command = line::Line::from("half-typed");
-        let before = (a.composer.clone(), a.command.clone(), a.store.len());
+        let before = (a.composer.clone(), a.command.clone());
 
         for _ in 0..20 {
             a.tick_schedule();
         }
-        assert_eq!(
-            (a.composer.clone(), a.command.clone(), a.store.len()),
-            before
-        );
+        assert_eq!((a.composer.clone(), a.command.clone()), before);
+
+        // The corpus is not user state, and the schedule does write to it —
+        // RFC 7 §5.1's prekey rotation has to happen without anyone typing.
+        // What it must not do is add anything else, or take anything away.
+        let me = a.identity.as_ref().unwrap().node_id();
+        let (mine, other) = a.store.with(|s| {
+            let mut mine = 0;
+            let mut other = 0;
+            for (_, id) in s.entries_in_range(0, u32::MAX) {
+                match s.get(&id).and_then(bulletin::from_object) {
+                    Some(b) if b.kind == bulletin::Kind::Prekeys && b.node_id() == me => mine += 1,
+                    _ => other += 1,
+                }
+            }
+            (mine, other)
+        });
+        assert_eq!(mine, 1, "the schedule published {mine} batches, not one");
+        assert_eq!(other, 0, "the schedule put something else in the corpus");
         // And it publishes a window rather than a countdown.
         let l = a.links.get("a1b2c3d4").expect("connected");
         assert!(
@@ -7314,22 +7487,19 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             b.drain_inbound();
-            if b.links
-                .get(&a_id)
-                .and_then(|l| l.session.as_ref())
-                .is_some()
-            {
+            if b.links.get(&a_id).is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        // The peer is in the link table. Its *session* is not: accepting hands
+        // it straight to the responder, because a caller who dialled did so in
+        // order to say something and there is no keypress to wait for.
         assert!(
-            b.links
-                .get(&a_id)
-                .and_then(|l| l.session.as_ref())
-                .is_some(),
-            "the accepted session never reached the link table"
+            b.links.get(&a_id).is_some(),
+            "the accepted call never reached the link table"
         );
+        assert!(b.inbound_ticks > 0, "the arrival was not registered");
     }
 
     /// One socket, not one per peer — a port per peer would publish the size
@@ -8325,5 +8495,249 @@ mod tests {
         type_command(&mut a, "group send alone nobody there");
         assert!(a.output.contains("no members but you"), "{}", a.output);
         assert!(a.pending.is_empty());
+    }
+
+    /// **Republishing must not destroy the keys already in flight.** An
+    /// earlier version built a fresh ring on every call, so the previous
+    /// batch's private halves were discarded and any message already
+    /// encapsulated to one became unreadable. It had one caller, at `init`,
+    /// which is why that never showed.
+    #[test]
+    fn republishing_keeps_the_private_halves_of_earlier_batches() {
+        let mut a = ready_node("prekey-rotate");
+        a.publish_prekeys().expect("a first batch");
+        let first = a.opening_keys().len();
+        assert!(first > 1, "the first batch published nothing");
+
+        // A message sealed to a key from the first batch.
+        let published = {
+            let w = a.epoch_key.unwrap();
+            let raw = krab_crypto::kek::open_under(
+                &w,
+                b"krab/prekeys",
+                &std::fs::read(a.path("prekeys.ring")).unwrap(),
+            )
+            .unwrap();
+            prekeys::decode_ring(&raw).expect("a ring")
+        };
+        let target = published.candidates()[3].public();
+
+        a.publish_prekeys().expect("republishes");
+        let after = a.opening_keys();
+        assert!(
+            after.iter().any(|k| k.public().0 == target.0),
+            "a key from the previous batch was destroyed by republishing"
+        );
+        assert!(
+            after.len() > first,
+            "republishing added nothing: {} then {}",
+            first,
+            after.len()
+        );
+    }
+
+    /// **RFC 7 §5.1's rotation is what bounds exposure.** Without a caller the
+    /// period is for ever, which is not the property §5 claims.
+    #[test]
+    fn the_signed_prekey_rotates_on_its_cadence() {
+        let mut a = ready_node("prekey-cadence");
+        a.publish_prekeys().expect("a first batch");
+        let read_ring = |a: &App| {
+            let w = a.epoch_key.unwrap();
+            let raw = krab_crypto::kek::open_under(
+                &w,
+                b"krab/prekeys",
+                &std::fs::read(a.path("prekeys.ring")).unwrap(),
+            )
+            .unwrap();
+            prekeys::decode_ring(&raw).expect("a ring")
+        };
+        let before = read_ring(&a).signed().public().0;
+
+        // Same epoch: no rotation, because the tier is weekly and not
+        // per-publication.
+        a.publish_prekeys().expect("republishes");
+        assert_eq!(
+            read_ring(&a).signed().public().0,
+            before,
+            "it rotated early"
+        );
+
+        // Backdate the signed prekey past the cadence.
+        {
+            let w = a.epoch_key.unwrap();
+            let mut ring = read_ring(&a);
+            ring.rotate(krab_crypto::prekey::SignedPrekey::create(
+                a.identity.as_ref().unwrap().signing_key(),
+                krab_core::tag::Epoch(now_epoch().0 - SIGNED_PREKEY_EPOCHS),
+                &mut OsRng,
+            ));
+            let sealed = krab_crypto::kek::seal_under(
+                &w,
+                b"krab/prekeys",
+                &prekeys::encode_ring(&ring),
+                &mut OsRng,
+            )
+            .unwrap();
+            atomic::write(&a.path("prekeys.ring"), &sealed).unwrap();
+        }
+        let stale = read_ring(&a).signed().public().0;
+        let out = a.publish_prekeys().expect("republishes");
+        assert!(out.contains("rotated"), "{out}");
+        assert_ne!(
+            read_ring(&a).signed().public().0,
+            stale,
+            "the signed prekey did not rotate past its cadence"
+        );
+    }
+
+    /// The scheduler republishes without anybody typing, and does not
+    /// republish every tick.
+    #[test]
+    fn the_schedule_republishes_prekeys_when_due() {
+        let mut a = ready_node("prekey-schedule");
+        let batches = |a: &App| {
+            let me = a.identity.as_ref().unwrap().node_id();
+            a.store.with(|s| {
+                s.entries_in_range(0, u32::MAX)
+                    .into_iter()
+                    .filter(|(_, i)| {
+                        s.get(i)
+                            .and_then(bulletin::from_object)
+                            .is_some_and(|b| b.kind == bulletin::Kind::Prekeys && b.node_id() == me)
+                    })
+                    .count()
+            })
+        };
+        // A node with no batch publishes on its first tick, rather than
+        // depending on the ceremony having run — `unlock` does not go through
+        // `init`, and a restarted node must not be left without prekeys.
+        assert_eq!(batches(&a), 0);
+        a.republish_prekeys_if_due();
+        assert_eq!(batches(&a), 1, "the schedule never published a first batch");
+
+        a.republish_prekeys_if_due();
+        assert_eq!(batches(&a), 1, "it republished on the same day");
+
+        // Nothing published within the cadence: due again.
+        a.store = shared::SharedStore::new(krab_store::index::Store::new());
+        a.republish_prekeys_if_due();
+        assert_eq!(batches(&a), 1, "the schedule did not republish when due");
+        assert!(
+            a.log.recent(8).iter().any(|l| l.contains("prekeys")),
+            "the rotation is not in the activity log: {:?}",
+            a.log.recent(8)
+        );
+    }
+
+    /// Retirement is on a schedule and only past the window mail may arrive
+    /// in — RFC 7 §5.2 and RFC 1 §6.2. A key dropped sooner strands mail that
+    /// is still legitimately in flight.
+    #[test]
+    fn batches_retire_only_past_the_acceptance_window() {
+        let mut ring = krab_crypto::prekey::Ring::new(krab_crypto::prekey::SignedPrekey::create(
+            &krab_crypto::sign::SigningKey::generate(&mut OsRng),
+            krab_core::tag::Epoch(1_000),
+            &mut OsRng,
+        ));
+        // Both inside the window that ends at "now" = 1050.
+        ring.add_batch(4, krab_core::tag::Epoch(1_040), &mut OsRng);
+        ring.add_batch(4, krab_core::tag::Epoch(1_050), &mut OsRng);
+        assert_eq!(
+            ring.retire(krab_core::tag::Epoch(1_050 - krab_core::tag::EPOCH_WINDOW)),
+            0,
+            "a batch inside the acceptance window was retired — mail still in \
+             flight to it would be stranded"
+        );
+        assert_eq!(ring.batch_count(), 2);
+
+        // One falls out of the window.
+        assert_eq!(ring.retire(krab_core::tag::Epoch(1_045)), 1);
+        assert_eq!(ring.batch_count(), 1);
+    }
+
+    /// **The assumption everything else rests on.** Two live nodes, a real
+    /// pair of sessions, a message crossing by reconciliation rather than by a
+    /// test copying objects between stores.
+    ///
+    /// Nothing exercised this. `reconcile_with` initiated and **nothing
+    /// responded** — `exchange::respond_to` had no caller in the application
+    /// at all — so a node that accepted a session installed it and never
+    /// spoke. Every feature built on top of reconciliation was built on a path
+    /// that could not complete.
+    #[test]
+    fn a_message_crosses_between_two_nodes_by_reconciliation() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("recon-live");
+
+        type_command(&mut a, &format!("send {b_id} bring the good coffee"));
+        assert!(a.output.contains("composed"), "{}", a.output);
+        assert!(b.messages.is_empty(), "B has it before anything moved");
+
+        // A pair of in-process sessions, as `listen`/`connect` would leave.
+        let (sa, sb) = session_pair();
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+        a.links.established(&b_id, Some(Box::new(sa)));
+        b.links.connect(&a_id, profile_named("tcp").unwrap());
+        b.links.established(&a_id, Some(Box::new(sb)));
+
+        // B answers; A initiates. Both halves, which is the point.
+        let a_peer = a_id.clone();
+        let responder = std::thread::spawn(move || {
+            b.answer_reconciliation(&a_peer);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                b.drain_exchanges();
+                if !b.messages.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            b
+        });
+
+        a.reconcile_with(&b_id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut sent = 0;
+        while std::time::Instant::now() < deadline && sent == 0 {
+            while let Ok(e) = a.exchanges.1.try_recv() {
+                if let activity_log::Event::Reconciled { sent: n, .. } = e {
+                    sent = n;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let b = responder.join().expect("B's thread");
+
+        assert!(sent > 0, "A sent nothing — the exchange did not complete");
+        assert!(
+            b.messages.iter().any(|m| m.body.contains("good coffee")),
+            "the message did not arrive: {:?}",
+            b.messages.iter().map(|m| &m.body).collect::<Vec<_>>()
+        );
+    }
+
+    /// And it is the *schedule* that drives it, never a keypress — RFC 8
+    /// §5.1. `connect` establishes a session and transfers nothing.
+    #[test]
+    fn connecting_transfers_nothing_by_itself() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("recon-no-keypress");
+        type_command(&mut a, &format!("send {b_id} not yet"));
+        let (sa, _sb) = session_pair();
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+        a.links.established(&b_id, Some(Box::new(sa)));
+
+        // The link is up and there is mail queued; nothing has left.
+        assert!(
+            a.links
+                .get(&b_id)
+                .and_then(|l| l.session.as_ref())
+                .is_some(),
+            "the link is not up"
+        );
+        let mut moved = false;
+        while a.exchanges.1.try_recv().is_ok() {
+            moved = true;
+        }
+        assert!(!moved, "connecting caused a transfer");
     }
 }

@@ -115,6 +115,16 @@ impl SignedPrekey {
         SignedPrekey { secret, epoch, sig }
     }
 
+    /// Rebuild from stored parts.
+    ///
+    /// The signature is not re-checked here: it was verified when the key was
+    /// created and this is the node's own sealed storage, not the wire. A
+    /// caller reading someone *else's* signed prekey uses
+    /// [`SignedPrekey::verify`].
+    pub fn from_parts(secret: SecretKey, epoch: Epoch, sig: Sig) -> SignedPrekey {
+        SignedPrekey { secret, epoch, sig }
+    }
+
     /// The public half.
     pub fn public(&self) -> PublicKey {
         self.secret.public()
@@ -283,6 +293,21 @@ impl Ring {
         let before = self.batches.len();
         self.batches.retain(|(_, epoch, _)| *epoch >= keep_from);
         before - self.batches.len()
+    }
+
+    /// The batches held, for storage.
+    ///
+    /// **With their epochs**, because [`Ring::retire`] is schedule-based and a
+    /// ring reloaded without them cannot retire anything — it would either
+    /// keep every key ever generated or drop keys that mail in flight was
+    /// encapsulated to. RFC 1 §6.2 gives an object `MAX_TTL` to arrive.
+    pub fn batches(&self) -> &[([u8; 32], Epoch, Vec<SecretKey>)] {
+        &self.batches
+    }
+
+    /// Adopt stored batches.
+    pub fn adopt(&mut self, batches: Vec<([u8; 32], Epoch, Vec<SecretKey>)>) {
+        self.batches = batches;
     }
 
     /// Rotate the signed prekey — RFC 7 §5.1's weekly-to-monthly tier.

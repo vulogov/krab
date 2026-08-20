@@ -165,9 +165,18 @@ use krab_crypto::rng::Rng;
 pub fn encode_ring(ring: &Ring) -> Vec<u8> {
     let signed = ring.signed();
     let mut w = cbor::Writer::new();
-    let mut flat = Vec::new();
-    for k in ring.candidates() {
-        flat.extend_from_slice(&k.to_bytes());
+    // Batches keep their identifiers and epochs. A ring reloaded without them
+    // cannot retire on schedule, and would either hold every key it ever
+    // generated or drop keys that mail still in flight was sealed to.
+    let mut batches = cbor::Writer::new();
+    let b = ring.batches();
+    batches.array(b.len() * 3);
+    for (id, epoch, keys) in b {
+        let mut flat = Vec::with_capacity(keys.len() * 32);
+        for k in keys {
+            flat.extend_from_slice(&k.to_bytes());
+        }
+        batches.bstr(id).uint(epoch.0 as u64).bstr(&flat);
     }
     w.map(4)
         .uint(1)
@@ -177,8 +186,51 @@ pub fn encode_ring(ring: &Ring) -> Vec<u8> {
         .uint(3)
         .bstr(&signed.sig.0)
         .uint(4)
-        .bstr(&flat);
+        .bstr(&batches.finish());
     w.finish()
+}
+
+/// Rebuild a ring from storage.
+pub fn decode_ring(bytes: &[u8]) -> Option<Ring> {
+    let mut r = cbor::Reader::new(bytes);
+    let mut m = r.map().ok()?;
+    if m.left() != 4 {
+        return None;
+    }
+    let secret: [u8; 32] = bstr_at(&mut m, 1)?.try_into().ok()?;
+    let epoch = Epoch(u32::try_from(uint_at(&mut m, 2)?).ok()?);
+    let sig: [u8; 64] = bstr_at(&mut m, 3)?.try_into().ok()?;
+    let raw = bstr_at(&mut m, 4)?;
+
+    let mut ring = Ring::new(SignedPrekey::from_parts(
+        SecretKey::from_bytes(secret),
+        epoch,
+        Sig(sig),
+    ));
+    let mut br = cbor::Reader::new(raw);
+    let mut batches = Vec::new();
+    if let Ok(cbor::Item::Array(n)) = br.item() {
+        for _ in 0..n / 3 {
+            let (Ok(cbor::Item::Bstr(id)), Ok(cbor::Item::Uint(e)), Ok(cbor::Item::Bstr(flat))) =
+                (br.item(), br.item(), br.item())
+            else {
+                break;
+            };
+            let (Ok(id), Ok(e)) = (<[u8; 32]>::try_from(id), u32::try_from(e)) else {
+                break;
+            };
+            if flat.len() % 32 != 0 || flat.len() / 32 > BATCH_KEYS * 4 {
+                break;
+            }
+            let keys = flat
+                .chunks_exact(32)
+                .map(|c| SecretKey::from_bytes(c.try_into().expect("32 bytes")))
+                .collect();
+            batches.push((id, Epoch(e), keys));
+        }
+    }
+    ring.adopt(batches);
+    Some(ring)
 }
 
 /// The private keys a node should try when opening an object.
@@ -188,23 +240,17 @@ pub fn encode_ring(ring: &Ring) -> Vec<u8> {
 /// module documentation for why an API that could return early eventually
 /// does.
 pub fn stored_candidates(bytes: &[u8]) -> Option<Vec<SecretKey>> {
-    let mut r = cbor::Reader::new(bytes);
-    let mut m = r.map().ok()?;
-    if m.left() != 4 {
-        return None;
-    }
-    let signed_sk: [u8; 32] = bstr_at(&mut m, 1)?.try_into().ok()?;
-    let _epoch = uint_at(&mut m, 2)?;
-    let _sig = bstr_at(&mut m, 3)?;
-    let flat = bstr_at(&mut m, 4)?;
-    if flat.len() % 32 != 0 {
-        return None;
-    }
-    let mut out = vec![SecretKey::from_bytes(signed_sk)];
-    for c in flat.chunks_exact(32) {
-        out.push(SecretKey::from_bytes(c.try_into().expect("32 bytes")));
-    }
-    Some(out)
+    // Through `decode_ring`, so there is one definition of the stored shape.
+    // There were two: the encoding grew batch epochs and this reader kept
+    // parsing the flat form, so it silently returned nothing and every message
+    // sealed to a prekey stopped opening.
+    let ring = decode_ring(bytes)?;
+    Some(
+        ring.candidates()
+            .into_iter()
+            .map(|k| SecretKey::from_bytes(k.to_bytes()))
+            .collect(),
+    )
 }
 
 fn at<'a>(m: &mut cbor::MapReader<'a, '_>, k: u64) -> Option<cbor::Item<'a>> {
