@@ -1,6 +1,9 @@
 # Moving a pad when you cannot meet — a proposal
 
-**Status: adopted in principle, not yet implemented.**
+**Status: §3's spoken route is implemented** — `peer wrap`, `peer seal …
+spoken`, and `Channel::Spoken`, in `apps/krab-tui/src/spoken.rs`. The in-band
+`network` bootstrap and `peer reseal` are not; `peer reseal` refuses rather
+than recording a classification it cannot honestly deliver.
 
 The framing this document opened with was wrong and is corrected here. It
 argued for a careful exception to a rule. The rule is the problem:

@@ -335,6 +335,17 @@ pub enum Peering {
     /// different channel requirements *and* different storage requirements, and
     /// a single command producing both invites leaving one behind.
     Pad,
+    /// Wrap the contribution under a spoken transfer key — `crate::spoken`.
+    ///
+    /// The route for two people who cannot meet. The wrapped file crosses any
+    /// network; the 32-word key crosses a voice call, once ever.
+    Wrap,
+    /// Upgrade a peering's channel classification in place.
+    ///
+    /// A weak peering is recoverable rather than permanent: start on
+    /// `network` today, `reseal` when you next meet, and keep the peer-link
+    /// and the message history throughout.
+    Reseal,
     /// Ingest the peer's card. Displays the fingerprint word list for RFC 3
     /// §11 step 2, which the operator must then read aloud.
     Accept,
@@ -357,6 +368,8 @@ impl Peering {
         Some(match rest.split_whitespace().next().unwrap_or("status") {
             "offer" => Peering::Offer,
             "pad" => Peering::Pad,
+            "wrap" => Peering::Wrap,
+            "reseal" => Peering::Reseal,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,
             "status" => Peering::Status,

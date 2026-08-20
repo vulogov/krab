@@ -145,6 +145,7 @@ guessed:
 |---|---|---|
 | `in-person` | handed over face to face | **yes** |
 | `media` | on physical media, carried | **yes** |
+| `spoken` | wrapped under 32 words read aloud on a call | **yes**, if the call is not recorded |
 | `corpus` | through the Krab network itself | no |
 | `network` | any other online path | no |
 
@@ -155,10 +156,9 @@ is exactly what a store-and-forward adversary is recording against later.
 **`in-person` or `media` if you can.** If you cannot, `corpus` still works and
 Krab will tell you what you got.
 
-Neither route practical? There is a proposal for moving a pad over a network
-without giving up the post-quantum property — a transfer key read aloud over a
-voice call, with all the warnings that implies. It is **not implemented**; see
-`PAD-OVER-NETWORK.md`.
+**Cannot meet at all?** Use `spoken` — §4b. The pad crosses the network; only
+32 words cross a voice call, once ever. It keeps the post-quantum property,
+because the words never touch the wire.
 
 ---
 
@@ -185,6 +185,72 @@ ceremony.
 
 For a sneakernet peering, carry the medium. For an in-person one, exchange
 media or read it across. Do not email it.
+
+---
+
+## 4b. Peering at a distance: `peer wrap`
+
+For two people who will not meet. Instead of carrying a pad, wrap it under a
+key that only ever crosses a voice call.
+
+```
+> peer wrap /tmp/alice.wrapped
+wrote /tmp/alice.wrapped
+
+That file is safe to send over anything — email, chat, a shared drive.
+It is useless without the words below.
+
+READ THESE ALOUD, on a live voice call, and nowhere else:
+
+  <32 words>
+```
+
+Send the file however you like. Read the words on the call you are already
+making for step 3. Then each end runs:
+
+```
+> peer seal from-bob.wrapped spoken
+type the 32 words they read to you, separated by spaces.
+
+> <the 32 words>
+peer-link signed with <fingerprint>
+```
+
+The words are typed at a **prompt**, not on the command line, so they never
+enter the command history.
+
+### Why this keeps the post-quantum property
+
+The wrapping is symmetric throughout — a 256-bit key, Argon2id, an AEAD — and
+that key never touched the wire. There is nothing for a quantum computer to
+solve. Contrast a PAKE (CPace, SPAKE2, OPAQUE): all Diffie–Hellman based, so
+they fail exactly the adversary the reservoir exists for. **A PAKE here would
+look stronger and be weaker.**
+
+Krab generates the words; you cannot choose them. A chosen phrase is
+guessable, and an offline dictionary attack against the recorded file then
+recovers the pad — silently, with the peering appearing to have worked.
+
+32 words is 256 bits: the alphabet carries 8 bits per word, and even and odd
+positions draw from different lists, so **a transposition is audible** — two
+words read out of order land in the wrong alphabet and are rejected rather
+than producing a different key.
+
+### What defeats it
+
+- **A recorded call.** The words are the whole protection. A spoken key over
+  a recorded call is `network`, not `spoken`, and nothing in the software can
+  tell the difference.
+- **A synthesised voice.** Cheap now. The fingerprint comparison does not
+  help — an attacker relaying the call reads them faithfully. Ask something
+  only they would know, that is in no message either of you has sent.
+- **Typing the words into chat "so they can copy them."** This puts the key
+  on the same recorded channel as the file and downgrades the peering
+  invisibly, while the interface still says `spoken`. It is the likeliest way
+  this fails in practice.
+
+Krab cannot verify any of it. `spoken` means *"I assert I did this properly"*,
+exactly as `in-person` does.
 
 ---
 

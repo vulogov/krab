@@ -69,6 +69,16 @@ pub enum Channel {
     InPerson,
     /// Physically transported media — the courier leg of RFC 4 §6.
     RemovableMedia,
+    /// The pad crossed a network, wrapped under a 256-bit key **read aloud on
+    /// a voice call** — see `crate::spoken` and `PAD-OVER-NETWORK.md` §3.
+    ///
+    /// Post-quantum, because the wrapping is symmetric throughout and the key
+    /// never touched the wire. It is **not** equivalent to meeting, and it is
+    /// recorded separately for that reason: it rests on a voice channel, which
+    /// a synthesised voice defeats and a *recorded* call defeats completely.
+    /// An operator reviewing a link months later should be able to see which
+    /// assertion they made.
+    Spoken,
     /// Through the corpus, per RFC 3 §11.1.
     Corpus,
     /// A live network link, secured by the very keys at issue.
@@ -82,7 +92,10 @@ impl Channel {
     /// A contribution that arrives over a channel where this is `false` is
     /// only as strong as X25519, which makes the reservoir decorative.
     pub fn independent_of_dh(&self) -> bool {
-        matches!(self, Channel::InPerson | Channel::RemovableMedia)
+        matches!(
+            self,
+            Channel::InPerson | Channel::RemovableMedia | Channel::Spoken
+        )
     }
 }
 
@@ -91,6 +104,7 @@ impl fmt::Display for Channel {
         f.write_str(match self {
             Channel::InPerson => "in person",
             Channel::RemovableMedia => "removable media",
+            Channel::Spoken => "a key read aloud",
             Channel::Corpus => "corpus",
             Channel::Network => "network",
         })

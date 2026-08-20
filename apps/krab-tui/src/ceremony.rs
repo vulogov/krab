@@ -238,6 +238,7 @@ pub fn parse_channel(arg: &str) -> Option<Channel> {
     Some(match arg {
         "in-person" | "person" => Channel::InPerson,
         "media" | "usb" | "sneakernet" => Channel::RemovableMedia,
+        "spoken" | "voice" | "aloud" => Channel::Spoken,
         "corpus" => Channel::Corpus,
         "network" | "net" => Channel::Network,
         _ => return None,

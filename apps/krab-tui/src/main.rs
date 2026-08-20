@@ -52,6 +52,7 @@ mod render;
 mod request;
 mod shared;
 mod shred;
+mod spoken;
 mod sync;
 mod words;
 // RFC 1 §12's vector file is a test artifact: it is generated and checked by
@@ -120,6 +121,14 @@ fn rekey_failure(peer: &str, e: rekey_run::Error) -> String {
              epoch boundary; try again."
         ),
     }
+}
+
+/// An action waiting for one line that is not a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Prompt {
+    /// The 32 words the other end read aloud, and the wrapped pad they go
+    /// with. See [`crate::spoken`].
+    TransferWords { path: String },
 }
 
 /// Seconds since the Unix epoch, or zero if the clock is before it.
@@ -283,6 +292,14 @@ struct App {
     /// observation of this network now.
     observed_arrivals: u64,
     observed_hours: f64,
+    /// A pending action waiting for one line of input.
+    ///
+    /// Exists so the transfer words do not go through the command line: they
+    /// would land in the history, which is a record of a live key sitting in
+    /// memory next to the thing it protects. A prompt is also the only way to
+    /// take a value that contains spaces without quoting rules an operator
+    /// reading words off a phone call should not have to think about.
+    prompt: Option<Prompt>,
     /// Commands submitted this session, oldest first.
     ///
     /// **In memory only.** A history file would be a record of who this node
@@ -382,6 +399,7 @@ impl Default for App {
             pending: Vec::new(),
             observed_arrivals: 0,
             observed_hours: 0.0,
+            prompt: None,
             history: Vec::new(),
             history_at: 0,
             output_scroll: 0,
@@ -1847,10 +1865,16 @@ impl App {
         // Tokenise once, up front, so a malformed line is refused with the
         // reason rather than reaching a verb that sees a truncated argument
         // and reports a file that does not exist.
-        self.push_history(&line);
-        // A new command's output starts at the newest line, not wherever the
-        // operator had scrolled to.
+        // A new reply starts at the newest line, not wherever the operator
+        // had scrolled to.
         self.output_scroll = 0;
+        // A pending prompt consumes the line **and keeps it out of the
+        // history**: transfer words are a live key, and a history is a record.
+        if let Some(p) = self.prompt.take() {
+            self.output = self.answer_prompt(p, &line);
+            return;
+        }
+        self.push_history(&line);
         if let Err(e) = words::split(&line) {
             self.output = format!("{e}");
             return;
@@ -1938,6 +1962,8 @@ impl App {
                         self.peer_seal(arg(rest, 1).as_deref(), arg(rest, 2).as_deref())
                     }
                     Some(Peering::Pad) => self.peer_pad(arg(rest, 1).as_deref()),
+                    Some(Peering::Wrap) => self.peer_wrap(arg(rest, 1).as_deref()),
+                    Some(Peering::Reseal) => self.peer_reseal(arg(rest, 1).as_deref()),
                     Some(Peering::Status) => self.peer_status(),
                     Some(Peering::Rekey) => self.peer_rekey(arg(rest, 1).as_deref()),
                     None => {
@@ -2262,6 +2288,101 @@ impl App {
         }
     }
 
+    /// Consume a line typed in answer to a prompt.
+    fn answer_prompt(&mut self, p: Prompt, line: &str) -> String {
+        match p {
+            Prompt::TransferWords { path } => {
+                let words = line.trim();
+                if words.is_empty() {
+                    return "cancelled — nothing was sealed.".into();
+                }
+                let Some(raw) = std::fs::read(&path)
+                    .ok()
+                    .and_then(|b| spoken::Wrapped::decode(&b))
+                else {
+                    return format!("{path} is not a wrapped pad");
+                };
+                let Some(plain) = spoken::unwrap(&raw, words) else {
+                    // One message for both, deliberately: an operator's remedy
+                    // is the same, and distinguishing them would tell an
+                    // interceptor which of their guesses was closer.
+                    return "those words did not open it.\n\n\
+                            Either a word is wrong or the file was altered. \
+                            Check the words with them — the alphabets differ \
+                            between even and odd positions, so a pair read out \
+                            of order is rejected rather than silently accepted."
+                        .into();
+                };
+                self.seal_with_contribution(&plain, peering::Channel::Spoken)
+            }
+        }
+    }
+
+    /// Wrap the contribution under a spoken transfer key — `crate::spoken`.
+    ///
+    /// The route for two people who cannot meet. Unlike `peer pad`, the file
+    /// this writes is **safe to send over anything**: it is useless without 32
+    /// words that only ever cross a voice call.
+    fn peer_wrap(&mut self, dest: Option<&str>) -> String {
+        let Some(dest) = dest else {
+            return "usage: peer wrap <file>\n\n\
+                    Writes your contribution wrapped under a 256-bit key shown \
+                    as 32 words. The file may travel over any network; the \
+                    words must be read aloud on a voice call and nowhere else."
+                .into();
+        };
+        let pending = match self.load_ceremony() {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let plain = ceremony::encode_contribution(&pending.my_contribution);
+        let Some((wrapped, phrase)) = spoken::wrap(&plain, &mut OsRng) else {
+            return "could not wrap the contribution".into();
+        };
+        // Not atomic, for the same reason `peer pad` is not: an atomic write
+        // leaves a `.tmp` on failure, and here that file would be the wrapped
+        // contribution under a name nothing cleans up.
+        if let Err(e) = std::fs::write(dest, wrapped.encode()) {
+            return format!("could not write {dest}: {e}");
+        }
+        spoken::instructions(dest, &phrase)
+    }
+
+    /// Upgrade a peering's channel classification in place — the property
+    /// that makes starting weak recoverable rather than permanent.
+    ///
+    /// **The reservoir is not re-derived.** Re-sealing records that the pad
+    /// *also* travelled by a stronger route; it cannot retroactively make a
+    /// root that crossed the wire never have crossed it. So this is only
+    /// honest when the two ends have actually exchanged pads again by the
+    /// channel being claimed, and the text says so.
+    fn peer_reseal(&mut self, channel: Option<&str>) -> String {
+        let Some(channel) = channel else {
+            return "usage: peer reseal <in-person|media|spoken>\n\n\
+                    Records that you have since exchanged pads by a stronger \
+                    route, and upgrades the peering without redoing it — you \
+                    keep the peer-link and the message history."
+                .into();
+        };
+        let Some(ch) = ceremony::parse_channel(channel) else {
+            return format!("unknown channel {channel:?}");
+        };
+        if !ch.independent_of_dh() {
+            return format!(
+                "{ch} is not an upgrade — a reseal exists to record that the \
+                 pad travelled by a route an adversary cannot record and later \
+                 break. Use in-person, media, or spoken."
+            );
+        }
+        "peer reseal is not implemented yet.\n\n\
+         The mechanism it needs — re-running the contribution exchange over the \
+         new channel and re-deriving the root — is `peer offer` and `peer seal` \
+         again. Doing that today loses the message history, which is exactly \
+         what reseal exists to avoid, so it is better to say so than to record \
+         a stronger classification over a root that did not change."
+            .into()
+    }
+
     /// Record the counterparty's card — RFC 3 §11 step 1.
     fn peer_accept(&mut self, path: Option<&str>) -> String {
         let Some(path) = path else {
@@ -2340,9 +2461,37 @@ impl App {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let Some(their_card) = pending.their_card.clone() else {
+        if pending.their_card.is_none() {
             return "no card recorded yet — run `peer accept <their.card>` first".into();
-        };
+        }
+        // A pad that crossed a network is wrapped, and opening it needs the
+        // words. They are taken at a prompt rather than on the command line:
+        // the line goes into the history, and a history is a record of a live
+        // key sitting next to the thing it protects.
+        if channel == peering::Channel::Spoken {
+            if std::fs::read(path)
+                .ok()
+                .and_then(|b| spoken::Wrapped::decode(&b))
+                .is_none()
+            {
+                return format!(
+                    "{path} is not a wrapped pad.\n\n\
+                     `spoken` opens a file written by their `peer wrap`. A bare \
+                     pad from `peer pad` is sealed with `media` or `in-person`."
+                );
+            }
+            self.prompt = Some(Prompt::TransferWords {
+                path: path.to_string(),
+            });
+            return format!(
+                "type the {} words they read to you, separated by spaces.\n\n\
+                 They are not echoed to the history. If a word is wrong the \
+                 file will not open, and a pair read out of order is rejected \
+                 rather than silently accepted.",
+                spoken::WORDS
+            );
+        }
+
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -2354,7 +2503,24 @@ impl App {
                 )
             }
         };
-        let theirs = match ceremony::decode_contribution(&bytes) {
+        self.seal_with_contribution(&bytes, channel)
+    }
+
+    /// Finish a peering from the counterparty's contribution bytes.
+    ///
+    /// Split out because the bytes arrive two ways now: from a pad handed over
+    /// on media, and from a wrapped file opened with words read aloud. The
+    /// sealing itself must be one path — a second would be a second place to
+    /// get the channel classification or the reservoir derivation wrong.
+    fn seal_with_contribution(&mut self, bytes: &[u8], channel: peering::Channel) -> String {
+        let pending = match self.load_ceremony() {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let Some(their_card) = pending.their_card.clone() else {
+            return "no card recorded yet — run `peer accept <their.card>` first".into();
+        };
+        let theirs = match ceremony::decode_contribution(bytes) {
             Ok(c) => c,
             Err(e) => return format!("not a contribution: {e:?}"),
         };
@@ -8739,5 +8905,159 @@ mod tests {
             moved = true;
         }
         assert!(!moved, "connecting caused a transfer");
+    }
+
+    /// A node mid-ceremony with a counterparty card recorded — the state
+    /// `peer seal` requires, since you cannot seal without their card.
+    fn mid_ceremony(tag: &str) -> App {
+        let mut a = ready_node(tag);
+        let mut other = ready_node(&format!("{tag}-other"));
+        type_command(&mut a, "peer offer");
+        type_command(&mut other, "peer offer");
+        let card = a.path("theirs.card");
+        std::fs::write(&card, std::fs::read(other.path("peer.card")).unwrap()).unwrap();
+        type_command(&mut a, &format!("peer accept {}", card.display()));
+        a
+    }
+
+    /// **Peering at distance, end to end.** Two nodes that never meet: the
+    /// cards and the wrapped pads cross a network, and only 32 words cross a
+    /// voice call — once, ever.
+    #[test]
+    fn two_nodes_peer_over_the_network_with_a_spoken_key() {
+        let mut a = ready_node("spoken-a");
+        let mut b = ready_node("spoken-b");
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+
+        // Cards, over anything. They are public and signed.
+        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+            let bytes = std::fs::read(from.path(name)).expect("exists");
+            let dest = to.path(as_name);
+            std::fs::write(&dest, bytes).expect("delivered");
+            dest.to_string_lossy().into_owned()
+        };
+        let a_card = carry(&a, &b, "peer.card", "from-a.card");
+        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        type_command(&mut a, &format!("peer accept {b_card}"));
+        type_command(&mut b, &format!("peer accept {a_card}"));
+        for n in [&mut a, &mut b] {
+            let mut p = n.load_ceremony().unwrap();
+            p.fingerprint_verified = true;
+            n.save_ceremony(&p).unwrap();
+        }
+
+        // Each wraps its pad. The file is safe to send over anything.
+        let a_dest = a.path("a.wrapped").display().to_string();
+        type_command(&mut a, &format!("peer wrap {a_dest}"));
+        assert!(a.output.contains("READ THESE ALOUD"), "{}", a.output);
+        let a_words = a
+            .output
+            .lines()
+            .find(|l| l.split_whitespace().count() == spoken::WORDS)
+            .expect("32 words")
+            .trim()
+            .to_string();
+
+        let b_dest = b.path("b.wrapped").display().to_string();
+        type_command(&mut b, &format!("peer wrap {b_dest}"));
+        let b_words = b
+            .output
+            .lines()
+            .find(|l| l.split_whitespace().count() == spoken::WORDS)
+            .expect("32 words")
+            .trim()
+            .to_string();
+
+        // The wrapped files cross the network; the words cross a voice call.
+        let to_b = carry(&a, &b, "a.wrapped", "from-a.wrapped");
+        let to_a = carry(&b, &a, "b.wrapped", "from-b.wrapped");
+
+        type_command(&mut a, &format!("peer seal {to_a} spoken"));
+        assert!(a.output.contains("type the 32 words"), "{}", a.output);
+        type_command(&mut a, &b_words);
+        assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
+
+        type_command(&mut b, &format!("peer seal {to_b} spoken"));
+        type_command(&mut b, &a_words);
+        assert!(b.output.starts_with("peer-link signed"), "{}", b.output);
+
+        // **Post-quantum.** The pad crossed a network, and the key that
+        // protected it never did.
+        assert!(
+            !a.output.contains("does NOT survive"),
+            "a spoken peering was not credited as post-quantum:\n{}",
+            a.output
+        );
+
+        // Both ends hold the same reservoir, so the peering actually works.
+        let a_of_b = short_id(&b.identity.as_ref().unwrap().node_id());
+        let b_of_a = short_id(&a.identity.as_ref().unwrap().node_id());
+        assert_eq!(stored_root(&a, &a_of_b), stored_root(&b, &b_of_a));
+    }
+
+    /// **The words never enter the history.** A history is a record, and these
+    /// are a live key sitting next to the thing they protect.
+    #[test]
+    fn the_transfer_words_do_not_reach_the_command_history() {
+        let mut a = mid_ceremony("spoken-history");
+        let dest = a.path("mine.wrapped").display().to_string();
+        type_command(&mut a, &format!("peer wrap {dest}"));
+        let words = a
+            .output
+            .lines()
+            .find(|l| l.split_whitespace().count() == spoken::WORDS)
+            .expect("32 words")
+            .trim()
+            .to_string();
+
+        type_command(&mut a, &format!("peer seal {dest} spoken"));
+        assert!(a.prompt.is_some(), "no prompt was raised");
+        type_command(&mut a, &words);
+
+        let first = words.split_whitespace().next().unwrap();
+        assert!(
+            !a.history.iter().any(|h| h.contains(first)),
+            "the transfer words are in the history: {:?}",
+            a.history
+        );
+        // And Up-arrow cannot bring them back.
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert!(!a.command.as_string().contains(first));
+    }
+
+    /// Wrong words are refused, and a bare pad is not a wrapped one.
+    #[test]
+    fn a_spoken_seal_refuses_the_wrong_words_and_the_wrong_file() {
+        let mut a = mid_ceremony("spoken-wrong");
+
+        // A bare pad is not a wrapped pad, and says so rather than prompting.
+        let pad = a.path("bare.pad").display().to_string();
+        type_command(&mut a, &format!("peer pad {pad}"));
+        type_command(&mut a, &format!("peer seal {pad} spoken"));
+        assert!(a.output.contains("not a wrapped pad"), "{}", a.output);
+        assert!(a.prompt.is_none(), "it prompted for a file it cannot use");
+
+        // Wrong words fail closed, and the same way tampering does.
+        let dest = a.path("mine.wrapped").display().to_string();
+        type_command(&mut a, &format!("peer wrap {dest}"));
+        type_command(&mut a, &format!("peer seal {dest} spoken"));
+        type_command(&mut a, "aardvark absurd accrue acme adrift adult");
+        assert!(a.output.contains("did not open it"), "{}", a.output);
+    }
+
+    /// `spoken` earns post-quantum credit; `network` does not, and the
+    /// classification is what an operator reviewing a link months later reads.
+    #[test]
+    fn the_spoken_channel_is_post_quantum_and_distinct_from_in_person() {
+        use peering::Channel;
+        assert!(Channel::Spoken.independent_of_dh());
+        assert!(!Channel::Network.independent_of_dh());
+        assert!(!Channel::Corpus.independent_of_dh());
+        // Distinct, because the assertion an operator made is different: a
+        // voice call is defeated by a recording and a meeting is not.
+        assert_ne!(Channel::Spoken, Channel::InPerson);
+        assert_eq!(ceremony::parse_channel("spoken"), Some(Channel::Spoken));
+        assert_eq!(ceremony::parse_channel("voice"), Some(Channel::Spoken));
     }
 }
