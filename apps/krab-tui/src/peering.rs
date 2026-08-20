@@ -86,6 +86,30 @@ pub enum Channel {
 }
 
 impl Channel {
+    /// A stable byte for storage. Permanent, like `Caveat::code`.
+    pub fn code(&self) -> u8 {
+        match self {
+            Channel::InPerson => 1,
+            Channel::RemovableMedia => 2,
+            Channel::Corpus => 3,
+            Channel::Network => 4,
+            Channel::Spoken => 5,
+        }
+    }
+
+    /// Read a stored code. Unknown is `None` rather than a guess: a channel
+    /// this build does not know is not one it may classify.
+    pub fn from_code(b: u8) -> Option<Channel> {
+        Some(match b {
+            1 => Channel::InPerson,
+            2 => Channel::RemovableMedia,
+            3 => Channel::Corpus,
+            4 => Channel::Network,
+            5 => Channel::Spoken,
+            _ => return None,
+        })
+    }
+
     /// Whether this channel's confidentiality rests on the asymmetric
     /// cryptography the reservoir exists to outlive.
     ///
@@ -513,6 +537,88 @@ pub enum Caveat {
     DegenerateContribution,
     /// The card's signature did not verify under its own identity key.
     BadSignature,
+}
+
+impl Caveat {
+    /// A stable byte for storage. The values are permanent: a stored link
+    /// written by an older build must not be read as a different caveat.
+    fn code(&self) -> u8 {
+        match self {
+            Caveat::FingerprintUnverified => 1,
+            Caveat::ReservoirNotPostQuantum(_) => 2,
+            Caveat::DegenerateContribution => 3,
+            Caveat::BadSignature => 4,
+        }
+    }
+}
+
+/// How a peering was formed, kept beside the link it describes.
+///
+/// **`PeerLink::caveats` said it was "kept, not discarded" and it was not
+/// stored anywhere.** A link formed remotely on a bad afternoon said so until
+/// the process exited, and then presented as though it had been formed in
+/// person. This is what makes the claim true, and what `peer reseal` upgrades.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Terms {
+    /// The channel the contribution travelled by.
+    pub channel: Channel,
+    /// Whether the fingerprint word lists were compared aloud.
+    pub fingerprint_verified: bool,
+    /// The epoch the peering, or its most recent re-seal, was completed in.
+    pub sealed_epoch: u32,
+    /// How many times it has been re-sealed. Zero is the original peering.
+    pub reseals: u32,
+}
+
+impl Terms {
+    /// Whether the reservoir survives X25519 being broken.
+    pub fn post_quantum(&self) -> bool {
+        self.channel.independent_of_dh()
+    }
+
+    /// Deterministic CBOR — RFC 1 §4.3.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = krab_core::cbor::Writer::new();
+        w.map(4)
+            .uint(1)
+            .uint(self.channel.code() as u64)
+            .uint(2)
+            .bool(self.fingerprint_verified)
+            .uint(3)
+            .uint(self.sealed_epoch as u64)
+            .uint(4)
+            .uint(self.reseals as u64);
+        w.finish()
+    }
+
+    /// Decode. This is the node's own storage, but a corrupt file must not
+    /// panic and must not read as a *stronger* set of terms than were stored.
+    pub fn decode(bytes: &[u8]) -> Option<Terms> {
+        use krab_core::cbor::{Item, Reader};
+        let mut r = Reader::new(bytes);
+        let mut m = r.map().ok()?;
+        if m.left() != 4 {
+            return None;
+        }
+        let mut vals = [0u64; 4];
+        let mut verified = false;
+        for (i, expect) in (1u64..=4).enumerate() {
+            if m.key().ok()?? != expect {
+                return None;
+            }
+            match m.value().ok()? {
+                Item::Uint(v) => vals[i] = v,
+                Item::Bool(b) if expect == 2 => verified = b,
+                _ => return None,
+            }
+        }
+        Some(Terms {
+            channel: Channel::from_code(u8::try_from(vals[0]).ok()?)?,
+            fingerprint_verified: verified,
+            sealed_epoch: u32::try_from(vals[2]).ok()?,
+            reseals: u32::try_from(vals[3]).ok()?,
+        })
+    }
 }
 
 /// A completed peering, and what it is honestly worth.

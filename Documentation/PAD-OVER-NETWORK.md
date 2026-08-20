@@ -1,9 +1,14 @@
 # Moving a pad when you cannot meet — a proposal
 
-**Status: §3's spoken route is implemented** — `peer wrap`, `peer seal …
-spoken`, and `Channel::Spoken`, in `apps/krab-tui/src/spoken.rs`. The in-band
-`network` bootstrap and `peer reseal` are not; `peer reseal` refuses rather
-than recording a classification it cannot honestly deliver.
+**Status: §3 is implemented.** The spoken route is `peer wrap` / `peer seal …
+spoken` (`apps/krab-tui/src/spoken.rs`), and `peer reseal` upgrades a weak
+peering in place by re-deriving the root over a stronger channel
+(`krab_crypto::rekey::reseal_root`). Terms are recorded on disk beside each
+link, so what a peering is worth survives a restart.
+
+Not implemented: the fully in-band `network` bootstrap, which needs an
+unauthenticated Noise mode — there is no peer-link yet to authenticate
+against.
 
 The framing this document opened with was wrong and is corrected here. It
 argued for a careful exception to a rule. The rule is the problem:

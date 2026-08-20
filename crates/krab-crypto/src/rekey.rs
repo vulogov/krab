@@ -143,6 +143,71 @@ pub fn next_root(
     out
 }
 
+/// Domain for a re-seal — a root upgraded over a stronger channel.
+pub const LABEL_RESEAL: &[u8] = b"krab/reseal/root/v1";
+
+/// Derive a root from an existing one and two **out-of-band** contributions.
+///
+/// This is `peer reseal`: a peering established over a weak channel, later
+/// strengthened without being redone. The peer-link, the message history and
+/// the correspondent's identity all survive; only the root changes.
+///
+/// # Why there is no `dh` here, unlike [`next_root`]
+///
+/// A re-key mixes a fresh Diffie-Hellman exchange because its contributions
+/// travel **over the session**, so an adversary who read the disk once could
+/// read them off the wire and follow the chain forward; `dh` is what locks
+/// them out again.
+///
+/// A re-seal's contributions never cross a recorded channel at all — that is
+/// the entire point of the exercise. They are therefore strictly better than
+/// `dh` at the job `dh` was doing, and adding one would mix a value the
+/// adversary *can* attack into a root that otherwise does not depend on
+/// asymmetric cryptography anywhere.
+///
+/// # Why the old root is still mixed in
+///
+/// So that a re-seal proves continuity. Only the two ends of the existing
+/// peering hold `old_root`, so a third party who obtains both fresh
+/// contributions — by being handed a stick, say — still cannot produce the
+/// new root. Dropping it would make a re-seal indistinguishable from a fresh
+/// peering with the same card, which is the shape of an impersonation.
+///
+/// And it costs nothing: the result is post-quantum as long as *either* input
+/// is, and the fresh contributions are.
+pub fn reseal_root(
+    old_root: &[u8; 32],
+    mine: (&[u8; 32], &Contribution),
+    theirs: (&[u8; 32], &Contribution),
+    epoch: u32,
+) -> [u8; 32] {
+    // Ordered by node id, for the reason `next_root` is: both ends must derive
+    // the same value without negotiating who spoke first.
+    let (first, second) = if mine.0 <= theirs.0 {
+        (mine.1, theirs.1)
+    } else {
+        (theirs.1, mine.1)
+    };
+
+    let mut ikm = [0u8; 96];
+    ikm[..32].copy_from_slice(old_root);
+    ikm[32..64].copy_from_slice(first.expose());
+    ikm[64..96].copy_from_slice(second.expose());
+
+    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    let mut info = [0u8; 32];
+    let l = LABEL_RESEAL.len();
+    info[..l].copy_from_slice(LABEL_RESEAL);
+    info[l..l + 4].copy_from_slice(&epoch.to_le_bytes());
+    let mut out = [0u8; 32];
+    hk.expand(&info[..l + 4], &mut out)
+        .expect("32 bytes is far below 255·HashLen");
+
+    use zeroize::Zeroize;
+    ikm.zeroize();
+    out
+}
+
 /// A fresh contribution.
 pub fn contribute(rng: &mut impl Rng) -> Contribution {
     Secret::new(rng.next_32())
@@ -293,5 +358,60 @@ mod tests {
     #[test]
     fn the_rekey_interval_matches_the_acceptance_window() {
         assert_eq!(REKEY_EPOCHS, krab_core::tag::EPOCH_WINDOW);
+    }
+
+    /// **A re-seal produces the same root at both ends**, from the old root
+    /// and two out-of-band contributions, with no session between them.
+    #[test]
+    fn both_ends_reseal_to_the_same_root() {
+        let old = [3u8; 32];
+        let (id_a, id_b) = ([1u8; 32], [2u8; 32]);
+        let (a, b) = (contrib(0xaa), contrib(0xbb));
+        assert_eq!(
+            reseal_root(&old, (&id_a, &a), (&id_b, &b), 9),
+            reseal_root(&old, (&id_b, &b), (&id_a, &a), 9),
+            "the two ends disagree"
+        );
+    }
+
+    /// Every input is load-bearing, including the old root — which is what
+    /// makes a re-seal prove continuity rather than being a fresh peering
+    /// under an old card.
+    #[test]
+    fn a_reseal_needs_the_old_root_and_both_contributions() {
+        let old = [3u8; 32];
+        let (id_a, id_b) = ([1u8; 32], [2u8; 32]);
+        let (a, b) = (contrib(0xaa), contrib(0xbb));
+        let base = reseal_root(&old, (&id_a, &a), (&id_b, &b), 9);
+
+        assert_ne!(
+            base,
+            reseal_root(&[4u8; 32], (&id_a, &a), (&id_b, &b), 9),
+            "someone holding both fresh contributions could forge this"
+        );
+        assert_ne!(
+            base,
+            reseal_root(&old, (&id_a, &contrib(0xac)), (&id_b, &b), 9)
+        );
+        assert_ne!(
+            base,
+            reseal_root(&old, (&id_a, &a), (&id_b, &contrib(0xbc)), 9)
+        );
+        assert_ne!(base, reseal_root(&old, (&id_a, &a), (&id_b, &b), 10));
+    }
+
+    /// A re-seal is not a re-key, and must not collide with one: the same
+    /// inputs under the two labels give different roots.
+    #[test]
+    fn a_reseal_is_domain_separated_from_a_rekey() {
+        let old = [3u8; 32];
+        let (id_a, id_b) = ([1u8; 32], [2u8; 32]);
+        let (a, b) = (contrib(0xaa), contrib(0xbb));
+        // `next_root` with an all-zero dh is the closest a re-key can come to
+        // the same input set.
+        assert_ne!(
+            reseal_root(&old, (&id_a, &a), (&id_b, &b), 9),
+            next_root(&old, &[0u8; 32], (&id_a, &a), (&id_b, &b), 9)
+        );
     }
 }

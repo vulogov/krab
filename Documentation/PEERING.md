@@ -323,6 +323,54 @@ a peer who stopped relaying had no way to say so.
 
 ---
 
+## 5c. Starting weak is recoverable: `peer reseal`
+
+A peering formed over `corpus` or `network` is not permanent. When you next
+meet, or next get a voice call, upgrade it **in place** — you keep the
+peer-link, the correspondent, and every message you hold.
+
+```
+> peer reseal fed356f2
+re-sealing fed356f2.
+
+currently: corpus — NOT post-quantum
+
+next:
+  peer reseal pad <destination>   — onto the medium you carry
+  peer reseal wrap <file>         — or wrapped under spoken words
+
+then, once you have theirs:
+  peer reseal seal <their file> <in-person|media|spoken>
+```
+
+Both ends run it. Each generates a **fresh** contribution, exchanges it over
+the stronger channel, and the new root is derived from the old root plus both
+fresh halves:
+
+```
+new_root = HKDF(old_root ‖ fresh_A ‖ fresh_B ‖ epoch)
+```
+
+There is no Diffie–Hellman in it, unlike a re-key. A re-key mixes one because
+its contributions travel *over the session*, so `dh` is what locks out an
+adversary who read the disk. A re-seal's contributions never cross a recorded
+channel at all — they are strictly better at that job, and adding a DH would
+mix in a value the adversary *can* attack.
+
+The old root stays in the mix so a re-seal proves **continuity**: only the two
+ends of the existing peering hold it, so someone who obtains both fresh
+contributions — by being handed a stick — still cannot produce the new root.
+Without it, a re-seal would be indistinguishable from a fresh peering under an
+old card, which is the shape of an impersonation.
+
+**Both ends must run it**, or your roots differ and nothing opens.
+
+A re-seal will not claim a weak channel, and it does not invent a fingerprint
+comparison nobody performed: if that step is still outstanding, it stays
+outstanding.
+
+---
+
 ## 6. Check: `peer status` and `peers`
 
 ```
@@ -344,7 +392,13 @@ restarts, so you can start a peering, quit, and finish it tomorrow.
 ```
 > peers
 fed356f2  peered  ·  not connected  ·  terms as of peering
+    a key read aloud · post-quantum, re-sealed 1×
 ```
+
+The second line is **how the peering was formed** — the channel, whether it
+survives X25519 being broken, whether fingerprints were ever compared, and how
+many times it has been re-sealed. It is stored on disk beside the link, so a
+peering made remotely on a bad afternoon still says so a year later.
 
 `peers` lists **peerings**, which live on disk — they survive restarts and
 failed connections. A dial that fails takes the link down and leaves the

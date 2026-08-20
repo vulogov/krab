@@ -129,6 +129,8 @@ enum Prompt {
     /// The 32 words the other end read aloud, and the wrapped pad they go
     /// with. See [`crate::spoken`].
     TransferWords { path: String },
+    /// The same, for a re-seal rather than a first peering.
+    ResealWords { path: String },
 }
 
 /// Seconds since the Unix epoch, or zero if the clock is before it.
@@ -1963,7 +1965,10 @@ impl App {
                     }
                     Some(Peering::Pad) => self.peer_pad(arg(rest, 1).as_deref()),
                     Some(Peering::Wrap) => self.peer_wrap(arg(rest, 1).as_deref()),
-                    Some(Peering::Reseal) => self.peer_reseal(arg(rest, 1).as_deref()),
+                    Some(Peering::Reseal) => {
+                        let tail = rest.trim().strip_prefix("reseal").unwrap_or("").to_string();
+                        self.peer_reseal(&tail)
+                    }
                     Some(Peering::Status) => self.peer_status(),
                     Some(Peering::Rekey) => self.peer_rekey(arg(rest, 1).as_deref()),
                     None => {
@@ -2315,6 +2320,28 @@ impl App {
                 };
                 self.seal_with_contribution(&plain, peering::Channel::Spoken)
             }
+            Prompt::ResealWords { path } => {
+                let words = line.trim();
+                if words.is_empty() {
+                    return "cancelled — nothing was re-sealed.".into();
+                }
+                let Some(raw) = std::fs::read(&path)
+                    .ok()
+                    .and_then(|b| spoken::Wrapped::decode(&b))
+                else {
+                    return format!("{path} is not a wrapped pad");
+                };
+                let Some(plain) = spoken::unwrap(&raw, words) else {
+                    return "those words did not open it.".into();
+                };
+                let Some((peer, mine)) = self.load_reseal() else {
+                    return "no re-seal in progress".into();
+                };
+                let Some(me) = self.identity.as_ref().map(|i| i.node_id()) else {
+                    return "no identity".into();
+                };
+                self.reseal_with(&peer, &me, mine, &plain, peering::Channel::Spoken)
+            }
         }
     }
 
@@ -2348,39 +2375,281 @@ impl App {
         spoken::instructions(dest, &phrase)
     }
 
-    /// Upgrade a peering's channel classification in place — the property
-    /// that makes starting weak recoverable rather than permanent.
+    /// Upgrade an existing peering over a stronger channel, in place.
     ///
-    /// **The reservoir is not re-derived.** Re-sealing records that the pad
-    /// *also* travelled by a stronger route; it cannot retroactively make a
-    /// root that crossed the wire never have crossed it. So this is only
-    /// honest when the two ends have actually exchanged pads again by the
-    /// channel being claimed, and the text says so.
-    fn peer_reseal(&mut self, channel: Option<&str>) -> String {
-        let Some(channel) = channel else {
-            return "usage: peer reseal <in-person|media|spoken>\n\n\
-                    Records that you have since exchanged pads by a stronger \
-                    route, and upgrades the peering without redoing it — you \
-                    keep the peer-link and the message history."
-                .into();
+    /// **The peer-link, the message history and the correspondent survive.**
+    /// Only the reservoir root changes, derived from the old root and two
+    /// fresh contributions that never crossed a recorded channel — see
+    /// `krab_crypto::rekey::reseal_root`.
+    ///
+    /// This is what makes starting weak recoverable rather than permanent: peer
+    /// over the network today, re-seal the first time you meet, and keep
+    /// everything.
+    fn peer_reseal(&mut self, rest: &str) -> String {
+        match arg(rest, 0).as_deref() {
+            Some("pad") => self.reseal_materialise(arg(rest, 1).as_deref(), false),
+            Some("wrap") => self.reseal_materialise(arg(rest, 1).as_deref(), true),
+            Some("seal") => self.reseal_finish(arg(rest, 1).as_deref(), arg(rest, 2).as_deref()),
+            Some(peer) => self.reseal_begin(peer),
+            None => "usage:\n\
+                     \x20 peer reseal <peer>              start, on an existing peering\n\
+                     \x20 peer reseal pad <dest>          your fresh half, for media\n\
+                     \x20 peer reseal wrap <dest>         or wrapped, for a voice call\n\
+                     \x20 peer reseal seal <file> <ch>    finish\n\n\
+                     Upgrades a peering over a stronger channel without redoing \
+                     it. You keep the peer-link and the message history."
+                .into(),
+        }
+    }
+
+    /// Begin a re-seal: a fresh contribution for an existing peering.
+    fn reseal_begin(&mut self, peer: &str) -> String {
+        let Some(w) = self.epoch_key else {
+            return "locked — unlock first".into();
+        };
+        if !self.peer_path(peer, "link").exists() {
+            return format!(
+                "no peering with {peer}.\n\n\
+                 `peer reseal` strengthens one that exists. To make a new one, \
+                 start with `peer offer`."
+            );
+        }
+        let terms = self.peer_terms(peer);
+        let r = OsRng.next_32();
+        let record = {
+            let mut wr = krab_core::cbor::Writer::new();
+            wr.map(2).uint(1).tstr(peer).uint(2).bstr(&r);
+            wr.finish()
+        };
+        let Ok(sealed) = krab_crypto::kek::seal_under(&w, b"krab/reseal", &record, &mut OsRng)
+        else {
+            return "could not store the re-seal".into();
+        };
+        if let Err(e) = atomic::write(&self.path("reseal.cbor"), &sealed) {
+            return format!("could not store the re-seal: {e}");
+        }
+        format!(
+            "re-sealing {peer}.\n\n\
+             currently: {}{}\n\n\
+             next:\n\
+             \x20 peer reseal pad <destination>   — onto the medium you carry\n\
+             \x20 peer reseal wrap <file>         — or wrapped under spoken words\n\n\
+             then, once you have theirs:\n\
+             \x20 peer reseal seal <their file> <in-person|media|spoken>\n\n\
+             Your peer-link and every message you hold are untouched.",
+            terms
+                .as_ref()
+                .map(|t| t.channel.to_string())
+                .unwrap_or_else(|| "unrecorded".into()),
+            match terms.as_ref() {
+                Some(t) if t.post_quantum() => " — already post-quantum",
+                Some(_) => " — NOT post-quantum",
+                None => "",
+            }
+        )
+    }
+
+    /// Write the fresh contribution out, bare or wrapped.
+    fn reseal_materialise(&mut self, dest: Option<&str>, wrapped: bool) -> String {
+        let verb = if wrapped { "wrap" } else { "pad" };
+        let Some(dest) = dest else {
+            return format!("usage: peer reseal {verb} <destination>");
+        };
+        let Some((_, r)) = self.load_reseal() else {
+            return "no re-seal in progress — `peer reseal <peer>` first".into();
+        };
+        let plain = ceremony::encode_contribution(&peering::Contribution { r });
+        if wrapped {
+            let Some((w, phrase)) = spoken::wrap(&plain, &mut OsRng) else {
+                return "could not wrap the contribution".into();
+            };
+            if let Err(e) = std::fs::write(dest, w.encode()) {
+                return format!("could not write {dest}: {e}");
+            }
+            spoken::instructions(dest, &phrase)
+        } else {
+            match std::fs::write(dest, plain) {
+                Err(e) => format!("could not write {dest}: {e}"),
+                Ok(()) => format!(
+                    "wrote your fresh contribution to {dest}.\n\n\
+                     Half a shared secret in plaintext, exactly like `peer pad` \
+                     — carry it, hand it over, leave no copy."
+                ),
+            }
+        }
+    }
+
+    /// Finish: derive the new root, seat it, and record the stronger terms.
+    fn reseal_finish(&mut self, path: Option<&str>, channel: Option<&str>) -> String {
+        let (Some(path), Some(channel)) = (path, channel) else {
+            return "usage: peer reseal seal <their file> <in-person|media|spoken>".into();
         };
         let Some(ch) = ceremony::parse_channel(channel) else {
             return format!("unknown channel {channel:?}");
         };
         if !ch.independent_of_dh() {
             return format!(
-                "{ch} is not an upgrade — a reseal exists to record that the \
-                 pad travelled by a route an adversary cannot record and later \
-                 break. Use in-person, media, or spoken."
+                "{ch} is not an upgrade.\n\n\
+                 A re-seal exists to record that the pad travelled by a route an \
+                 adversary cannot record and later break. Use in-person, media, \
+                 or spoken."
             );
         }
-        "peer reseal is not implemented yet.\n\n\
-         The mechanism it needs — re-running the contribution exchange over the \
-         new channel and re-deriving the root — is `peer offer` and `peer seal` \
-         again. Doing that today loses the message history, which is exactly \
-         what reseal exists to avoid, so it is better to say so than to record \
-         a stronger classification over a root that did not change."
-            .into()
+        if self.epoch_key.is_none() {
+            return "locked — unlock first".into();
+        }
+        let Some((peer, mine)) = self.load_reseal() else {
+            return "no re-seal in progress — `peer reseal <peer>` first".into();
+        };
+        let Some(me) = self.identity.as_ref().map(|i| i.node_id()) else {
+            return "no identity".into();
+        };
+
+        // A wrapped file needs the words; a bare pad does not.
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => return format!("could not read {path}: {e}"),
+        };
+        let theirs = if ch == peering::Channel::Spoken {
+            match spoken::Wrapped::decode(&raw) {
+                Some(_) => {
+                    self.prompt = Some(Prompt::ResealWords {
+                        path: path.to_string(),
+                    });
+                    return format!(
+                        "type the {} words they read to you, separated by spaces.",
+                        spoken::WORDS
+                    );
+                }
+                None => return format!("{path} is not a wrapped pad"),
+            }
+        } else {
+            raw
+        };
+        self.reseal_with(&peer, &me, mine, &theirs, ch)
+    }
+
+    /// The half of a re-seal that both the bare and the spoken route reach.
+    fn reseal_with(
+        &mut self,
+        peer: &str,
+        me: &[u8; 32],
+        mine: [u8; 32],
+        their_bytes: &[u8],
+        ch: peering::Channel,
+    ) -> String {
+        let Some(w) = self.epoch_key else {
+            return "locked".into();
+        };
+        let theirs = match ceremony::decode_contribution(their_bytes) {
+            Ok(c) => c,
+            Err(e) => return format!("not a contribution: {e:?}"),
+        };
+        let card = match std::fs::read(self.peer_path(peer, "link"))
+            .ok()
+            .and_then(|b| peering::Card::decode(&b).ok())
+            .filter(|c| c.verify())
+        {
+            Some(c) => c,
+            None => return format!("the stored peer-link for {peer} does not verify"),
+        };
+        let sealed = match std::fs::read(self.peer_path(peer, "reservoir")) {
+            Ok(b) => b,
+            Err(_) => return format!("no reservoir for {peer}"),
+        };
+        let Some((old_root, stored_epoch)) =
+            krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed)
+                .ok()
+                .and_then(|r| persist::decode_reservoir(&r).ok())
+        else {
+            return format!("the reservoir for {peer} did not open");
+        };
+
+        let epoch = now_epoch().0.max(stored_epoch.0);
+        let new_root = krab_crypto::rekey::reseal_root(
+            &old_root,
+            (me, &krab_crypto::secret::Secret::new(mine)),
+            (&card.node_id(), &krab_crypto::secret::Secret::new(theirs.r)),
+            epoch,
+        );
+
+        let mut res = krab_crypto::reservoir::Reservoir::new(old_root, stored_epoch);
+        if !res.rekey(new_root, krab_core::tag::Epoch(epoch)) {
+            return "the new root landed before the ratchet — nothing changed".into();
+        }
+        let record = persist::encode_reservoir(
+            &res.root_bytes().expect("just seated"),
+            krab_core::tag::Epoch(epoch),
+        );
+        let Ok(out) = krab_crypto::kek::seal_under(&w, b"krab/reservoir", &record, &mut OsRng)
+        else {
+            return "could not seal the new reservoir — nothing changed".into();
+        };
+        if let Err(e) = atomic::write(&self.peer_path(peer, "reservoir"), &out) {
+            return format!("could not store the new reservoir: {e} — nothing changed");
+        }
+
+        let previous = self.peer_terms(peer);
+        let terms = peering::Terms {
+            channel: ch,
+            // A re-seal does not assert a fingerprint comparison it did not
+            // witness. If one was never done, it is still outstanding.
+            fingerprint_verified: previous
+                .as_ref()
+                .map(|t| t.fingerprint_verified)
+                .unwrap_or(false),
+            sealed_epoch: epoch,
+            reseals: previous.as_ref().map(|t| t.reseals + 1).unwrap_or(1),
+        };
+        let _ = atomic::write(&self.peer_path(peer, "terms"), &terms.encode());
+        shred::remove(&self.path("reseal.cbor"), &mut OsRng);
+
+        format!(
+            "re-sealed {peer} over {ch}.\n\n\
+             The reservoir root is now derived from material that never crossed \
+             a recorded channel, so this peering survives X25519 being broken. \
+             Your peer-link and every message you hold are unchanged.\n\n\
+             was: {}   now: {ch}\n\n\
+             The other end must run the same command, or your roots will differ \
+             and nothing will open.",
+            previous
+                .map(|t| t.channel.to_string())
+                .unwrap_or_else(|| "unrecorded".into())
+        )
+    }
+
+    /// The recorded terms of a peering, if any were stored.
+    fn peer_terms(&self, peer: &str) -> Option<peering::Terms> {
+        std::fs::read(self.peer_path(peer, "terms"))
+            .ok()
+            .and_then(|b| peering::Terms::decode(&b))
+    }
+
+    /// The re-seal in progress: whose, and this node's fresh contribution.
+    fn load_reseal(&self) -> Option<(String, [u8; 32])> {
+        use krab_core::cbor::{Item, Reader};
+        let w = self.epoch_key?;
+        let raw = krab_crypto::kek::open_under(
+            &w,
+            b"krab/reseal",
+            &std::fs::read(self.path("reseal.cbor")).ok()?,
+        )
+        .ok()?;
+        let mut r = Reader::new(&raw);
+        let mut m = r.map().ok()?;
+        if m.left() != 2 {
+            return None;
+        }
+        (m.key().ok()?? == 1).then_some(())?;
+        let Item::Tstr(peer) = m.value().ok()? else {
+            return None;
+        };
+        let peer = peer.to_string();
+        (m.key().ok()?? == 2).then_some(())?;
+        let Item::Bstr(b) = m.value().ok()? else {
+            return None;
+        };
+        Some((peer, b.try_into().ok()?))
     }
 
     /// Record the counterparty's card — RFC 3 §11 step 1.
@@ -2565,6 +2834,17 @@ impl App {
         if let Err(e) = atomic::write(&self.peer_path(&short, "link"), &their_card.encode()) {
             return format!("could not store the peer-link: {e}");
         }
+        // **What this peering is honestly worth, on disk beside it.**
+        // `PeerLink::caveats` claimed to be "kept, not discarded" and was held
+        // only in memory, so a link formed remotely said so until the process
+        // exited and then presented as though it had been formed in person.
+        let terms = peering::Terms {
+            channel,
+            fingerprint_verified: pending.fingerprint_verified,
+            sealed_epoch: now_epoch().0,
+            reseals: 0,
+        };
+        let _ = atomic::write(&self.peer_path(&short, "terms"), &terms.encode());
         shred::remove(&self.path("ceremony.cbor"), &mut OsRng);
         // `peer.pad` is this node's own contribution, written in the clear
         // because it has to be handed over. Once the reservoir exists it has no
@@ -3578,7 +3858,33 @@ impl App {
             } else {
                 "terms as of peering"
             };
-            out.push_str(&format!("{id}  peered  ·  {link}  ·  {policy}\n"));
+            // How the peering was formed, and what it is worth — kept on disk
+            // so a link made remotely on a bad afternoon still says so a year
+            // later, which is what `PeerLink::caveats` always claimed.
+            let how = match self.peer_terms(id) {
+                Some(t) => {
+                    let pq = if t.post_quantum() {
+                        "post-quantum"
+                    } else {
+                        "NOT post-quantum"
+                    };
+                    let fp = if t.fingerprint_verified {
+                        ""
+                    } else {
+                        ", fingerprints never compared"
+                    };
+                    let re = if t.reseals > 0 {
+                        format!(", re-sealed {}×", t.reseals)
+                    } else {
+                        String::new()
+                    };
+                    format!("{} · {pq}{fp}{re}", t.channel)
+                }
+                None => "how it was formed: unrecorded".into(),
+            };
+            out.push_str(&format!(
+                "{id}  peered  ·  {link}  ·  {policy}\n    {how}\n"
+            ));
         }
         // Links to nodes we have no peering with cannot exist — `establish`
         // refuses without a stored card — but a half-built one can, and
@@ -4578,6 +4884,37 @@ mod tests {
         let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
         type_command(&mut a, &format!("peer seal {b_pad} media"));
         type_command(&mut b, &format!("peer seal {a_pad} media"));
+        assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
+        assert!(b.output.starts_with("peer-link signed"), "{}", b.output);
+
+        let a_id = short_id(&a.identity.as_ref().unwrap().node_id());
+        let b_id = short_id(&b.identity.as_ref().unwrap().node_id());
+        (a, b, a_id, b_id)
+    }
+
+    /// A peered pair sealed over a chosen channel, so a test can start from a
+    /// weak peering and upgrade it.
+    fn peered_pair_over(tag: &str, channel: &str) -> (App, App, String, String) {
+        let mut a = ready_node(&format!("{tag}-a"));
+        let mut b = ready_node(&format!("{tag}-b"));
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+
+        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+            let bytes = std::fs::read(from.path(name)).expect("artifact exists");
+            let dest = to.path(as_name);
+            std::fs::write(&dest, bytes).expect("delivered");
+            dest.to_string_lossy().into_owned()
+        };
+        let a_card = carry(&a, &b, "peer.card", "from-a.card");
+        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        type_command(&mut a, &format!("peer accept {b_card}"));
+        type_command(&mut b, &format!("peer accept {a_card}"));
+
+        let a_pad = pad_onto(&mut a, &b.path("from-a.pad"));
+        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
+        type_command(&mut a, &format!("peer seal {b_pad} {channel}"));
+        type_command(&mut b, &format!("peer seal {a_pad} {channel}"));
         assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
         assert!(b.output.starts_with("peer-link signed"), "{}", b.output);
 
@@ -9059,5 +9396,104 @@ mod tests {
         assert_ne!(Channel::Spoken, Channel::InPerson);
         assert_eq!(ceremony::parse_channel("spoken"), Some(Channel::Spoken));
         assert_eq!(ceremony::parse_channel("voice"), Some(Channel::Spoken));
+    }
+
+    /// **A weak peering is recoverable.** Peer over the network today,
+    /// re-seal the first time you meet, and keep the peer-link, the message
+    /// history and the correspondent.
+    #[test]
+    fn a_network_peering_is_upgraded_in_place_by_reseal() {
+        let (mut a, mut b, a_id, b_id) = peered_pair_over("reseal", "corpus");
+
+        // It starts weak, and says so.
+        let before = a.peer_terms(&b_id).expect("terms were recorded");
+        assert!(!before.post_quantum(), "corpus must not be post-quantum");
+        assert_eq!(before.reseals, 0);
+        type_command(&mut a, "peers");
+        assert!(a.output.contains("NOT post-quantum"), "{}", a.output);
+
+        let root_before = stored_root(&a, &b_id);
+        let messages_before = a.store.len();
+
+        // They meet. Fresh contributions, carried.
+        type_command(&mut a, &format!("peer reseal {b_id}"));
+        assert!(a.output.contains("NOT post-quantum"), "{}", a.output);
+        type_command(&mut b, &format!("peer reseal {a_id}"));
+
+        let a_pad = a.path("a.fresh").display().to_string();
+        let b_pad = b.path("b.fresh").display().to_string();
+        type_command(&mut a, &format!("peer reseal pad {a_pad}"));
+        type_command(&mut b, &format!("peer reseal pad {b_pad}"));
+
+        type_command(&mut a, &format!("peer reseal seal {b_pad} in-person"));
+        assert!(a.output.contains("re-sealed"), "{}", a.output);
+        type_command(&mut b, &format!("peer reseal seal {a_pad} in-person"));
+        assert!(b.output.contains("re-sealed"), "{}", b.output);
+
+        // The root changed, and both ends agree on the new one.
+        assert_ne!(stored_root(&a, &b_id), root_before, "the root did not move");
+        assert_eq!(
+            stored_root(&a, &b_id),
+            stored_root(&b, &a_id),
+            "the two ends re-sealed to different roots"
+        );
+
+        // And nothing else was lost.
+        assert_eq!(a.store.len(), messages_before, "the corpus was disturbed");
+        assert!(
+            a.peer_path(&b_id, "link").exists(),
+            "the peer-link was lost"
+        );
+        let after = a.peer_terms(&b_id).expect("terms");
+        assert!(after.post_quantum(), "the upgrade was not recorded");
+        assert_eq!(after.reseals, 1);
+        type_command(&mut a, "peers");
+        assert!(a.output.contains("re-sealed 1×"), "{}", a.output);
+    }
+
+    /// A re-seal must not claim a channel that is not an upgrade, and must
+    /// not invent a fingerprint comparison nobody performed.
+    #[test]
+    fn a_reseal_refuses_a_weak_channel_and_keeps_outstanding_caveats() {
+        let (mut a, _b, _a_id, b_id) = peered_pair_over("reseal-weak", "corpus");
+        type_command(&mut a, &format!("peer reseal {b_id}"));
+        let pad = a.path("mine.fresh").display().to_string();
+        type_command(&mut a, &format!("peer reseal pad {pad}"));
+
+        for weak in ["corpus", "network"] {
+            type_command(&mut a, &format!("peer reseal seal {pad} {weak}"));
+            assert!(a.output.contains("not an upgrade"), "{}", a.output);
+        }
+        assert_eq!(
+            a.peer_terms(&b_id).unwrap().reseals,
+            0,
+            "it re-sealed anyway"
+        );
+    }
+
+    /// Re-sealing something that was never peered is refused, rather than
+    /// silently creating a peering with no card behind it.
+    #[test]
+    fn a_reseal_needs_an_existing_peering() {
+        let mut a = ready_node("reseal-stranger");
+        type_command(&mut a, "peer reseal deadbeef");
+        assert!(a.output.contains("no peering with"), "{}", a.output);
+    }
+
+    /// The terms survive a restart. They were held in memory only, so a link
+    /// formed remotely presented as though it had been formed in person the
+    /// moment the process exited.
+    #[test]
+    fn how_a_peering_was_formed_survives_a_restart() {
+        let (a, _b, _a_id, b_id) = peered_pair_over("terms-restart", "corpus");
+        let mut fresh = App {
+            home: a.home.clone(),
+            ..App::default()
+        };
+        fresh.passphrase = line::Line::from("a passphrase");
+        fresh.unlock(b"a passphrase").expect("reopens");
+        let t = fresh.peer_terms(&b_id).expect("terms were lost");
+        assert!(!t.post_quantum());
+        assert_eq!(t.channel, peering::Channel::Corpus);
     }
 }
