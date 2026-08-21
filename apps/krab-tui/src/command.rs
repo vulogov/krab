@@ -340,6 +340,19 @@ pub enum Peering {
     /// The route for two people who cannot meet. The wrapped file crosses any
     /// network; the 32-word key crosses a voice call, once ever.
     Wrap,
+    /// First contact over a live link — the whole ceremony in one exchange.
+    ///
+    /// The route for two people who can reach each other on a network and
+    /// nowhere else. Not post-quantum, and not authenticated until the
+    /// fingerprints are compared: `peer reseal` repairs the first and
+    /// `peer verified` records the second.
+    Meet,
+    /// Record that the fingerprints were compared aloud and matched.
+    ///
+    /// Separate from `meet` because it is a *human* act performed elsewhere.
+    /// A ceremony that recorded it automatically would be recording that
+    /// something happened which it cannot observe.
+    Verified,
     /// Upgrade a peering's channel classification in place.
     ///
     /// A weak peering is recoverable rather than permanent: start on
@@ -369,6 +382,8 @@ impl Peering {
             "offer" => Peering::Offer,
             "pad" => Peering::Pad,
             "wrap" => Peering::Wrap,
+            "meet" => Peering::Meet,
+            "verified" => Peering::Verified,
             "reseal" => Peering::Reseal,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,

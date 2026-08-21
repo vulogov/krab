@@ -6,9 +6,9 @@ peering in place by re-deriving the root over a stronger channel
 (`krab_crypto::rekey::reseal_root`). Terms are recorded on disk beside each
 link, so what a peering is worth survives a restart.
 
-Not implemented: the fully in-band `network` bootstrap, which needs an
-unauthenticated Noise mode — there is no peer-link yet to authenticate
-against.
+The in-band `network` bootstrap is `peer meet` (`apps/krab-tui/src/bootstrap.rs`),
+over Noise XX. It is labelled `Channel::Network`, refuses a card that does not
+match the session's static, and does not mark itself verified.
 
 The framing this document opened with was wrong and is corrected here. It
 argued for a careful exception to a rule. The rule is the problem:

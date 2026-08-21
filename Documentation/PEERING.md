@@ -160,6 +160,11 @@ Krab will tell you what you got.
 32 words cross a voice call, once ever. It keeps the post-quantum property,
 because the words never touch the wire.
 
+**Cannot even call?** Use `peer meet` — §4c. One exchange over a live link and
+you have a working peering, honestly labelled: not authenticated until you
+compare fingerprints, not post-quantum until you `peer reseal`. Both are
+repairable and neither is silent.
+
 ---
 
 ## 4. Writing the pad: `peer pad <destination>`
@@ -320,6 +325,68 @@ the last re-key.
 
 Before re-keying existed, a policy was agreed once and never spoken of again:
 a peer who stopped relaying had no way to say so.
+
+---
+
+## 4c. Neither of you can meet or call: `peer meet`
+
+First contact over a live link. No files, no courier, no prior key — one
+exchange, and you have a working peering.
+
+```
+# Bob waits
+> peer meet listen 127.0.0.1:40000
+
+# Alice calls
+> peer meet 127.0.0.1:40000
+peer-link signed with <fingerprint>
+
+first contact complete, over the network.
+
+their fingerprint:
+
+  <eight words>
+
+yours, for them to check:
+
+  <eight words>
+
+**Nothing is verified yet.** The link proved the far end holds a key; it
+did not prove whose. An attacker in the middle completes two handshakes
+and relays, and would show you a fingerprint you have no reason to doubt.
+
+Call them. Read yours; they read theirs. Both must match.
+```
+
+### What it costs
+
+This uses Noise **XX** rather than IK, because IK needs the responder's static
+key before the first message and two nodes that have never met do not have it.
+XX carries both statics inside the handshake instead.
+
+| | |
+|---|---|
+| Confidential against a passive observer | yes |
+| Tells you *a* key the far end holds | yes |
+| Tells you **whose** key it is | **no** |
+| Post-quantum | **no** |
+
+Both gaps are repairable, and neither is silent:
+
+- **Not authenticated** until you compare fingerprints on a call. Then
+  `peer verified <peer>`. That verb exists separately because the comparison
+  is a human act performed elsewhere — a ceremony that recorded it
+  automatically would be recording something it cannot observe.
+- **Not post-quantum**, because the contribution crossed a channel secured by
+  X25519. `peer reseal` (§5c) repairs it the first time you meet or get a
+  voice call, without redoing the peering.
+
+One check is automatic and is worth knowing about: **the card must belong to
+whoever is on the other end of the connection.** If they do not match, someone
+completed a handshake with you and forwarded a genuine card belonging to
+somebody else — so the fingerprint you were about to compare is not theirs.
+Krab refuses, records nothing, and says not to retry on that address until you
+have spoken to your friend.
 
 ---
 

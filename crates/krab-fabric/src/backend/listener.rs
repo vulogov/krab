@@ -115,6 +115,59 @@ impl Listener {
     }
 }
 
+/// Open a first-contact session to `addr` — RFC 3 §11 over a live link.
+///
+/// **Unauthenticated by construction.** There is no peer-link yet, so there is
+/// no static key to check against; see [`crate::noise::NOISE_PARAMS_XX`] for
+/// why that is the ceremony's shape rather than a gap in it. The static the
+/// far end presented is returned so the caller can bind it to the card that
+/// arrives inside.
+pub fn bootstrap_connect(addr: &str, local_static: [u8; 32]) -> Result<Accepted, Error> {
+    let mut stream = TcpStream::connect(addr)?;
+    let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
+    stream.set_read_timeout(t)?;
+    stream.set_write_timeout(t)?;
+    let (noise, peer) = crate::noise::handshake_initiator_xx(&mut stream, &local_static)?;
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    Ok((Box::new(StreamSession::new(stream, noise)), peer))
+}
+
+/// Wait for one first-contact call on `addr`.
+///
+/// Bounded, and one call only: a socket that accepts strangers indefinitely is
+/// a different thing from a node that is expecting a friend at an agreed time,
+/// and only the second is what RFC 3 §11 describes.
+pub fn bootstrap_accept(
+    addr: &str,
+    local_static: [u8; 32],
+    wait: std::time::Duration,
+) -> Result<Option<Accepted>, Error> {
+    let inner = TcpListener::bind(addr)?;
+    inner.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        match inner.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false)?;
+                let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
+                stream.set_read_timeout(t)?;
+                stream.set_write_timeout(t)?;
+                let (noise, peer) =
+                    crate::noise::handshake_responder_xx(&mut stream, &local_static)?;
+                stream.set_read_timeout(None)?;
+                stream.set_write_timeout(None)?;
+                return Ok(Some((Box::new(StreamSession::new(stream, noise)), peer)));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(None)
+}
+
 /// How long a caller has to complete a handshake.
 ///
 /// Bounded because the accept loop is serial: one caller that connects and
@@ -258,5 +311,46 @@ mod tests {
         let (me_sk, _) = keypair(1);
         let (l, _) = Listener::bind("127.0.0.1:0", me_sk, Allowed::default()).expect("binds");
         assert!(l.accept().expect("not an error").is_none());
+    }
+
+    /// **First contact needs no prior key.** `IK` cannot do this at all: it
+    /// wants the responder's static before the first message, which is
+    /// precisely what two nodes that have never met do not have.
+    #[test]
+    fn two_strangers_complete_a_bootstrap_handshake() {
+        use krab_proto::control::Control;
+
+        let (a_sk, a_pk) = keypair(1);
+        let (b_sk, b_pk) = keypair(2);
+
+        let responder = std::thread::spawn(move || {
+            bootstrap_accept("127.0.0.1:45571", b_sk, std::time::Duration::from_secs(10))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let (mut client, saw_b) =
+            bootstrap_connect("127.0.0.1:45571", a_sk).expect("the dial completes");
+        let (mut server, saw_a) = responder
+            .join()
+            .unwrap()
+            .expect("no error")
+            .expect("a call arrived");
+
+        // Each learned the other's static without either knowing it before.
+        assert_eq!(saw_b, b_pk, "the initiator misread the responder's key");
+        assert_eq!(saw_a, a_pk, "the responder misread the initiator's key");
+
+        // And the session carries control messages.
+        client.send(&Control::Done).expect("send");
+        assert_eq!(server.recv().expect("recv"), Some(Control::Done));
+    }
+
+    /// Nobody calling is not an error, and the wait is bounded — a socket that
+    /// waits for ever is one an operator cannot cancel.
+    #[test]
+    fn a_bootstrap_that_nobody_answers_gives_up() {
+        let (sk, _) = keypair(3);
+        let got = bootstrap_accept("127.0.0.1:45572", sk, std::time::Duration::from_millis(200));
+        assert!(matches!(got, Ok(None)), "an unanswered wait did not return");
     }
 }

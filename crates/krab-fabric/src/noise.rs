@@ -29,6 +29,88 @@ use std::io::{Read, Write};
 /// RFC 4 §4.1's pattern, with RFC 1 §6.1's primitives.
 pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
+/// The pattern for **first contact only** — RFC 3 §11 over a live link.
+///
+/// `IK` requires the responder's static key before the first message, which is
+/// exactly what two nodes that have never met do not have. `XX` carries both
+/// statics inside the handshake instead, encrypted after the first message.
+///
+/// # What XX does and does not give
+///
+/// It gives confidentiality against a **passive** observer, and it tells each
+/// end *a* static key the other possesses the private half of. It does not
+/// tell either end **whose** key that is: an active attacker in the middle
+/// completes two XX handshakes and relays.
+///
+/// That is not a weakness this pattern is being used despite — it is the
+/// reason RFC 3 §11 step 2 exists. The card carries an identity signature and
+/// the *fingerprint read aloud* is what binds a key to a person. XX moves the
+/// bytes; the voice call is the authentication, exactly as it is when a card
+/// arrives by email.
+///
+/// So a peering bootstrapped this way is `Channel::Network` — never
+/// post-quantum, and not authenticated until the fingerprints match.
+pub const NOISE_PARAMS_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
+
+/// Run an `XX` handshake as the initiator, learning the responder's static.
+///
+/// Three messages rather than two: `XX` cannot authenticate in one round trip
+/// because neither end knows the other in advance.
+pub fn handshake_initiator_xx<S: Read + Write>(
+    stream: &mut S,
+    local_static: &[u8; 32],
+) -> Result<(TransportState, [u8; 32]), Error> {
+    let mut hs = Builder::new(NOISE_PARAMS_XX.parse().map_err(|_| Error::Frame)?)
+        .local_private_key(local_static)
+        .map_err(|_| Error::Frame)?
+        .build_initiator()
+        .map_err(|_| Error::Frame)?;
+
+    let mut buf = [0u8; 1024];
+    let n = hs.write_message(&[], &mut buf).map_err(|_| Error::Frame)?;
+    crate::frame::write_bytes(stream, &buf[..n])?;
+
+    let msg2 = crate::frame::read_bytes(stream)?.ok_or(Error::Frame)?;
+    hs.read_message(&msg2, &mut buf).map_err(|_| Error::Frame)?;
+
+    let n = hs.write_message(&[], &mut buf).map_err(|_| Error::Frame)?;
+    crate::frame::write_bytes(stream, &buf[..n])?;
+
+    let remote = remote_static(&hs)?;
+    Ok((hs.into_transport_mode().map_err(|_| Error::Frame)?, remote))
+}
+
+/// Run an `XX` handshake as the responder.
+pub fn handshake_responder_xx<S: Read + Write>(
+    stream: &mut S,
+    local_static: &[u8; 32],
+) -> Result<(TransportState, [u8; 32]), Error> {
+    let mut hs = Builder::new(NOISE_PARAMS_XX.parse().map_err(|_| Error::Frame)?)
+        .local_private_key(local_static)
+        .map_err(|_| Error::Frame)?
+        .build_responder()
+        .map_err(|_| Error::Frame)?;
+
+    let mut buf = [0u8; 1024];
+    let msg1 = crate::frame::read_bytes(stream)?.ok_or(Error::Frame)?;
+    hs.read_message(&msg1, &mut buf).map_err(|_| Error::Frame)?;
+
+    let n = hs.write_message(&[], &mut buf).map_err(|_| Error::Frame)?;
+    crate::frame::write_bytes(stream, &buf[..n])?;
+
+    let msg3 = crate::frame::read_bytes(stream)?.ok_or(Error::Frame)?;
+    hs.read_message(&msg3, &mut buf).map_err(|_| Error::Frame)?;
+
+    let remote = remote_static(&hs)?;
+    Ok((hs.into_transport_mode().map_err(|_| Error::Frame)?, remote))
+}
+
+fn remote_static(hs: &snow::HandshakeState) -> Result<[u8; 32], Error> {
+    hs.get_remote_static()
+        .and_then(|r| r.try_into().ok())
+        .ok_or(Error::Frame)
+}
+
 /// Generate a Noise static keypair.
 ///
 /// Lives in this crate rather than `krab-crypto` because it is a *link* key —

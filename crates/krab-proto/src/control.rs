@@ -113,6 +113,19 @@ pub enum Control {
         /// either can derive the shared secret that protects everything else.
         ephemeral: [u8; 32],
     },
+    /// 10 — a signed card, during first contact over a live link.
+    ///
+    /// RFC 3 §11 step 1's artifact, on a session instead of in a file. It is
+    /// public and signed, so carrying it here costs nothing that carrying it
+    /// by email would not.
+    Card(Vec<u8>),
+    /// 11 — a reservoir contribution, during first contact.
+    ///
+    /// **Half a shared secret, on a channel secured by X25519.** The link is
+    /// therefore `Channel::Network` and earns no post-quantum credit: an
+    /// adversary recording this session and later breaking X25519 recovers it.
+    /// `peer reseal` is how that is repaired without redoing the peering.
+    Contribution(Vec<u8>),
     /// 9 — `index` adopted, and here is the confirmation.
     ///
     /// A re-key that half-completes is worse than one that fails: one end
@@ -155,6 +168,8 @@ impl Control {
             Control::Bye { .. } => 7,
             Control::Rekey { .. } => 8,
             Control::RekeyAck { .. } => 9,
+            Control::Card(_) => 10,
+            Control::Contribution(_) => 11,
         }
     }
 
@@ -227,6 +242,12 @@ impl Control {
             }
             Control::RekeyAck { index, confirm } => {
                 w.array(3).uint(9).uint(*index as u64).bstr(confirm);
+            }
+            Control::Card(b) => {
+                w.array(2).uint(10).bstr(b);
+            }
+            Control::Contribution(b) => {
+                w.array(2).uint(11).bstr(b);
             }
         }
         w.finish()
@@ -374,6 +395,8 @@ impl Control {
                     ephemeral,
                 })
             }
+            10 => Ok(Control::Card(bstr(&mut r)?.to_vec())),
+            11 => Ok(Control::Contribution(bstr(&mut r)?.to_vec())),
             9 => {
                 let index = u32f(uint(&mut r)?)?;
                 let raw = bstr(&mut r)?;

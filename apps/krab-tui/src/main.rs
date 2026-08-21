@@ -26,6 +26,7 @@
 mod activity;
 mod activity_log;
 mod atomic;
+mod bootstrap;
 mod bulletin;
 mod ceremony;
 mod channels;
@@ -131,6 +132,27 @@ enum Prompt {
     TransferWords { path: String },
     /// The same, for a re-seal rather than a first peering.
     ResealWords { path: String },
+}
+
+/// Why a first contact stopped, in words an operator can act on.
+fn meet_failure(e: bootstrap::Error) -> String {
+    use bootstrap::Error;
+    match e {
+        Error::Link => "the link failed during first contact — nothing was recorded".into(),
+        Error::Protocol => "the far end sent something unexpected — nothing was recorded".into(),
+        Error::BadCard => "their card's signature does not verify. It is not what it claims \
+                           to be, and RFC 4 §4.1 makes that a refusal rather than a prompt."
+            .into(),
+        // The one that is not an accident.
+        Error::KeyMismatch => "**the card does not belong to whoever is on the other end of \
+             this connection.**\n\n\
+             Someone is relaying: they completed a handshake with you and \
+             forwarded a genuine card belonging to somebody else, so the \
+             fingerprint you would have compared is not theirs. Nothing was \
+             recorded. Do not try again on this address until you have spoken \
+             to your friend."
+            .into(),
+    }
 }
 
 /// Seconds since the Unix epoch, or zero if the clock is before it.
@@ -1965,6 +1987,10 @@ impl App {
                     }
                     Some(Peering::Pad) => self.peer_pad(arg(rest, 1).as_deref()),
                     Some(Peering::Wrap) => self.peer_wrap(arg(rest, 1).as_deref()),
+                    Some(Peering::Meet) => {
+                        self.peer_meet(arg(rest, 1).as_deref(), arg(rest, 2).as_deref())
+                    }
+                    Some(Peering::Verified) => self.peer_verified(arg(rest, 1).as_deref()),
                     Some(Peering::Reseal) => {
                         let tail = rest.trim().strip_prefix("reseal").unwrap_or("").to_string();
                         self.peer_reseal(&tail)
@@ -2373,6 +2399,137 @@ impl App {
             return format!("could not write {dest}: {e}");
         }
         spoken::instructions(dest, &phrase)
+    }
+
+    /// First contact over a live link — the whole ceremony in one exchange.
+    ///
+    /// `peer meet listen <addr>` waits; `peer meet <addr>` dials. Both then run
+    /// the same exchange, because who called is a transport question that was
+    /// answered before the ceremony starts.
+    ///
+    /// The result is a working peering that is **neither post-quantum nor
+    /// authenticated**, and the output says so at length. `peer reseal`
+    /// repairs the first; `peer verified` records the second once a human has
+    /// done it.
+    fn peer_meet(&mut self, a: Option<&str>, b: Option<&str>) -> String {
+        let (listening, addr) = match (a, b) {
+            (Some("listen"), Some(addr)) => (true, addr.to_string()),
+            (Some("listen"), None) => match self.listen.clone() {
+                Some(addr) => (true, addr),
+                None => return "usage: peer meet listen <address>".into(),
+            },
+            (Some(addr), _) => (false, addr.to_string()),
+            (None, _) => {
+                return "usage:\n\
+                        \x20 peer meet listen <addr>   wait for them to call\n\
+                        \x20 peer meet <addr>          call them\n\n\
+                        First contact over a link, for two people who can reach \
+                        each other on a network and nowhere else. The result is \
+                        NOT post-quantum and NOT authenticated until you compare \
+                        fingerprints on a call."
+                    .into()
+            }
+        };
+
+        let Some((my_card, noise, my_fingerprint)) = self.identity.as_ref().map(|id| {
+            (
+                id.card(Policy::default()),
+                id.noise_bytes(),
+                id.fingerprint(),
+            )
+        }) else {
+            return "no identity — run `init` first".into();
+        };
+        if self.epoch_key.is_none() {
+            return "locked — unlock first".into();
+        }
+        let (my_card, my_contribution) = bootstrap::offer(my_card, &mut OsRng);
+
+        let opened = if listening {
+            krab_fabric::backend::listener::bootstrap_accept(
+                &addr,
+                noise,
+                Duration::from_secs(ANSWER_WAIT_S),
+            )
+            .map_err(|e| format!("could not listen on {addr}: {e:?}"))
+            .and_then(|o| o.ok_or_else(|| format!("nobody called on {addr}")))
+        } else {
+            krab_fabric::backend::listener::bootstrap_connect(&addr, noise)
+                .map_err(|e| format!("could not reach {addr}: {e:?}"))
+        };
+        let (mut session, their_static) = match opened {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+
+        let outcome =
+            match bootstrap::run(session.as_mut(), &my_card, &my_contribution, &their_static) {
+                Ok(o) => o,
+                Err(e) => return meet_failure(e),
+            };
+
+        // Straight into the existing ceremony, so sealing is the one path it
+        // has always been. A second would be a second place to get the channel
+        // classification or the reservoir derivation wrong.
+        let pending = ceremony::Pending::open(my_card, my_contribution.r);
+        if let Err(e) = self.save_ceremony(&pending) {
+            return e;
+        }
+        let mut pending = match self.load_ceremony() {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if pending.accept_card(outcome.card.clone()).is_err() {
+            return "that card could not be recorded".into();
+        }
+        if let Err(e) = self.save_ceremony(&pending) {
+            return e;
+        }
+        let theirs = ceremony::encode_contribution(&outcome.contribution);
+        let sealed = self.seal_with_contribution(&theirs, peering::Channel::Network);
+        if !sealed.starts_with("peer-link signed") {
+            return sealed;
+        }
+        format!(
+            "{sealed}\n\n{}",
+            bootstrap::caveat(&outcome.card.fingerprint(), &my_fingerprint)
+        )
+    }
+
+    /// Record that the fingerprints were compared aloud and matched.
+    ///
+    /// **A human act, recorded by a human.** RFC 3 §11 step 2 is the only
+    /// thing that binds a key to a person, and nothing in the software can
+    /// observe it — a ceremony that set this automatically would be recording
+    /// that something happened which it cannot see.
+    fn peer_verified(&mut self, peer: Option<&str>) -> String {
+        let Some(peer) = peer else {
+            return "usage: peer verified <peer>\n\n\
+                    Records that you read the fingerprints to each other on a \
+                    call and they matched. Only do this if they did."
+                .into();
+        };
+        let Some(mut t) = self.peer_terms(peer) else {
+            return format!("no recorded terms for {peer} — is that a peering?");
+        };
+        if t.fingerprint_verified {
+            return format!("{peer} was already recorded as verified.");
+        }
+        t.fingerprint_verified = true;
+        if let Err(e) = atomic::write(&self.peer_path(peer, "terms"), &t.encode()) {
+            return format!("could not record it: {e}");
+        }
+        format!(
+            "{peer} recorded as verified.\n\n\
+             {}",
+            if t.post_quantum() {
+                "This peering is now both verified and post-quantum."
+            } else {
+                "It is still NOT post-quantum — the contribution crossed a \
+                 channel an adversary can record and later break. `peer reseal` \
+                 repairs that without redoing the peering."
+            }
+        )
     }
 
     /// Upgrade an existing peering over a stronger channel, in place.
@@ -9495,5 +9652,94 @@ mod tests {
         let t = fresh.peer_terms(&b_id).expect("terms were lost");
         assert!(!t.post_quantum());
         assert_eq!(t.channel, peering::Channel::Corpus);
+    }
+
+    /// **Two strangers peer over a network and nothing else.** No files, no
+    /// courier, no prior key — the case `PAD-OVER-NETWORK.md` §1 says people
+    /// will otherwise solve with `scp`.
+    #[test]
+    fn two_strangers_peer_over_a_live_link() {
+        let mut a = ready_node("meet-a");
+        let mut b = ready_node("meet-b");
+        let a_id = short_id(&a.identity.as_ref().unwrap().node_id());
+        let b_id = short_id(&b.identity.as_ref().unwrap().node_id());
+
+        let listener = std::thread::spawn(move || {
+            let out = b.peer_meet(Some("listen"), Some("127.0.0.1:45581"));
+            (b, out)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let out_a = a.peer_meet(Some("127.0.0.1:45581"), None);
+        let (b, out_b) = listener.join().expect("B's thread");
+
+        assert!(out_a.starts_with("peer-link signed"), "A: {out_a}");
+        assert!(out_b.starts_with("peer-link signed"), "B: {out_b}");
+
+        // A working peering: both ends hold the same reservoir.
+        assert_eq!(stored_root(&a, &b_id), stored_root(&b, &a_id));
+        assert!(a.peer_path(&b_id, "link").exists());
+
+        // **And it is honest about being neither verified nor post-quantum.**
+        for out in [&out_a, &out_b] {
+            assert!(out.contains("Nothing is verified yet"), "{out}");
+            assert!(out.contains("NOT post-quantum"), "{out}");
+            assert!(out.contains("peer reseal"), "{out}");
+        }
+        let t = a.peer_terms(&b_id).expect("terms recorded");
+        assert_eq!(t.channel, peering::Channel::Network);
+        assert!(!t.post_quantum());
+        assert!(
+            !t.fingerprint_verified,
+            "the ceremony recorded a comparison it cannot have observed"
+        );
+    }
+
+    /// The fingerprint comparison is a human act, recorded by a human — and
+    /// it does not make a network peering post-quantum.
+    #[test]
+    fn verification_is_recorded_separately_and_is_not_an_upgrade() {
+        let (mut a, _b, _a_id, b_id) = peered_pair_over("meet-verify", "corpus");
+        assert!(!a.peer_terms(&b_id).unwrap().fingerprint_verified);
+
+        type_command(&mut a, &format!("peer verified {b_id}"));
+        assert!(a.output.contains("recorded as verified"), "{}", a.output);
+        assert!(
+            a.output.contains("still NOT post-quantum"),
+            "verifying was presented as an upgrade:\n{}",
+            a.output
+        );
+        assert!(a.peer_terms(&b_id).unwrap().fingerprint_verified);
+        assert!(!a.peer_terms(&b_id).unwrap().post_quantum());
+
+        type_command(&mut a, "peers");
+        assert!(
+            !a.output.contains("fingerprints never compared"),
+            "{}",
+            a.output
+        );
+
+        // And it is idempotent rather than incrementing anything.
+        type_command(&mut a, &format!("peer verified {b_id}"));
+        assert!(a.output.contains("already"), "{}", a.output);
+    }
+
+    /// A meet, then a reseal: start over the network, upgrade when you can.
+    /// This is the whole argument of `PAD-OVER-NETWORK.md` in one test.
+    #[test]
+    fn a_network_peering_becomes_post_quantum_after_a_reseal() {
+        let (mut a, mut b, a_id, b_id) = peered_pair_over("meet-then-reseal", "network");
+        assert!(!a.peer_terms(&b_id).unwrap().post_quantum());
+
+        type_command(&mut a, &format!("peer reseal {b_id}"));
+        type_command(&mut b, &format!("peer reseal {a_id}"));
+        let a_pad = a.path("a.fresh").display().to_string();
+        let b_pad = b.path("b.fresh").display().to_string();
+        type_command(&mut a, &format!("peer reseal pad {a_pad}"));
+        type_command(&mut b, &format!("peer reseal pad {b_pad}"));
+        type_command(&mut a, &format!("peer reseal seal {b_pad} in-person"));
+        type_command(&mut b, &format!("peer reseal seal {a_pad} in-person"));
+
+        assert!(a.peer_terms(&b_id).unwrap().post_quantum());
+        assert_eq!(stored_root(&a, &b_id), stored_root(&b, &a_id));
     }
 }
