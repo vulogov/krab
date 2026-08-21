@@ -358,6 +358,111 @@ and relays, and would show you a fingerprint you have no reason to doubt.
 Call them. Read yours; they read theirs. Both must match.
 ```
 
+### Worked example, both terminals
+
+Alice is in São Paulo, Bob is in Nairobi. They have never met, cannot meet,
+and cannot arrange a call. Bob has a reachable address; Alice does not need
+one.
+
+```
+BOB — Nairobi                          ALICE — São Paulo
+─────────────                          ─────────────────
+$ krab --home ~/krab-bob               $ krab --home ~/krab-alice
+
+> init                                 > init
+  (four steps, write the words down)     (four steps, write the words down)
+
+> peer meet listen 0.0.0.0:40000
+  waiting…                             > peer meet bob.example.net:40000
+```
+
+Both ends print the same shape:
+
+```
+peer-link signed with vertigo absurd Wichita adroit ...
+
+agreed: buckets to 5, relaying for others, 1073741824 retained
+
+first contact complete, over the network.
+
+their fingerprint:
+
+  vertigo absurd Wichita adroit vagabond acme yesteryear Aztec
+
+yours, for them to check:
+
+  Waterloo adrift Yucatan aftermath visitor abrupt whimsical acre
+
+**Nothing is verified yet.** The link proved the far end holds a key; it
+did not prove whose. An attacker in the middle completes two handshakes
+and relays, and would show you a fingerprint you have no reason to doubt.
+
+Call them. Read yours; they read theirs. Both must match.
+
+This peering is NOT post-quantum: the contribution crossed a channel
+secured by X25519, so an adversary recording it today and breaking X25519
+later recovers it. That is repairable without redoing the peering —
+`peer reseal` the first time you meet or get a voice call.
+
+when the fingerprints match:  peer verified <peer>
+```
+
+They can already send mail. What they have is a working peering with two
+gaps, both written down and both repairable:
+
+```
+> peers
+7b1e04ff  peered  ·  not connected  ·  terms as of peering
+    network · NOT post-quantum, fingerprints never compared
+```
+
+**Later, when they do get a call:**
+
+```
+> peer verified 7b1e04ff
+7b1e04ff recorded as verified.
+
+It is still NOT post-quantum — the contribution crossed a channel an
+adversary can record and later break. `peer reseal` repairs that without
+redoing the peering.
+```
+
+**Later still, on that same call**, they can close the other gap too without
+meeting — §4b's spoken route, driven by `peer reseal`:
+
+```
+BOB                                    ALICE
+> peer reseal 7b1e04ff                 > peer reseal a1b2c3d4
+> peer reseal wrap /tmp/bob.w          > peer reseal wrap /tmp/alice.w
+  (reads 32 words aloud)                 (reads 32 words aloud)
+
+        ── the two .w files cross the network, either way ──
+
+> peer reseal seal alice.w spoken      > peer reseal seal bob.w spoken
+> <alice's 32 words>                   > <bob's 32 words>
+```
+
+```
+> peers
+7b1e04ff  peered  ·  not connected  ·  terms as of peering
+    a key read aloud · post-quantum, re-sealed 1×
+```
+
+The peer-link, the correspondent and every message either of them holds are
+unchanged throughout. **Nothing was ever redone.**
+
+### If one end has no reachable address
+
+Neither does, in most home networks. `peer meet` needs one end reachable, so:
+
+- run it on a host one of you can reach — a VPS you already have, a phone
+  hotspot, a machine on a shared network for the few minutes it takes;
+- or fall back to §4b, which needs no reachable address at all: the wrapped
+  file goes by email and the words go by voice.
+
+`peer meet` is the route for *"we can open a socket to each other and nothing
+else"*. It is not the strongest route and is not meant to be — see below.
+
 ### What it costs
 
 This uses Noise **XX** rather than IK, because IK needs the responder's static

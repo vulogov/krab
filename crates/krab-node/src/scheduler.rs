@@ -55,7 +55,28 @@ impl Scheduler {
     }
 
     /// Enrol a peer, drawing its first attempt.
+    /// Enrol a peer, **without disturbing one already enrolled**.
+    ///
+    /// Re-drawing an existing schedule is a keypress moving a transfer. An
+    /// observer who sees an operator connect *and* sees the sync that follows
+    /// learns the two are related, which is the correlation RFC 5 §6.1 forbids
+    /// and the whole reason the interval is drawn from entropy rather than
+    /// from the moment of the action.
+    ///
+    /// This was `insert`, and `connect` on an already-enrolled peer moved its
+    /// next sync by tens of thousands of seconds.
     pub fn add(&mut self, peer: PeerId, now: u64, entropy: u64) {
+        self.next
+            .entry(peer)
+            .or_insert_with(|| Self::draw(now, self.mean_interval_s, entropy));
+    }
+
+    /// Enrol a peer, re-drawing even if it is already present.
+    ///
+    /// For the one caller that legitimately wants a fresh interval: a peering
+    /// that has just been *created*, where there is no existing schedule an
+    /// observer could have been watching.
+    pub fn reschedule(&mut self, peer: PeerId, now: u64, entropy: u64) {
         self.next
             .insert(peer, Self::draw(now, self.mean_interval_s, entropy));
     }
@@ -256,5 +277,31 @@ mod tests {
         let at = s.next_due(&peer(1)).unwrap();
         let _ = s.due(at, 5); // caller ignores it, e.g. the link was down
         assert!(s.next_due(&peer(1)).unwrap() > at);
+    }
+
+    /// **Enrolling twice must not move an existing schedule.** A keypress that
+    /// re-draws is a keypress that moves a transfer, and an observer who sees
+    /// both learns they are related — RFC 5 §6.1's forbidden correlation.
+    #[test]
+    fn adding_an_enrolled_peer_leaves_its_schedule_alone() {
+        let mut s = Scheduler::new(7_200);
+        let p = peer(1);
+        s.add(p, 1_000, 0xabc);
+        let first = s.next_due(&p).expect("enrolled");
+
+        for e in [0u64, 0xdef, u64::MAX] {
+            s.add(p, 9_999, e);
+            assert_eq!(
+                s.next_due(&p),
+                Some(first),
+                "re-adding moved the schedule with entropy {e}"
+            );
+        }
+        assert_eq!(s.len(), 1);
+
+        // And `reschedule` is the deliberate way to move it, for a peering
+        // that has just been created and has no schedule to disturb.
+        s.reschedule(p, 9_999, 0xdef);
+        assert_ne!(s.next_due(&p), Some(first));
     }
 }

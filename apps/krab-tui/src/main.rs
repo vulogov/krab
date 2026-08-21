@@ -9742,4 +9742,137 @@ mod tests {
         assert!(a.peer_terms(&b_id).unwrap().post_quantum());
         assert_eq!(stored_root(&a, &b_id), stored_root(&b, &a_id));
     }
+
+    /// The full schedule, as an observer of the network would experience it:
+    /// when each peer is next spoken to.
+    fn schedule_of(a: &App) -> Vec<(String, Option<u64>)> {
+        let mut out: Vec<(String, Option<u64>)> = a
+            .peer_ids()
+            .iter()
+            .filter_map(|p| sync::peer_id_of(p).map(|id| (p.clone(), a.scheduler.next_due(&id))))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// **RFC 5 §6.1, and MILESTONE-0.1 phase D's first gate.** Inter-sync
+    /// intervals must be uncorrelated with message events.
+    ///
+    /// An absence test, which RFC 8 §14 calls the only durable protection: it
+    /// asserts that composing, sending, importing and reading mail change
+    /// *nothing* about when this node next talks to the network. A schedule
+    /// that moved when the operator did would let a passive observer read
+    /// their activity off the timing of syncs, which is the whole failure
+    /// mode Poisson scheduling exists to prevent.
+    #[test]
+    fn the_schedule_is_untouched_by_message_events() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("sched-events");
+        a.scheduler.add(
+            sync::peer_id_of(&b_id).expect("a peer id"),
+            now_seconds(),
+            0x5eed,
+        );
+        let before = schedule_of(&a);
+        assert!(
+            before.iter().any(|(_, due)| due.is_some()),
+            "nothing was scheduled, so the test proves nothing"
+        );
+
+        // Every message event the interface offers.
+        a.ui.compose();
+        a.composer.push_str("a draft in progress");
+        type_command(&mut a, &format!("send {b_id} the meeting is moved"));
+        a.refresh_inbox();
+        a.show_selected();
+        type_command(&mut a, "peers");
+        type_command(&mut a, "reach");
+
+        assert_eq!(
+            schedule_of(&a),
+            before,
+            "a message event moved the schedule — a passive observer could \
+             read the operator's activity off the timing of syncs"
+        );
+    }
+
+    /// **Phase D's second gate.** The schedule must be uncorrelated with lock
+    /// state too.
+    ///
+    /// Pausing sync while locked would publish the operator's daily rhythm —
+    /// when they are at the keyboard and when they are not — which
+    /// `MILESTONE-0.1.md` calls a worse I-5 violation than mail-driven sync.
+    /// So a locked node keeps its schedule *and keeps ticking*.
+    #[test]
+    fn the_schedule_is_untouched_by_locking_and_keeps_running() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("sched-lock");
+        a.scheduler.add(
+            sync::peer_id_of(&b_id).expect("a peer id"),
+            now_seconds(),
+            0x5eed,
+        );
+        let before = schedule_of(&a);
+        let enrolled = a.scheduler.len();
+
+        a.lock();
+        assert!(a.locked);
+        assert_eq!(
+            schedule_of(&a),
+            before,
+            "locking moved the schedule, which publishes when the operator \
+             locks their node"
+        );
+        assert_eq!(a.scheduler.len(), enrolled, "locking dropped a peer");
+
+        // And it keeps running: a locked node is a relay, not a silent one.
+        for _ in 0..5 {
+            a.tick_schedule();
+        }
+        assert_eq!(
+            a.scheduler.len(),
+            enrolled,
+            "ticking while locked unenrolled a peer"
+        );
+
+        a.passphrase = line::Line::from("a passphrase");
+        a.unlock(b"a passphrase").expect("reopens");
+        assert_eq!(
+            schedule_of(&a),
+            before,
+            "unlocking moved the schedule, which publishes when the operator \
+             returns to their node"
+        );
+    }
+
+    /// **A keypress must not move a transfer.** `Scheduler::add` overwrites,
+    /// so `connect` on a peer that was already enrolled re-drew its next sync
+    /// — and an observer who sees the connection *and* the sync learns the
+    /// operator pressed a key. RFC 5 §6.1 forbids exactly that correlation.
+    #[test]
+    fn connecting_does_not_move_an_existing_schedule() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("sched-connect");
+        a.scheduler.add(
+            sync::peer_id_of(&b_id).expect("a peer id"),
+            now_seconds(),
+            0x5eed,
+        );
+        let before = schedule_of(&a);
+
+        // A dial that fails still enrols; the point is the *schedule*, not the
+        // link. Nothing is listening on port 1.
+        type_command(&mut a, &format!("connect {b_id} tcp 127.0.0.1:1"));
+        assert_eq!(
+            schedule_of(&a),
+            before,
+            "connecting re-drew an existing schedule — the operator's keypress \
+             moved when this node next talks to the network"
+        );
+
+        // And a peer that was *not* enrolled still gets enrolled, or a node
+        // would never reconcile with someone it had just peered with.
+        a.scheduler
+            .remove(&sync::peer_id_of(&b_id).expect("a peer id"));
+        assert_eq!(a.scheduler.len(), 0);
+        type_command(&mut a, &format!("connect {b_id} tcp 127.0.0.1:1"));
+        assert_eq!(a.scheduler.len(), 1, "a new peer was not enrolled");
+    }
 }
