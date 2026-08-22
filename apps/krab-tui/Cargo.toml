@@ -26,6 +26,17 @@ krab-store = { workspace = true }
 # no platform dependency, so this is the one place in the workspace that names
 # an operating system as the root of key material.
 getrandom = "0.2"
+# RFC 8 §6's picture pipeline. Pure Rust, and pinned exactly like everything
+# else in this tree — see `Documentation/REPRODUCIBLE-BUILDS.md`.
+#
+# **These are the attack surface.** RFC 8 §6 says so in as many words: image
+# parsers are historically the richest source of remote code execution, which
+# is why nothing here validates and everything is re-encoded. Two decoders is
+# two parsers; the alternative is a format nobody can send.
+png = "=0.18.1"
+zune-jpeg = "=0.5.15"
+# For the CRC in `picture`'s bomb fixtures. Already in the tree via `png`.
+crc32fast = "=1.5.0"
 # Memory hygiene, not cryptography. `krab-crypto`'s single-boundary rule is
 # about the primitives an auditor must review; `zeroize` is a volatile-write
 # helper already in the tree transitively, and a hand-rolled loop under this

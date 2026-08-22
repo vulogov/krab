@@ -48,6 +48,12 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
+    /// **Not in RFC 8 §5.** Write a received picture to a file — RFC 8 §6.
+    ///
+    /// Writes bytes and stops. RFC 8 §6 forbids passing received bytes to a
+    /// system image viewer, so this program does not open one — not with a
+    /// flag, not with a setting.
+    Picture,
     /// **Not in RFC 8 §5.** Groups — RFC 6 §2.
     ///
     /// A closed roster with fan-out. The opposite security model from a
@@ -144,6 +150,7 @@ impl Command {
             "quit" | "exit" => Command::Quit,
             "channel" | "chan" => Command::Channel,
             "group" => Command::Group,
+            "picture" | "pic" => Command::Picture,
             "help" | "?" => Command::Help,
             _ => return None,
         })
@@ -217,6 +224,11 @@ impl Command {
         ),
         ("group remove <name> <peer>", "remove a member"),
         ("group list", "groups, their rosters and their epochs"),
+        (
+            "send <peer> --picture <file>",
+            "decoded and re-encoded; EXIF is stripped",
+        ),
+        ("picture save <file>", "write the selected picture out"),
     ];
 
     /// The chords, which are not typed and so are not in [`Self::SYNOPSES`].
@@ -308,6 +320,7 @@ impl fmt::Display for Command {
             Command::Quit => "quit",
             Command::Channel => "channel",
             Command::Group => "group",
+            Command::Picture => "picture",
             Command::Help => "help",
         };
         f.write_str(s)

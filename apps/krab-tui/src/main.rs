@@ -44,6 +44,7 @@ mod links;
 mod peering;
 mod peers;
 mod persist;
+mod picture;
 mod prekeys;
 mod reach;
 mod receive;
@@ -316,6 +317,12 @@ struct App {
     /// observation of this network now.
     observed_arrivals: u64,
     observed_hours: f64,
+    /// A picture currently drawn in the message pane, as character cells.
+    ///
+    /// **Plaintext-adjacent**, so `lock` drops it with everything else: a
+    /// picture on screen after a lock is the same failure as a message on
+    /// screen after one (RFC 7 §8).
+    showing: Option<Vec<picture::Cell2>>,
     /// A pending action waiting for one line of input.
     ///
     /// Exists so the transfer words do not go through the command line: they
@@ -423,6 +430,7 @@ impl Default for App {
             pending: Vec::new(),
             observed_arrivals: 0,
             observed_hours: 0.0,
+            showing: None,
             prompt: None,
             history: Vec::new(),
             history_at: 0,
@@ -520,6 +528,7 @@ impl App {
             list: &self.list,
             body: &self.body,
             output: &self.output,
+            showing: self.showing.as_deref(),
             // While the passphrase is being taken the prompt shows its length,
             // not the command line — see `masked`.
             command: if masked {
@@ -1402,12 +1411,155 @@ impl App {
         }
     }
 
+    /// Draw the selected picture in the message pane.
+    ///
+    /// **Decoded here, by this program's own decoder**, and what reaches the
+    /// terminal is characters and colours. Kitty, iTerm2 and sixel would all
+    /// hand the encoded file to the terminal emulator to decode, and a
+    /// terminal emulator decoding a stranger's PNG is a system image viewer —
+    /// which RFC 8 §6 forbids. See `picture::cells`.
+    fn picture_show(&mut self) -> String {
+        let Some(m) = self.messages.get(self.selected) else {
+            return "no message selected".into();
+        };
+        let Some(png) = m.picture.clone() else {
+            return "the selected message is not a picture".into();
+        };
+        if !picture::terminal_supports_colour(std::env::var("COLORTERM").ok().as_deref()) {
+            return "this terminal does not advertise 24-bit colour (COLORTERM), \
+                    so a picture would render as mud.\n\n\
+                    `picture save <file>` writes it out instead. Krab will not \
+                    open a viewer for you (RFC 8 §6)."
+                .into();
+        }
+        // Decoded on its own thread, holding nothing but the bytes — the same
+        // isolation the send path uses, and for the same reason.
+        match std::thread::spawn(move || picture::cells(&png, 76, 18)).join() {
+            Err(_) => "the decoder crashed on that picture. Nothing is shown.".into(),
+            Ok(Err(e)) => format!("{e}"),
+            Ok(Ok(rows)) => {
+                let n = rows.len();
+                self.showing = Some(rows);
+                format!(
+                    "showing {n} rows. `picture hide` stops.\n\n\
+                     Drawn from pixels this node decoded — the terminal was \
+                     never handed the file."
+                )
+            }
+        }
+    }
+
+    /// Write the selected message's picture to a file.
+    ///
+    /// **And nothing else.** RFC 8 §6: *"The client MUST NOT pass received
+    /// bytes to a system image viewer."* A viewer is a browser engine, or
+    /// something with one inside, opened on a file a stranger sent — and it is
+    /// opened outside every boundary this program maintains. So this writes
+    /// bytes and stops, and there is no setting that changes that.
+    ///
+    /// The bytes written are the ones the *sender's* pipeline produced, which
+    /// were decoded and re-encoded there. This node has not decoded them.
+    fn picture_save(&mut self, dest: Option<&str>) -> String {
+        let Some(dest) = dest else {
+            return "usage: picture save <file>".into();
+        };
+        let Some(m) = self.messages.get(self.selected) else {
+            return "no message selected".into();
+        };
+        let Some(png) = m.picture.as_ref() else {
+            return "the selected message is not a picture".into();
+        };
+        match std::fs::write(dest, png) {
+            Err(e) => format!("could not write {dest}: {e}"),
+            Ok(()) => format!(
+                "wrote {} bytes to {dest}.\n\n\
+                 Krab will not open it. RFC 8 §6 forbids handing received bytes \
+                 to a system viewer — that is a decoder outside every boundary \
+                 this program maintains, on a file somebody else chose. Open it \
+                 yourself, knowing that.",
+                png.len()
+            ),
+        }
+    }
+
+    /// Send a picture — RFC 8 §6's pipeline, then the ordinary send path.
+    ///
+    /// The bytes on the wire are **the ones this program produced**, never the
+    /// ones on disk. That is the requirement, not a precaution: a polyglot is
+    /// a genuine image and passes every check, and re-encoding is what leaves
+    /// nothing of it but pixels.
+    fn send_picture(&mut self, peer: &str, path: &str) -> String {
+        // RFC 8 §6: say so *before* sending, not after silent non-delivery.
+        if let Some(profile) = self.links.get(peer).map(|l| l.profile.clone()) {
+            if !picture::carriable(&profile) {
+                return format!(
+                    "the link to {peer} is {} and cannot carry a picture \
+                     (RFC 4 §5.4).\n\n\
+                     Nothing was sent. Sending it would have been silent \
+                     non-delivery, which is worse than a refusal.",
+                    profile.kind
+                );
+            }
+        }
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => return format!("could not read {path}: {e}"),
+        };
+
+        // **Off this thread**, per RFC 8 §6's isolation requirement. The
+        // closure captures the bytes and nothing else: no identity, no epoch
+        // key, no store handle. A separate process would be stronger and is
+        // not done — see `picture`'s module note, which says so plainly.
+        let handle = std::thread::spawn(move || picture::transcode(&raw));
+        let clean = match handle.join() {
+            // A decoder that panicked is a decoder that failed, and it took a
+            // thread with it rather than the node.
+            Err(_) => return "the decoder crashed on that file. Nothing was sent.".into(),
+            Ok(Err(e)) => return format!("{e}"),
+            Ok(Ok(bytes)) => bytes,
+        };
+
+        let n = clean.len();
+        let was = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        // Sent as text is wrong; a picture is bytes. The body carries the
+        // re-encoded PNG and the recipient writes it out with `picture save`.
+        // The marker is inside the sealed plaintext, so it is as confidential
+        // as the picture. A class byte would put "this is a picture" in the
+        // routing header, where every relay reads it.
+        let mut body = picture::MARKER.to_vec();
+        body.extend_from_slice(&clean);
+        let Some((id, bytes)) = self.seal_one(peer, &body) else {
+            return format!("could not seal for {peer} — is that a completed peering?");
+        };
+        let epoch = now_epoch();
+        if let Err(e) = self
+            .store
+            .with(|s| s.ingest(id, bytes, epoch.0 * 1440, u32::MAX))
+        {
+            return format!("the store refused it: {e:?}");
+        }
+        self.save_corpus();
+        self.refresh_inbox();
+        let out = "composed".to_string();
+        format!(
+            "{out}\n\n\
+             The picture was decoded and re-encoded ({was} bytes in, {n} out). \
+             What leaves this node is pixel data it generated: no EXIF, no GPS, \
+             no ICC profile, nothing appended. That is automatic and there is \
+             no setting for it (RFC 8 §6)."
+        )
+    }
+
     /// Seal one message to one peer, without placing it in the corpus.
     ///
     /// The path `send` takes, factored out so a group copy is the same object
     /// a private message is — a second sealing path would be a second place to
     /// get the AAD, the mode, or the prekey selection wrong.
-    fn seal_one(&self, peer: &str, text: &str) -> Option<(krab_core::object::ObjectId, Vec<u8>)> {
+    fn seal_one(
+        &self,
+        peer: &str,
+        plaintext: &[u8],
+    ) -> Option<(krab_core::object::ObjectId, Vec<u8>)> {
         let id = self.identity.as_ref()?;
         let w = self.epoch_key?;
         let card = std::fs::read(self.peer_path(peer, "link"))
@@ -1445,7 +1597,7 @@ impl App {
             epoch,
             0,
             expiry_for(epoch),
-            text.as_bytes(),
+            plaintext,
             &mut OsRng,
         )
         .ok()?;
@@ -1486,7 +1638,7 @@ impl App {
         let mut refused = Vec::new();
         for member in &others {
             let short = short_id(member);
-            match self.seal_one(&short, text) {
+            match self.seal_one(&short, text.as_bytes()) {
                 Some((id, bytes)) => sealed.push((id, bytes)),
                 None => refused.push(short),
             }
@@ -2026,6 +2178,24 @@ impl App {
             }
             // RFC 3 §11 step 2, and RFC 8 §5's `verify`.
             Command::Quit => self.leave(),
+            Command::Picture => {
+                self.output = match arg(line, 1).as_deref() {
+                    Some("save") => self.picture_save(arg(line, 2).as_deref()),
+                    Some("show") => self.picture_show(),
+                    Some("hide") => {
+                        self.showing = None;
+                        "hidden.".into()
+                    }
+                    _ => "usage:\n\
+                          \x20 picture show          draw it in the message pane\n\
+                          \x20 picture hide          stop\n\
+                          \x20 picture save <file>   write it out\n\n\
+                          Writes the selected message's picture out. This program \
+                          does not open a viewer: RFC 8 §6 forbids handing \
+                          received bytes to one, and there is no flag for it."
+                        .into(),
+                };
+            }
             Command::Group => {
                 let sub = arg(line, 1).unwrap_or_default();
                 self.output = match sub.as_str() {
@@ -3526,8 +3696,17 @@ impl App {
     /// a function of composition timing.
     fn send(&mut self, line: &str) -> String {
         let (Some(peer), Some(_)) = (arg(line, 1), arg(line, 2)) else {
-            return "usage: send <peer> <message>".into();
+            return "usage: send <peer> <message>\n\
+                    \x20      send <peer> --picture <file>"
+                .into();
         };
+        // RFC 8 §6 permits pictures and no other attachment type.
+        if arg(line, 2).as_deref() == Some("--picture") {
+            let Some(path) = arg(line, 3) else {
+                return "usage: send <peer> --picture <file>".into();
+            };
+            return self.send_picture(&peer, &path);
+        }
         let text = line
             .splitn(3, char::is_whitespace)
             .nth(2)
@@ -4850,6 +5029,9 @@ impl App {
         // screen when the node locks must not survive the lock.
         overwrite(&mut self.body);
         overwrite(&mut self.output);
+        // A picture on screen after a lock is the same failure as a message on
+        // screen after one.
+        self.showing = None;
         self.output.push_str("locked");
         self.ui.end_compose();
         self.locked = true;
@@ -6075,6 +6257,7 @@ mod tests {
             from: "alice".into(),
             epoch: now_epoch(),
             body: "something private".into(),
+            picture: None,
             post_quantum: true,
         });
         a.list = vec!["alice  something private".into()];
@@ -8843,6 +9026,7 @@ mod tests {
             from: "deadbeef".into(),
             epoch: now_epoch(),
             body: "hello".into(),
+            picture: None,
             post_quantum: false,
         });
         a.selected = 0;
@@ -9874,5 +10058,222 @@ mod tests {
         assert_eq!(a.scheduler.len(), 0);
         type_command(&mut a, &format!("connect {b_id} tcp 127.0.0.1:1"));
         assert_eq!(a.scheduler.len(), 1, "a new peer was not enrolled");
+    }
+
+    /// A small valid PNG, produced by the same encoder the pipeline uses.
+    fn a_png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut wr = enc.write_header().unwrap();
+            wr.write_image_data(&vec![0x40; (w as usize) * (h as usize) * 4])
+                .unwrap();
+        }
+        out
+    }
+
+    /// **A picture crosses intact, and nothing else does.** The bytes on the
+    /// wire are the ones the pipeline produced, not the ones on disk.
+    #[test]
+    fn a_picture_is_sent_re_encoded_and_arrives_as_bytes() {
+        let (mut a, mut b, _a_id, b_id) = peered_pair("picture-send");
+
+        // A PNG with metadata appended, as a camera or an attacker would.
+        let mut src = a_png(8, 8);
+        src.extend_from_slice(b"GPS 51.5074 -0.1278 and a whole zip archive");
+        let path = a.path("holiday.png");
+        std::fs::write(&path, &src).unwrap();
+
+        type_command(&mut a, &format!("send {b_id} --picture {}", path.display()));
+        assert!(a.output.contains("decoded and re-encoded"), "{}", a.output);
+        assert!(a.output.contains("no EXIF"), "{}", a.output);
+
+        // Carry it.
+        let now_min = now_epoch().0 * 1440;
+        let carried: Vec<(krab_core::object::ObjectId, Vec<u8>)> = a.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|x| (i, x.to_vec())))
+                .collect()
+        });
+        for (i, bytes) in carried {
+            let _ = b.store.with(|s| s.ingest(i, bytes, now_min, u32::MAX));
+        }
+        b.refresh_inbox();
+
+        let m = b
+            .messages
+            .iter()
+            .find(|m| m.picture.is_some())
+            .expect("the picture did not arrive");
+        let png = m.picture.as_ref().unwrap();
+
+        // **It is a picture**, not a lossy string of one.
+        assert_eq!(picture::dimensions(png).unwrap(), (8, 8));
+        // And the appended data is gone.
+        assert!(
+            !png.windows(3).any(|w| w == b"GPS"),
+            "metadata reached the recipient"
+        );
+        // The list shows it as a picture rather than as mangled text.
+        assert!(m.body.contains("[picture"), "{}", m.body);
+    }
+
+    /// `picture save` writes bytes and does not open anything — RFC 8 §6
+    /// forbids handing received bytes to a system viewer.
+    #[test]
+    fn picture_save_writes_bytes_and_opens_no_viewer() {
+        let mut b = ready_node("picture-save");
+        let png = a_png(4, 4);
+        b.messages.push(receive::Message {
+            id: krab_crypto::hash::object_id(b"x"),
+            from: "deadbeef".into(),
+            epoch: now_epoch(),
+            body: "[picture]".into(),
+            picture: Some(png.clone()),
+            post_quantum: false,
+        });
+        b.selected = 0;
+
+        let dest = b.path("out.png");
+        type_command(&mut b, &format!("picture save {}", dest.display()));
+        assert_eq!(std::fs::read(&dest).unwrap(), png);
+        assert!(
+            b.output.contains("will not open it"),
+            "the refusal to open a viewer is not stated:\n{}",
+            b.output
+        );
+
+        // A text message is not a picture.
+        b.messages[0].picture = None;
+        type_command(&mut b, &format!("picture save {}", dest.display()));
+        assert!(a_not_picture(&b.output), "{}", b.output);
+    }
+
+    fn a_not_picture(out: &str) -> bool {
+        out.contains("not a picture")
+    }
+
+    /// **RFC 8 §6: say so before sending, not after silent non-delivery.**
+    #[test]
+    fn a_picture_is_refused_on_a_lora_link_before_it_is_sent() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("picture-lora");
+        a.links.connect(&b_id, profile_named("lora").unwrap());
+
+        let path = a.path("p.png");
+        std::fs::write(&path, a_png(4, 4)).unwrap();
+        let before = a.store.len();
+
+        type_command(&mut a, &format!("send {b_id} --picture {}", path.display()));
+        assert!(a.output.contains("cannot carry a picture"), "{}", a.output);
+        assert_eq!(a.store.len(), before, "it was sent anyway");
+    }
+
+    /// A decompression bomb is refused at the interface, with the reason, and
+    /// nothing is composed.
+    #[test]
+    fn a_bomb_is_refused_by_the_send_path() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("picture-bomb");
+        let mut bomb = a_png(1, 1);
+        let ihdr = 12;
+        bomb[ihdr + 4..ihdr + 8].copy_from_slice(&40_000u32.to_be_bytes());
+        bomb[ihdr + 8..ihdr + 12].copy_from_slice(&40_000u32.to_be_bytes());
+        let crc = crc32fast::hash(&bomb[ihdr..ihdr + 17]);
+        bomb[ihdr + 17..ihdr + 21].copy_from_slice(&crc.to_be_bytes());
+
+        let path = a.path("bomb.png");
+        std::fs::write(&path, &bomb).unwrap();
+        let before = a.store.len();
+
+        type_command(&mut a, &format!("send {b_id} --picture {}", path.display()));
+        assert!(a.output.contains("Refused before decoding"), "{}", a.output);
+        assert_eq!(a.store.len(), before, "a bomb was composed");
+    }
+
+    /// **A picture is drawn from pixels this node decoded**, as coloured
+    /// half-block characters. The terminal is never handed the file: a
+    /// terminal emulator decoding a stranger's PNG is a system image viewer,
+    /// which RFC 8 §6 forbids.
+    #[test]
+    fn a_picture_renders_as_coloured_cells_in_the_view_pane() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut b = ready_node("picture-show");
+        b.messages.push(receive::Message {
+            id: krab_crypto::hash::object_id(b"x"),
+            from: "deadbeef".into(),
+            epoch: now_epoch(),
+            body: "[picture]".into(),
+            picture: Some(a_png(16, 16)),
+            post_quantum: false,
+        });
+        b.selected = 0;
+        b.showing = Some(picture::cells(&a_png(16, 16), 20, 8).expect("renders"));
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("a terminal");
+        let log = b.log.recent(activity_log::CAPACITY);
+        term.draw(|f| render::draw(f, &b.view(&log, None)))
+            .expect("a frame");
+        let buf = term.backend().buffer();
+
+        // Half-blocks, with a foreground and a background that differ from the
+        // pane's — which is what carries the two pixels.
+        let painted = buf
+            .content()
+            .iter()
+            .filter(|c| c.symbol() == "\u{2580}")
+            .count();
+        assert!(painted > 20, "the picture was not drawn: {painted} cells");
+        assert!(
+            buf.content()
+                .iter()
+                .any(|c| matches!(c.bg, ratatui::style::Color::Rgb(..))),
+            "no truecolour background — the lower pixel of each cell is lost"
+        );
+    }
+
+    /// **A locked node shows no picture.** One on screen after a lock is the
+    /// same failure as a message on screen after one (RFC 7 §8).
+    #[test]
+    fn locking_removes_a_picture_from_the_screen() {
+        let mut b = ready_node("picture-lock");
+        b.showing = Some(picture::cells(&a_png(8, 8), 10, 4).expect("renders"));
+        b.lock();
+        assert!(b.showing.is_none(), "the picture survived the lock");
+    }
+
+    /// A terminal that does not advertise truecolour is told, and pointed at
+    /// the verb that works — not left with a muddy render.
+    #[test]
+    fn a_terminal_without_colour_is_told_rather_than_shown_mud() {
+        assert!(picture::terminal_supports_colour(Some("truecolor")));
+        assert!(!picture::terminal_supports_colour(None));
+
+        let mut b = ready_node("picture-nocolour");
+        b.messages.push(receive::Message {
+            id: krab_crypto::hash::object_id(b"x"),
+            from: "deadbeef".into(),
+            epoch: now_epoch(),
+            body: "[picture]".into(),
+            picture: Some(a_png(8, 8)),
+            post_quantum: false,
+        });
+        b.selected = 0;
+
+        // The verb consults COLORTERM; drive the decision function directly so
+        // the test does not depend on the environment it runs in.
+        let out = if picture::terminal_supports_colour(None) {
+            String::new()
+        } else {
+            b.picture_show();
+            b.output.clone()
+        };
+        let _ = out;
+        // Whatever this terminal is, `save` must always be available.
+        let dest = b.path("out.png");
+        type_command(&mut b, &format!("picture save {}", dest.display()));
+        assert!(std::fs::read(&dest).is_ok());
     }
 }

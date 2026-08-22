@@ -39,6 +39,8 @@ pub struct View<'a> {
     pub command: &'a crate::line::Line,
     /// Command output — the output pane.
     pub output: &'a str,
+    /// A picture being shown, as character cells — RFC 8 §6.
+    pub showing: Option<&'a [crate::picture::Cell2]>,
     /// This node's short id, or `None` before `init`.
     pub me: Option<&'a str>,
     /// Whether anything is going out, and whether anything is coming in.
@@ -151,6 +153,33 @@ fn draw_list(f: &mut Frame, area: Rect, view: &View) {
 fn draw_view(f: &mut Frame, area: Rect, view: &View) {
     if view.ui.mode() == Mode::Compose {
         return draw_composer(f, area, view);
+    }
+    // A picture, if one is being shown. Half-blocks: the foreground is the
+    // upper pixel and the background the lower, so one cell carries two and
+    // the terminal is never handed an image to decode — see `picture::cells`.
+    if let Some(rows) = view.showing.filter(|_| !view.locked) {
+        let lines: Vec<Line> = rows
+            .iter()
+            .map(|row| {
+                Line::from(
+                    row.iter()
+                        .map(|(top, bottom)| {
+                            Span::styled(
+                                "\u{2580}",
+                                Style::default()
+                                    .fg(Color::Rgb(top[0], top[1], top[2]))
+                                    .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines).block(frame_for(view.ui, Pane::View, " picture ".into())),
+            area,
+        );
+        return;
     }
     // RFC 7 §8 and RFC 8 §2.2: plaintext exists only while displayed, and a
     // locked node has no key to produce any.

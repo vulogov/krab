@@ -118,6 +118,8 @@ impl TagTable {
     }
 }
 
+type Opened = (String, Epoch, String, Option<Vec<u8>>, bool);
+
 /// A message this node could open.
 pub struct Message {
     /// The object it came from.
@@ -133,6 +135,12 @@ pub struct Message {
     /// The epoch its tag derives from — not when it arrived, which this node
     /// deliberately does not record (RFC 3 §12).
     pub epoch: Epoch,
+    /// A picture, if this message is one — RFC 8 §6.
+    ///
+    /// Held as bytes, never as text: a PNG through `from_utf8_lossy` is a
+    /// destroyed PNG. **Lives only as long as this value does** (RFC 7 §8),
+    /// like the body beside it.
+    pub picture: Option<Vec<u8>>,
     /// Plaintext. **Lives only as long as this value does** (RFC 7 §8).
     pub body: String,
     /// Whether the reservoir was in play, so the interface can say what the
@@ -274,11 +282,12 @@ impl Inbox {
             }
 
             match Self::open_object(bytes, &header, candidates, correspondents, ours) {
-                Some((from, epoch, body, pq)) => out.messages.push(Message {
+                Some((from, epoch, body, picture, pq)) => out.messages.push(Message {
                     id,
                     from,
                     epoch,
                     body,
+                    picture,
                     post_quantum: pq,
                 }),
                 None => out.tag_match_decrypt_fail += 1,
@@ -298,7 +307,7 @@ impl Inbox {
         candidates: &[(usize, Epoch)],
         correspondents: &[Correspondent],
         ours: &[SecretKey],
-    ) -> Option<(String, Epoch, String, bool)> {
+    ) -> Option<Opened> {
         let (env, _) = decode_envelope(&bytes[ROUTING_HEADER_LEN..]).ok()?;
         if env.enc.len() != ENC_LEN {
             return None;
@@ -311,7 +320,7 @@ impl Inbox {
         let info = info_for(header.class);
         // Held rather than returned, so the loops below run to completion —
         // see the note on RFC 1 §6.3 further down.
-        let mut opened: Option<(String, Epoch, String, bool)> = None;
+        let mut opened: Option<Opened> = None;
 
         for (idx, tag_epoch) in candidates {
             let c = correspondents.get(*idx)?;
@@ -348,8 +357,23 @@ impl Inbox {
                     };
                     if let Ok(pt) = ctx.open(env.ciphertext, &aad) {
                         if opened.is_none() {
-                            let body = String::from_utf8_lossy(&pt).into_owned();
-                            opened = Some((c.name.clone(), epoch, body, n == 0 && chunk.is_some()));
+                            // A picture keeps its bytes; anything else is
+                            // text. `from_utf8_lossy` on a PNG produces a
+                            // string that is not the picture.
+                            let (body, picture) = match crate::picture::from_plaintext(&pt) {
+                                Some(png) => (
+                                    format!("[picture, {} bytes — `picture save`]", png.len()),
+                                    Some(png.to_vec()),
+                                ),
+                                None => (String::from_utf8_lossy(&pt).into_owned(), None),
+                            };
+                            opened = Some((
+                                c.name.clone(),
+                                epoch,
+                                body,
+                                picture,
+                                n == 0 && chunk.is_some(),
+                            ));
                         }
                     }
                 }
