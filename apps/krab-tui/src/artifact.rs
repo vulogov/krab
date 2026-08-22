@@ -1,0 +1,233 @@
+//! Every file a node writes, named once.
+//!
+//! # Why this exists
+//!
+//! `wipe` — RFC 7 §10's panic destruction — decided what to destroy from a
+//! hand-written list of filenames. That list failed twice.
+//!
+//! The first time it did not recurse, so every peering survived a wipe: the
+//! files were useless without the KEK, but *a list of who this node peered
+//! with is not nothing*, which is the reason they were on the list at all.
+//!
+//! The second time it was simply not updated. `prekeys.ring`, `groups.sealed`,
+//! `channels.roster` and `duress.wrapped` were added over several months and
+//! none reached the predicate, so a panic wipe left behind the private halves
+//! of every outstanding prekey, the roster of every group, the channel posting
+//! key, and the duress store — which means a "wiped" node was not the fresh
+//! one RFC 7 §10 says it presents as.
+//!
+//! Both were omissions in a list nobody had a reason to look at. A third
+//! omission was certain, so the list is no longer written by hand:
+//! [`App::path`](crate::App::path) takes an [`Artifact`] rather than a
+//! string, and a file that is not in this enum cannot be written at all.
+//!
+//! # What is destroyed
+//!
+//! Everything. `SECURE-DELETE.md`'s argument is that ciphertext is shredded
+//! too, because destruction protects against an adversary who obtains the key
+//! *later* — coercion, a keylogger, a passphrase brute-forced at leisure —
+//! and that adversary is the one RFC 7 §10 exists for. So
+//! [`Artifact::destroyed_by_wipe`] is `true` for every variant, and it is a
+//! method rather than an assumption so that adding a variant that should
+//! survive is a deliberate act with somewhere to write down why.
+
+/// A file in the node's home directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Artifact {
+    /// The key hierarchy, wrapped under the KEK.
+    IdentityWrapped,
+    /// Argon2 parameters and salt.
+    KekParams,
+    /// The corpus.
+    Corpus,
+    /// A peering ceremony in progress.
+    Ceremony,
+    /// This node's card, published during a peering.
+    PeerCard,
+    /// This node's contribution, in the clear, awaiting a courier.
+    PeerPad,
+    /// Prekey private halves — RFC 7 §5.
+    PrekeyRing,
+    /// Channels owned and followed, including the posting key — RFC 6 §3.
+    ChannelRoster,
+    /// Group rosters — RFC 6 §2. A membership disclosure.
+    Groups,
+    /// A re-seal in progress.
+    Reseal,
+    /// The duress store — RFC 7 §10.
+    DuressWrapped,
+}
+
+impl Artifact {
+    /// Every artifact. Used by the test that keeps this file honest.
+    pub const ALL: [Artifact; 11] = [
+        Artifact::IdentityWrapped,
+        Artifact::KekParams,
+        Artifact::Corpus,
+        Artifact::Ceremony,
+        Artifact::PeerCard,
+        Artifact::PeerPad,
+        Artifact::PrekeyRing,
+        Artifact::ChannelRoster,
+        Artifact::Groups,
+        Artifact::Reseal,
+        Artifact::DuressWrapped,
+    ];
+
+    /// The name on disk.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Artifact::IdentityWrapped => "identity.wrapped",
+            Artifact::KekParams => "kek.params",
+            Artifact::Corpus => "corpus.krab",
+            Artifact::Ceremony => "ceremony.cbor",
+            Artifact::PeerCard => "peer.card",
+            Artifact::PeerPad => "peer.pad",
+            Artifact::PrekeyRing => "prekeys.ring",
+            Artifact::ChannelRoster => "channels.roster",
+            Artifact::Groups => "groups.sealed",
+            Artifact::Reseal => "reseal.cbor",
+            Artifact::DuressWrapped => "duress.wrapped",
+        }
+    }
+
+    /// Whether `wipe` destroys it.
+    ///
+    /// True for everything. Written as a method so that a future artifact
+    /// which should survive has a place to say why, rather than being omitted
+    /// from a list and surviving by accident — which is how the two failures
+    /// this module exists for both happened.
+    pub fn destroyed_by_wipe(&self) -> bool {
+        match self {
+            Artifact::IdentityWrapped
+            | Artifact::KekParams
+            | Artifact::Corpus
+            | Artifact::Ceremony
+            | Artifact::PeerCard
+            | Artifact::PeerPad
+            | Artifact::PrekeyRing
+            | Artifact::ChannelRoster
+            | Artifact::Groups
+            | Artifact::Reseal
+            | Artifact::DuressWrapped => true,
+        }
+    }
+}
+
+/// A file inside one peer's directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerFile {
+    /// Their signed card — the peer-link.
+    Link,
+    /// The shared reservoir, sealed under the epoch key.
+    Reservoir,
+    /// Their terms, as of the last re-key.
+    Policy,
+    /// How the peering was formed, and what it is worth.
+    Terms,
+}
+
+impl PeerFile {
+    /// Every per-peer file.
+    pub const ALL: [PeerFile; 4] = [
+        PeerFile::Link,
+        PeerFile::Reservoir,
+        PeerFile::Policy,
+        PeerFile::Terms,
+    ];
+
+    /// The name on disk.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PeerFile::Link => "link",
+            PeerFile::Reservoir => "reservoir",
+            PeerFile::Policy => "policy",
+            PeerFile::Terms => "terms",
+        }
+    }
+}
+
+/// Whether `wipe` destroys a file with this name.
+///
+/// The predicate `shred::remove_matching` is given. It answers for names in
+/// the home directory *and* inside `peers/<id>/`, because the walk recurses.
+pub fn wiped(name: &str) -> bool {
+    Artifact::ALL
+        .iter()
+        .any(|a| a.name() == name && a.destroyed_by_wipe())
+        || PeerFile::ALL.iter().any(|p| p.name() == name)
+        // Names an older layout wrote, before per-peer directories. A node
+        // upgraded in place still has them, and a wipe that skipped them
+        // would leave exactly the peer list it is meant to destroy.
+        || name.ends_with(".link")
+        || name.ends_with(".reservoir")
+        || name.ends_with(".krab")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Every artifact is destroyed by a wipe.** The two failures this module
+    /// exists for were both omissions; this is the assertion that makes an
+    /// omission impossible, because a new variant fails to compile until it is
+    /// in `ALL` and fails this until `wiped` covers it.
+    #[test]
+    fn wipe_covers_every_artifact_this_node_writes() {
+        for a in Artifact::ALL {
+            assert!(
+                a.destroyed_by_wipe(),
+                "{:?} survives a wipe and nothing says why",
+                a
+            );
+            assert!(
+                wiped(a.name()),
+                "{} is not matched by the predicate",
+                a.name()
+            );
+        }
+        for p in PeerFile::ALL {
+            assert!(wiped(p.name()), "{} is not matched", p.name());
+        }
+    }
+
+    /// The four that were actually left behind, named so a regression is
+    /// recognisable rather than merely a failing count.
+    #[test]
+    fn the_artifacts_that_survived_a_wipe_no_longer_do() {
+        for name in [
+            "prekeys.ring",
+            "groups.sealed",
+            "channels.roster",
+            "duress.wrapped",
+        ] {
+            assert!(wiped(name), "{name} survived a panic wipe");
+        }
+    }
+
+    /// Names are distinct, or two artifacts would share a file.
+    #[test]
+    fn every_artifact_has_its_own_name() {
+        let mut names: Vec<&str> = Artifact::ALL.iter().map(|a| a.name()).collect();
+        let n = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), n, "two artifacts share a filename");
+
+        let mut peers: Vec<&str> = PeerFile::ALL.iter().map(|p| p.name()).collect();
+        let n = peers.len();
+        peers.sort();
+        peers.dedup();
+        assert_eq!(peers.len(), n);
+    }
+
+    /// A file this node never writes is not destroyed — a wipe that removed
+    /// everything in the working directory would be catastrophic, since
+    /// `--home` defaults to it.
+    #[test]
+    fn a_file_the_node_did_not_write_is_left_alone() {
+        for name in ["notes.txt", ".bashrc", "Cargo.toml", "holiday.png", ""] {
+            assert!(!wiped(name), "{name} would be destroyed by a wipe");
+        }
+    }
+}

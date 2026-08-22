@@ -25,6 +25,7 @@
 
 mod activity;
 mod activity_log;
+mod artifact;
 mod atomic;
 mod bootstrap;
 mod bulletin;
@@ -1048,7 +1049,8 @@ impl App {
         {
             for name in self.peer_ids() {
                 let name = name.as_str();
-                let Ok(bytes) = std::fs::read(self.peer_path(name, "link")) else {
+                let Ok(bytes) = std::fs::read(self.peer_path(name, artifact::PeerFile::Link))
+                else {
                     continue;
                 };
                 let Ok(card) = peering::Card::decode(&bytes) else {
@@ -1066,7 +1068,7 @@ impl App {
                 // resumes at the right index and advances to today. A node
                 // returning after a gap derives every chunk it missed on the
                 // way, and destroys each intermediate root (RFC 7 §6).
-                let reservoir = std::fs::read(self.peer_path(name, "reservoir"))
+                let reservoir = std::fs::read(self.peer_path(name, artifact::PeerFile::Reservoir))
                     .ok()
                     .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/reservoir", &s).ok())
                     .and_then(|r| persist::decode_reservoir(&r).ok())
@@ -1244,7 +1246,10 @@ impl App {
                 id.correspondence().to_bytes(),
             ));
         }
-        if let (Some(w), Ok(sealed)) = (self.epoch_key, std::fs::read(self.path("prekeys.ring"))) {
+        if let (Some(w), Ok(sealed)) = (
+            self.epoch_key,
+            std::fs::read(self.path(artifact::Artifact::PrekeyRing)),
+        ) {
             if let Some(keys) = krab_crypto::kek::open_under(&w, b"krab/prekeys", &sealed)
                 .ok()
                 .and_then(|raw| prekeys::stored_candidates(&raw))
@@ -1298,7 +1303,7 @@ impl App {
         };
         // The peer must be one this node has peered with: a group member who
         // cannot be sealed to is a member who silently receives nothing.
-        let Some(card) = std::fs::read(self.peer_path(peer, "link"))
+        let Some(card) = std::fs::read(self.peer_path(peer, artifact::PeerFile::Link))
             .ok()
             .and_then(|b| peering::Card::decode(&b).ok())
             .filter(|c| c.verify())
@@ -1562,14 +1567,14 @@ impl App {
     ) -> Option<(krab_core::object::ObjectId, Vec<u8>)> {
         let id = self.identity.as_ref()?;
         let w = self.epoch_key?;
-        let card = std::fs::read(self.peer_path(peer, "link"))
+        let card = std::fs::read(self.peer_path(peer, artifact::PeerFile::Link))
             .ok()
             .and_then(|b| peering::Card::decode(&b).ok())
             .filter(|c| c.verify())?;
 
         let epoch = now_epoch();
         let their_prekey = self.prekey_for(&card.node_id());
-        let reservoir = std::fs::read(self.peer_path(peer, "reservoir"))
+        let reservoir = std::fs::read(self.peer_path(peer, artifact::PeerFile::Reservoir))
             .ok()
             .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
             .and_then(|raw| persist::decode_reservoir(&raw).ok())
@@ -1822,7 +1827,7 @@ impl App {
             blob.extend_from_slice(&e);
         }
         let sealed = krab_crypto::kek::seal_under(&w, b"krab/groups", &blob, &mut OsRng).ok()?;
-        atomic::write(&self.path("groups.sealed"), &sealed)
+        atomic::write(&self.path(artifact::Artifact::Groups), &sealed)
             .err()
             .map(|e| format!("could not store the groups: {e}"))
     }
@@ -1830,7 +1835,7 @@ impl App {
     /// Read the groups back.
     fn load_groups(&mut self) {
         let Some(w) = self.epoch_key else { return };
-        let Some(blob) = std::fs::read(self.path("groups.sealed"))
+        let Some(blob) = std::fs::read(self.path(artifact::Artifact::Groups))
             .ok()
             .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/groups", &s).ok())
         else {
@@ -2375,7 +2380,25 @@ impl App {
     }
 
     /// The path of a ceremony artifact.
-    fn path(&self, name: &str) -> PathBuf {
+    /// A file in this node's home.
+    ///
+    /// **Takes an [`artifact::Artifact`], not a string.** `wipe` decides what
+    /// to destroy from the same enum, so a file this program can write is a
+    /// file `wipe` knows about — which is what stops the omission that left
+    /// prekey privates, group rosters, the channel posting key and the duress
+    /// store on disk after a panic wipe.
+    fn path(&self, a: artifact::Artifact) -> PathBuf {
+        self.home.join(a.name())
+    }
+
+    /// A file in the home that is **not** one of this node's artifacts.
+    ///
+    /// Test-only, and deliberately so: production code writing a file whose
+    /// name `wipe` has never heard of is the defect `artifact` exists to
+    /// prevent. Tests write fixtures — cards in transit, pictures, courier
+    /// archives — and those are the operator's files, not the node's.
+    #[cfg(test)]
+    fn at(&self, name: &str) -> PathBuf {
         self.home.join(name)
     }
 
@@ -2386,8 +2409,8 @@ impl App {
     /// re-keying gives each peer mutable state of its own, and state that
     /// belongs together should be removable together — a peering that ends
     /// should be one directory to shred, not a pattern to glob.
-    fn peer_path(&self, peer: impl AsRef<str>, name: &str) -> PathBuf {
-        self.home.join("peers").join(peer.as_ref()).join(name)
+    fn peer_path(&self, peer: impl AsRef<str>, f: artifact::PeerFile) -> PathBuf {
+        self.home.join("peers").join(peer.as_ref()).join(f.name())
     }
 
     /// Create a peer's directory. Called before the first write into it.
@@ -2418,7 +2441,7 @@ impl App {
         let w = self
             .epoch_key
             .ok_or("locked — unlock to work on a peering")?;
-        let bytes = std::fs::read(self.path("ceremony.cbor"))
+        let bytes = std::fs::read(self.path(artifact::Artifact::Ceremony))
             .map_err(|_| "no ceremony in progress — run `peer offer`".to_string())?;
         let (parts, wrapped) =
             ceremony::Pending::decode(&bytes).map_err(|e| format!("corrupt ceremony: {e:?}"))?;
@@ -2448,8 +2471,11 @@ impl App {
         .map_err(|e| format!("{e:?}"))?;
         // Atomic: a ceremony is days long, and a crash mid-save would lose the
         // contribution while the counterparty still holds theirs.
-        atomic::write(&self.path("ceremony.cbor"), &p.encode(&wrapped))
-            .map_err(|e| format!("could not write ceremony state: {e}"))
+        atomic::write(
+            &self.path(artifact::Artifact::Ceremony),
+            &p.encode(&wrapped),
+        )
+        .map_err(|e| format!("could not write ceremony state: {e}"))
     }
 
     /// Write this node's reservoir contribution to a named destination.
@@ -2514,7 +2540,7 @@ impl App {
                             of order is rejected rather than silently accepted."
                         .into();
                 };
-                self.seal_with_contribution(&plain, peering::Channel::Spoken)
+                self.seal_from(&plain, peering::Channel::Spoken, Some(&path))
             }
             Prompt::ResealWords { path } => {
                 let words = line.trim();
@@ -2686,7 +2712,10 @@ impl App {
             return format!("{peer} was already recorded as verified.");
         }
         t.fingerprint_verified = true;
-        if let Err(e) = atomic::write(&self.peer_path(peer, "terms"), &t.encode()) {
+        if let Err(e) = atomic::write(
+            &self.peer_path(peer, artifact::PeerFile::Terms),
+            &t.encode(),
+        ) {
             return format!("could not record it: {e}");
         }
         format!(
@@ -2734,7 +2763,7 @@ impl App {
         let Some(w) = self.epoch_key else {
             return "locked — unlock first".into();
         };
-        if !self.peer_path(peer, "link").exists() {
+        if !self.peer_path(peer, artifact::PeerFile::Link).exists() {
             return format!(
                 "no peering with {peer}.\n\n\
                  `peer reseal` strengthens one that exists. To make a new one, \
@@ -2752,7 +2781,7 @@ impl App {
         else {
             return "could not store the re-seal".into();
         };
-        if let Err(e) = atomic::write(&self.path("reseal.cbor"), &sealed) {
+        if let Err(e) = atomic::write(&self.path(artifact::Artifact::Reseal), &sealed) {
             return format!("could not store the re-seal: {e}");
         }
         format!(
@@ -2872,7 +2901,7 @@ impl App {
             Ok(c) => c,
             Err(e) => return format!("not a contribution: {e:?}"),
         };
-        let card = match std::fs::read(self.peer_path(peer, "link"))
+        let card = match std::fs::read(self.peer_path(peer, artifact::PeerFile::Link))
             .ok()
             .and_then(|b| peering::Card::decode(&b).ok())
             .filter(|c| c.verify())
@@ -2880,7 +2909,7 @@ impl App {
             Some(c) => c,
             None => return format!("the stored peer-link for {peer} does not verify"),
         };
-        let sealed = match std::fs::read(self.peer_path(peer, "reservoir")) {
+        let sealed = match std::fs::read(self.peer_path(peer, artifact::PeerFile::Reservoir)) {
             Ok(b) => b,
             Err(_) => return format!("no reservoir for {peer}"),
         };
@@ -2912,7 +2941,7 @@ impl App {
         else {
             return "could not seal the new reservoir — nothing changed".into();
         };
-        if let Err(e) = atomic::write(&self.peer_path(peer, "reservoir"), &out) {
+        if let Err(e) = atomic::write(&self.peer_path(peer, artifact::PeerFile::Reservoir), &out) {
             return format!("could not store the new reservoir: {e} — nothing changed");
         }
 
@@ -2928,8 +2957,11 @@ impl App {
             sealed_epoch: epoch,
             reseals: previous.as_ref().map(|t| t.reseals + 1).unwrap_or(1),
         };
-        let _ = atomic::write(&self.peer_path(peer, "terms"), &terms.encode());
-        shred::remove(&self.path("reseal.cbor"), &mut OsRng);
+        let _ = atomic::write(
+            &self.peer_path(peer, artifact::PeerFile::Terms),
+            &terms.encode(),
+        );
+        shred::remove(&self.path(artifact::Artifact::Reseal), &mut OsRng);
 
         format!(
             "re-sealed {peer} over {ch}.\n\n\
@@ -2947,7 +2979,7 @@ impl App {
 
     /// The recorded terms of a peering, if any were stored.
     fn peer_terms(&self, peer: &str) -> Option<peering::Terms> {
-        std::fs::read(self.peer_path(peer, "terms"))
+        std::fs::read(self.peer_path(peer, artifact::PeerFile::Terms))
             .ok()
             .and_then(|b| peering::Terms::decode(&b))
     }
@@ -2959,7 +2991,7 @@ impl App {
         let raw = krab_crypto::kek::open_under(
             &w,
             b"krab/reseal",
-            &std::fs::read(self.path("reseal.cbor")).ok()?,
+            &std::fs::read(self.path(artifact::Artifact::Reseal)).ok()?,
         )
         .ok()?;
         let mut r = Reader::new(&raw);
@@ -3099,7 +3131,7 @@ impl App {
                 )
             }
         };
-        self.seal_with_contribution(&bytes, channel)
+        self.seal_from(&bytes, channel, Some(path))
     }
 
     /// Finish a peering from the counterparty's contribution bytes.
@@ -3109,6 +3141,17 @@ impl App {
     /// sealing itself must be one path — a second would be a second place to
     /// get the channel classification or the reservoir derivation wrong.
     fn seal_with_contribution(&mut self, bytes: &[u8], channel: peering::Channel) -> String {
+        self.seal_from(bytes, channel, None)
+    }
+
+    /// As [`App::seal_with_contribution`], remembering the file the
+    /// contribution came from so it can be destroyed once consumed.
+    fn seal_from(
+        &mut self,
+        bytes: &[u8],
+        channel: peering::Channel,
+        source: Option<&str>,
+    ) -> String {
         let pending = match self.load_ceremony() {
             Ok(p) => p,
             Err(e) => return e,
@@ -3155,10 +3198,14 @@ impl App {
         if let Err(e) = self.ensure_peer_dir(&short) {
             return e;
         }
-        if let Err(e) = atomic::write(&self.peer_path(&short, "reservoir"), &out) {
+        if let Err(e) = atomic::write(&self.peer_path(&short, artifact::PeerFile::Reservoir), &out)
+        {
             return format!("could not store the reservoir: {e}");
         }
-        if let Err(e) = atomic::write(&self.peer_path(&short, "link"), &their_card.encode()) {
+        if let Err(e) = atomic::write(
+            &self.peer_path(&short, artifact::PeerFile::Link),
+            &their_card.encode(),
+        ) {
             return format!("could not store the peer-link: {e}");
         }
         // **What this peering is honestly worth, on disk beside it.**
@@ -3171,14 +3218,26 @@ impl App {
             sealed_epoch: now_epoch().0,
             reseals: 0,
         };
-        let _ = atomic::write(&self.peer_path(&short, "terms"), &terms.encode());
-        shred::remove(&self.path("ceremony.cbor"), &mut OsRng);
+        let _ = atomic::write(
+            &self.peer_path(&short, artifact::PeerFile::Terms),
+            &terms.encode(),
+        );
+        shred::remove(&self.path(artifact::Artifact::Ceremony), &mut OsRng);
         // `peer.pad` is this node's own contribution, written in the clear
         // because it has to be handed over. Once the reservoir exists it has no
         // further use and is half a live shared secret sitting unwrapped on
         // disk — the one file in the layout that is neither signed nor sealed,
         // and therefore the one where overwriting is the only tool available.
-        shred::remove(&self.path("peer.pad"), &mut OsRng);
+        shred::remove(&self.path(artifact::Artifact::PeerPad), &mut OsRng);
+        // **And theirs.** Their pad is half the same shared secret and is
+        // equally unprotected; it survived every wipe because the operator
+        // chose where to put it and `wipe` only destroys what this node wrote.
+        // Consuming it is the moment its owner is known, so it is the moment
+        // to destroy it — the alternative is a plaintext half-secret sitting
+        // in whatever directory a courier happened to unload into.
+        if let Some(path) = source {
+            shred::remove(std::path::Path::new(path), &mut OsRng);
+        }
         // A peering completed while the listener runs must be accepted at
         // once — requiring a restart to talk to someone you just peered with
         // is a rule nothing states.
@@ -3237,7 +3296,7 @@ impl App {
         // Cheap checks first: this runs on every scheduled peer, every tick.
         self.links.get(peer).and_then(|l| l.session.as_ref())?;
         let w = self.epoch_key?;
-        let sealed = std::fs::read(self.peer_path(peer, "reservoir")).ok()?;
+        let sealed = std::fs::read(self.peer_path(peer, artifact::PeerFile::Reservoir)).ok()?;
         let (_, seated) = krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed)
             .ok()
             .and_then(|r| persist::decode_reservoir(&r).ok())?;
@@ -3521,7 +3580,7 @@ impl App {
     /// touched a channel has none.
     fn load_roster(&mut self) {
         let Some(w) = self.epoch_key else { return };
-        if let Some(r) = std::fs::read(self.path("channels.roster"))
+        if let Some(r) = std::fs::read(self.path(artifact::Artifact::ChannelRoster))
             .ok()
             .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/roster", &sealed).ok())
             .and_then(|raw| channels::Roster::decode(&raw))
@@ -3536,7 +3595,7 @@ impl App {
         let sealed =
             krab_crypto::kek::seal_under(&w, b"krab/roster", &self.roster.encode(), &mut OsRng)
                 .ok()?;
-        atomic::write(&self.path("channels.roster"), &sealed)
+        atomic::write(&self.path(artifact::Artifact::ChannelRoster), &sealed)
             .err()
             .map(|e| format!("could not store the roster: {e}"))
     }
@@ -3568,7 +3627,7 @@ impl App {
 
         // Their card, from disk. RFC 4 §4.1's rule: the key a signature is
         // checked against comes from the stored link, never from the wire.
-        let card = match std::fs::read(self.peer_path(peer, "link"))
+        let card = match std::fs::read(self.peer_path(peer, artifact::PeerFile::Link))
             .ok()
             .and_then(|b| peering::Card::decode(&b).ok())
             .filter(|c| c.verify())
@@ -3578,7 +3637,7 @@ impl App {
         };
 
         // The reservoir, and where its ratchet has reached.
-        let sealed = match std::fs::read(self.peer_path(peer, "reservoir")) {
+        let sealed = match std::fs::read(self.peer_path(peer, artifact::PeerFile::Reservoir)) {
             Ok(b) => b,
             Err(_) => return format!("no reservoir for {peer}"),
         };
@@ -3647,12 +3706,15 @@ impl App {
             Ok(o) => o,
             Err(_) => return "could not seal the new reservoir — nothing changed".into(),
         };
-        if let Err(e) = atomic::write(&self.peer_path(peer, "reservoir"), &out) {
+        if let Err(e) = atomic::write(&self.peer_path(peer, artifact::PeerFile::Reservoir), &out) {
             return format!("could not store the new reservoir: {e} — nothing changed");
         }
         // Their terms, which until now propagated once at peering and never
         // again. Written beside the link so a locked node still shows them.
-        let _ = atomic::write(&self.peer_path(peer, "policy"), &outcome.theirs.encode());
+        let _ = atomic::write(
+            &self.peer_path(peer, artifact::PeerFile::Policy),
+            &outcome.theirs.encode(),
+        );
 
         self.log.push(activity_log::Event::Rekeyed {
             peer: peer.to_string(),
@@ -3719,7 +3781,7 @@ impl App {
             return "locked — unlock to compose".into();
         };
 
-        let card_bytes = match std::fs::read(self.peer_path(&peer, "link")) {
+        let card_bytes = match std::fs::read(self.peer_path(&peer, artifact::PeerFile::Link)) {
             Ok(b) => b,
             Err(_) => {
                 return format!(
@@ -3744,7 +3806,7 @@ impl App {
         // obtains that key opens everything ever sent to it, including
         // ciphertext recorded years earlier.
         let their_prekey = self.prekey_for(&card.node_id());
-        let reservoir = std::fs::read(self.peer_path(&peer, "reservoir"))
+        let reservoir = std::fs::read(self.peer_path(&peer, artifact::PeerFile::Reservoir))
             .ok()
             .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
             .and_then(|raw| persist::decode_reservoir(&raw).ok())
@@ -3907,10 +3969,14 @@ impl App {
         let Some(profile) = profile_named(kind) else {
             return format!("unknown transport {kind:?}");
         };
+        // An operator-named courier archive, not an artifact: it has no fixed
+        // name, so it cannot be an `Artifact` variant. `wipe` reaches it by
+        // the `.krab` suffix, which is what `pack` defaults to and what the
+        // predicate in `artifact` matches.
         let path = if out.contains('/') {
             PathBuf::from(out)
         } else {
-            self.path(&out)
+            self.home.join(&out)
         };
 
         // MAX_TTL back from now, not "since last time". RFC 1 §2 sets the TTL
@@ -4078,7 +4144,7 @@ impl App {
         // The expected static comes from the stored peer-link, which is signed.
         // There is no path that dials without one, and no prompt: RFC 4 §4.1
         // requires a mismatch be "a hard failure, never a TOFU prompt".
-        let card_bytes = std::fs::read(self.peer_path(peer, "link"))
+        let card_bytes = std::fs::read(self.peer_path(peer, artifact::PeerFile::Link))
             .map_err(|_| format!("no peer-link for {peer} — complete a peering first"))?;
         let card = peering::Card::decode(&card_bytes)
             .ok()
@@ -4189,7 +4255,7 @@ impl App {
                 Some(_) => "link down",
                 None => "not connected",
             };
-            let policy = if self.peer_path(id, "policy").exists() {
+            let policy = if self.peer_path(id, artifact::PeerFile::Policy).exists() {
                 "terms current"
             } else {
                 "terms as of peering"
@@ -4332,13 +4398,13 @@ impl App {
                 // Where in the five steps, and what to type next. An operator
                 // who has lost track reaches for this verb, so it has to
                 // answer "what now" rather than only "what happened".
-                let pad = self.path("peer.pad").exists();
+                let pad = self.path(artifact::Artifact::PeerPad).exists();
                 match p.their_fingerprint() {
                     None => format!(
                         "step 1 of 5 — your card is written, theirs has not arrived.\n\n\
                          wrote:  {}\n\n\
                          next:   send them that file, then `peer accept <their.card>`",
-                        self.path("peer.card").display()
+                        self.path(artifact::Artifact::PeerCard).display()
                     ),
                     Some(f) => format!(
                         "step {} of 5 — their card is recorded.\n\n\
@@ -4406,27 +4472,10 @@ impl App {
         // only thing that touches one who obtains it later — coercion, a
         // keylogger, a passphrase brute-forced at leisure. RFC 7 §10 exists
         // because coercion is in the threat model.
-        let n = shred::remove_matching(
-            &self.home,
-            |name| {
-                // Bare `link` and `reservoir` live in `peers/<id>/`; the
-                // suffixed forms are what older layouts left behind.
-                name == "link"
-                    || name == "reservoir"
-                    || name.ends_with(".link")
-                    || name.ends_with(".reservoir")
-                    || name.ends_with(".krab")
-                    || matches!(
-                        name,
-                        "identity.wrapped"
-                            | "kek.params"
-                            | "ceremony.cbor"
-                            | "peer.card"
-                            | "peer.pad"
-                    )
-            },
-            &mut OsRng,
-        );
+        // The predicate lives in `artifact`, beside the enum every write
+        // goes through. It was a hand-written list here, and it was wrong
+        // twice — see that module for both.
+        let n = shred::remove_matching(&self.home, artifact::wiped, &mut OsRng);
         format!(
             "destroyed. {n} files overwritten and removed.\n\n\
              The key went first and the store was unreadable before any file was \
@@ -4450,14 +4499,22 @@ impl App {
     /// save is worse than one that failed to start.
     fn save(&self, kek: &krab_crypto::kek::Kek) -> Result<(), String> {
         let at = |what: &str, e: persist::Error| format!("could not write {what}: {e:?}");
-        persist::write_params(&self.path("kek.params"), &self.identity_params())
-            .map_err(|e| at("kek.params", e))?;
+        persist::write_params(
+            &self.path(artifact::Artifact::KekParams),
+            &self.identity_params(),
+        )
+        .map_err(|e| at("kek.params", e))?;
         if let Some(id) = &self.identity {
-            persist::write_identity(&self.path("identity.wrapped"), id, kek, &mut OsRng)
-                .map_err(|e| at("identity.wrapped", e))?;
+            persist::write_identity(
+                &self.path(artifact::Artifact::IdentityWrapped),
+                id,
+                kek,
+                &mut OsRng,
+            )
+            .map_err(|e| at("identity.wrapped", e))?;
         }
         self.store
-            .with(|s| persist::write_corpus(&self.path("corpus.krab"), s))
+            .with(|s| persist::write_corpus(&self.path(artifact::Artifact::Corpus), s))
             .map(|_| ())
             .map_err(|e| at("corpus.krab", e))
     }
@@ -4521,7 +4578,7 @@ impl App {
         let keys: Vec<[u8; 32]> = self
             .peer_ids()
             .iter()
-            .filter_map(|p| std::fs::read(self.peer_path(p, "link")).ok())
+            .filter_map(|p| std::fs::read(self.peer_path(p, artifact::PeerFile::Link)).ok())
             .filter_map(|b| peering::Card::decode(&b).ok())
             .filter(|c| c.verify())
             .map(|c| c.noise_static_pk)
@@ -4546,7 +4603,7 @@ impl App {
             // Which peering this is. The listener verified the static against
             // the set; this maps it back to the directory it belongs to.
             let who = self.peer_ids().into_iter().find(|p| {
-                std::fs::read(self.peer_path(p, "link"))
+                std::fs::read(self.peer_path(p, artifact::PeerFile::Link))
                     .ok()
                     .and_then(|b| peering::Card::decode(&b).ok())
                     .is_some_and(|c| c.noise_static_pk == static_pk)
@@ -4579,7 +4636,7 @@ impl App {
     fn save_corpus(&self) {
         let _ = self
             .store
-            .with(|s| persist::write_corpus(&self.path("corpus.krab"), s));
+            .with(|s| persist::write_corpus(&self.path(artifact::Artifact::Corpus), s));
     }
 
     fn identity_params(&self) -> krab_crypto::kek::KekParams {
@@ -4591,7 +4648,7 @@ impl App {
 
     /// Whether a store already exists here.
     fn has_stored_identity(&self) -> bool {
-        self.path("identity.wrapped").exists()
+        self.path(artifact::Artifact::IdentityWrapped).exists()
     }
 
     /// Open the store with `passphrase`, distinguishing duress from normal.
@@ -4615,7 +4672,7 @@ impl App {
     /// to attempt both opens. Every outcome now costs one Argon2 and two AEAD
     /// operations, which are microseconds against half a second.
     fn open_with(&self, passphrase: &[u8]) -> Result<Opened, String> {
-        let params = persist::read_params(&self.path("kek.params"))
+        let params = persist::read_params(&self.path(artifact::Artifact::KekParams))
             .map_err(|_| "no store here — run `init`".to_string())?;
         let kek = persist::kek_for(passphrase, &params)
             .map_err(|_| "that passphrase does not open this store".to_string())?;
@@ -4623,11 +4680,16 @@ impl App {
         // Both attempts run regardless of which succeeds. Ordering the duress
         // check first would leak through early return; ordering it second
         // would leak the same way for a correct passphrase.
-        let duress = std::fs::read(self.path("duress.wrapped"))
+        let duress = std::fs::read(self.path(artifact::Artifact::DuressWrapped))
             .ok()
             .and_then(|sealed| kek.open(persist::CONTEXT_DURESS, &sealed).ok())
             .is_some();
-        let identity = persist::read_identity(&self.path("identity.wrapped"), &kek, params).ok();
+        let identity = persist::read_identity(
+            &self.path(artifact::Artifact::IdentityWrapped),
+            &kek,
+            params,
+        )
+        .ok();
 
         match (duress, identity) {
             (true, _) => Ok(Opened::Duress),
@@ -4641,13 +4703,13 @@ impl App {
     /// Not enabled by default (§10 requires that), and set by an explicit
     /// command so the operator knows it exists.
     fn set_duress(&self, passphrase: &[u8]) -> Result<(), String> {
-        let params = persist::read_params(&self.path("kek.params"))
+        let params = persist::read_params(&self.path(artifact::Artifact::KekParams))
             .map_err(|_| "no store here".to_string())?;
         let kek = persist::kek_for(passphrase, &params).map_err(|e| format!("{e:?}"))?;
         let sealed = kek
             .seal(persist::CONTEXT_DURESS, b"duress", &mut OsRng)
             .map_err(|e| format!("{e:?}"))?;
-        atomic::write(&self.path("duress.wrapped"), &sealed)
+        atomic::write(&self.path(artifact::Artifact::DuressWrapped), &sealed)
             .map_err(|e| format!("could not store it: {e}"))
     }
 
@@ -4685,9 +4747,9 @@ impl App {
 
         // The corpus goes through the same verification a stranger's archive
         // does. The disk is not trusted (RFC 7 §4).
-        let _ = self
-            .store
-            .with(|s| persist::read_corpus(&self.path("corpus.krab"), s, epoch.0 * 1440));
+        let _ = self.store.with(|s| {
+            persist::read_corpus(&self.path(artifact::Artifact::Corpus), s, epoch.0 * 1440)
+        });
         // Both are sealed under the epoch key, so this is the first moment
         // either can be read — and a restarted node that could not find its
         // own channel key would restart its post numbering, which is two
@@ -4715,7 +4777,7 @@ impl App {
         // — so any message already encapsulated to one of those prekeys became
         // unreadable. It was only ever called once, at `init`, which is why
         // that did not show.
-        let mut ring = std::fs::read(self.path("prekeys.ring"))
+        let mut ring = std::fs::read(self.path(artifact::Artifact::PrekeyRing))
             .ok()
             .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/prekeys", &sealed).ok())
             .and_then(|raw| prekeys::decode_ring(&raw));
@@ -4760,7 +4822,7 @@ impl App {
             &mut OsRng,
         )
         .ok()?;
-        atomic::write(&self.path("prekeys.ring"), &sealed).ok()?;
+        atomic::write(&self.path(artifact::Artifact::PrekeyRing), &sealed).ok()?;
 
         let b = bulletin::Bulletin::create(
             bulletin::Kind::Prekeys,
@@ -4834,7 +4896,10 @@ impl App {
         // wrapped under W_N in the ceremony, so a plaintext copy would be a
         // redundant one — see Documentation/SECURE-DELETE.md. `peer pad
         // <destination>` materialises it onto the medium being carried.
-        if let Err(e) = atomic::write(&self.path("peer.card"), &mine.card.encode()) {
+        if let Err(e) = atomic::write(
+            &self.path(artifact::Artifact::PeerCard),
+            &mine.card.encode(),
+        ) {
             return format!("could not write peer.card: {e}");
         }
         if let Err(e) = self.save_ceremony(&pending) {
@@ -4866,7 +4931,7 @@ impl App {
              \x20 5. exchange pads, then: peer seal <their.pad> <channel>\n\n\
              Your pad does not exist yet. Step 4 creates it, where you tell it \
              to — on the medium you are carrying, not in this directory.",
-            self.path("peer.card").display(),
+            self.path(artifact::Artifact::PeerCard).display(),
             mine.card.fingerprint()
         )
     }
@@ -5208,19 +5273,19 @@ mod tests {
         type_command(&mut a, "peer offer");
         type_command(&mut b, "peer offer");
 
-        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+        let carry = |from: &App, to: &App, name: artifact::Artifact, as_name: &str| {
             let bytes = std::fs::read(from.path(name)).expect("artifact exists");
-            let dest = to.path(as_name);
+            let dest = to.at(as_name);
             std::fs::write(&dest, bytes).expect("delivered");
             dest.to_string_lossy().into_owned()
         };
-        let a_card = carry(&a, &b, "peer.card", "from-a.card");
-        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        let a_card = carry(&a, &b, artifact::Artifact::PeerCard, "from-a.card");
+        let b_card = carry(&b, &a, artifact::Artifact::PeerCard, "from-b.card");
         type_command(&mut a, &format!("peer accept {b_card}"));
         type_command(&mut b, &format!("peer accept {a_card}"));
 
-        let a_pad = pad_onto(&mut a, &b.path("from-a.pad"));
-        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
+        let a_pad = pad_onto(&mut a, &b.at("from-a.pad"));
+        let b_pad = pad_onto(&mut b, &a.at("from-b.pad"));
         type_command(&mut a, &format!("peer seal {b_pad} media"));
         type_command(&mut b, &format!("peer seal {a_pad} media"));
         assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
@@ -5239,19 +5304,19 @@ mod tests {
         type_command(&mut a, "peer offer");
         type_command(&mut b, "peer offer");
 
-        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+        let carry = |from: &App, to: &App, name: artifact::Artifact, as_name: &str| {
             let bytes = std::fs::read(from.path(name)).expect("artifact exists");
-            let dest = to.path(as_name);
+            let dest = to.at(as_name);
             std::fs::write(&dest, bytes).expect("delivered");
             dest.to_string_lossy().into_owned()
         };
-        let a_card = carry(&a, &b, "peer.card", "from-a.card");
-        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        let a_card = carry(&a, &b, artifact::Artifact::PeerCard, "from-a.card");
+        let b_card = carry(&b, &a, artifact::Artifact::PeerCard, "from-b.card");
         type_command(&mut a, &format!("peer accept {b_card}"));
         type_command(&mut b, &format!("peer accept {a_card}"));
 
-        let a_pad = pad_onto(&mut a, &b.path("from-a.pad"));
-        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
+        let a_pad = pad_onto(&mut a, &b.at("from-a.pad"));
+        let b_pad = pad_onto(&mut b, &a.at("from-b.pad"));
         type_command(&mut a, &format!("peer seal {b_pad} {channel}"));
         type_command(&mut b, &format!("peer seal {a_pad} {channel}"));
         assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
@@ -5270,7 +5335,8 @@ mod tests {
 
     /// The reservoir root `n` currently holds for `peer`.
     fn stored_root(n: &App, peer: &str) -> [u8; 32] {
-        let sealed = std::fs::read(n.peer_path(peer, "reservoir")).expect("a reservoir");
+        let sealed =
+            std::fs::read(n.peer_path(peer, artifact::PeerFile::Reservoir)).expect("a reservoir");
         let raw = krab_crypto::kek::open_under(&n.epoch_key.unwrap(), b"krab/reservoir", &sealed)
             .expect("it opens");
         persist::decode_reservoir(&raw).expect("it decodes").0
@@ -5517,14 +5583,14 @@ mod tests {
         type_command(&mut b, "peer offer");
 
         // The courier: files move, nothing else does.
-        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+        let carry = |from: &App, to: &App, name: artifact::Artifact, as_name: &str| {
             let bytes = std::fs::read(from.path(name)).expect("artifact exists");
-            let dest = to.path(as_name);
+            let dest = to.at(as_name);
             std::fs::write(&dest, bytes).expect("delivered");
             dest.to_string_lossy().into_owned()
         };
-        let a_card = carry(&a, &b, "peer.card", "from-a.card");
-        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        let a_card = carry(&a, &b, artifact::Artifact::PeerCard, "from-a.card");
+        let b_card = carry(&b, &a, artifact::Artifact::PeerCard, "from-b.card");
 
         // Step 1 (receive) and step 2. Each side sees the other's words.
         type_command(&mut a, &format!("peer accept {b_card}"));
@@ -5555,8 +5621,8 @@ mod tests {
         }
 
         // Steps 3 and 4: the pads travel on the same media.
-        let a_pad = pad_onto(&mut a, &b.path("from-a.pad"));
-        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
+        let a_pad = pad_onto(&mut a, &b.at("from-a.pad"));
+        let b_pad = pad_onto(&mut b, &a.at("from-b.pad"));
         type_command(&mut a, &format!("peer seal {b_pad} media"));
         type_command(&mut b, &format!("peer seal {a_pad} media"));
         assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
@@ -5574,7 +5640,7 @@ mod tests {
         // other up by identifier.
         let reservoir = |n: &App, other: &App| {
             let peer = short_id(&other.identity.as_ref().unwrap().node_id());
-            let sealed = std::fs::read(n.peer_path(peer, "reservoir")).unwrap();
+            let sealed = std::fs::read(n.peer_path(peer, artifact::PeerFile::Reservoir)).unwrap();
             krab_crypto::kek::open_under(&n.epoch_key.unwrap(), b"krab/reservoir", &sealed).unwrap()
         };
         assert_eq!(
@@ -5585,7 +5651,7 @@ mod tests {
         assert_ne!(reservoir(&a, &b), vec![0u8; 32]);
 
         // The ceremony is retired, so a stale pad cannot be replayed into it.
-        assert!(!a.path("ceremony.cbor").exists());
+        assert!(!a.path(artifact::Artifact::Ceremony).exists());
         assert!(a.load_ceremony().is_err());
     }
 
@@ -5597,7 +5663,7 @@ mod tests {
         let mut b = ready_node("corpus-b");
         type_command(&mut a, "peer offer");
         type_command(&mut b, "peer offer");
-        std::fs::copy(b.path("peer.card"), a.path("b.card")).unwrap();
+        std::fs::copy(b.path(artifact::Artifact::PeerCard), a.at("b.card")).unwrap();
         {
             let mut b2 = App {
                 home: b.home.clone(),
@@ -5605,11 +5671,11 @@ mod tests {
             };
             b2.identity = Some(Identity::generate(&mut OsRng));
             b2.epoch_key = b.epoch_key;
-            type_command(&mut b2, &format!("peer pad {}", a.path("b.pad").display()));
+            type_command(&mut b2, &format!("peer pad {}", a.at("b.pad").display()));
         }
 
-        let card = a.path("b.card").display().to_string();
-        let pad = a.path("b.pad").display().to_string();
+        let card = a.at("b.card").display().to_string();
+        let pad = a.at("b.pad").display().to_string();
         type_command(&mut a, &format!("peer accept {card}"));
         type_command(&mut a, &format!("peer seal {pad} corpus"));
         assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
@@ -5657,14 +5723,14 @@ mod tests {
         }
         type_command(&mut a, "peer offer");
 
-        std::fs::copy(first.path("peer.card"), a.path("first.card")).unwrap();
-        std::fs::copy(second.path("peer.card"), a.path("second.card")).unwrap();
+        std::fs::copy(first.at("peer.card"), a.at("first.card")).unwrap();
+        std::fs::copy(second.at("peer.card"), a.at("second.card")).unwrap();
 
-        let p1 = a.path("first.card").display().to_string();
+        let p1 = a.at("first.card").display().to_string();
         type_command(&mut a, &format!("peer accept {p1}"));
         assert!(a.output.contains("their fingerprint"), "{}", a.output);
 
-        let p2 = a.path("second.card").display().to_string();
+        let p2 = a.at("second.card").display().to_string();
         type_command(&mut a, &format!("peer accept {p2}"));
         assert!(a.output.contains("already recorded"), "{}", a.output);
     }
@@ -5684,7 +5750,7 @@ mod tests {
         let err = a.load_ceremony().unwrap_err();
         assert!(err.contains("locked"), "{err}");
         // The file is still there; it is simply unreadable without the key.
-        assert!(a.path("ceremony.cbor").exists());
+        assert!(a.path(artifact::Artifact::Ceremony).exists());
     }
 
     /// A card that does not verify is refused at step 1, not recorded and
@@ -5704,12 +5770,12 @@ mod tests {
             type_command(&mut b2, "peer offer");
         }
 
-        let mut raw = std::fs::read(b.path("peer.card")).unwrap();
+        let mut raw = std::fs::read(b.path(artifact::Artifact::PeerCard)).unwrap();
         let n = raw.len();
         raw[n - 1] ^= 1; // last byte is inside the signature
-        std::fs::write(a.path("forged.card"), raw).unwrap();
+        std::fs::write(a.at("forged.card"), raw).unwrap();
 
-        let p = a.path("forged.card").display().to_string();
+        let p = a.at("forged.card").display().to_string();
         type_command(&mut a, &format!("peer accept {p}"));
         assert!(a.output.contains("does not verify"), "{}", a.output);
         assert!(
@@ -5884,12 +5950,12 @@ mod tests {
         type_command(&mut a, "peer offer");
         type_command(&mut b, "peer offer");
 
-        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
-            std::fs::write(to.path(as_name), std::fs::read(from.path(name)).unwrap()).unwrap();
-            to.path(as_name).to_string_lossy().into_owned()
+        let carry = |from: &App, to: &App, name: artifact::Artifact, as_name: &str| {
+            std::fs::write(to.at(as_name), std::fs::read(from.path(name)).unwrap()).unwrap();
+            to.at(as_name).to_string_lossy().into_owned()
         };
-        let b_card = carry(&b, &a, "peer.card", "from-b.card");
-        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
+        let b_card = carry(&b, &a, artifact::Artifact::PeerCard, "from-b.card");
+        let b_pad = pad_onto(&mut b, &a.at("from-b.pad"));
         type_command(&mut a, &format!("peer accept {b_card}"));
         {
             let mut p = a.load_ceremony().unwrap();
@@ -5901,7 +5967,7 @@ mod tests {
 
         // The peer-link is durable, and named by the peer's identifier.
         let peer = short_id(&b.identity.as_ref().unwrap().node_id());
-        assert!(a.peer_path(&peer, "link").exists());
+        assert!(a.peer_path(&peer, artifact::PeerFile::Link).exists());
 
         type_command(&mut a, &format!("send {peer} meet me at the usual place"));
         assert!(a.output.contains("composed"), "{}", a.output);
@@ -5928,7 +5994,7 @@ mod tests {
 
         // B derives the same tag from its own side -- neither party sent it.
         let a_pk = krab_crypto::dh::PublicKey(
-            peering::Card::decode(&std::fs::read(a.path("peer.card")).unwrap())
+            peering::Card::decode(&std::fs::read(a.path(artifact::Artifact::PeerCard)).unwrap())
                 .unwrap()
                 .correspondence_pk,
         );
@@ -5940,10 +6006,10 @@ mod tests {
         );
 
         // And opens it with the reservoir chunk from its own root.
-        let sealed_res = std::fs::read(b.path(&format!(
-            "{}.reservoir",
-            short_id(&a.identity.as_ref().unwrap().node_id())
-        )));
+        let sealed_res = std::fs::read(b.peer_path(
+            short_id(&a.identity.as_ref().unwrap().node_id()),
+            artifact::PeerFile::Reservoir,
+        ));
         let chunk = sealed_res.ok().and_then(|s| {
             krab_crypto::kek::open_under(&b.epoch_key.unwrap(), b"krab/reservoir", &s).ok()
         });
@@ -5954,7 +6020,7 @@ mod tests {
         let record = krab_crypto::kek::open_under(
             &a.epoch_key.unwrap(),
             b"krab/reservoir",
-            &std::fs::read(a.peer_path(peer, "reservoir")).unwrap(),
+            &std::fs::read(a.peer_path(peer, artifact::PeerFile::Reservoir)).unwrap(),
         )
         .unwrap();
         let (r, stored_epoch) = persist::decode_reservoir(&record).unwrap();
@@ -6029,12 +6095,12 @@ mod tests {
         type_command(&mut a, "peer offer");
         type_command(&mut b, "peer offer");
 
-        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
-            std::fs::write(to.path(as_name), std::fs::read(from.path(name)).unwrap()).unwrap();
-            to.path(as_name).to_string_lossy().into_owned()
+        let carry = |from: &App, to: &App, name: artifact::Artifact, as_name: &str| {
+            std::fs::write(to.at(as_name), std::fs::read(from.path(name)).unwrap()).unwrap();
+            to.at(as_name).to_string_lossy().into_owned()
         };
-        let b_card = carry(&b, &a, "peer.card", "from-b.card");
-        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
+        let b_card = carry(&b, &a, artifact::Artifact::PeerCard, "from-b.card");
+        let b_pad = pad_onto(&mut b, &a.at("from-b.pad"));
         type_command(&mut a, &format!("peer accept {b_card}"));
         {
             let mut p = a.load_ceremony().unwrap();
@@ -6054,14 +6120,14 @@ mod tests {
             a.output.contains("not what changed"),
             "the window property is stated"
         );
-        assert!(a.path("outbound.krab").exists());
+        assert!(a.at("outbound.krab").exists());
         // The manifest is for the courier, and names nobody.
-        let manifest = std::fs::read_to_string(a.path("outbound.MANIFEST.hjson")).unwrap();
+        let manifest = std::fs::read_to_string(a.at("outbound.MANIFEST.hjson")).unwrap();
         assert!(!manifest.contains(&peer), "{manifest}");
 
         // Carried, renamed, imported.
-        let delivered = b.path("holiday-photos.zip");
-        std::fs::copy(a.path("outbound.krab"), &delivered).unwrap();
+        let delivered = b.at("holiday-photos.zip");
+        std::fs::copy(a.at("outbound.krab"), &delivered).unwrap();
         type_command(&mut b, &format!("import {}", delivered.display()));
         assert!(b.output.starts_with("1 new"), "{}", b.output);
         assert!(b.output.contains("re-hashed"), "{}", b.output);
@@ -6077,7 +6143,7 @@ mod tests {
         let (env, _) = krab_core::object::decode_envelope(&raw[16..]).unwrap();
 
         let a_pk = krab_crypto::dh::PublicKey(
-            peering::Card::decode(&std::fs::read(a.path("peer.card")).unwrap())
+            peering::Card::decode(&std::fs::read(a.path(artifact::Artifact::PeerCard)).unwrap())
                 .unwrap()
                 .correspondence_pk,
         );
@@ -6092,7 +6158,7 @@ mod tests {
         let record = krab_crypto::kek::open_under(
             &a.epoch_key.unwrap(),
             b"krab/reservoir",
-            &std::fs::read(a.peer_path(peer, "reservoir")).unwrap(),
+            &std::fs::read(a.peer_path(peer, artifact::PeerFile::Reservoir)).unwrap(),
         )
         .unwrap();
         let (r, stored_epoch) = persist::decode_reservoir(&record).unwrap();
@@ -6130,8 +6196,8 @@ mod tests {
         let mut a = ready_node("sticks");
         type_command(&mut a, "pack monday.krab");
         type_command(&mut a, "pack tuesday.krab");
-        let one = std::fs::read(a.path("monday.krab")).unwrap();
-        let two = std::fs::read(a.path("tuesday.krab")).unwrap();
+        let one = std::fs::read(a.at("monday.krab")).unwrap();
+        let two = std::fs::read(a.at("tuesday.krab")).unwrap();
         assert_eq!(
             one, two,
             "an unchanged corpus produces an unchanged archive"
@@ -6161,12 +6227,12 @@ mod tests {
             .unwrap();
         type_command(&mut a, "pack out.krab");
 
-        let mut raw = std::fs::read(a.path("out.krab")).unwrap();
+        let mut raw = std::fs::read(a.at("out.krab")).unwrap();
         let mid = raw.len() / 2;
         raw[mid] ^= 0xFF;
-        std::fs::write(b.path("torn.krab"), raw).unwrap();
+        std::fs::write(b.at("torn.krab"), raw).unwrap();
 
-        let p = b.path("torn.krab").display().to_string();
+        let p = b.at("torn.krab").display().to_string();
         type_command(&mut b, &format!("import {p}"));
 
         // A tampered object is not an *invalid* object — it is a *different*
@@ -6208,15 +6274,15 @@ mod tests {
         type_command(&mut a, "peer offer");
         type_command(&mut b, "peer offer");
 
-        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
-            std::fs::write(to.path(as_name), std::fs::read(from.path(name)).unwrap()).unwrap();
-            to.path(as_name).to_string_lossy().into_owned()
+        let carry = |from: &App, to: &App, name: artifact::Artifact, as_name: &str| {
+            std::fs::write(to.at(as_name), std::fs::read(from.path(name)).unwrap()).unwrap();
+            to.at(as_name).to_string_lossy().into_owned()
         };
         // Each side records the other, so both can recognise the other's tags.
-        let b_card = carry(&b, &a, "peer.card", "from-b.card");
-        let a_card = carry(&a, &b, "peer.card", "from-a.card");
-        let b_pad = pad_onto(&mut b, &a.path("from-b.pad"));
-        let a_pad = pad_onto(&mut a, &b.path("from-a.pad"));
+        let b_card = carry(&b, &a, artifact::Artifact::PeerCard, "from-b.card");
+        let a_card = carry(&a, &b, artifact::Artifact::PeerCard, "from-a.card");
+        let b_pad = pad_onto(&mut b, &a.at("from-b.pad"));
+        let a_pad = pad_onto(&mut a, &b.at("from-a.pad"));
         for (n, card, pad) in [(&mut a, b_card, b_pad), (&mut b, a_card, a_pad)] {
             type_command(n, &format!("peer accept {card}"));
             let mut p = n.load_ceremony().unwrap();
@@ -6229,8 +6295,8 @@ mod tests {
         type_command(&mut a, &format!("send {b_id} bring the good coffee"));
         type_command(&mut a, "pack out.krab");
 
-        let stick = b.path("anything.bin");
-        std::fs::copy(a.path("out.krab"), &stick).unwrap();
+        let stick = b.at("anything.bin");
+        std::fs::copy(a.at("out.krab"), &stick).unwrap();
         type_command(&mut b, &format!("import {}", stick.display()));
 
         // The list pane names the sender; the view pane holds the body.
@@ -6370,11 +6436,11 @@ mod tests {
         type_command(&mut a, "peer offer");
 
         assert!(
-            a.path("peer.card").exists(),
+            a.path(artifact::Artifact::PeerCard).exists(),
             "the card is public and signed"
         );
         assert!(
-            !a.path("peer.pad").exists(),
+            !a.path(artifact::Artifact::PeerPad).exists(),
             "no plaintext contribution on our own disk"
         );
 
@@ -6429,8 +6495,8 @@ mod tests {
     fn wipe_overwrites_every_artifact_including_encrypted_ones() {
         let mut a = ready_node("wipe-shred");
         type_command(&mut a, "peer offer");
-        let card_before = std::fs::read(a.path("peer.card")).unwrap();
-        assert!(a.path("ceremony.cbor").exists());
+        let card_before = std::fs::read(a.path(artifact::Artifact::PeerCard)).unwrap();
+        assert!(a.path(artifact::Artifact::Ceremony).exists());
 
         type_command(&mut a, "wipe");
         type_command(&mut a, "wipe");
@@ -6451,7 +6517,7 @@ mod tests {
             "identity.wrapped",
             "corpus.krab",
         ] {
-            assert!(!a.path(name).exists(), "{name} survived wipe");
+            assert!(!a.at(name).exists(), "{name} survived wipe");
         }
         assert!(!card_before.is_empty());
     }
@@ -6493,10 +6559,10 @@ mod tests {
         let fingerprint = a.identity.as_ref().unwrap().fingerprint();
 
         type_command(&mut a, "peer offer");
-        std::fs::copy(them.path("peer.card"), a.path("t.card")).unwrap();
-        pad_onto(&mut them, &a.path("t.pad"));
-        let card = a.path("t.card").display().to_string();
-        let pad = a.path("t.pad").display().to_string();
+        std::fs::copy(them.at("peer.card"), a.at("t.card")).unwrap();
+        pad_onto(&mut them, &a.at("t.pad"));
+        let card = a.at("t.card").display().to_string();
+        let pad = a.at("t.pad").display().to_string();
         type_command(&mut a, &format!("peer accept {card}"));
         type_command(&mut a, &format!("peer seal {pad} media"));
 
@@ -6527,7 +6593,7 @@ mod tests {
         assert_eq!(b.store.len(), 1, "the corpus came back");
         assert!(b.epoch_key.is_some());
         // And the peer-link is still there, so tags still derive.
-        assert!(b.peer_path(peer, "link").exists());
+        assert!(b.peer_path(peer, artifact::PeerFile::Link).exists());
     }
 
     /// The wrong passphrase opens nothing, and says nothing about how wrong.
@@ -6628,7 +6694,7 @@ mod tests {
         a.open_store().unwrap();
         type_command(&mut a, "peer offer");
         a.set_duress(b"under duress").unwrap();
-        assert!(a.path("identity.wrapped").exists());
+        assert!(a.path(artifact::Artifact::IdentityWrapped).exists());
         drop(a);
 
         // Someone is made to unlock.
@@ -6765,16 +6831,16 @@ mod tests {
         type_command(&mut b, "peer offer");
 
         // A has only B's card. That is the entire precondition.
-        std::fs::copy(b.path("peer.card"), a.path("stranger.card")).unwrap();
-        let card = a.path("stranger.card").display().to_string();
+        std::fs::copy(b.path(artifact::Artifact::PeerCard), a.at("stranger.card")).unwrap();
+        let card = a.at("stranger.card").display().to_string();
         type_command(&mut a, &format!("request {card} we met at the thing"));
         assert!(a.output.contains("request composed"), "{}", a.output);
         assert_eq!(a.store.len(), 1);
 
         // It travels as an ordinary object, so a stick carries it.
         type_command(&mut a, "pack out.krab");
-        let stick = b.path("unremarkable.bin");
-        std::fs::copy(a.path("out.krab"), &stick).unwrap();
+        let stick = b.at("unremarkable.bin");
+        std::fs::copy(a.at("out.krab"), &stick).unwrap();
         type_command(&mut b, &format!("import {}", stick.display()));
         assert_eq!(b.store.len(), 1);
 
@@ -6823,14 +6889,14 @@ mod tests {
         type_command(&mut b, "peer offer");
 
         // A addresses B, but C imports the object.
-        std::fs::copy(b.path("peer.card"), a.path("b.card")).unwrap();
-        let card = a.path("b.card").display().to_string();
+        std::fs::copy(b.path(artifact::Artifact::PeerCard), a.at("b.card")).unwrap();
+        let card = a.at("b.card").display().to_string();
         type_command(&mut a, &format!("request {card} for B only"));
         type_command(&mut a, "pack out.krab");
 
         let mut c = c;
-        let stick = c.path("in.krab");
-        std::fs::copy(a.path("out.krab"), &stick).unwrap();
+        let stick = c.at("in.krab");
+        std::fs::copy(a.at("out.krab"), &stick).unwrap();
         type_command(&mut c, &format!("import {}", stick.display()));
 
         let incoming = c.store.with(|st| {
@@ -6891,14 +6957,14 @@ mod tests {
             &mut OsRng,
         )
         .unwrap();
-        std::fs::write(a.path("abcd1234.reservoir"), sealed).unwrap();
+        std::fs::write(a.at("abcd1234.reservoir"), sealed).unwrap();
 
         // What a peer that stayed up would hold today.
         let mut peer = krab_crypto::reservoir::Reservoir::new(root, then);
         assert!(peer.advance_to(now_epoch()), "within MAX_ADVANCE");
 
         // What this node reconstructs from the record alone.
-        let raw = std::fs::read(a.path("abcd1234.reservoir")).unwrap();
+        let raw = std::fs::read(a.at("abcd1234.reservoir")).unwrap();
         let opened =
             krab_crypto::kek::open_under(&a.epoch_key.unwrap(), b"krab/reservoir", &raw).unwrap();
         let (stored_root, stored_epoch) = persist::decode_reservoir(&opened).unwrap();
@@ -7760,7 +7826,7 @@ mod tests {
             a.identity = Some(id);
             a.passphrase = line::Line::from("a passphrase");
             a.open_store().expect("the store opens");
-            std::fs::remove_file(a.path("corpus.krab")).expect("start without one");
+            std::fs::remove_file(a.path(artifact::Artifact::Corpus)).expect("start without one");
             a
         };
 
@@ -7768,7 +7834,7 @@ mod tests {
         chord.on_key(KeyCode::Char('q'), KeyModifiers::CONTROL);
         assert!(chord.quit);
         assert!(
-            chord.path("corpus.krab").exists(),
+            chord.at("corpus.krab").exists(),
             "Ctrl-Q left the corpus unwritten"
         );
 
@@ -7776,7 +7842,7 @@ mod tests {
         type_command(&mut verb, "quit");
         assert!(verb.quit);
         assert!(
-            verb.path("corpus.krab").exists(),
+            verb.path(artifact::Artifact::Corpus).exists(),
             "`quit` left the corpus unwritten"
         );
     }
@@ -7849,18 +7915,18 @@ mod tests {
         let mut a = ready_node("wipe-peers");
         let peer = "deadbeef";
         a.ensure_peer_dir(peer).expect("a peer directory");
-        std::fs::write(a.peer_path(peer, "link"), b"a card").unwrap();
-        std::fs::write(a.peer_path(peer, "reservoir"), b"sealed").unwrap();
+        std::fs::write(a.peer_path(peer, artifact::PeerFile::Link), b"a card").unwrap();
+        std::fs::write(a.peer_path(peer, artifact::PeerFile::Reservoir), b"sealed").unwrap();
 
         a.confirmed = true;
         type_command(&mut a, "wipe");
 
         assert!(
-            !a.peer_path(peer, "link").exists(),
+            !a.peer_path(peer, artifact::PeerFile::Link).exists(),
             "the peer-link survived the wipe"
         );
         assert!(
-            !a.peer_path(peer, "reservoir").exists(),
+            !a.peer_path(peer, artifact::PeerFile::Reservoir).exists(),
             "the reservoir survived the wipe"
         );
         assert!(
@@ -7875,11 +7941,11 @@ mod tests {
         let a = ready_node("peer-layout");
         for id in ["aaaa1111", "bbbb2222"] {
             a.ensure_peer_dir(id).unwrap();
-            std::fs::write(a.peer_path(id, "link"), b"card").unwrap();
+            std::fs::write(a.peer_path(id, artifact::PeerFile::Link), b"card").unwrap();
         }
         assert_eq!(a.peer_ids(), vec!["aaaa1111", "bbbb2222"]);
         assert_eq!(
-            a.peer_path("aaaa1111", "reservoir"),
+            a.peer_path("aaaa1111", artifact::PeerFile::Reservoir),
             a.home.join("peers").join("aaaa1111").join("reservoir")
         );
         // A directory without a link is not a peer — a half-written one must
@@ -7912,7 +7978,10 @@ mod tests {
         chord(&mut a);
         assert!(a.identity.is_none(), "the hierarchy survived");
         assert!(a.epoch_key.is_none());
-        assert!(!a.path("identity.wrapped").exists(), "the store survived");
+        assert!(
+            !a.path(artifact::Artifact::IdentityWrapped).exists(),
+            "the store survived"
+        );
     }
 
     /// An armed node that stays armed destroys itself on an unrelated
@@ -8005,7 +8074,7 @@ mod tests {
         // And the peer's terms landed, which they never did before: `Policy`
         // was signed into the card at peering and never propagated again.
         assert!(
-            a.peer_path(&b_id2, "policy").exists(),
+            a.peer_path(&b_id2, artifact::PeerFile::Policy).exists(),
             "their policy was not recorded"
         );
     }
@@ -8030,7 +8099,7 @@ mod tests {
     /// Re-seat `peer`'s stored reservoir at `epoch`, to stand in for time
     /// passing. The root is unchanged; only where the ratchet claims to be.
     fn backdate_reservoir(n: &App, peer: &str, epoch: u32) {
-        let sealed = std::fs::read(n.peer_path(peer, "reservoir")).unwrap();
+        let sealed = std::fs::read(n.peer_path(peer, artifact::PeerFile::Reservoir)).unwrap();
         let raw = krab_crypto::kek::open_under(&n.epoch_key.unwrap(), b"krab/reservoir", &sealed)
             .unwrap();
         let (root, _) = persist::decode_reservoir(&raw).unwrap();
@@ -8042,7 +8111,7 @@ mod tests {
             &mut OsRng,
         )
         .unwrap();
-        atomic::write(&n.peer_path(peer, "reservoir"), &out).unwrap();
+        atomic::write(&n.peer_path(peer, artifact::PeerFile::Reservoir), &out).unwrap();
     }
 
     /// **The guarantee must not depend on someone remembering to type.**
@@ -8159,9 +8228,12 @@ mod tests {
         let mut a = ready_node("offer-honest");
         type_command(&mut a, "peer offer");
 
-        assert!(a.path("peer.card").exists(), "the card was not written");
         assert!(
-            !a.path("peer.pad").exists(),
+            a.path(artifact::Artifact::PeerCard).exists(),
+            "the card was not written"
+        );
+        assert!(
+            !a.path(artifact::Artifact::PeerPad).exists(),
             "the pad must not be written into the node's own storage"
         );
         assert!(
@@ -8199,8 +8271,8 @@ mod tests {
         assert!(a.output.contains("peer accept"), "{}", a.output);
 
         let b_card = {
-            let bytes = std::fs::read(b.path("peer.card")).unwrap();
-            let dest = a.path("from-b.card");
+            let bytes = std::fs::read(b.path(artifact::Artifact::PeerCard)).unwrap();
+            let dest = a.at("from-b.card");
             std::fs::write(&dest, bytes).unwrap();
             dest.to_string_lossy().into_owned()
         };
@@ -8224,8 +8296,8 @@ mod tests {
         let mut b = ready_node("seal-missing-b");
         type_command(&mut b, "peer offer");
         let b_card = {
-            let bytes = std::fs::read(b.path("peer.card")).unwrap();
-            let dest = a.path("from-b.card");
+            let bytes = std::fs::read(b.path(artifact::Artifact::PeerCard)).unwrap();
+            let dest = a.at("from-b.card");
             std::fs::write(&dest, bytes).unwrap();
             dest.to_string_lossy().into_owned()
         };
@@ -8408,7 +8480,7 @@ mod tests {
         let mut b = ready_node("quoted-path-b");
         type_command(&mut b, "peer offer");
         let card = dir.join("bob.card");
-        std::fs::copy(b.path("peer.card"), &card).unwrap();
+        std::fs::copy(b.path(artifact::Artifact::PeerCard), &card).unwrap();
 
         type_command(&mut a, &format!("peer accept \"{}\"", card.display()));
         assert!(
@@ -8869,7 +8941,7 @@ mod tests {
         fresh.passphrase = line::Line::from("a passphrase");
         fresh.unlock(b"a passphrase").expect("reopens");
         assert_eq!(fresh.epoch_key, a.epoch_key, "the epoch key changed");
-        let sealed = std::fs::read(fresh.path("channels.roster")).unwrap();
+        let sealed = std::fs::read(fresh.path(artifact::Artifact::ChannelRoster)).unwrap();
         let raw = krab_crypto::kek::open_under(&fresh.epoch_key.unwrap(), b"krab/roster", &sealed)
             .expect("the roster opens");
         assert!(
@@ -9359,7 +9431,7 @@ mod tests {
             let raw = krab_crypto::kek::open_under(
                 &w,
                 b"krab/prekeys",
-                &std::fs::read(a.path("prekeys.ring")).unwrap(),
+                &std::fs::read(a.path(artifact::Artifact::PrekeyRing)).unwrap(),
             )
             .unwrap();
             prekeys::decode_ring(&raw).expect("a ring")
@@ -9391,7 +9463,7 @@ mod tests {
             let raw = krab_crypto::kek::open_under(
                 &w,
                 b"krab/prekeys",
-                &std::fs::read(a.path("prekeys.ring")).unwrap(),
+                &std::fs::read(a.path(artifact::Artifact::PrekeyRing)).unwrap(),
             )
             .unwrap();
             prekeys::decode_ring(&raw).expect("a ring")
@@ -9423,7 +9495,7 @@ mod tests {
                 &mut OsRng,
             )
             .unwrap();
-            atomic::write(&a.path("prekeys.ring"), &sealed).unwrap();
+            atomic::write(&a.path(artifact::Artifact::PrekeyRing), &sealed).unwrap();
         }
         let stale = read_ring(&a).signed().public().0;
         let out = a.publish_prekeys().expect("republishes");
@@ -9592,8 +9664,8 @@ mod tests {
         let mut other = ready_node(&format!("{tag}-other"));
         type_command(&mut a, "peer offer");
         type_command(&mut other, "peer offer");
-        let card = a.path("theirs.card");
-        std::fs::write(&card, std::fs::read(other.path("peer.card")).unwrap()).unwrap();
+        let card = a.at("theirs.card");
+        std::fs::write(&card, std::fs::read(other.at("peer.card")).unwrap()).unwrap();
         type_command(&mut a, &format!("peer accept {}", card.display()));
         a
     }
@@ -9609,14 +9681,14 @@ mod tests {
         type_command(&mut b, "peer offer");
 
         // Cards, over anything. They are public and signed.
-        let carry = |from: &App, to: &App, name: &str, as_name: &str| {
+        let carry = |from: &App, to: &App, name: artifact::Artifact, as_name: &str| {
             let bytes = std::fs::read(from.path(name)).expect("exists");
-            let dest = to.path(as_name);
+            let dest = to.at(as_name);
             std::fs::write(&dest, bytes).expect("delivered");
             dest.to_string_lossy().into_owned()
         };
-        let a_card = carry(&a, &b, "peer.card", "from-a.card");
-        let b_card = carry(&b, &a, "peer.card", "from-b.card");
+        let a_card = carry(&a, &b, artifact::Artifact::PeerCard, "from-a.card");
+        let b_card = carry(&b, &a, artifact::Artifact::PeerCard, "from-b.card");
         type_command(&mut a, &format!("peer accept {b_card}"));
         type_command(&mut b, &format!("peer accept {a_card}"));
         for n in [&mut a, &mut b] {
@@ -9626,7 +9698,7 @@ mod tests {
         }
 
         // Each wraps its pad. The file is safe to send over anything.
-        let a_dest = a.path("a.wrapped").display().to_string();
+        let a_dest = a.at("a.wrapped").display().to_string();
         type_command(&mut a, &format!("peer wrap {a_dest}"));
         assert!(a.output.contains("READ THESE ALOUD"), "{}", a.output);
         let a_words = a
@@ -9637,7 +9709,7 @@ mod tests {
             .trim()
             .to_string();
 
-        let b_dest = b.path("b.wrapped").display().to_string();
+        let b_dest = b.at("b.wrapped").display().to_string();
         type_command(&mut b, &format!("peer wrap {b_dest}"));
         let b_words = b
             .output
@@ -9648,8 +9720,15 @@ mod tests {
             .to_string();
 
         // The wrapped files cross the network; the words cross a voice call.
-        let to_b = carry(&a, &b, "a.wrapped", "from-a.wrapped");
-        let to_a = carry(&b, &a, "b.wrapped", "from-b.wrapped");
+        // These are fixtures the test wrote, not artifacts, so they move by
+        // hand rather than through `carry`.
+        let move_file = |from: &App, to: &App, name: &str, as_name: &str| {
+            let dest = to.at(as_name);
+            std::fs::write(&dest, std::fs::read(from.at(name)).unwrap()).unwrap();
+            dest.to_string_lossy().into_owned()
+        };
+        let to_b = move_file(&a, &b, "a.wrapped", "from-a.wrapped");
+        let to_a = move_file(&b, &a, "b.wrapped", "from-b.wrapped");
 
         type_command(&mut a, &format!("peer seal {to_a} spoken"));
         assert!(a.output.contains("type the 32 words"), "{}", a.output);
@@ -9679,7 +9758,7 @@ mod tests {
     #[test]
     fn the_transfer_words_do_not_reach_the_command_history() {
         let mut a = mid_ceremony("spoken-history");
-        let dest = a.path("mine.wrapped").display().to_string();
+        let dest = a.at("mine.wrapped").display().to_string();
         type_command(&mut a, &format!("peer wrap {dest}"));
         let words = a
             .output
@@ -9710,14 +9789,14 @@ mod tests {
         let mut a = mid_ceremony("spoken-wrong");
 
         // A bare pad is not a wrapped pad, and says so rather than prompting.
-        let pad = a.path("bare.pad").display().to_string();
+        let pad = a.at("bare.pad").display().to_string();
         type_command(&mut a, &format!("peer pad {pad}"));
         type_command(&mut a, &format!("peer seal {pad} spoken"));
         assert!(a.output.contains("not a wrapped pad"), "{}", a.output);
         assert!(a.prompt.is_none(), "it prompted for a file it cannot use");
 
         // Wrong words fail closed, and the same way tampering does.
-        let dest = a.path("mine.wrapped").display().to_string();
+        let dest = a.at("mine.wrapped").display().to_string();
         type_command(&mut a, &format!("peer wrap {dest}"));
         type_command(&mut a, &format!("peer seal {dest} spoken"));
         type_command(&mut a, "aardvark absurd accrue acme adrift adult");
@@ -9761,8 +9840,8 @@ mod tests {
         assert!(a.output.contains("NOT post-quantum"), "{}", a.output);
         type_command(&mut b, &format!("peer reseal {a_id}"));
 
-        let a_pad = a.path("a.fresh").display().to_string();
-        let b_pad = b.path("b.fresh").display().to_string();
+        let a_pad = a.at("a.fresh").display().to_string();
+        let b_pad = b.at("b.fresh").display().to_string();
         type_command(&mut a, &format!("peer reseal pad {a_pad}"));
         type_command(&mut b, &format!("peer reseal pad {b_pad}"));
 
@@ -9782,7 +9861,7 @@ mod tests {
         // And nothing else was lost.
         assert_eq!(a.store.len(), messages_before, "the corpus was disturbed");
         assert!(
-            a.peer_path(&b_id, "link").exists(),
+            a.peer_path(&b_id, artifact::PeerFile::Link).exists(),
             "the peer-link was lost"
         );
         let after = a.peer_terms(&b_id).expect("terms");
@@ -9798,7 +9877,7 @@ mod tests {
     fn a_reseal_refuses_a_weak_channel_and_keeps_outstanding_caveats() {
         let (mut a, _b, _a_id, b_id) = peered_pair_over("reseal-weak", "corpus");
         type_command(&mut a, &format!("peer reseal {b_id}"));
-        let pad = a.path("mine.fresh").display().to_string();
+        let pad = a.at("mine.fresh").display().to_string();
         type_command(&mut a, &format!("peer reseal pad {pad}"));
 
         for weak in ["corpus", "network"] {
@@ -9861,7 +9940,7 @@ mod tests {
 
         // A working peering: both ends hold the same reservoir.
         assert_eq!(stored_root(&a, &b_id), stored_root(&b, &a_id));
-        assert!(a.peer_path(&b_id, "link").exists());
+        assert!(a.peer_path(&b_id, artifact::PeerFile::Link).exists());
 
         // **And it is honest about being neither verified nor post-quantum.**
         for out in [&out_a, &out_b] {
@@ -9916,8 +9995,8 @@ mod tests {
 
         type_command(&mut a, &format!("peer reseal {b_id}"));
         type_command(&mut b, &format!("peer reseal {a_id}"));
-        let a_pad = a.path("a.fresh").display().to_string();
-        let b_pad = b.path("b.fresh").display().to_string();
+        let a_pad = a.at("a.fresh").display().to_string();
+        let b_pad = b.at("b.fresh").display().to_string();
         type_command(&mut a, &format!("peer reseal pad {a_pad}"));
         type_command(&mut b, &format!("peer reseal pad {b_pad}"));
         type_command(&mut a, &format!("peer reseal seal {b_pad} in-person"));
@@ -10083,7 +10162,7 @@ mod tests {
         // A PNG with metadata appended, as a camera or an attacker would.
         let mut src = a_png(8, 8);
         src.extend_from_slice(b"GPS 51.5074 -0.1278 and a whole zip archive");
-        let path = a.path("holiday.png");
+        let path = a.at("holiday.png");
         std::fs::write(&path, &src).unwrap();
 
         type_command(&mut a, &format!("send {b_id} --picture {}", path.display()));
@@ -10137,7 +10216,7 @@ mod tests {
         });
         b.selected = 0;
 
-        let dest = b.path("out.png");
+        let dest = b.at("out.png");
         type_command(&mut b, &format!("picture save {}", dest.display()));
         assert_eq!(std::fs::read(&dest).unwrap(), png);
         assert!(
@@ -10162,7 +10241,7 @@ mod tests {
         let (mut a, _b, _a_id, b_id) = peered_pair("picture-lora");
         a.links.connect(&b_id, profile_named("lora").unwrap());
 
-        let path = a.path("p.png");
+        let path = a.at("p.png");
         std::fs::write(&path, a_png(4, 4)).unwrap();
         let before = a.store.len();
 
@@ -10183,7 +10262,7 @@ mod tests {
         let crc = crc32fast::hash(&bomb[ihdr..ihdr + 17]);
         bomb[ihdr + 17..ihdr + 21].copy_from_slice(&crc.to_be_bytes());
 
-        let path = a.path("bomb.png");
+        let path = a.at("bomb.png");
         std::fs::write(&path, &bomb).unwrap();
         let before = a.store.len();
 
@@ -10272,8 +10351,126 @@ mod tests {
         };
         let _ = out;
         // Whatever this terminal is, `save` must always be available.
-        let dest = b.path("out.png");
+        let dest = b.at("out.png");
         type_command(&mut b, &format!("picture save {}", dest.display()));
         assert!(std::fs::read(&dest).is_ok());
+    }
+
+    /// **A panic wipe leaves nothing.** RFC 7 §10's destruction, checked
+    /// against a node that has actually been used — peered, prekeyed,
+    /// channelled, grouped, with a duress store — rather than a fresh one.
+    ///
+    /// This is the test that was missing. The predicate was a hand-written
+    /// list of filenames and it failed twice: once by not recursing into
+    /// `peers/`, once by never being updated as four more artifacts appeared.
+    /// The second left prekey private halves, every group roster, the channel
+    /// posting key and the duress store on disk after the operator had pressed
+    /// the panic chord.
+    #[test]
+    fn a_wipe_leaves_no_artifact_behind() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("wipe-everything");
+        a.publish_prekeys().expect("a prekey batch");
+        type_command(&mut a, "channel new");
+        type_command(&mut a, "group new friends");
+        type_command(&mut a, &format!("group add friends {b_id}"));
+        type_command(&mut a, &format!("peer reseal {b_id}"));
+        type_command(&mut a, "peer offer");
+        std::fs::write(a.path(artifact::Artifact::DuressWrapped), b"a duress store").unwrap();
+
+        // Everything this node writes now exists.
+        let expected: Vec<_> = artifact::Artifact::ALL
+            .iter()
+            .filter(|x| a.path(**x).exists())
+            .collect();
+        assert!(
+            expected.len() >= 8,
+            "the fixture did not exercise enough artifacts: {expected:?}"
+        );
+        assert!(a.peer_path(&b_id, artifact::PeerFile::Link).exists());
+
+        a.confirmed = true;
+        type_command(&mut a, "wipe");
+
+        // Walk the whole home, not just the top level.
+        fn survivors(dir: &std::path::Path, out: &mut Vec<String>) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    if e.path().is_dir() {
+                        survivors(&e.path(), out);
+                    } else {
+                        out.push(e.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        let mut left = Vec::new();
+        survivors(&a.home, &mut left);
+        left.sort();
+        // Nothing secret survives. A *card* the operator was handed may — it
+        // is public and signed, and destroying arbitrary files an operator
+        // placed is the catastrophic behaviour the next test guards against.
+        let secret: Vec<_> = left.iter().filter(|n| !n.ends_with(".card")).collect();
+        assert!(
+            secret.is_empty(),
+            "these survived a panic wipe: {secret:?}\n\
+             Each is either key material or a disclosure of who this node \
+             talks to, and RFC 7 §10 exists to destroy exactly those."
+        );
+    }
+
+    /// A wipe destroys the node's files and **not the operator's**. `--home`
+    /// defaults to the working directory, so a wipe that removed everything
+    /// there would be catastrophic.
+    #[test]
+    fn a_wipe_leaves_files_the_node_did_not_write() {
+        let mut a = ready_node("wipe-bystanders");
+        for name in ["notes.txt", "holiday.png", "Cargo.toml"] {
+            std::fs::write(a.at(name), b"the operator's").unwrap();
+        }
+        a.confirmed = true;
+        type_command(&mut a, "wipe");
+
+        for name in ["notes.txt", "holiday.png", "Cargo.toml"] {
+            assert!(
+                a.at(name).exists(),
+                "{name} was destroyed, and the node did not write it"
+            );
+        }
+        assert!(!a.path(artifact::Artifact::IdentityWrapped).exists());
+    }
+
+    /// **Their pad is destroyed when it is consumed.** It is half the same
+    /// shared secret as this node's own, equally unprotected, and it survived
+    /// every wipe — because the operator chose where to put it and `wipe` only
+    /// destroys what this node wrote. Sealing is the moment its owner is
+    /// known, so it is the moment to destroy it.
+    #[test]
+    fn sealing_destroys_the_pad_it_consumed() {
+        let mut a = ready_node("seal-shreds-a");
+        let mut b = ready_node("seal-shreds-b");
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+        let card = a.at("theirs.card");
+        std::fs::write(
+            &card,
+            std::fs::read(b.path(artifact::Artifact::PeerCard)).unwrap(),
+        )
+        .unwrap();
+        type_command(&mut a, &format!("peer accept {}", card.display()));
+
+        // Their pad, delivered wherever a courier unloaded it.
+        let their_pad = a.at("from-bob.pad");
+        let path = pad_onto(&mut b, &their_pad);
+        assert!(their_pad.exists());
+
+        type_command(&mut a, &format!("peer seal {path} media"));
+        assert!(a.output.starts_with("peer-link signed"), "{}", a.output);
+        assert!(
+            !their_pad.exists(),
+            "their pad survived the seal that consumed it — half a shared \
+             secret, in plaintext, in whatever directory it was delivered to"
+        );
+        // And this node's own, as before.
+        assert!(!a.path(artifact::Artifact::PeerPad).exists());
     }
 }
