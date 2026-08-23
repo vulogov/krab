@@ -17,7 +17,7 @@ nothing to prepare, edit, or copy onto the machine first.
 Two arguments exist:
 
 ```
-krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>]
+krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>] [--relay]
 ```
 
 - `--home` is where the store lives. **Default is the working directory.**
@@ -25,6 +25,7 @@ krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>]
   you care where the files land.
 - `--listen` names the address inbound links arrive on. Optional; a node that
   only dials never needs it.
+- `--relay` locks the node the moment it opens — see §8.
 - `--sync-interval` is the mean reconciliation interval. Under 60 seconds is
   refused — RFC 5 §6.1, a node that syncs that often is correlated with its
   own activity.
@@ -260,3 +261,42 @@ Argon2 derivation runs either way.
 
 Erased artefacts are overwritten before removal — see `SECURE-DELETE.md` for
 what that does and does not buy you.
+
+---
+
+## 8. Running a relay
+
+A relay carries for the friends you chose without holding a readable corpus.
+It is **not** a daemon and not a special build: it is this same program in the
+state `lock` already defines.
+
+```
+$ krab --home ~/krab-relay --listen 0.0.0.0:40000 --relay
+> unlock
+  (passphrase)
+
+relay.
+
+This node is locked and will stay locked. It reconciles for the peers you
+chose and cannot read a message — including its own.
+
+Its disk is encrypted under the passphrase you just entered, which is the
+whole reason it asked: a relay that took no passphrase would leave its
+peer list in the clear.
+
+`unlock` makes it an ordinary node again.
+```
+
+**It still asks for the passphrase, and that is the point.** An earlier design
+had a relay take none, which left its disk unencrypted and made RFC 0 §4.4's
+*"seizure yields nothing"* false for the peer list — the one thing a seized
+relay would actually reveal. One prompt at start buys the same key hierarchy
+every other node has.
+
+It keeps reconciling while locked. Pausing would publish the operator's daily
+rhythm — when they are at the keyboard and when they are not — which
+`MILESTONE-0.1.md` calls a worse violation than mail-driven sync.
+
+There is deliberately **no headless mode**. RFC 8 forbids one, and a relay that
+could start without a human is a relay whose passphrase lives somewhere a
+machine can read.

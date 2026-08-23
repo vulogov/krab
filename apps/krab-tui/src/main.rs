@@ -369,6 +369,15 @@ struct App {
     /// does makes it fire.
     inbound_ticks: u8,
     outbound_ticks: u8,
+    /// Lock the moment the store opens — `RFC-7-review.md` §9.3.
+    ///
+    /// **Not a daemon and not a special key configuration.** A relay is this
+    /// same program in the state `lock` already defines: session keys live,
+    /// reconciling, unable to read mail — and its disk encrypted under RFC 7
+    /// §4's hierarchy, because a passphrase *was* entered once. §7's relay
+    /// took no passphrase, which left its peer list in the clear and made
+    /// RFC 0 §4.4's "seizure yields nothing" false for it.
+    relay: bool,
     /// Where inbound links arrive, from `--listen`. `None` means this node
     /// only dials.
     listen: Option<String>,
@@ -436,6 +445,7 @@ impl Default for App {
             passphrase: line::Line::default(),
             epoch_key: None,
             home: default_home(),
+            relay: false,
             listen: None,
             roster: channels::Roster::default(),
             groups: Vec::new(),
@@ -478,14 +488,18 @@ impl App {
     /// parent process would be choosing on the operator's behalf without the
     /// operator seeing it.
     fn from_args(args: impl Iterator<Item = String>) -> Result<App, String> {
-        const USAGE: &str =
-            "krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>]\n\n\
+        const USAGE: &str = "krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>] \
+             [--relay]\n\n\
              krab reads no configuration file. Everything else is set by a \
              command-pane verb during the session.\n\n\
              --listen binds one socket and accepts calls from any node this \
              one has peered with. There is no port per peer: that would \
              publish the size of the operator's friend list to a port \
-             scanner.";
+             scanner.\n\n\
+             --relay locks the node the moment it opens. It still asks for the \
+             passphrase, because that is what encrypts the disk — a relay that \
+             took no passphrase would leave its peer list in the clear, and \
+             RFC 0 §4.4's \"seizure yields nothing\" would be false for it.";
 
         let mut app = App::default();
         let mut args = args.peekable();
@@ -493,6 +507,9 @@ impl App {
             match arg.as_str() {
                 "--home" => {
                     app.home = PathBuf::from(args.next().ok_or(USAGE)?);
+                }
+                "--relay" => {
+                    app.relay = true;
                 }
                 "--listen" => {
                     let addr = args.next().ok_or(USAGE)?;
@@ -4788,6 +4805,7 @@ impl App {
         self.load_roster();
         self.load_groups();
         self.refresh_inbox();
+        self.become_relay_if_asked();
         Ok(())
     }
 
@@ -5042,6 +5060,7 @@ impl App {
                 if let Some(note) = self.start_listener() {
                     self.output.push_str(&format!("\n\n{note}"));
                 }
+                self.become_relay_if_asked();
             }
             Some(next) => {
                 if next == InitStep::Generate {
@@ -5090,6 +5109,36 @@ impl App {
             self.save_corpus();
         }
         self.quit = true;
+    }
+
+    /// Lock immediately, if this node was started as a relay.
+    ///
+    /// `RFC-7-review.md` §9.3: *"A relay is a TUI that was unlocked once at
+    /// startup and locked immediately."* The operator enters the passphrase,
+    /// the node locks, and it runs indefinitely in that state — session keys
+    /// live, reconciling, unable to read mail.
+    ///
+    /// The passphrase is the point. §7's relay took none, which left its disk
+    /// unencrypted and made RFC 0 §4.4's "seizure yields nothing" false for
+    /// the peer list. Entering one costs a single prompt at start and buys the
+    /// same hierarchy every other node has.
+    ///
+    /// It is deliberately **not** a headless mode. RFC 8 forbids one, and a
+    /// relay that could start without a human is a relay whose passphrase
+    /// lives somewhere a machine can read.
+    fn become_relay_if_asked(&mut self) {
+        if !self.relay || self.locked {
+            return;
+        }
+        self.lock();
+        self.output = "relay.\n\n\
+             This node is locked and will stay locked. It reconciles for the \
+             peers you chose and cannot read a message — including its own.\n\n\
+             Its disk is encrypted under the passphrase you just entered, \
+             which is the whole reason it asked: a relay that took no \
+             passphrase would leave its peer list in the clear.\n\n\
+             `unlock` makes it an ordinary node again."
+            .into();
     }
 
     /// Lock: zeroize what the interface holds and drop to the relay role.
@@ -10542,5 +10591,117 @@ mod tests {
             .to_string()
             .contains("separate process"));
         assert!(picture::Error::Corrupt.to_string().contains("refused"));
+    }
+
+    /// **A relay is this same program, locked.** `RFC-7-review.md` §9.3, and
+    /// the reason it takes a passphrase at all: §7's relay took none, which
+    /// left its disk unencrypted and made RFC 0 §4.4's "seizure yields
+    /// nothing" false for its peer list.
+    #[test]
+    fn a_relay_locks_itself_and_still_has_an_encrypted_disk() {
+        let (a, _b, _a_id, b_id) = peered_pair("relay");
+
+        // Restart as a relay: the passphrase is still entered.
+        let mut r = App {
+            home: a.home.clone(),
+            relay: true,
+            ..App::default()
+        };
+        r.passphrase = line::Line::from("a passphrase");
+        r.unlock(b"a passphrase").expect("it opens");
+
+        assert!(r.locked, "a relay must lock the moment it opens");
+        assert!(r.epoch_key.is_none(), "it kept a content key");
+        assert!(r.output.contains("relay"), "{}", r.output);
+
+        // **The disk is encrypted**, which is the whole point of the prompt.
+        assert!(r.path(artifact::Artifact::IdentityWrapped).exists());
+        assert!(r.path(artifact::Artifact::KekParams).exists());
+        // And a wrong passphrase does not open it, so the peer list is not
+        // readable from the disk alone.
+        let mut wrong = App {
+            home: a.home.clone(),
+            ..App::default()
+        };
+        assert!(wrong.unlock(b"not the passphrase").is_err());
+
+        // It still knows who it peers with, from disk, and still schedules.
+        assert!(r.peer_ids().contains(&b_id));
+    }
+
+    /// **A relay keeps reconciling.** It is a relay, not a silent node:
+    /// pausing while locked would publish the operator's daily rhythm, which
+    /// `MILESTONE-0.1.md` calls a worse violation than mail-driven sync.
+    #[test]
+    fn a_relay_keeps_its_schedule_and_keeps_ticking() {
+        let (a, _b, _a_id, b_id) = peered_pair("relay-ticks");
+        let mut r = App {
+            home: a.home.clone(),
+            relay: true,
+            ..App::default()
+        };
+        r.passphrase = line::Line::from("a passphrase");
+        r.unlock(b"a passphrase").expect("it opens");
+        // Enrolled from the peer-links on disk, without anyone typing.
+        let id = sync::peer_id_of(&b_id).expect("a peer id");
+        assert!(
+            r.scheduler.next_due(&id).is_some(),
+            "a relay did not enrol the peers it holds links for — it would \
+             never reconcile, which is the only thing it is for"
+        );
+        let enrolled = r.scheduler.len();
+
+        for _ in 0..10 {
+            r.tick_schedule();
+        }
+        assert!(r.locked, "ticking unlocked it");
+        assert_eq!(
+            r.scheduler.len(),
+            enrolled,
+            "a relay stopped scheduling a peer while locked"
+        );
+        assert!(
+            r.scheduler.next_due(&id).is_some(),
+            "the peer fell out of the schedule"
+        );
+        // Still cannot read anything, which is the other half of what a relay
+        // is: it carries and does not open.
+        assert!(r.epoch_key.is_none());
+        assert!(r.messages.is_empty());
+    }
+
+    /// It is not a headless mode. RFC 8 forbids one, and a relay that could
+    /// start without a human is a relay whose passphrase lives somewhere a
+    /// machine can read.
+    #[test]
+    fn a_relay_still_needs_a_passphrase() {
+        let a = App::from_args(["--relay"].iter().map(|s| s.to_string())).expect("parses");
+        assert!(a.relay);
+        assert!(a.identity.is_none(), "it started with a key from nowhere");
+        assert!(a.epoch_key.is_none());
+        // And `--relay` is not accepted as a value for anything else.
+        assert!(App::from_args(["--home", "--relay"].iter().map(|s| s.to_string())).is_ok());
+    }
+
+    /// `unlock` makes it an ordinary node again — a relay is a state, not a
+    /// build.
+    #[test]
+    fn a_relay_can_be_unlocked_into_an_ordinary_node() {
+        let (a, _b, _a_id, _b_id) = peered_pair("relay-unlock");
+        let mut r = App {
+            home: a.home.clone(),
+            relay: true,
+            ..App::default()
+        };
+        r.passphrase = line::Line::from("a passphrase");
+        r.unlock(b"a passphrase").expect("opens");
+        assert!(r.locked);
+
+        // The operator sits down and unlocks it.
+        r.relay = false;
+        r.passphrase = line::Line::from("a passphrase");
+        r.unlock(b"a passphrase").expect("reopens");
+        assert!(!r.locked, "it would not come back");
+        assert!(r.epoch_key.is_some(), "it has no content key");
     }
 }
