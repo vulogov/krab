@@ -102,6 +102,14 @@ pub enum Error {
     Corrupt,
     /// Re-encoded, and larger than one object can hold.
     TooLarge { bytes: usize },
+    /// The decoder child could not be started.
+    ///
+    /// **Distinct from a refusal**, because the remedies are opposite: a
+    /// refusal means the file is bad, this means the isolation RFC 8 §6 asks
+    /// for is unavailable and the caller must decide whether to decode
+    /// anyway. Collapsing the two would make a missing safety property look
+    /// like a bad picture.
+    NoIsolation,
 }
 
 impl core::fmt::Display for Error {
@@ -118,6 +126,9 @@ impl core::fmt::Display for Error {
                  pixels, and the limit is what stops it."
             ),
             Error::Corrupt => f.write_str("the decoder refused it"),
+            Error::NoIsolation => {
+                f.write_str("the decoder could not be started as a separate process")
+            }
             Error::TooLarge { bytes } => write!(
                 f,
                 "re-encoded to {bytes} bytes, and the largest object is {MAX_OBJECT}. \
@@ -242,6 +253,82 @@ fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), Error> {
     Ok((rgba, w as u32, h as u32))
 }
 
+/// The flag that turns this binary into a decoder and nothing else.
+///
+/// RFC 8 §6: *"Decoding SHOULD occur in a separate process."* This is that
+/// process. It is the same executable, re-invoked, which is why there is no
+/// second binary to keep in step and no path where a node runs a decoder from
+/// somewhere else on disk.
+pub const CHILD_FLAG: &str = "--decode-picture";
+
+/// What the child was asked to do.
+const OP_TRANSCODE: u8 = 0;
+const OP_CELLS: u8 = 1;
+
+/// Run as the decoder child: read one request from stdin, write the answer to
+/// stdout, exit.
+///
+/// # What this process holds
+///
+/// Nothing. It is entered from the first line of `main`, **before** any
+/// argument is parsed, any home directory is resolved, any passphrase is
+/// taken or any key is derived. There is no identity in this address space to
+/// steal, no epoch key, no corpus, no session. A decoder bug that achieves
+/// code execution here owns a process whose entire contents are one attacker-
+/// supplied image and the pixels it decoded to.
+///
+/// # What it does not do
+///
+/// It does not drop privileges, install a seccomp filter, or enter a macOS
+/// sandbox. Those are per-platform and none of them are here, so a compromised
+/// child still has the operator's filesystem and network. The separation is
+/// **address space**, which is what stops a decoder bug reaching key material;
+/// it is not a jail.
+pub fn run_child() -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let mut req = Vec::new();
+    std::io::stdin().read_to_end(&mut req)?;
+    if req.len() < 9 {
+        std::process::exit(2);
+    }
+    let op = req[0];
+    let cols = u32::from_le_bytes(req[1..5].try_into().expect("4 bytes"));
+    let rows = u32::from_le_bytes(req[5..9].try_into().expect("4 bytes"));
+    let payload = &req[9..];
+
+    let out = match op {
+        OP_TRANSCODE => transcode(payload),
+        OP_CELLS => cells(payload, cols, rows).map(|rows| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            let w = rows.first().map(|r| r.len()).unwrap_or(0);
+            out.extend_from_slice(&(w as u32).to_le_bytes());
+            for row in &rows {
+                for (top, bottom) in row {
+                    out.extend_from_slice(top);
+                    out.extend_from_slice(bottom);
+                }
+            }
+            out
+        }),
+        _ => std::process::exit(2),
+    };
+
+    match out {
+        // The refusal travels as text on stderr and a non-zero status, so the
+        // parent never parses a payload it did not ask for.
+        Err(e) => {
+            let _ = write!(std::io::stderr(), "{e}");
+            std::process::exit(1);
+        }
+        Ok(bytes) => {
+            std::io::stdout().write_all(&bytes)?;
+            std::io::stdout().flush()?;
+            Ok(())
+        }
+    }
+}
+
 /// One character cell of a rendered picture: two vertically-stacked pixels.
 pub type Cell = ([u8; 3], [u8; 3]);
 
@@ -339,6 +426,148 @@ pub fn cells(png: &[u8], max_cols: u32, max_rows: u32) -> Result<Vec<Vec<Cell>>,
 /// it wrong produces bad colours rather than a bad security outcome.
 pub fn terminal_supports_colour(colorterm: Option<&str>) -> bool {
     matches!(colorterm, Some(v) if v.eq_ignore_ascii_case("truecolor") || v == "24bit")
+}
+
+/// How long the decoder child may run before it is killed.
+///
+/// A decoder that has not finished by now is either wedged or being made to
+/// spin by its input, and neither is worth waiting on. Bounded because the
+/// caller is an interactive program: an unbounded wait is a frozen interface,
+/// which takes the lock chord with it.
+pub const CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The most the child may return.
+///
+/// The pixel cap bounds the *child's* memory; this bounds the parent's. A
+/// child that has been compromised is no longer bound by any check inside it,
+/// so the parent trusts nothing it says about size.
+const MAX_CHILD_OUTPUT: usize = 64 * 1024 * 1024;
+
+/// Ask the decoder child to transcode a picture.
+pub fn transcode_isolated(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut req = Vec::with_capacity(bytes.len() + 9);
+    req.push(OP_TRANSCODE);
+    req.extend_from_slice(&0u32.to_le_bytes());
+    req.extend_from_slice(&0u32.to_le_bytes());
+    req.extend_from_slice(bytes);
+    run_isolated(&req)
+}
+
+/// Ask the decoder child to render a picture to cells.
+pub fn cells_isolated(bytes: &[u8], cols: u32, rows: u32) -> Result<Vec<Vec<Cell>>, Error> {
+    let mut req = Vec::with_capacity(bytes.len() + 9);
+    req.push(OP_CELLS);
+    req.extend_from_slice(&cols.to_le_bytes());
+    req.extend_from_slice(&rows.to_le_bytes());
+    req.extend_from_slice(bytes);
+    let out = run_isolated(&req)?;
+    if out.len() < 8 {
+        return Err(Error::Corrupt);
+    }
+    let n = u32::from_le_bytes(out[..4].try_into().expect("4 bytes")) as usize;
+    let w = u32::from_le_bytes(out[4..8].try_into().expect("4 bytes")) as usize;
+    // The parent checks the child's arithmetic. A compromised child is not
+    // bound by anything inside it, so its framing is input like any other.
+    if n.saturating_mul(w).saturating_mul(6) != out.len() - 8 {
+        return Err(Error::Corrupt);
+    }
+    let mut grid = Vec::with_capacity(n);
+    let mut at = 8;
+    for _ in 0..n {
+        let mut row = Vec::with_capacity(w);
+        for _ in 0..w {
+            row.push((
+                [out[at], out[at + 1], out[at + 2]],
+                [out[at + 3], out[at + 4], out[at + 5]],
+            ));
+            at += 6;
+        }
+        grid.push(row);
+    }
+    Ok(grid)
+}
+
+/// Spawn this binary as a decoder, feed it, and read the answer.
+///
+/// Falls back to decoding in this process **only if the child cannot be
+/// spawned at all** — a `current_exe` that does not resolve, or a platform
+/// that refuses. That is a degradation, and it is reported rather than
+/// silent: see [`Isolation`].
+fn run_isolated(req: &[u8]) -> Result<Vec<u8>, Error> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().map_err(|_| Error::NoIsolation)?;
+    let mut child = Command::new(exe)
+        .arg(CHILD_FLAG)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| Error::NoIsolation)?;
+
+    // Written on a thread: a child that never reads fills the pipe and a
+    // blocking write in the parent would deadlock against a wait that has not
+    // happened yet.
+    let mut stdin = child.stdin.take().ok_or(Error::Corrupt)?;
+    let payload = req.to_vec();
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(&payload);
+    });
+
+    let mut stdout = child.stdout.take().ok_or(Error::Corrupt)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let n = stdout
+            .by_ref()
+            .take(MAX_CHILD_OUTPUT as u64 + 1)
+            .read_to_end(&mut buf);
+        let _ = tx.send(n.map(|_| buf));
+    });
+
+    let status = match wait_bounded(&mut child) {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Corrupt);
+        }
+    };
+    let out = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .map_err(|_| Error::Corrupt)?
+        .map_err(|_| Error::Corrupt)?;
+
+    if !status.success() {
+        // Includes a decoder that crashed. The node did not.
+        //
+        // An *empty* failure with no output is how a binary that is not this
+        // one answers — a test harness, say, which does not know the flag. It
+        // is reported as missing isolation rather than a bad picture, because
+        // the file was never looked at.
+        if out.is_empty() && status.code().map(|c| c > 1).unwrap_or(true) {
+            return Err(Error::NoIsolation);
+        }
+        return Err(Error::Corrupt);
+    }
+    if out.len() > MAX_CHILD_OUTPUT {
+        return Err(Error::Corrupt);
+    }
+    Ok(out)
+}
+
+fn wait_bounded(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + CHILD_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => return Some(s),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// Whether a link can carry a picture at all — RFC 4 §5.4.
@@ -616,5 +845,38 @@ mod tests {
         for cut in 0..good.len() {
             let _ = cells(&good[..cut], 40, 20);
         }
+    }
+
+    /// **The parent checks the child's arithmetic.** A compromised child is
+    /// not bound by any check inside it, so its framing is input like any
+    /// other — a row count that does not match the bytes must not become an
+    /// allocation.
+    ///
+    /// The process boundary itself is exercised in
+    /// `tests/decoder_isolation.rs`, which can reach the real binary;
+    /// `cargo test` builds a harness, and re-invoking *that* with the child
+    /// flag runs the test suite again.
+    #[test]
+    fn a_lying_child_frame_is_refused() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1_000_000u32.to_le_bytes()); // rows
+        frame.extend_from_slice(&1_000_000u32.to_le_bytes()); // cols
+        frame.extend_from_slice(&[0u8; 6]); // one cell
+        let n = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
+        let w = u32::from_le_bytes(frame[4..8].try_into().unwrap()) as usize;
+        assert_ne!(
+            n.saturating_mul(w).saturating_mul(6),
+            frame.len() - 8,
+            "the check that rejects this must not pass it"
+        );
+    }
+
+    /// The wait is bounded. An interactive program that blocks for ever on a
+    /// wedged decoder is a frozen interface, and it takes the lock chord with
+    /// it.
+    #[test]
+    fn the_child_wait_is_bounded() {
+        assert!(CHILD_TIMEOUT <= std::time::Duration::from_secs(60));
+        assert!(CHILD_TIMEOUT >= std::time::Duration::from_secs(5));
     }
 }

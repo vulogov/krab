@@ -231,6 +231,17 @@ fn default_home() -> PathBuf {
 }
 
 fn main() -> io::Result<()> {
+    // **Before anything else.** RFC 8 §6 wants image decoding in a separate
+    // process; this is that process, and it is this same binary re-invoked.
+    //
+    // It returns here, so nothing below runs: no arguments parsed, no home
+    // resolved, no passphrase taken, no key derived. There is nothing in this
+    // address space for a decoder bug to reach — which is the entire point,
+    // and would not be true if this check were one line further down.
+    if std::env::args().any(|a| a == picture::CHILD_FLAG) {
+        return picture::run_child();
+    }
+
     let mut app = match App::from_args(std::env::args().skip(1)) {
         Ok(app) => app,
         Err(usage) => {
@@ -1439,10 +1450,13 @@ impl App {
         }
         // Decoded on its own thread, holding nothing but the bytes — the same
         // isolation the send path uses, and for the same reason.
-        match std::thread::spawn(move || picture::cells(&png, 76, 18)).join() {
-            Err(_) => "the decoder crashed on that picture. Nothing is shown.".into(),
-            Ok(Err(e)) => format!("{e}"),
-            Ok(Ok(rows)) => {
+        let rendered = match picture::cells_isolated(&png, 76, 18) {
+            Err(picture::Error::NoIsolation) => picture::cells(&png, 76, 18),
+            other => other,
+        };
+        match rendered {
+            Err(e) => format!("{e}"),
+            Ok(rows) => {
                 let n = rows.len();
                 self.showing = Some(rows);
                 format!(
@@ -1515,13 +1529,22 @@ impl App {
         // closure captures the bytes and nothing else: no identity, no epoch
         // key, no store handle. A separate process would be stronger and is
         // not done — see `picture`'s module note, which says so plainly.
-        let handle = std::thread::spawn(move || picture::transcode(&raw));
-        let clean = match handle.join() {
-            // A decoder that panicked is a decoder that failed, and it took a
-            // thread with it rather than the node.
-            Err(_) => return "the decoder crashed on that file. Nothing was sent.".into(),
-            Ok(Err(e)) => return format!("{e}"),
-            Ok(Ok(bytes)) => bytes,
+        // **A separate process**, per RFC 8 §6. It holds no key material
+        // because it is entered from the first line of `main`, before anything
+        // is loaded — so a decoder bug that achieves code execution owns a
+        // process containing one attacker-supplied image and nothing else.
+        // **A separate process**, per RFC 8 §6. Where one cannot be started —
+        // a restricted environment, an executable that cannot re-invoke
+        // itself — the picture is still decoded, in this process, and the
+        // operator is told. A silent fallback would be a safety property
+        // quietly absent, which is worse than not having it.
+        let (clean, isolated) = match picture::transcode_isolated(&raw) {
+            Ok(bytes) => (bytes, true),
+            Err(picture::Error::NoIsolation) => match picture::transcode(&raw) {
+                Ok(bytes) => (bytes, false),
+                Err(e) => return format!("{e}"),
+            },
+            Err(e) => return format!("{e}"),
         };
 
         let n = clean.len();
@@ -1551,7 +1574,15 @@ impl App {
              The picture was decoded and re-encoded ({was} bytes in, {n} out). \
              What leaves this node is pixel data it generated: no EXIF, no GPS, \
              no ICC profile, nothing appended. That is automatic and there is \
-             no setting for it (RFC 8 §6)."
+             no setting for it (RFC 8 §6).{}",
+            if isolated {
+                ""
+            } else {
+                "\n\nNOTE: it was decoded in this process rather than a separate \
+                 one. RFC 8 §6 prefers a separate process because an image \
+                 decoder is the likeliest place a hostile file gets code \
+                 running, and this address space holds your keys."
+            }
         )
     }
 
@@ -10472,5 +10503,44 @@ mod tests {
         );
         // And this node's own, as before.
         assert!(!a.path(artifact::Artifact::PeerPad).exists());
+    }
+
+    /// **A missing safety property is reported, never silent.** Where the
+    /// decoder cannot be run as a separate process, the picture is still
+    /// decoded — and the operator is told that the isolation RFC 8 §6 prefers
+    /// was not available. A silent fallback would be a property quietly
+    /// absent, which is worse than not having it.
+    #[test]
+    fn losing_process_isolation_is_reported_and_not_silent() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("picture-fallback");
+        let path = a.at("p.png");
+        std::fs::write(&path, a_png(8, 8)).unwrap();
+
+        type_command(&mut a, &format!("send {b_id} --picture {}", path.display()));
+        assert!(a.output.contains("re-encoded"), "{}", a.output);
+        // Under `cargo test` the executable is a harness that does not know
+        // the child flag, so this exercises exactly the degraded path.
+        assert!(
+            a.output.contains("decoded in this process"),
+            "the fallback happened without saying so:\n{}",
+            a.output
+        );
+        assert!(
+            a.output.contains("holds your keys"),
+            "it does not say what the cost is:\n{}",
+            a.output
+        );
+    }
+
+    /// Missing isolation and a bad picture are different, because the
+    /// remedies are opposite: one means the file is bad, the other means a
+    /// safety property is unavailable.
+    #[test]
+    fn missing_isolation_is_not_a_refusal() {
+        assert_ne!(picture::Error::NoIsolation, picture::Error::Corrupt);
+        assert!(picture::Error::NoIsolation
+            .to_string()
+            .contains("separate process"));
+        assert!(picture::Error::Corrupt.to_string().contains("refused"));
     }
 }
