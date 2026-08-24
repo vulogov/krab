@@ -2132,15 +2132,56 @@ impl App {
         // The other end must be someone this node actually peered with. A
         // credential proposed by a stranger is a document asking for a
         // signature on a relationship that does not exist.
-        if self.peer_card(&short).is_none() {
+        let Some(their_card) = self.peer_card(&short) else {
             return format!(
                 "no peer-link for {short}.\n\n\
                  Complete the ceremony first — `peer offer`, `peer accept`, \
                  `peer seal`. A credential records a peering; it does not \
                  create one."
             );
+        };
+
+        // **Both parties' keys must be the ones this node holds.**
+        //
+        // `other_than` matches on node id, which is a hash of `sig_pk`, so a
+        // wrong identity key cannot get this far. `kx_pk` is not covered by
+        // that and was not checked at all: a peer could propose a credential
+        // carrying this node's real identity key beside a **correspondence key
+        // they control**, and countersigning it would produce a mutually
+        // signed — and per §15 non-repudiable — statement by this node that
+        // its own key is theirs.
+        //
+        // Nothing reads `kx_pk` out of a credential today, which made it
+        // latent rather than live. It does not stay latent: RFC 3 §9.2 makes
+        // the credential the place contact details are exchanged, and §3 keys
+        // 1 and 2 carry `{sig_pk, kx_pk}` precisely so a reader can use them.
+        let mine = id.card(peering::Policy::default());
+        let ours = if cred.a.node_id() == me {
+            cred.a
+        } else {
+            cred.b
+        };
+        if ours.sig_pk != mine.identity_pk || ours.kx_pk != mine.correspondence_pk {
+            return "refused: that credential does not name your keys.\n\n\
+                    It carries your node identifier beside a correspondence key \
+                    that is not yours. Signing it would be signing a statement \
+                    about your own key that is false — and RFC 3 §15 makes a \
+                    credential non-repudiable, so it would be your signature on \
+                    it for as long as it lasts."
+                .into();
+        }
+        if them.sig_pk != their_card.identity_pk || them.kx_pk != their_card.correspondence_pk {
+            return format!(
+                "refused: that credential does not match the peer-link you \
+                 hold for {short}.\n\n\
+                 The keys in it are not the keys you peered with. Two documents \
+                 about one peering that disagree is a peering where nobody can \
+                 say which is right."
+            );
         }
 
+        // Whether *this* call completed it, which is what decides whether the
+        // other end is still owed a copy.
         let added = cred.sign(id.signing_key());
         match cred.verify(self.now_s()) {
             Ok(()) => {}
@@ -2190,33 +2231,123 @@ impl App {
         if let Err(e) = self.ensure_peer_dir(&short) {
             return e;
         }
+        // **Sealed under W_N, because RFC 3 §15 says MUST.** "Seizing a disk
+        // yields the peer list *with cryptographic proof* — worse than an
+        // address book. The credential store MUST be encrypted under the RFC 7
+        // key hierarchy." A completed credential is the single most
+        // incriminating file this node writes: not merely a name, a mutually
+        // signed and therefore non-repudiable statement that these two agreed
+        // to peer. The first version of this function wrote it in the clear.
+        let Some(w) = self.epoch_key else {
+            return "locked".into();
+        };
+        let Ok(sealed) =
+            krab_crypto::kek::seal_under(&w, b"krab/credential", &cred.encode(), &mut OsRng)
+        else {
+            return "could not seal it".into();
+        };
         if let Err(e) = atomic::write(
             &self.peer_path(&short, artifact::PeerFile::Credential),
-            &cred.encode(),
+            &sealed,
         ) {
             return format!("could not store it: {e}");
         }
+        // **Whoever completed it still owes the other end a copy.**
+        //
+        // The first version shredded the loose file unconditionally, so the
+        // side that countersigned kept the only complete credential — sealed,
+        // and therefore unreadable to anyone else — and the side that proposed
+        // was left holding a half-signed document for ever. Neither could cite
+        // one as evidence, which is the whole reason it exists.
+        //
+        // So: if this node added the second signature, the document goes back
+        // out. If it arrived already complete, this node was the last to need
+        // it and the loose copy is destroyed.
         let loose = self.home.join(format!("{short}.credential"));
-        if loose.exists() {
-            shred::remove(&loose, &mut OsRng);
+        let handover = if added {
+            let _ = atomic::write(&loose, &cred.encode());
+            format!(
+                "\n\nGive {} back to {short} — they hold only their own half \
+                 until they run `peer countersign` on it. Destroy it once they \
+                 have it: a completed credential is non-repudiable (RFC 3 §15), \
+                 and the copy in your peer directory is sealed while that one \
+                 is not.",
+                loose.display()
+            )
+        } else {
+            String::new()
+        };
+        // **Shred the file that was read, not the one we assume it was named.**
+        // The operator chooses the path, so keying destruction off a
+        // conventional filename destroys nothing and leaves a plaintext,
+        // non-repudiable credential wherever a courier unloaded it — the same
+        // reasoning as `peer seal` shredding the counterparty's pad, and the
+        // same mistake it once made.
+        let read_from = std::path::Path::new(path);
+        let same = read_from
+            .canonicalize()
+            .ok()
+            .zip(loose.canonicalize().ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+        if !same {
+            shred::remove(read_from, &mut OsRng);
         }
         let days = (cred.expires_s.saturating_sub(self.now_s())) / 86_400;
+        // **The terms, printed.** RFC 3 §5.3 makes countersigning the act of
+        // agreeing to them, and §6 says quota is "a checkable statement
+        // against a signed artifact rather than a unilateral judgement" —
+        // which is only true if the party bound by it saw it. The first
+        // version of this command signed and reported success without showing
+        // the operator what they had agreed to.
+        let (to_them, from_them) = if cred.a.node_id() == me {
+            (cred.terms_ab, cred.terms_ba)
+        } else {
+            (cred.terms_ba, cred.terms_ab)
+        };
+        let terms = format!(
+            "\n\nyou accept from them: buckets to {} B, {}, {} B retained{}\n\
+             they accept from you: buckets to {} B, {}, {} B retained{}",
+            krab_core::object::BUCKETS[to_them.max_bucket.min(5) as usize],
+            if to_them.relay { "relaying" } else { "leaf" },
+            to_them.retention_bytes,
+            if to_them.shard_bits > 0 {
+                format!(", 1/{} shard", 1u32 << to_them.shard_bits)
+            } else {
+                String::new()
+            },
+            krab_core::object::BUCKETS[from_them.max_bucket.min(5) as usize],
+            if from_them.relay { "relaying" } else { "leaf" },
+            from_them.retention_bytes,
+            if from_them.shard_bits > 0 {
+                format!(", 1/{} shard", 1u32 << from_them.shard_bits)
+            } else {
+                String::new()
+            },
+        );
         format!(
-            "peer-link with {short} is complete{}.\n\n\
+            "peer-link with {short} is complete{}.{terms}\n\n\
              Both signatures are on it, so it is a contract rather than a \
              claim — and it is what someone introducing you to a third party \
              cites as evidence (RFC 3 §5.1, §10).\n\n\
              It expires in {days} days. There is no revocation list and never \
              will be: revocation is non-renewal (RFC 3 §4), so re-run the \
-             ceremony before then.",
+             ceremony before then.{handover}",
             if added { "" } else { " (it already was)" }
         )
     }
 
     /// This node's completed credential with `peer`, if there is one.
+    ///
+    /// Sealed at rest under `W_N` — RFC 3 §15 makes that a MUST, so a locked
+    /// node cannot read its own credentials and therefore cannot cite one.
+    /// That is the intended behaviour and not a limitation: §15 calls a
+    /// running node holding them in memory "mitigation, not a fix".
     fn credential_with(&self, peer: &str) -> Option<credential::Credential> {
-        let bytes = std::fs::read(self.peer_path(peer, artifact::PeerFile::Credential)).ok()?;
-        let cred = credential::Credential::decode(&bytes)?;
+        let w = self.epoch_key?;
+        let sealed = std::fs::read(self.peer_path(peer, artifact::PeerFile::Credential)).ok()?;
+        let raw = krab_crypto::kek::open_under(&w, b"krab/credential", &sealed).ok()?;
+        let cred = credential::Credential::decode(&raw)?;
         cred.verify(self.now_s()).ok().map(|()| cred)
     }
 
@@ -7546,6 +7677,206 @@ mod tests {
         );
     }
 
+    /// **Both ends finish holding a credential they can cite.**
+    ///
+    /// The first version shredded the handover file unconditionally, so the
+    /// countersigner kept the only complete document — sealed, and therefore
+    /// unreadable to anyone else — while the proposer held a half-signed one
+    /// for ever. Neither could supply evidence, which is the entire reason the
+    /// document exists, and nothing reported anything wrong.
+    #[test]
+    fn both_ends_end_up_holding_the_completed_credential() {
+        let mut x = ready_node("both-x");
+        let mut y = ready_node("both-y");
+        let short_y = peer_up(&mut x, &mut y);
+        let short_x = peer_up(&mut y, &mut x);
+
+        // X proposes.
+        let proposal = x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default()));
+        let to_y = y.home.join("in.credential");
+        std::fs::write(&to_y, &proposal).unwrap();
+
+        // Y countersigns, and must hand something back.
+        y.peer_countersign(Some(to_y.to_str().unwrap()));
+        assert!(
+            y.credential_with(&short_x).is_some(),
+            "Y cannot cite its own credential"
+        );
+        let back = y.home.join(format!("{short_x}.credential"));
+        assert!(back.exists(), "Y kept the only complete credential");
+
+        // X ingests it.
+        let to_x = x.home.join("in.credential");
+        std::fs::copy(&back, &to_x).unwrap();
+        x.peer_countersign(Some(to_x.to_str().unwrap()));
+        assert!(
+            x.credential_with(&short_y).is_some(),
+            "X was left holding a proposal for ever"
+        );
+
+        // X received a complete document, so nothing is owed onward — and the
+        // plaintext file it was read from is gone, whatever it was called.
+        assert!(
+            !to_x.exists(),
+            "a plaintext credential was left where the courier unloaded it"
+        );
+        assert!(!x.home.join(format!("{short_y}.credential")).exists());
+    }
+
+    /// **RFC 3 §15: "The credential store MUST be encrypted under the RFC 7
+    /// key hierarchy."**
+    ///
+    /// A completed credential is the most incriminating file this node writes
+    /// — not a name but a mutually signed, non-repudiable statement that two
+    /// nodes agreed to peer. The first version of `peer countersign` wrote it
+    /// in the clear.
+    #[test]
+    fn a_credential_is_sealed_at_rest() {
+        let mut x = ready_node("seal-x");
+        let mut y = ready_node("seal-y");
+        peer_up(&mut x, &mut y);
+        peer_up(&mut y, &mut x);
+
+        let proposal = x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default()));
+        let path = y.home.join("p.credential");
+        std::fs::write(&path, &proposal).unwrap();
+        assert!(y
+            .peer_countersign(Some(path.to_str().unwrap()))
+            .contains("complete"));
+
+        let short_x = short_id(&x.identity.as_ref().unwrap().node_id());
+        let stored = std::fs::read(y.peer_path(&short_x, artifact::PeerFile::Credential)).unwrap();
+        assert!(
+            credential::Credential::decode(&stored).is_none(),
+            "the credential is readable straight off the disk"
+        );
+        // The identity keys must not appear in the file at all.
+        for pk in [
+            x.identity
+                .as_ref()
+                .unwrap()
+                .card(Policy::default())
+                .identity_pk,
+            y.identity
+                .as_ref()
+                .unwrap()
+                .card(Policy::default())
+                .identity_pk,
+        ] {
+            assert!(
+                !stored.windows(32).any(|w| w == pk),
+                "an identity key is in the clear on disk"
+            );
+        }
+        // And it still opens for the node that owns it.
+        assert!(y.credential_with(&short_x).is_some());
+    }
+
+    /// **A credential must name this node's own keys.**
+    ///
+    /// `other_than` matches on node id, which is a hash of `sig_pk`, so a
+    /// wrong identity key cannot get through. `kx_pk` is not covered by that
+    /// and was unchecked: a peer could propose a credential carrying this
+    /// node's real identity key beside a correspondence key **they** control,
+    /// and countersigning it would produce a signed, non-repudiable statement
+    /// by this node that its own key is theirs.
+    #[test]
+    fn a_credential_naming_the_wrong_correspondence_key_is_refused() {
+        let mut x = ready_node("kx-x");
+        let mut y = ready_node("kx-y");
+        peer_up(&mut x, &mut y);
+        peer_up(&mut y, &mut x);
+        let attacker = ready_node("kx-evil");
+
+        let mut cred = credential::Credential::decode(
+            &x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default())),
+        )
+        .unwrap();
+
+        // Swap Y's correspondence key for one the attacker holds, leaving
+        // every identity key untouched so the parties still resolve.
+        let evil_kx = attacker
+            .identity
+            .as_ref()
+            .unwrap()
+            .card(Policy::default())
+            .correspondence_pk;
+        let y_id = y.identity.as_ref().unwrap().node_id();
+        if cred.a.node_id() == y_id {
+            cred.a.kx_pk = evil_kx;
+        } else {
+            cred.b.kx_pk = evil_kx;
+        }
+
+        let path = y.home.join("evil.credential");
+        std::fs::write(&path, cred.encode()).unwrap();
+        let out = y.peer_countersign(Some(path.to_str().unwrap()));
+        assert!(out.contains("does not name your keys"), "{out}");
+        let short_x = short_id(&x.identity.as_ref().unwrap().node_id());
+        assert!(
+            y.credential_with(&short_x).is_none(),
+            "it was signed anyway"
+        );
+    }
+
+    /// The same, for the counterparty's keys: a credential that disagrees with
+    /// the peer-link this node holds is two documents about one peering saying
+    /// different things.
+    #[test]
+    fn a_credential_disagreeing_with_the_peer_link_is_refused() {
+        let mut x = ready_node("dis-x");
+        let mut y = ready_node("dis-y");
+        peer_up(&mut x, &mut y);
+        peer_up(&mut y, &mut x);
+        let other = ready_node("dis-o");
+
+        let mut cred = credential::Credential::decode(
+            &x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default())),
+        )
+        .unwrap();
+        let evil_kx = other
+            .identity
+            .as_ref()
+            .unwrap()
+            .card(Policy::default())
+            .correspondence_pk;
+        let x_id = x.identity.as_ref().unwrap().node_id();
+        if cred.a.node_id() == x_id {
+            cred.a.kx_pk = evil_kx;
+        } else {
+            cred.b.kx_pk = evil_kx;
+        }
+
+        let path = y.home.join("mismatch.credential");
+        std::fs::write(&path, cred.encode()).unwrap();
+        let out = y.peer_countersign(Some(path.to_str().unwrap()));
+        assert!(out.contains("does not match the peer-link"), "{out}");
+    }
+
+    /// **Countersigning is agreeing to terms, so the terms are printed.**
+    ///
+    /// RFC 3 §5.3 makes the countersignature the act of acceptance, and §6
+    /// says quota is "a checkable statement against a signed artifact rather
+    /// than a unilateral judgement" — which is only true if the party bound by
+    /// it saw it. The first version signed and reported success without ever
+    /// showing the operator what they had agreed to.
+    #[test]
+    fn countersigning_shows_the_terms_being_agreed_to() {
+        let mut x = ready_node("terms-x");
+        let mut y = ready_node("terms-y");
+        peer_up(&mut x, &mut y);
+        peer_up(&mut y, &mut x);
+
+        let proposal = x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default()));
+        let path = y.home.join("t.credential");
+        std::fs::write(&path, &proposal).unwrap();
+        let out = y.peer_countersign(Some(path.to_str().unwrap()));
+
+        assert!(out.contains("you accept from them"), "{out}");
+        assert!(out.contains("they accept from you"), "{out}");
+        assert!(out.contains("retained"), "{out}");
+    }
+
     /// `peer countersign` completes a credential and stores it where the
     /// request path finds it, and refuses one between two other nodes.
     #[test]
@@ -7571,8 +7902,9 @@ mod tests {
             "Y did not store the completed credential"
         );
 
-        // And X, given the returned document, stores it too.
-        let done = std::fs::read(y.peer_path(&short_x, artifact::PeerFile::Credential)).unwrap();
+        // And X, given the document Y hands back, stores it too. Y's copy in
+        // its peer directory is sealed; the handover file is the plaintext one.
+        let done = std::fs::read(y.home.join(format!("{short_x}.credential"))).unwrap();
         std::fs::write(&path, &done).unwrap();
         let out = x.peer_countersign(Some(path.to_str().unwrap()));
         assert!(out.contains("is complete"), "{out}");

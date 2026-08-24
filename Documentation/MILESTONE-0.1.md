@@ -144,7 +144,7 @@ not a plan, so the check is written down here.
 | C — transport | **done, and past its scope** | `sim`, `courier`, `tcp` as planned; `socks` (Tor) and `serial` were "later" and exist. Both sync modes now run over a session — see §2.2.1 for how long only one did |
 | D — node | **done** | Poisson scheduler, sync loop, peer metrics, lock. Both absence-tests hold: intervals uncorrelated with message events *and* with lock state |
 | E — TUI | **done, and past its scope** | shell, chords, zoom, commands, picture pipeline with an out-of-process decoder. Relay mode present |
-| F — gates | **one of three met** | §2.2 |
+| F — gates | **two of three met**, the third unmeetable | §2.2 |
 
 Built although §5 called it 0.2: **groups** (`groups.rs`), **channels**
 (`channels.rs`), the **reservoir** (`krab-crypto/src/reservoir.rs`), **Tor** via

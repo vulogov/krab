@@ -628,3 +628,143 @@ hierarchy that was never persisted.
 The durable fixes have all been the same: make the rule structural rather than
 enumerated. `Artifact` for the disk, `panic_wipe → lock` for memory. Where a
 list is unavoidable, a test that walks it and fails on omission.
+
+---
+
+## Pass 8 — the credential, and the newest surface
+
+Run against everything added since Pass 7: the RBSR session driver, the `sim`
+backend's blocking semantics, rollcall, introduction tokens, RFC 3 §3's
+credential, and `evidence`. Four of those decode input from strangers, and one
+is a wire protocol that had never existed before.
+
+**Five findings, all in the newest code, four of them in the same command.**
+That concentration is itself the result: `peer countersign` was two days old
+and had been written, reviewed and tested by the same person in one sitting.
+
+### 1. Credentials were stored in the clear — a MUST violation
+
+RFC 3 §15:
+
+> "**Credentials at rest are non-repudiable.** Seizing a disk yields the peer
+> list *with cryptographic proof* — worse than an address book. The credential
+> store **MUST be encrypted under the RFC 7 key hierarchy.**"
+
+`peer countersign` wrote `peers/<id>/credential` as plaintext CBOR. Every other
+sensitive per-peer file is sealed under `W_N`; this one, the only file in the
+layout that is *cryptographic proof* of a relationship rather than an assertion
+of one, was not.
+
+Sealed under `W_N` with domain `krab/credential`. A locked node can no longer
+read its own credentials, which is the intended consequence — §15 calls holding
+them in memory "mitigation, not a fix".
+
+The test asserts the identity keys do not appear anywhere in the stored bytes,
+rather than asserting the file is "encrypted", because the second is not a
+property anything can check.
+
+### 2. Countersigning did not check that the document named this node's keys
+
+`other_than` resolves a party by node id, which is `BLAKE3(sig_pk)`, so a wrong
+identity key could not get through. **`kx_pk` was covered by nothing.**
+
+A peer could propose a credential carrying this node's real identity key beside
+a correspondence key *they* control. Countersigning it produced a mutually
+signed — and per §15 non-repudiable — statement by this node that its own
+correspondence key was the attacker's.
+
+Nothing reads `kx_pk` out of a credential today, which made it latent rather
+than live. It does not stay latent: RFC 3 §9.2 makes the credential the place
+contact details are exchanged, and §3 keys 1 and 2 carry `{sig_pk, kx_pk}`
+precisely so a reader can use them. The first code to do so would have been
+encapsulating to an attacker.
+
+Both parties' entries are now checked against the cards this node holds.
+
+### 3. Countersigning agreed to terms the operator never saw
+
+RFC 3 §5.3 makes the countersignature the act of acceptance, and §6 says quota
+is "a checkable statement against a signed artifact rather than a unilateral
+judgement" — which is only true if the party bound by it saw it.
+
+The command signed and reported success without printing the terms. A peer
+could propose one byte of retention and the operator would agree to it blind.
+Both directions are now printed before the confirmation.
+
+### 4. Only one side ever ended up with a credential
+
+The countersigner sealed the completed document into its peer directory and
+shredded the handover copy unconditionally. So the proposer was left holding a
+half-signed proposal for ever, and the countersigner held the only complete
+one — sealed, and therefore unreadable to anyone else.
+
+Neither could cite it as evidence, which is the entire reason the document
+exists. Nothing reported anything wrong: `credential_with` returned `None` and
+a request simply went out unevidenced.
+
+Found by a test written for finding 1, which is the argument for writing tests
+that drive the whole flow rather than the unit under repair.
+
+### 4b. And the fix to it was wrong, for a reason worth keeping
+
+`Credential::sign` returned `true` for re-signing a slot it had already filled.
+So the proposer, handed the completed document back, believed it had just
+countersigned — and wrote out *another* plaintext handover copy, in the home
+directory of a node that owed nobody one.
+
+`sign` now reports whether it **added** a signature. Two falses: not a party,
+and already signed.
+
+The related half: destruction was keyed off a conventional filename
+(`<peer>.credential`) rather than the path the operator actually passed, so a
+credential delivered as `incoming.dat` was sealed into the peer directory and
+also left in the clear wherever the courier unloaded it. `peer seal` had made
+exactly this mistake with the counterparty's pad and had already been fixed;
+the new code did not inherit the fix.
+
+### 5. `Command::ALL` did not exist, and the list standing in for it had drifted
+
+`every_verb_parses_and_round_trips` walked a hand-written array covering **19
+of 26** verbs. `Command` is `#[non_exhaustive]`, so adding a variant failed
+nothing.
+
+All seven missing verbs happened to round-trip, so there was no live defect.
+That is luck. `Command::ALL` is now the list, and `every_variant_is_in_all`
+matches on it exhaustively, so a new variant does not compile until it is
+there.
+
+`peer countersign` was also missing from `help`, while `peer seal` had just
+started telling operators to run it.
+
+### What did not fail
+
+- **The RBSR descent terminates against a hostile peer.** `resolved` grows only
+  through leaves, leaves are produced only while `rounds <= RBSR_MAX_ROUNDS`,
+  and a batch is bounded by `MAX_FRAME`. The initiator's drain loop is nested
+  inside the outer loop but breaks it immediately, so it is not
+  `MAX_MESSAGES²`.
+- **`Control::Range` allocates nothing on a declared count.**
+- **Evidence discloses no edge the token had not already disclosed.** A token
+  is signed by the introducer and names the requester, so a recipient learns
+  those two know each other from the token alone. Evidence adds proof, not the
+  fact — which is why it can ride along without a separate consent step.
+- **The rollcall entry still carries no endpoint**, checked against the
+  published object rather than the struct.
+
+### The pattern, again, and where it moved
+
+Findings 2, 4, 4b and 5 are the same shape as every previous pass: a rule
+enforced only over what existed when it was written. Finding 4b is the sharpest
+version yet — `peer seal` had already made the filename mistake and already
+been fixed, and the new command reproduced it anyway, because the fix lived in
+`peer seal` rather than anywhere a second caller would meet it.
+
+Findings 1 and 3 are a different shape, and new: **a MUST read, understood,
+and then not carried into the code that needed it.** Both §15 and §5.3 are
+quoted in the module that violated them. Reading the specification is not the
+step that fails; connecting a sentence in it to the four lines that had to
+change is.
+
+No structural fix suggests itself for that one. What the pass can do is keep
+finding them, which is the argument for running it after every feature rather
+than before every release.

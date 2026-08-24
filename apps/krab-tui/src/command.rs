@@ -140,6 +140,49 @@ pub enum Command {
 }
 
 impl Command {
+    /// Every verb.
+    ///
+    /// Used by the two tests that keep it complete and correct. Not read by
+    /// the program itself, which is why `#[allow(dead_code)]` is here rather
+    /// than the constant being deleted: the list's job is to fail a test, and
+    /// a list that must be *used* to be kept would be back where it started.
+    #[allow(dead_code)]
+    ///
+    /// **Exhaustive, and a test says so.** `Command` is `#[non_exhaustive]`
+    /// for callers outside this crate, which means nothing inside it fails
+    /// when a variant is added — the hand-written list this replaced had drifted
+    /// to 19 of 26 without anything noticing. `every_variant_is_in_all` closes
+    /// that: it matches on `Command` exhaustively, so a new variant does not
+    /// compile until it appears here.
+    pub const ALL: [Command; 26] = [
+        Command::Picture,
+        Command::Group,
+        Command::Channel,
+        Command::Quit,
+        Command::Listen,
+        Command::Help,
+        Command::Init,
+        Command::Peer,
+        Command::Lock,
+        Command::Duress,
+        Command::Request,
+        Command::Unlock,
+        Command::Wipe,
+        Command::Connect,
+        Command::Disconnect,
+        Command::Rollcall,
+        Command::Introduce,
+        Command::Requests,
+        Command::Import,
+        Command::Pack,
+        Command::Message,
+        Command::Send,
+        Command::Keys,
+        Command::Reach,
+        Command::Peers,
+        Command::Verify,
+    ];
+
     /// Parse a verb.
     pub fn parse(s: &str) -> Option<Command> {
         Some(match s.split_whitespace().next()? {
@@ -188,6 +231,10 @@ impl Command {
         (
             "peer seal",
             "finish the peering once both cards are exchanged",
+        ),
+        (
+            "peer countersign <file>",
+            "sign their half of the peer-link credential — RFC 3 §3 needs both",
         ),
         (
             "peer pad",
@@ -535,9 +582,64 @@ pub fn admit(
 mod tests {
     use super::*;
 
-    /// RFC 8 §5's ten verbs all parse, and so do the four it omits.
+    /// **`ALL` is complete.** The match is exhaustive, so a variant added to
+    /// the enum fails to compile here until it is added to `ALL` too — which
+    /// is the only way a list like that stays true. `#[non_exhaustive]` makes
+    /// the wildcard necessary for outside callers and useless as a guard, so
+    /// the guard lives in this crate where the match can be total.
+    #[test]
+    fn every_variant_is_in_all() {
+        for c in Command::ALL {
+            match c {
+                Command::Picture => {}
+                Command::Group => {}
+                Command::Channel => {}
+                Command::Quit => {}
+                Command::Listen => {}
+                Command::Help => {}
+                Command::Init => {}
+                Command::Peer => {}
+                Command::Lock => {}
+                Command::Duress => {}
+                Command::Request => {}
+                Command::Unlock => {}
+                Command::Wipe => {}
+                Command::Connect => {}
+                Command::Disconnect => {}
+                Command::Rollcall => {}
+                Command::Introduce => {}
+                Command::Requests => {}
+                Command::Import => {}
+                Command::Pack => {}
+                Command::Message => {}
+                Command::Send => {}
+                Command::Keys => {}
+                Command::Reach => {}
+                Command::Peers => {}
+                Command::Verify => {}
+            }
+        }
+        assert_eq!(Command::ALL.len(), 26);
+    }
+
+    /// **Every verb round-trips.** RFC 8 §5's ten, and the sixteen it omits.
+    ///
+    /// The list below was hand-written and had gone stale: it covered 19 of
+    /// 26 verbs, and `Command` is `#[non_exhaustive]`, so adding one failed
+    /// nothing. All seven missing ones happened to round-trip, so there was no
+    /// live defect — but that is luck, and this codebase's recurring failure
+    /// is a rule enforced only over what existed when it was written
+    /// (`artifact.rs`, `.gitignore`, `wipe`). `ALL` is now the list, and
+    /// `every_variant_is_in_all` is what keeps it complete.
     #[test]
     fn every_verb_parses_and_round_trips() {
+        for c in Command::ALL {
+            assert_eq!(
+                Command::parse(&c.to_string()).as_ref(),
+                Some(&c),
+                "{c} does not survive to_string -> parse"
+            );
+        }
         let all = [
             Command::Init,
             Command::Peer,

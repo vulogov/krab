@@ -244,22 +244,37 @@ impl Credential {
 
     /// Add this signer's signature to whichever side it belongs on.
     ///
-    /// A no-op for a key that is neither party's: a credential cannot be
-    /// signed by a bystander, and silently attaching their signature to a
-    /// slot would produce a document that fails verification later with no
-    /// explanation of why.
+    /// Returns whether a signature was **added** — false for a key that is
+    /// neither party's, and false for a slot that was already filled.
+    ///
+    /// Both falses matter. A credential cannot be signed by a bystander, and
+    /// silently attaching their signature to a slot would produce a document
+    /// that fails verification later with nothing saying why.
+    ///
+    /// The second is subtler and was wrong first time round: this returned
+    /// true for re-signing a slot it had already filled, so the proposer,
+    /// handed back the completed document, believed it had just countersigned
+    /// and wrote out another handover copy — a plaintext, non-repudiable
+    /// credential left in the home directory of a node that owed nobody
+    /// anything.
     pub fn sign(&mut self, signer: &SigningKey) -> bool {
         let pk = signer.verifying_key().to_bytes();
-        let sig = signer.sign(&self.body()).0;
-        if pk == self.a.sig_pk {
-            self.sig_a = Some(sig);
-            true
-        } else if pk == self.b.sig_pk {
-            self.sig_b = Some(sig);
-            true
-        } else {
-            false
+        let is_a = pk == self.a.sig_pk;
+        if !is_a && pk != self.b.sig_pk {
+            return false;
         }
+        if (is_a && self.sig_a.is_some()) || (!is_a && self.sig_b.is_some()) {
+            return false;
+        }
+        // Computed before taking the mutable borrow: `body` reads the whole
+        // document, including the slot about to be written.
+        let sig = signer.sign(&self.body()).0;
+        if is_a {
+            self.sig_a = Some(sig);
+        } else {
+            self.sig_b = Some(sig);
+        }
+        true
     }
 
     /// Whether this is a complete, valid, unexpired credential.
@@ -674,6 +689,27 @@ mod tests {
                 "a field is outside the signatures"
             );
         }
+    }
+
+    /// **Signing an already-signed slot adds nothing and says so.** The
+    /// proposer, handed the completed document back, must not think it just
+    /// countersigned — that is how a second plaintext copy gets written by a
+    /// node that owes nobody one.
+    #[test]
+    fn signing_twice_adds_nothing() {
+        let (x, y) = (node(1), node(2));
+        let mut c = Credential::propose(
+            x.signing_key(),
+            &x.card(Policy::default()),
+            &y.card(Policy::default()),
+            NOW,
+            DEFAULT_TERM_DAYS,
+            [3u8; 16],
+        );
+        assert!(!c.sign(x.signing_key()), "re-signing reported as new");
+        assert!(c.sign(y.signing_key()), "the missing signature was refused");
+        assert!(!c.sign(y.signing_key()));
+        assert_eq!(c.verify(NOW + 60), Ok(()));
     }
 
     /// A third party's signature is not attached to either slot — a credential
