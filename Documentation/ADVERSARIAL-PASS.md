@@ -559,3 +559,72 @@ smallest tabulated size.
 That is the lesson worth keeping: the tests were not wrong, they were small.
 A property that holds for five objects and fails for five thousand is invisible
 to every one of them.
+
+---
+
+## Pass 7 — overlapping operator state
+
+**Axis.** Every previous pass looked at one subsystem under stress. This one
+looks at the *interaction* of state that accumulated across many sessions:
+prompts, an open composition, a background socket accepting strangers, queued
+fan-out copies, a wipe confirmation, a displayed picture.
+
+**Method.** Enumerate every field of `App`, then ask of each: does `lock`
+clear it, does `panic_wipe` clear it, and should it? `lock` carries the rule
+in its own comment — *"the screen must not list correspondents"* — so that
+rule was applied to fields written long after it.
+
+Three findings, all severe, all the same shape: a rule stated in one place and
+enforced only over the fields that existed when it was written.
+
+### 7.1 The command history survived a lock
+
+`lock` cleared the activity log because it names correspondents. The command
+history names them too — `send b73a4d8c`, `message b73a4d8c`, the paths of
+cards and pads — and Up-arrow recalled it on a node that is supposed to be
+unable to read anything.
+
+Alongside it: an open composition's recipient list, a first-contact socket
+still accepting strangers, a `wipe` still confirmed, and a pending `Prompt`
+that would consume whatever the returning operator typed next.
+
+### 7.2 A panic wipe cleared *less* than a lock
+
+The verb behind the chord an operator presses when somebody is at the door
+left the decrypted body, the activity log, a displayed picture, the channel
+posting key and every group roster in memory. `lock` cleared the first three;
+nothing cleared the last two.
+
+**The fix is structural.** `panic_wipe` now calls `lock` rather than repeating
+its list, so a field added to one is cleared by both. The two had drifted
+apart precisely because they were two lists.
+
+### 7.3 A wiped node kept answering for an identity it had destroyed
+
+A lock deliberately keeps links and the listener: a locked node is a relay and
+still carries for its peers. A *wiped* node has no peers — it has just
+destroyed the credentials that define them — and it was still accepting calls
+from their statics, still scheduling reconciliations with them, and still
+holding sealed copies whose release would have rebuilt the corpus the wipe
+destroyed.
+
+### What did not fail
+
+Three probes found nothing, and are kept as tests because a negative result
+about a security property is worth as much as a positive one:
+
+- a `Prompt` cannot intercept a passphrase — the passphrase step has its own
+  buffer and its own key handling
+- a stale prompt does not eat the verb that starts an unlock
+- a `wipe` confirmation does not survive an unrelated command
+
+### The pattern, again
+
+Every finding in this pass is a rule that was true when written and silently
+stopped being true as fields were added around it. That is the same shape as
+`wipe`'s filename list (twice), `respond_to` with no caller, and the epoch
+hierarchy that was never persisted.
+
+The durable fixes have all been the same: make the rule structural rather than
+enumerated. `Artifact` for the disk, `panic_wipe → lock` for memory. Where a
+list is unavoidable, a test that walks it and fails on omission.

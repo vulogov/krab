@@ -4910,6 +4910,31 @@ impl App {
     /// would mean an interrupted wipe leaves a live key beside partially
     /// overwritten files, which is the worst of both.
     fn panic_wipe(&mut self) -> String {
+        // **Everything `lock` clears, first.** A panic wipe cleared *less*
+        // than a lock did: it left the decrypted body, the activity log, the
+        // command history, a displayed picture, the channel posting key and
+        // every group roster in memory — on the one path an operator reaches
+        // when somebody is at the door.
+        //
+        // Calling `lock` rather than repeating its list is what stops the two
+        // drifting apart again. A field added to one is now cleared by both.
+        self.lock();
+
+        // **And the things a lock deliberately keeps.** A locked node is a
+        // relay: it holds its links and its listener because it still carries
+        // for the peers it has. A wiped node has none — it has just destroyed
+        // the credentials that define them — so a socket still accepting the
+        // statics of former peers is a node answering for an identity that no
+        // longer exists.
+        self.inbound = None;
+        self.allowed.set(Vec::new());
+        self.links = links::LinkTable::new();
+        self.scheduler = krab_node::scheduler::Scheduler::new(self.scheduler.mean_interval_s());
+        // Sealed copies composed before the wipe. They are ciphertext, but
+        // emitting them would rebuild the corpus the wipe destroyed and
+        // deliver mail the operator was destroying the means to have sent.
+        self.pending.clear();
+
         // ---- The erasure. Milliseconds, and irreversible. ----
         self.identity = None; // Drop runs Zeroize on every private key
         self.epoch_key = None;
@@ -5578,6 +5603,35 @@ impl App {
         // The counters in `PeerMetrics` keep moving — a relay still
         // reconciles — but the screen must not list correspondents.
         self.log.clear();
+        // **And neither must the history.** It held `send <peer>`, `message
+        // <peer>`, and the paths of cards and pads — a list of who this node
+        // talks to, recallable with Up-arrow on a node that is supposed to be
+        // unable to read anything. It was cleared for the log and not for the
+        // history, which is the same disclosure by another route.
+        self.history.clear();
+        self.history_at = 0;
+        // An open composition names its recipients.
+        self.composing_to = None;
+        self.composing_to_many.clear();
+        // A socket accepting strangers, on a node that cannot complete the
+        // ceremony one would start: it needs the epoch key to seal a
+        // reservoir, and that is the first thing gone.
+        if let Some(m) = self.meeting.take() {
+            m.running.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        // A confirmation given before a lock must not authorise a destruction
+        // after it — the operator who returns is not necessarily the one who
+        // typed `wipe`.
+        self.confirmed = false;
+        // A pending prompt would consume the next line typed, which after an
+        // unlock is whatever the returning operator meant to run.
+        self.prompt = None;
+        // The channel posting key and every group roster. Both are read back
+        // from sealed storage on unlock, so holding them while locked buys
+        // nothing and keeps a signing key and a membership list in the memory
+        // of a node that is supposed to be unable to read anything.
+        self.roster = channels::Roster::default();
+        self.groups.clear();
         self.list = vec!["(locked)".into()];
         self.passphrase.clear();
         overwrite(&mut self.composer);
@@ -11404,5 +11458,223 @@ mod tests {
 
         // A working peering at both ends.
         assert_eq!(stored_root(&a, &b_id), stored_root(&b, &a_id));
+    }
+
+    /// **Adversarial: what does `lock` leave in memory?**
+    ///
+    /// `lock` clears the log because "the screen must not list
+    /// correspondents". This asks the same question of every other field that
+    /// accumulated since — the command history, an open composition's
+    /// recipients, a first-contact socket, a wipe confirmation, a pending
+    /// prompt.
+    #[test]
+    fn locking_leaves_nothing_that_names_a_correspondent() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("adv-lock-state");
+
+        // A session's worth of state: mail sent, a composition open, a
+        // stranger-accepting socket, a wipe half-confirmed, a prompt pending.
+        type_command(&mut a, &format!("send {b_id} the meeting is moved"));
+        type_command(&mut a, &format!("message {b_id}"));
+        type_command(&mut a, "peer meet listen 127.0.0.1:0");
+        type_command(&mut a, "wipe");
+        a.prompt = Some(Prompt::TransferWords {
+            path: "/tmp/theirs.wrapped".into(),
+        });
+
+        a.lock();
+        assert!(a.locked);
+
+        // The history names who this node talks to, and Up-arrow recalls it.
+        assert!(
+            !a.history.iter().any(|h| h.contains(&b_id)),
+            "the command history still lists a correspondent: {:?}",
+            a.history
+        );
+        // So does an open composition's recipient list.
+        assert!(
+            a.composing_to.is_none() && a.composing_to_many.is_empty(),
+            "a locked node still holds who it was writing to"
+        );
+        // A socket accepting strangers, on a node that cannot complete the
+        // ceremony it would start.
+        assert!(
+            a.meeting.is_none(),
+            "a locked node left a first-contact socket open"
+        );
+        // A confirmation given before the lock must not authorise a
+        // destruction after it.
+        assert!(!a.confirmed, "a wipe stayed confirmed across a lock");
+        // And a pending prompt would swallow the next line typed.
+        assert!(a.prompt.is_none(), "a prompt survived the lock");
+    }
+
+    /// **Adversarial: a panic wipe must clear at least as much as a lock.**
+    ///
+    /// It cleared less. `lock` overwrote the decrypted body, the log and a
+    /// displayed picture; `panic_wipe` — the verb behind the chord an operator
+    /// presses when somebody is at the door — did not, and also left the
+    /// channel posting key and every group roster in memory.
+    #[test]
+    fn a_panic_wipe_clears_at_least_as_much_as_a_lock() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("adv-panic-state");
+        type_command(&mut a, "channel new");
+        type_command(&mut a, "group new friends");
+        type_command(
+            &mut a,
+            &format!("send {b_id} the safe house is on Rua Augusta"),
+        );
+        a.body = "from bob\n\nthe safe house is on Rua Augusta".into();
+        a.showing = Some(picture::cells(&a_png(8, 8), 10, 4).expect("renders"));
+        a.composing_to = Some(b_id.clone());
+
+        a.panic_wipe();
+
+        assert!(
+            a.body.is_empty(),
+            "decrypted plaintext survived a panic wipe"
+        );
+        assert!(a.showing.is_none(), "a picture was still on screen");
+        assert!(
+            a.roster.mine.is_none(),
+            "the channel posting key survived in memory"
+        );
+        assert!(a.groups.is_empty(), "group rosters survived in memory");
+        assert!(
+            !a.history.iter().any(|h| h.contains(&b_id)),
+            "the history still names a correspondent: {:?}",
+            a.history
+        );
+        assert!(a.composing_to.is_none());
+        assert!(a.log.recent(8).is_empty(), "the activity log survived");
+    }
+
+    /// **Adversarial: two things wanting the next line.**
+    ///
+    /// `Prompt` consumes the next submitted line without parsing it. The
+    /// first-run ceremony and `unlock` also consume input. If both are live,
+    /// one of them silently gets the other's text — and one of those texts is
+    /// a passphrase.
+    #[test]
+    fn a_prompt_and_the_ceremony_never_both_want_the_next_line() {
+        let mut a = ready_node("adv-prompt-clash");
+        a.prompt = Some(Prompt::TransferWords {
+            path: "/tmp/nonexistent.wrapped".into(),
+        });
+
+        // `unlock` asks for a passphrase through `init_step`, not through the
+        // command line, so the two channels are separate — but a stale prompt
+        // must not eat the verb that starts it.
+        type_command(&mut a, "unlock");
+        assert!(
+            a.prompt.is_none(),
+            "the prompt is still armed and will eat the next line"
+        );
+
+        // Whatever happened, the passphrase buffer did not receive the verb.
+        assert!(!a.passphrase.as_string().contains("unlock"));
+    }
+
+    /// **Adversarial: a passphrase typed while a prompt is armed.**
+    ///
+    /// The passphrase step has its own buffer and its own key handling, so a
+    /// prompt must not be able to intercept it. If it could, the transfer-word
+    /// handler would receive a passphrase and — since a wrong phrase is
+    /// reported the same way a tampered file is — the operator would be told
+    /// only that "those words did not open it".
+    #[test]
+    fn a_prompt_cannot_intercept_a_passphrase() {
+        let mut a = App::default();
+        a.home = temp_home("adv-prompt-passphrase");
+        type_command(&mut a, "init");
+        assert_eq!(a.init_step, Some(InitStep::Passphrase));
+        a.prompt = Some(Prompt::TransferWords {
+            path: "/tmp/x".into(),
+        });
+
+        for c in "hunter2".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            a.passphrase.as_string(),
+            "hunter2",
+            "the passphrase went somewhere else"
+        );
+        assert!(a.command.is_empty());
+        assert!(
+            !a.history.iter().any(|h| h.contains("hunter2")),
+            "{:?}",
+            a.history
+        );
+    }
+
+    /// **Adversarial: a wipe confirmed, then something else typed.**
+    ///
+    /// `confirmed` is a one-shot latch. Anything between the two `wipe`s must
+    /// clear it, or an operator who typed `wipe`, changed their mind, ran
+    /// something else, and later typed `wipe` again would destroy the node on
+    /// what they believed was the first of two presses.
+    #[test]
+    fn a_wipe_confirmation_does_not_survive_another_command() {
+        let mut a = ready_node("adv-wipe-latch");
+        type_command(&mut a, "wipe");
+        assert!(a.output.contains("cannot be undone"), "{}", a.output);
+        assert!(a.confirmed);
+
+        type_command(&mut a, "peers");
+        assert!(
+            !a.confirmed,
+            "a wipe stayed armed across an unrelated command — the next `wipe` \
+             would destroy the node on what looks like the first press"
+        );
+        assert!(a.identity.is_some());
+
+        type_command(&mut a, "wipe");
+        assert!(a.output.contains("cannot be undone"), "{}", a.output);
+        assert!(a.identity.is_some(), "it destroyed on a single press");
+    }
+
+    /// **Adversarial: what does a tick do after a panic wipe?**
+    ///
+    /// The node keeps running — the operator pressed the chord, they did not
+    /// quit. Anything still queued gets a chance to act, and two things were:
+    /// fan-out copies awaiting release, and a listener still holding the
+    /// statics of peers that no longer exist.
+    #[test]
+    fn nothing_queued_before_a_panic_wipe_acts_after_it() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("adv-wipe-tick");
+
+        // Copies composed but not yet emitted, and a bound listener.
+        a.listen = Some("127.0.0.1:0".into());
+        a.start_listener();
+        let _ = a.fan_out(
+            &[b_id.clone(), b_id.clone()],
+            "the safe house is on Rua Augusta",
+        );
+        assert_eq!(a.pending.len(), 2, "the fixture did not queue anything");
+
+        a.panic_wipe();
+        assert!(
+            !a.path(artifact::Artifact::Corpus).exists(),
+            "the wipe failed"
+        );
+
+        // Release everything that was waiting, then tick.
+        for p in a.pending.iter_mut() {
+            p.release_at_s = 0;
+        }
+        a.tick_schedule();
+
+        assert!(
+            a.pending.is_empty() || a.store.is_empty(),
+            "sealed messages composed before the wipe were emitted after it"
+        );
+        assert!(
+            !a.path(artifact::Artifact::Corpus).exists(),
+            "a tick recreated the corpus a panic wipe had destroyed"
+        );
+        assert!(
+            a.inbound.is_none(),
+            "a wiped node is still accepting calls from its former peers"
+        );
     }
 }

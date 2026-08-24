@@ -224,11 +224,14 @@ mod tests {
     /// footprint being under 100 KB.
     #[test]
     fn tag_table_breaks_rfc7_s_under_100kb_claim() {
+        // RFC 7 §4.1's own figure, and its own claim about it. Stated rather
+        // than asserted: comparing two literals checks nothing, and clippy is
+        // right to say so. What the test checks is the *consequence* below.
         const RFC7_FOOTPRINT: usize = 82_732;
-        assert!(RFC7_FOOTPRINT < 100_000);
+        const RFC7_CLAIM: usize = 100_000;
         for (c, w) in [(50usize, 45usize), (200, 30), (500, 45)] {
             assert!(
-                RFC7_FOOTPRINT + table_bytes(c, w) > 100_000,
+                RFC7_FOOTPRINT + table_bytes(c, w) > RFC7_CLAIM,
                 "{c} correspondents at ±{w} should exceed the claim"
             );
         }
