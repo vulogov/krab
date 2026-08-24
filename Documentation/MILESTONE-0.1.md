@@ -1,8 +1,10 @@
 # Milestone 0.1 — Implementation Plan
 
     Branch:   0.1
-    Status:   A–E done; F has one gate outstanding, and it needs a second
-              author (§2.2). Last checked against the tree 2026-08-24.
+    Status:   A–E done. F: two of three gates met; RFC 1 §12's needs a second
+              implementation that will not exist, and **0.1 ships with it
+              unmet** — the decision and its cost are in §2.2.2.
+              Last checked against the tree 2026-08-24.
     Scope:    a message from A to B, over sim, TCP and courier, with lock
               — plus what §5 records as having grown past that
 
@@ -159,9 +161,64 @@ Nothing from §5 remains absent. Every feature the plan deferred to 0.2 exists.
 
 | gate | state |
 |---|---|
-| RFC 1 §12 vectors | vectors exist and are checked every run (`Documentation/vectors/rfc-1.txt`, `krab-tui/src/vectors.rs`). **The second implementation is not mine to write** — a second reading by the same author agrees with the first whether or not the first is right, and two agreeing implementations from one understanding look like evidence while being none |
+| RFC 1 §12 vectors | **unmet, and 0.1 ships anyway — see §2.2.2.** The vectors exist and are checked every run; the second implementation does not and will not exist |
 | RFC 3 §11.3, all interfaces down | **met.** `courier_only_peering_completes_with_no_network` drives offer, accept, pad and seal by file copy with no socket; `courier_only.rs` carries a sealed first message across with no round trip |
 | SIM-2 through the `sim` backend | **met.** All four items measure the real `Store`, `recon` and `Node`, and `sim2.rs` now drives every reconciliation through `SimFabric` — two halves, two threads, real opcodes — rather than calling `recon::reconcile` on two corpora it holds at once |
+
+### 2.2.2 0.1 ships with the first gate unmet
+
+RFC 1 §12:
+
+> "Two independent implementations MUST agree on every vector before the status
+> changes. **For a format that cannot be revised, vectors are the
+> specification; the prose is commentary.**"
+
+There is one implementation and there will not be a second. **0.1 ships with
+this gate unmet.** That is a decision, recorded here so nobody has to infer it
+from an empty checkbox.
+
+What that costs is specific, and it is not "the vectors are untested". It is
+that nothing has yet checked this implementation's *reading* of RFC 1. A second
+implementation is valuable because it is a second reader: where §6.2 can be
+read two ways, two independent readers find out and one does not. Everything
+below reduces the surface where that matters; none of it removes it.
+
+**What exists in place of the second implementation:**
+
+- The vectors cover all seven categories §12 enumerates, and are regenerated
+  and compared on every test run, so drift fails the suite.
+- Every derived value is published **beside the inputs it came from** — the
+  literal HKDF `info` bytes, both private keys and the agreed secret, the full
+  canonical preimage of each identifier, the header's fields next to its
+  encoding. A reader holding RFC 1 can check the constructions by hand.
+- `Documentation/vectors/check.py` recomputes all of it in standard-library
+  Python, sharing no code with the implementation. It anchors its **own**
+  X25519 against RFC 7748 §5.2 and §6.1 and its own HKDF-Expand against
+  RFC 5869 §A.1 before checking anything.
+- Two tests keep that honest: one runs the checker against the committed file,
+  one mutates the file four ways — including writing an epoch big-endian — and
+  requires each mutation to be rejected.
+- The file marks each block **external**, **derivable** or **drift**, so its
+  status is legible rather than uniform.
+
+**What none of that catches.** `check.py` was written by the same author from
+the same reading of §6.2. A misreading is reproduced there rather than caught,
+and the two agreeing would look like evidence while being none. It is said in
+the module header, in the vector file, and in the checker's own output, so the
+gate's status cannot be mistaken by someone reading any one of them.
+
+It has already paid for itself once: on its first run it disagreed with the
+vector file's own comment about the routing header's byte order, and the
+comment was what was wrong.
+
+**What a second implementer inherits.** Not a pass, and not a claim of one —
+a file where a disagreement can be *localised*. A failing line comes with the
+inputs that produced it, so the answer is "we differ on the epoch's byte
+order", not "we differ".
+
+**To change this**, RFC 1 §12 needs a second implementation from a different
+reader. Until then this gate stays unmet, and the status line at the top of
+this document says so.
 
 ### 2.2.1 What the third gate was hiding
 

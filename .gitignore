@@ -23,14 +23,58 @@ fuzz/corpus/
 fuzz/artifacts/
 fuzz/target/
 
-# Node store artefacts. A running node writes these into its --home; with no
-# --home that is the working directory, and during `cargo test` that is the
-# package root. They are key material — `kek.params` carries the Argon2 salt
-# that `identity.wrapped` was wrapped under — and must never be committed.
+# ---------------------------------------------------------------------------
+# Node artefacts. Never commit these.
+# ---------------------------------------------------------------------------
+#
+# A running node writes them into its --home; with no --home that is the
+# working directory, and during `cargo test` that was once the package root.
+# That is how `identity.wrapped`, `kek.params`, `corpus.krab` and a plaintext
+# `peer.pad` reached this repository and stayed in its history until the
+# purge — see SECURITY-HYGIENE.md.
+#
+# **This list is not maintained by hand.** It was, and it went stale exactly
+# the way `wipe`'s did: written when six artefacts existed, and ten more were
+# added over the following months without anyone thinking about this file. The
+# test `every_artifact_is_gitignored` in apps/krab-tui/src/artifact.rs asks git
+# whether each `Artifact` and `PeerFile` variant is ignored, so a new variant
+# fails the suite until it appears below.
+#
+# The suffix patterns are a second layer for artefacts that do not exist yet.
+# A file this program writes should match one of them by name; if it does not,
+# the test is what catches it.
+
+# Every Artifact variant, by name.
 identity.wrapped
 kek.params
 corpus.krab
 ceremony.cbor
+peer.card
+peer.pad
+prekeys.ring
+channels.roster
+groups.sealed
+reseal.cbor
+duress.wrapped
+introductions.spent
+
+# Every PeerFile variant. They live in `peers/<node-id>/`, and that whole
+# directory is node state — the list of who this node has peered with is a
+# disclosure even where the files are sealed.
+peers/
+
+# The pre-per-peer-directory layout, still on disk for a node upgraded in
+# place. `artifact::wiped` matches these for the same reason.
 *.link
+*.reservoir
+
+# Suffix patterns, for the artefact nobody has written yet.
+*.wrapped
 *.card
 *.pad
+*.ring
+*.sealed
+*.roster
+*.spent
+*.krab
+kek.*

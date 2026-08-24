@@ -1,0 +1,60 @@
+#!/bin/sh
+# Refuse to commit node artefacts — key material, and the peer list.
+#
+# `.gitignore` is the first layer and it is not sufficient on its own: git
+# applies ignore rules only to *untracked* paths, so anything already in the
+# index keeps being committed no matter what the rules say. That is exactly how
+# `identity.wrapped` and `kek.params` stayed in this repository through several
+# commits that added ignore rules for them.
+#
+# This is the second layer: it looks at what is actually staged.
+#
+# Enable it (once per clone):
+#
+#     git config core.hooksPath .githooks
+#
+# There is no way to make that automatic, which is why it is not the only
+# defence. The durable one is `every_artifact_is_gitignored` in
+# apps/krab-tui/src/artifact.rs, which runs with the test suite and fails when
+# a new artefact is not covered.
+
+set -eu
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -n "$staged" ] || exit 0
+
+# Every Artifact::ALL and PeerFile::ALL name. Kept in step by the test named
+# above, which asks git rather than trusting a list like this one.
+names='identity.wrapped kek.params corpus.krab ceremony.cbor peer.card
+peer.pad prekeys.ring channels.roster groups.sealed reseal.cbor
+duress.wrapped introductions.spent'
+
+bad=''
+for path in $staged; do
+    base=${path##*/}
+    for n in $names; do
+        [ "$base" = "$n" ] && bad="$bad$path\n"
+    done
+    # Per-peer files count only inside a peers/ directory: `link`, `policy`
+    # and `terms` are all plausible source filenames elsewhere.
+    case "$path" in
+        *peers/*/link|*peers/*/reservoir|*peers/*/policy|*peers/*/terms)
+            bad="$bad$path\n" ;;
+        *.wrapped|*.pad|*.ring|*.sealed|*.roster|*.spent|*.krab|*.link|*.reservoir)
+            bad="$bad$path\n" ;;
+    esac
+done
+
+if [ -n "$bad" ]; then
+    printf '\nREFUSED: node artefacts are staged.\n\n'
+    printf "$bad" | sed 's/^/  /' | sort -u
+    printf '\nThese are key material or a record of who this node peers with.\n'
+    printf 'A wrapped identity plus kek.params is an offline brute-force\n'
+    printf 'target; a .pad is a reservoir contribution in the clear.\n\n'
+    printf 'Unstage them:  git rm --cached <path>\n'
+    printf 'If one is already committed, it is in the history and needs\n'
+    printf 'purging as well as removing — see SECURITY-HYGIENE.md.\n\n'
+    exit 1
+fi
+
+exit 0

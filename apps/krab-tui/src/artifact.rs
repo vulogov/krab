@@ -230,6 +230,119 @@ mod tests {
         assert_eq!(peers.len(), n);
     }
 
+    /// The repository root, or `None` when the tests are not run from a
+    /// checkout.
+    fn repo_root() -> Option<std::path::PathBuf> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)?
+            .to_path_buf();
+        root.join(".gitignore").exists().then_some(root)
+    }
+
+    /// **Every artefact this node writes is gitignored.**
+    ///
+    /// The same failure as `wipe`'s, in a different file. `.gitignore` listed
+    /// six artefacts because six existed when it was written; ten more were
+    /// added over the following months and none of them reached it. The result
+    /// was `identity.wrapped`, `kek.params`, `corpus.krab` and a **plaintext
+    /// reservoir contribution** committed to a public repository, where they
+    /// stayed in the history until it was rewritten.
+    ///
+    /// So the list is no longer trusted to be complete: git is asked directly,
+    /// for every variant, and a new one fails here until `.gitignore` covers
+    /// it. That is the same shape as [`wipe_covers_every_artifact_this_node_writes`] —
+    /// an omission has to fail something rather than be noticed.
+    #[test]
+    fn every_artifact_is_gitignored() {
+        let Some(root) = repo_root() else {
+            eprintln!("not a checkout; skipping");
+            return;
+        };
+        // The paths a node actually writes, relative to a home directory that
+        // may be anywhere in the tree — including the package root, which is
+        // where the leak came from.
+        let mut paths: Vec<String> = Artifact::ALL.iter().map(|a| a.name().to_string()).collect();
+        paths.extend(
+            PeerFile::ALL
+                .iter()
+                .map(|p| format!("peers/6a1284df/{}", p.name())),
+        );
+        // And the same again one directory down, since `--home` is arbitrary.
+        let nested: Vec<String> = paths.iter().map(|p| format!("apps/krab-tui/{p}")).collect();
+        paths.extend(nested);
+
+        let mut missed = Vec::new();
+        for p in &paths {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["check-ignore", "-q", "--no-index", p])
+                .status();
+            match out {
+                Ok(s) if s.success() => {}
+                Ok(_) => missed.push(p.clone()),
+                Err(_) => {
+                    eprintln!("no git; skipping");
+                    return;
+                }
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "these are written by this node and are NOT gitignored — add them \
+             to .gitignore:\n  {}",
+            missed.join("\n  ")
+        );
+    }
+
+    /// **No artefact is tracked right now.**
+    ///
+    /// `.gitignore` does nothing for a file already in the index: git ignores
+    /// ignore rules for tracked paths, which is precisely how the committed
+    /// key material kept being committed after the rules were added. This asks
+    /// what is tracked rather than what is ignored.
+    #[test]
+    fn no_artifact_is_tracked_by_git() {
+        let Some(root) = repo_root() else {
+            eprintln!("not a checkout; skipping");
+            return;
+        };
+        let Ok(out) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["ls-files"])
+            .output()
+        else {
+            eprintln!("no git; skipping");
+            return;
+        };
+        let tracked = String::from_utf8_lossy(&out.stdout);
+
+        let names: Vec<&str> = Artifact::ALL
+            .iter()
+            .map(|a| a.name())
+            .chain(PeerFile::ALL.iter().map(|p| p.name()))
+            .collect();
+        let mut found = Vec::new();
+        for line in tracked.lines() {
+            let base = line.rsplit('/').next().unwrap_or(line);
+            // `link`, `policy` and `terms` are plausible source filenames, so
+            // a bare basename match is not enough for those: they only count
+            // inside a `peers/` directory, which is where a node writes them.
+            let is_peer_file = PeerFile::ALL.iter().any(|p| p.name() == base);
+            if names.contains(&base) && (!is_peer_file || line.contains("peers/")) {
+                found.push(line.to_string());
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "node artefacts are tracked by git — `git rm --cached` them, and \
+             check whether they need purging from history too:\n  {}",
+            found.join("\n  ")
+        );
+    }
+
     /// A file this node never writes is not destroyed — a wipe that removed
     /// everything in the working directory would be catastrophic, since
     /// `--home` defaults to it.
