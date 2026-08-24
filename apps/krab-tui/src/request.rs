@@ -35,6 +35,7 @@
 //! reachable only by courier (RFC 3 §5.1). That is why rollcall entries carry
 //! no endpoints — a request does not need one.
 
+use crate::introduction;
 use crate::peering::{Card, Policy};
 use krab_core::cbor::{Error as CborError, Item, Reader, Writer};
 use krab_crypto::sign::{Sig, SigningKey, VerifyingKey};
@@ -46,6 +47,18 @@ use krab_crypto::sign::{Sig, SigningKey, VerifyingKey};
 pub const DOMAIN_REQUEST: &[u8] = b"krab/req/v1";
 
 /// RFC 3 §5.1's document.
+///
+/// # The key numbers are §5.1's, and once were not
+///
+/// §5.1 tabulates keys 0–7, and an earlier encoder here flattened `terms`
+/// across keys 5, 6 and 7. That put `relay` where §5.1 puts the **introduction
+/// token** and `retention_bytes` where it puts the **note**, so a second
+/// implementation written from the table would have disagreed about every
+/// field after `to` — and, because a peer-request that fails to parse is
+/// simply a peering that never happens, neither side would have learned why.
+///
+/// Fixed here rather than worked around, since adding key 6 was impossible
+/// without it and gate 1 is about exactly this class of disagreement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerRequest {
     /// Key 1 — the requester's keys, as a full card so the recipient learns
@@ -53,29 +66,64 @@ pub struct PeerRequest {
     pub from: Card,
     /// Key 2 — the recipient's node identifier.
     pub to: [u8; 32],
+    /// Key 3 — the introducer's node id, when there is one (RFC 3 §10).
+    ///
+    /// Separate from the token so the recipient can say *whose* introduction
+    /// this claims to be before evaluating anything, and so a request naming
+    /// an introducer with no token is visibly that rather than silently
+    /// unvouched.
+    pub via: Option<[u8; 32]>,
     /// Key 5 — proposed terms.
     pub terms: Policy,
+    /// Key 6 — an introduction token (RFC 3 §10), when there is one.
+    ///
+    /// **Private by construction.** It is only ever here, inside a sealed
+    /// object addressed to the one party evaluating it. Nothing publishes a
+    /// token, and there is no bulletin kind that could.
+    pub token: Option<introduction::Token>,
     /// Key 7 — a free-text note, read by a human and by nothing else.
     ///
     /// RFC 3 §5.1 sizes the document at 683 B without one and 804 B with 120
     /// bytes of note — still a single QR code either way.
     pub note: String,
     /// The inner Ed25519 signature over everything above.
+    ///
+    /// Key 8. §5.1's table stops at 7 and §3 writes signatures as `—`, so the
+    /// number is this implementation's choice; it is recorded in
+    /// `AMENDMENTS.md` rather than left for a second implementation to guess.
     pub sig: [u8; 64],
 }
 
 impl PeerRequest {
     /// The bytes the signature covers.
-    fn signed_bytes(from: &Card, to: &[u8; 32], terms: &Policy, note: &str) -> Vec<u8> {
+    ///
+    /// Optional fields are **omitted when absent**, never encoded as a null or
+    /// an empty string: deterministic CBOR (RFC 1 §4.3) has one encoding per
+    /// value, and a present-but-empty token is a different document from no
+    /// token — one claims a vouch and the other does not.
+    fn signed_bytes(
+        from: &Card,
+        to: &[u8; 32],
+        via: Option<&[u8; 32]>,
+        terms: &Policy,
+        token: Option<&introduction::Token>,
+        note: &str,
+    ) -> Vec<u8> {
+        // Keys 0, 1, 2, 5 and 7 always appear; 3 and 6 only when present.
+        let n = 5 + usize::from(via.is_some()) + usize::from(token.is_some());
         let mut w = Writer::new();
-        w.map(7);
+        w.map(n);
         w.uint(0).uint(1); // version
         w.uint(1).bstr(&from.encode());
         w.uint(2).bstr(to);
-        w.uint(5).uint(terms.max_bucket as u64);
-        w.uint(6).bool(terms.relay);
-        w.uint(7).uint(terms.retention_bytes);
-        w.uint(8).tstr(note);
+        if let Some(v) = via {
+            w.uint(3).bstr(v);
+        }
+        w.uint(5).bstr(&terms.encode());
+        if let Some(t) = token {
+            w.uint(6).bstr(&t.encode());
+        }
+        w.uint(7).tstr(note);
         let body = w.finish();
 
         let mut out = Vec::with_capacity(DOMAIN_REQUEST.len() + body.len());
@@ -84,20 +132,32 @@ impl PeerRequest {
         out
     }
 
-    /// Build and sign a request.
-    pub fn create(
+    /// Build and sign a request, with or without an introduction — RFC 3 §10.
+    ///
+    /// There is deliberately no shorter `create` taking no token. Two
+    /// constructors for one document is how the unvouched path and the vouched
+    /// path come to differ in something other than the token.
+    ///
+    /// `via` is taken from the token rather than passed separately, so the two
+    /// cannot disagree: a request naming one introducer and carrying another's
+    /// vouch is a document with no useful reading.
+    pub fn create_introduced(
         signing: &SigningKey,
         from: Card,
         to: [u8; 32],
         terms: Policy,
         note: &str,
+        token: Option<introduction::Token>,
     ) -> PeerRequest {
-        let msg = PeerRequest::signed_bytes(&from, &to, &terms, note);
+        let via = token.as_ref().map(|t| t.introducer);
+        let msg = PeerRequest::signed_bytes(&from, &to, via.as_ref(), &terms, token.as_ref(), note);
         let sig = signing.sign(&msg).0;
         PeerRequest {
             from,
             to,
+            via,
             terms,
+            token,
             note: note.to_string(),
             sig,
         }
@@ -117,10 +177,44 @@ impl PeerRequest {
         if !self.from.verify() {
             return false;
         }
+        // A request naming an introducer the token does not match has no
+        // useful reading — `create_introduced` derives one from the other, so
+        // a mismatch means it was assembled somewhere else.
+        if self.via != self.token.as_ref().map(|t| t.introducer) {
+            return false;
+        }
         // The signature must be by the identity the card names, or the request
         // is a valid card wrapped in someone else's claim.
-        let msg = PeerRequest::signed_bytes(&self.from, &self.to, &self.terms, &self.note);
+        let msg = PeerRequest::signed_bytes(
+            &self.from,
+            &self.to,
+            self.via.as_ref(),
+            &self.terms,
+            self.token.as_ref(),
+            &self.note,
+        );
         VerifyingKey::from_bytes(self.from.identity_pk).verify(&msg, &Sig(self.sig))
+    }
+
+    /// Evaluate the introduction this request carries, if any — RFC 3 §10.
+    ///
+    /// Returns `None` when the request claims no introduction, which is not a
+    /// failure: most first contacts are unvouched, and §10's token is
+    /// optional in §5.1's table.
+    ///
+    /// **Bound to this request's sender.** The requester passed to
+    /// [`introduction::Token::evaluate`] is the card's node id, not anything
+    /// the token says, so a token minted for someone else cannot be attached
+    /// to a request and pass.
+    pub fn introduction(
+        &self,
+        introducer_key: Option<&VerifyingKey>,
+        me: &[u8; 32],
+        now_s: u64,
+        spent: &introduction::Spent,
+    ) -> Option<introduction::Verdict> {
+        let token = self.token.as_ref()?;
+        Some(token.evaluate(introducer_key, me, &self.from.node_id(), now_s, spent))
     }
 
     /// Whether this request is addressed to `node_id`.
@@ -135,16 +229,22 @@ impl PeerRequest {
 
     /// Deterministic CBOR, signature included.
     pub fn encode(&self) -> Vec<u8> {
+        // As `signed_bytes`, plus key 8 for the signature.
+        let n = 6 + usize::from(self.via.is_some()) + usize::from(self.token.is_some());
         let mut w = Writer::new();
-        w.map(8);
+        w.map(n);
         w.uint(0).uint(1);
         w.uint(1).bstr(&self.from.encode());
         w.uint(2).bstr(&self.to);
-        w.uint(5).uint(self.terms.max_bucket as u64);
-        w.uint(6).bool(self.terms.relay);
-        w.uint(7).uint(self.terms.retention_bytes);
-        w.uint(8).tstr(&self.note);
-        w.uint(9).bstr(&self.sig);
+        if let Some(v) = &self.via {
+            w.uint(3).bstr(v);
+        }
+        w.uint(5).bstr(&self.terms.encode());
+        if let Some(t) = &self.token {
+            w.uint(6).bstr(&t.encode());
+        }
+        w.uint(7).tstr(&self.note);
+        w.uint(8).bstr(&self.sig);
         w.finish()
     }
 
@@ -153,7 +253,9 @@ impl PeerRequest {
         let mut r = Reader::new(bytes);
         let mut m = r.map()?;
         let (mut from, mut to, mut note, mut sig) = (None, None, String::new(), None);
-        let mut terms = Policy::default();
+        let (mut via, mut token, mut terms) = (None, None, None);
+        // Keys 0, 1, 2, 5, 7 and 8 are required; 3 and 6 are optional, so the
+        // mask covers the six that must appear and nothing else.
         let mut seen = 0u8;
         while let Some(key) = m.key()? {
             match (key, m.value()?) {
@@ -166,36 +268,36 @@ impl PeerRequest {
                     to = <[u8; 32]>::try_from(b).ok();
                     seen |= 4;
                 }
-                (5, Item::Uint(v)) => {
-                    terms.max_bucket = u8::try_from(v).map_err(|_| CborError::Malformed)?;
+                (3, Item::Bstr(b)) => {
+                    via = Some(<[u8; 32]>::try_from(b).map_err(|_| CborError::Malformed)?);
+                }
+                (5, Item::Bstr(b)) => {
+                    terms = Some(Policy::decode(b).ok_or(CborError::Malformed)?);
                     seen |= 8;
                 }
-                (6, Item::Bool(v)) => {
-                    terms.relay = v;
+                (6, Item::Bstr(b)) => {
+                    token = Some(introduction::Token::decode(b).ok_or(CborError::Malformed)?);
+                }
+                (7, Item::Tstr(t)) => {
+                    note = t.to_string();
                     seen |= 16;
                 }
-                (7, Item::Uint(v)) => {
-                    terms.retention_bytes = v;
-                    seen |= 32;
-                }
-                (8, Item::Tstr(t)) => {
-                    note = t.to_string();
-                    seen |= 64;
-                }
-                (9, Item::Bstr(b)) => {
+                (8, Item::Bstr(b)) => {
                     sig = <[u8; 64]>::try_from(b).ok();
-                    seen |= 128;
+                    seen |= 32;
                 }
                 _ => return Err(CborError::Malformed),
             }
         }
-        if seen != 0xFF {
+        if seen != 0x3F {
             return Err(CborError::Truncated);
         }
         Ok(PeerRequest {
             from: from.ok_or(CborError::Truncated)?,
             to: to.ok_or(CborError::Truncated)?,
-            terms,
+            via,
+            terms: terms.ok_or(CborError::Truncated)?,
+            token,
             note,
             sig: sig.ok_or(CborError::Truncated)?,
         })
@@ -218,7 +320,7 @@ mod tests {
     fn request(seed: u64, to: [u8; 32], note: &str) -> PeerRequest {
         let k = signer(seed);
         let c = card_for(&k, seed as u8);
-        PeerRequest::create(&k, c, to, Policy::default(), note)
+        PeerRequest::create_introduced(&k, c, to, Policy::default(), note, None)
     }
 
     #[test]
@@ -325,7 +427,9 @@ mod tests {
     fn the_signing_domains_are_disjoint() {
         assert_ne!(DOMAIN_REQUEST, crate::peering::DOMAIN_CARD);
         let r = request(10, [4; 32], "n");
-        assert!(PeerRequest::signed_bytes(&r.from, &r.to, &r.terms, &r.note)
-            .starts_with(DOMAIN_REQUEST));
+        assert!(
+            PeerRequest::signed_bytes(&r.from, &r.to, None, &r.terms, None, &r.note)
+                .starts_with(DOMAIN_REQUEST)
+        );
     }
 }

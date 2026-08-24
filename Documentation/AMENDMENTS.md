@@ -12,6 +12,40 @@ out of implementing the thing the paragraph describes.
 | 5 | RFC 4 §5.5 | nothing says an archive must be a window rather than a diff | **ADOPTED** 2026-08-07 |
 | 6 | RFC 1 §11 | the checks are prose; three of six were never implemented | **ADOPTED** 2026-08-07 |
 | 7 | RFC 3 §9.1 | "153 bytes computed" for a rollcall entry, with no field list to compute it from | open — see below |
+| 8 | RFC 3 §5.1 | the table numbers keys 0–7 and never numbers the signature | open — see below |
+
+## 8. RFC 3 §5.1's `peer-request` has an unnumbered field
+
+§5.1 tabulates keys 0–7 for a `peer-request` and then requires an inner
+Ed25519 signature, which the table does not number. §3 does the same for
+`peer-link`, writing both signatures as `—`.
+
+For `peer-link` that is harmless: the signatures are appended around a body
+whose extent §3 defines. For `peer-request` there is no such statement, so the
+signature has to go somewhere in the same map and **every implementation picks
+its own key**. This one uses 8.
+
+Found while implementing §10's introduction token, which §5.1 puts at key 6 —
+and key 6 was occupied, because an earlier encoder here had flattened "proposed
+terms" across keys 5, 6 and 7. That is worth recording separately as the same
+failure from the other direction: the table said terms was one field, the
+encoder made it three, and the collision was invisible until something needed
+the key. Two implementations, one from the table and one from that encoder,
+would have disagreed about every field after `to` — and a `peer-request` that
+does not parse is simply a peering that never happens, with nothing logged
+anywhere.
+
+Suggested text — number it:
+
+> | 8 | signature | Ed25519 by the identity in key 1, over `"krab/req/v1" ‖ body`, where `body` is the deterministic CBOR map of keys 0–7 |
+>
+> Keys 3, 4 and 6 are optional and MUST be omitted entirely when absent rather
+> than encoded as empty or null: RFC 1 §4.3 admits one encoding per value, and
+> a present-but-empty introduction token is a different document from no token.
+
+The second paragraph matters as much as the first. Without it, "optional" has
+two readings that produce different signed bytes over the same intent, which is
+the same class of silent divergence as the key numbering itself.
 
 ## 7. RFC 3 §9.1's rollcall entry size
 

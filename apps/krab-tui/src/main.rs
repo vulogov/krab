@@ -38,6 +38,7 @@ mod entropy;
 mod fanout;
 mod groups;
 mod identity;
+mod introduction;
 mod keys;
 mod layout;
 mod line;
@@ -346,6 +347,13 @@ struct App {
     home: PathBuf,
     /// Channels owned and followed — RFC 6 §3.
     roster: channels::Roster,
+    /// Introduction tokens this node holds, to present when it requests —
+    /// RFC 3 §10.
+    ///
+    /// Held in memory only. A token is a private vouch someone made for this
+    /// operator; writing it to disk would leave a record of who vouched, which
+    /// is the persistence §10 exists to avoid, and it is single-use anyway.
+    introductions: Vec<introduction::Token>,
     /// Whether this node lists itself in the public rollcall — RFC 3 §9.
     ///
     /// Default is not listed, which §9 requires. Not persisted: there is no
@@ -502,6 +510,7 @@ impl Default for App {
             listen: None,
             roster: channels::Roster::default(),
             rollcall: rollcall::Listing::default(),
+            introductions: Vec::new(),
             groups: Vec::new(),
             pending: Vec::new(),
             observed_arrivals: 0,
@@ -1712,6 +1721,321 @@ impl App {
     /// same reason RFC 6 §2.7 staggers a group's — `N` objects appearing at
     /// once in one size bucket announces both the fan-out and how many people
     /// are in it.
+    /// Unix seconds. Introduction tokens expire in days, so they need a wall
+    /// clock rather than the epoch counter everything else runs on.
+    fn now_s(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// A peer's verified card, by short name.
+    fn peer_card(&self, peer: &str) -> Option<peering::Card> {
+        std::fs::read(self.peer_path(peer, artifact::PeerFile::Link))
+            .ok()
+            .and_then(|b| peering::Card::decode(&b).ok())
+            .filter(|c| c.verify())
+    }
+
+    /// Tokens this node has already honoured — RFC 3 §10's single-use.
+    ///
+    /// Read from disk on each use rather than held. Single-use is a property
+    /// of the evaluator's *memory*, so the memory has to be the durable copy;
+    /// a cached one that drifted from the file would honour a token twice
+    /// after a restart and report nothing unusual.
+    fn spent_tokens(&self) -> introduction::Spent {
+        let Some(w) = self.epoch_key else {
+            return introduction::Spent::default();
+        };
+        std::fs::read(self.path(artifact::Artifact::IntroductionsSpent))
+            .ok()
+            .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/introductions", &s).ok())
+            .and_then(|raw| introduction::Spent::decode(&raw))
+            .unwrap_or_default()
+    }
+
+    /// Record a token as honoured, and forget the expired ones while here.
+    fn spend_token(&mut self, token: &introduction::Token) -> Option<()> {
+        let w = self.epoch_key?;
+        let mut spent = self.spent_tokens();
+        spent.spend(token);
+        // Bounded by expiry, not by count. A record of every introduction ever
+        // made to this node is the accumulating trace RFC 3 §10 objects to,
+        // and an expired nonce protects nothing.
+        spent.forget_expired(self.now_s());
+        let sealed =
+            krab_crypto::kek::seal_under(&w, b"krab/introductions", &spent.encode(), &mut OsRng)
+                .ok()?;
+        atomic::write(&self.path(artifact::Artifact::IntroductionsSpent), &sealed).ok()
+    }
+
+    /// `introduce` — RFC 3 §10's private vouch.
+    ///
+    /// Two forms, on opposite sides of one handover: the introducer mints,
+    /// the person vouched for holds.
+    fn introduce(&mut self, line: &str) -> String {
+        let Ok(words) = words::split(line) else {
+            return "unbalanced quotes".into();
+        };
+        let args: Vec<String> = words.iter().skip(1).map(|w| w.text()).collect();
+        match args.first().map(String::as_str) {
+            Some("use") if args.len() == 2 => self.introduce_use(&args[1]),
+            _ if args.len() == 2 => self.introduce_mint(&args[0], &args[1]),
+            _ => "usage:\n\n\
+                  \x20 introduce <peer> <to>   vouch for <peer>, for an \
+                  introduction to <to>\n\
+                  \x20 introduce use <token>   hold a token someone gave you\n\n\
+                  A token is private, single-use, expires in days, and is bound \
+                  to the person it names — it is not an endorsement and there \
+                  is no score (RFC 3 §10)."
+                .into(),
+        }
+    }
+
+    /// Mint a vouch for `peer`, scoped to an introduction to `to`.
+    fn introduce_mint(&mut self, peer: &str, to: &str) -> String {
+        let Some(id) = self.identity.as_ref() else {
+            return "no identity — run `init` first".into();
+        };
+        if self.epoch_key.is_none() {
+            return "locked — unlock to vouch".into();
+        }
+        // **Both must be people this node has peered with.** Vouching for
+        // someone you have not peered with is not evidence of anything, and
+        // §10's whole claim is that a token "carries the credibility of
+        // vouching" — which it can only do if there is a real relationship
+        // behind it.
+        let Some(requester) = self.peer_card(peer) else {
+            return format!(
+                "no peer-link for {peer}.\n\n\
+                 You can only vouch for someone you have peered with — that \
+                 peering is what the vouch is evidence of (RFC 3 §10)."
+            );
+        };
+        let Some(target) = self.peer_card(to) else {
+            return format!(
+                "no peer-link for {to}.\n\n\
+                 The introduction is to them, and they have to know you for \
+                 your signature to mean anything to them."
+            );
+        };
+        if requester.node_id() == target.node_id() {
+            return "that would introduce someone to themselves".into();
+        }
+
+        let token = introduction::Token::create(
+            id.signing_key(),
+            requester.node_id(),
+            target.node_id(),
+            self.now_s(),
+            introduction::MAX_LIFETIME_S,
+            &mut OsRng,
+        );
+        format!(
+            "a vouch for {peer}, for an introduction to {to}:\n\n\
+             {text}\n\n\
+             Give this to {peer}, who runs `introduce use <token>` and then \
+             `request`. It is:\n\n\
+             \x20 private     — it travels only inside their sealed request to \
+             {to}, and nothing publishes it\n\
+             \x20 bound       — to {peer}. Passing it on gets nobody anything\n\
+             \x20 scoped      — to {to}, and no one else\n\
+             \x20 single-use  — {to} honours it once\n\
+             \x20 expiring    — in {days} days\n\n\
+             There is no score and no record: RFC 3 §10 refuses visible \
+             reputation because standing accumulates into hubs, and hubs become \
+             chokepoints.",
+            text = introduction::to_text(&token),
+            days = introduction::MAX_LIFETIME_S / 86_400,
+        )
+    }
+
+    /// Hold a token somebody gave us, for the next request to its target.
+    fn introduce_use(&mut self, text: &str) -> String {
+        let Some(token) = introduction::from_text(text) else {
+            return "that is not a token".into();
+        };
+        let Some(id) = self.identity.as_ref() else {
+            return "no identity — run `init` first".into();
+        };
+        // A token bound to somebody else is worthless here, and saying so now
+        // beats saying it after a request has already gone out unvouched.
+        if token.requester != id.node_id() {
+            return "that token vouches for somebody else. A token is bound to \
+                    one person's key and cannot be passed on (RFC 3 §10)."
+                .into();
+        }
+        if self.now_s() >= token.expires_s {
+            return "that token has expired.".into();
+        }
+        let target = short_id(&token.target);
+        self.introductions.retain(|t| t.nonce != token.nonce);
+        self.introductions.push(token);
+        format!(
+            "held. It will travel with your next `request` to {target}.\n\n\
+             Held in memory only — a token is a private vouch, and writing one \
+             down would leave the record RFC 3 §10 exists to avoid. It is gone \
+             on lock, and it is good once."
+        )
+    }
+
+    /// `requests` — first-contact requests waiting on this node's inbox tag.
+    ///
+    /// **This had no caller at all.** `receive::scan_requests` existed, was
+    /// tested, and nothing in the application ran it — so a node could send a
+    /// peer-request and never see one arrive, which is half a protocol. Adding
+    /// it here is what makes an introduction evaluable by anyone.
+    fn requests(&mut self, line: &str) -> String {
+        let Ok(words) = words::split(line) else {
+            return "unbalanced quotes".into();
+        };
+        let accept = words.get(1).map(|w| w.text()) == Some("accept".to_string());
+        let which = words.get(2).and_then(|w| w.int()).unwrap_or(0);
+
+        let (Some(id), Some(_)) = (&self.identity, self.epoch_key) else {
+            return "locked — unlock to read requests".into();
+        };
+        let me = id.node_id();
+        let window = {
+            let now = now_epoch().0 * 1440;
+            (
+                now.saturating_sub(45 * 1440),
+                now.saturating_add(45 * 1440) + 1,
+            )
+        };
+        let incoming = self
+            .store
+            .with(|s| receive::scan_requests(s, id.correspondence(), &me, now_epoch(), window));
+        if incoming.is_empty() {
+            return "no first-contact requests.\n\nThey arrive on your inbox \
+                    tag, which anyone holding your public key can compute — so \
+                    one can reach you with no network at all (RFC 3 §5.1)."
+                .into();
+        }
+
+        if accept {
+            let Some(n) = (which as usize).checked_sub(1) else {
+                return "usage: requests accept <n>".into();
+            };
+            let Some(inc) = incoming.get(n) else {
+                return format!("there is no request {which}");
+            };
+            return self.accept_request(&inc.request);
+        }
+
+        let now_s = self.now_s();
+        let spent = self.spent_tokens();
+        let mut out = format!("{} request(s):\n\n", incoming.len());
+        for (i, inc) in incoming.iter().enumerate() {
+            let who = short_id(&inc.request.from.node_id());
+            out.push_str(&format!("\x20 {}. {who}\n", i + 1));
+            if !inc.request.note.is_empty() {
+                out.push_str(&format!("\x20    \"{}\"\n", inc.request.note));
+            }
+            out.push_str(&format!(
+                "\x20    {}\n",
+                self.introduction_line(&inc.request, &me, now_s, &spent)
+            ));
+        }
+        out.push_str(
+            "\n`requests accept <n>` records the introduction as used and \
+             writes their card, so you can peer.\n\n\
+             Whether an introduction is sufficient is your decision. The \
+             protocol establishes facts; the operator makes judgements \
+             (RFC 3 §10).",
+        );
+        if !spent.is_empty() {
+            out.push_str(&format!(
+                "\n\n{} introduction(s) already honoured and still within their \
+                 lifetime. That record is dropped as each expires — a standing \
+                 list of who was introduced here is the accumulating trace \
+                 RFC 3 §10 exists to avoid.",
+                spent.len()
+            ));
+        }
+        out
+    }
+
+    /// One line describing what, if anything, vouches for a request.
+    fn introduction_line(
+        &self,
+        req: &request::PeerRequest,
+        me: &[u8; 32],
+        now_s: u64,
+        spent: &introduction::Spent,
+    ) -> String {
+        let Some(via) = req.via else {
+            return "no introduction — nobody you know has vouched".into();
+        };
+        let name = short_id(&via);
+        // **Resolved from this node's own peer-links, never from the token.**
+        // A token carrying its own key would let a stranger vouch for
+        // themselves with a perfectly valid signature, which is the Sybil case
+        // RFC 3 §10 names.
+        let key = self
+            .peer_card(&name)
+            .map(|c| krab_crypto::sign::VerifyingKey::from_bytes(c.identity_pk));
+        match req.introduction(key.as_ref(), me, now_s, spent) {
+            None => format!("names {name} as introducer but carries no token"),
+            Some(introduction::Verdict::Good) => {
+                format!("introduced by {name}, who you peer with — unspent, unexpired")
+            }
+            Some(introduction::Verdict::UnknownIntroducer) => format!(
+                "claims an introduction by {name}, who you do not peer with — \
+                 so the signature could be anyone's and vouches for nothing"
+            ),
+            Some(introduction::Verdict::BadSignature) => {
+                format!("claims an introduction by {name}; the signature is not theirs")
+            }
+            Some(introduction::Verdict::NotYours) => {
+                "carries a token minted for somebody else".into()
+            }
+            Some(introduction::Verdict::NotForUs) => {
+                "carries a token for an introduction to somebody else".into()
+            }
+            Some(introduction::Verdict::Expired) => {
+                format!("introduced by {name}, but the token has expired")
+            }
+            Some(introduction::Verdict::Overlong) => format!(
+                "introduced by {name}, with a lifetime longer than RFC 3 §10 \
+                 allows — refused rather than honoured in part"
+            ),
+            Some(introduction::Verdict::Spent) => {
+                format!("introduced by {name}, but that token was already used")
+            }
+        }
+    }
+
+    /// Record a request's introduction as used, and write their card.
+    fn accept_request(&mut self, req: &request::PeerRequest) -> String {
+        let short = short_id(&req.from.node_id());
+        let path = self.home.join(format!("{short}.card"));
+        if let Err(e) = atomic::write(&path, &req.from.encode()) {
+            return format!("could not write their card: {e}");
+        }
+        let mut out = format!(
+            "wrote {}.\n\nNow `peer offer` and exchange as usual — this does \
+             not peer you with anyone, it only records that you acted on the \
+             request.",
+            path.display()
+        );
+        // **Spent on acceptance, not on display.** Reading a list is not
+        // honouring an introduction, and burning a token because somebody
+        // looked at their inbox would make single-use mean something nobody
+        // asked for.
+        if let Some(token) = &req.token {
+            if self.spend_token(token).is_some() {
+                out.push_str(
+                    "\n\nThe introduction is now spent. RFC 3 §10 makes a \
+                     token single-use, so the same vouch cannot introduce \
+                     twice.",
+                );
+            }
+        }
+        out
+    }
+
     /// `rollcall` — the public tier, RFC 3 §9.
     ///
     /// Three forms, and the bare one is a *read*. Listing yourself is
@@ -2874,6 +3198,8 @@ impl App {
             Command::Reach => self.output = self.reach_report(line),
             Command::Keys => self.output = self.keys_report(),
             Command::Rollcall => self.output = self.rollcall_command(line),
+            Command::Introduce => self.output = self.introduce(line),
+            Command::Requests => self.output = self.requests(line),
             Command::Message => self.output = self.message(line),
             Command::Send => self.output = self.send(line),
             Command::Request => self.output = self.peer_request(line),
@@ -4584,12 +4910,27 @@ impl App {
         let epoch = now_epoch();
         let their_pk = krab_crypto::dh::PublicKey(card.correspondence_pk);
         let tag = krab_crypto::inbox_tag(&their_pk, epoch);
-        let req = request::PeerRequest::create(
+        // A held token whose target is this recipient rides along — RFC 3
+        // §10. Matched on target rather than offered as a choice: a token is
+        // scoped to one introduction, so there is never more than one right
+        // answer, and asking would invite attaching the wrong one.
+        let token = self
+            .introductions
+            .iter()
+            .find(|t| t.target == card.node_id())
+            .cloned();
+        let vouched = token.as_ref().map(|t| short_id(&t.introducer));
+        // Spent on this node's side the moment it leaves: a token is scoped to
+        // one introduction, and holding it after using it would let a second
+        // request go out carrying a vouch the recipient will refuse.
+        let used = token.as_ref().map(|t| t.nonce);
+        let req = request::PeerRequest::create_introduced(
             id.signing_key(),
             id.card(Policy::default()),
             card.node_id(),
             Policy::default(),
             note,
+            token,
         );
 
         let composed = match compose::seal_to(
@@ -4614,13 +4955,30 @@ impl App {
         {
             Ok(()) => {
                 self.save_corpus();
-                format!(
+                if let Some(nonce) = used {
+                    self.introductions.retain(|t| t.nonce != nonce);
+                }
+                let mut out = format!(
                     "request composed for {}.\n\nIt carries your card and an inner \
                      signature, because first contact cannot be deniable — the \
                      recipient can prove you sent it, which RFC 3 §5.1 considers \
                      the right trade for this one message.",
                     card.fingerprint()
-                )
+                );
+                match vouched {
+                    Some(who) => out.push_str(&format!(
+                        "\n\n{who}'s introduction travelled with it, and is now \
+                         released from this node — a token is good for one \
+                         introduction (RFC 3 §10). Whether it counts for \
+                         anything is their decision, not the protocol's."
+                    )),
+                    None => out.push_str(
+                        "\n\nNo introduction. Nothing is wrong with an unvouched \
+                         request — it just arrives with only your note to \
+                         recommend it.",
+                    ),
+                }
+                out
             }
             Err(e) => format!("the store refused it: {e:?}"),
         }
@@ -5847,6 +6205,9 @@ impl App {
         // flooded stands until it expires, because there is no recall
         // (RFC 3 §6.1) and pretending otherwise would be worse than saying so.
         self.rollcall = rollcall::Listing::default();
+        // Held tokens are private vouches other people made. A locked node has
+        // no business holding one, and they are single-use in any case.
+        self.introductions.clear();
         self.list = vec!["(locked)".into()];
         self.passphrase.clear();
         overwrite(&mut self.composer);
@@ -6672,6 +7033,225 @@ mod tests {
             "the backup phrase leaked into `keys`: {}",
             a.output
         );
+    }
+
+    /// Give `a` a verified peer-link for `b`, as the ceremony would.
+    ///
+    /// Written directly rather than driven through `peer`, because what these
+    /// tests are about is what happens *after* a peering exists.
+    fn peer_up(a: &mut App, b: &mut App) -> String {
+        let card = b
+            .identity
+            .as_ref()
+            .unwrap()
+            .card(peering::Policy::default());
+        let short = short_id(&card.node_id());
+        let path = a.peer_path(&short, artifact::PeerFile::Link);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, card.encode()).unwrap();
+        short
+    }
+
+    /// The token text out of an `introduce` output pane.
+    fn minted(out: &str) -> String {
+        out.lines()
+            .map(str::trim)
+            .find(|l| l.len() > 100 && l.chars().all(|c| c.is_ascii_hexdigit()))
+            .expect("a token in the output")
+            .to_string()
+    }
+
+    /// **The whole of RFC 3 §10, three parties.**
+    ///
+    /// A vouches for C, C requests to B, B evaluates. The point of the test is
+    /// the last step: B accepts the vouch *because B peers with A*, which is
+    /// the only thing that distinguishes a real introduction from a stranger's
+    /// perfectly valid signature.
+    #[test]
+    fn an_introduction_travels_from_introducer_to_evaluator() {
+        let mut a = ready_node("intro-a");
+        let mut c = ready_node("intro-c");
+        let mut b = ready_node("intro-b");
+
+        // A peers with both. B peers with A.
+        peer_up(&mut a, &mut c);
+        peer_up(&mut a, &mut b);
+        peer_up(&mut b, &mut a);
+
+        let c_short = short_id(&c.identity.as_ref().unwrap().node_id());
+        let b_short = short_id(&b.identity.as_ref().unwrap().node_id());
+        type_command(&mut a, &format!("introduce {c_short} {b_short}"));
+        assert!(a.output.contains("a vouch for"), "{}", a.output);
+        let token = minted(&a.output);
+
+        type_command(&mut c, &format!("introduce use {token}"));
+        assert!(c.output.contains("held"), "{}", c.output);
+        assert_eq!(c.introductions.len(), 1);
+
+        // C sends the request; the token rides along.
+        let card = c.home.join("theirs.card");
+        std::fs::write(
+            &card,
+            b.identity
+                .as_ref()
+                .unwrap()
+                .card(Policy::default())
+                .encode(),
+        )
+        .unwrap();
+        type_command(&mut c, &format!("request {} hello", card.display()));
+        assert!(c.output.contains("introduction travelled"), "{}", c.output);
+        assert!(c.introductions.is_empty(), "the token was not released");
+    }
+
+    /// **The Sybil case.** A stranger's token is signed correctly and is worth
+    /// nothing, and the only thing telling those apart is whether the
+    /// evaluator peers with the introducer.
+    #[test]
+    fn a_vouch_from_someone_the_evaluator_does_not_know_is_worthless() {
+        let a = ready_node("intro-stranger");
+        let b = ready_node("intro-eval");
+        let c = ready_node("intro-req");
+
+        let me = b.identity.as_ref().unwrap().node_id();
+        let token = introduction::Token::create(
+            a.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().node_id(),
+            me,
+            b.now_s(),
+            introduction::MAX_LIFETIME_S,
+            &mut OsRng,
+        );
+        let req = request::PeerRequest::create_introduced(
+            c.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().card(Policy::default()),
+            me,
+            Policy::default(),
+            "let me in",
+            Some(token),
+        );
+        assert!(req.verify());
+
+        // B does not peer with A, so B cannot resolve the introducer.
+        let line = b.introduction_line(&req, &me, b.now_s(), &introduction::Spent::default());
+        assert!(line.contains("you do not peer with"), "{line}");
+        assert!(line.contains("vouches for nothing"), "{line}");
+    }
+
+    /// An introduction is honoured once — RFC 3 §10's "single-use" — and the
+    /// record survives a restart, or it is a sentence rather than a property.
+    #[test]
+    fn an_introduction_is_spent_on_acceptance_and_stays_spent() {
+        let mut a = ready_node("spend-a");
+        let mut b = ready_node("spend-b");
+        let c = ready_node("spend-c");
+        peer_up(&mut b, &mut a);
+
+        let me = b.identity.as_ref().unwrap().node_id();
+        let token = introduction::Token::create(
+            a.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().node_id(),
+            me,
+            b.now_s(),
+            introduction::MAX_LIFETIME_S,
+            &mut OsRng,
+        );
+        let req = request::PeerRequest::create_introduced(
+            c.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().card(Policy::default()),
+            me,
+            Policy::default(),
+            "",
+            Some(token.clone()),
+        );
+
+        let now = b.now_s();
+        assert!(
+            b.introduction_line(&req, &me, now, &b.spent_tokens())
+                .contains("unspent"),
+            "{}",
+            b.introduction_line(&req, &me, now, &b.spent_tokens())
+        );
+
+        let out = b.accept_request(&req);
+        assert!(out.contains("now spent"), "{out}");
+        assert!(b.spent_tokens().contains(&token.nonce));
+
+        // Reading the spent set from disk is what a restart does.
+        assert!(
+            b.introduction_line(&req, &me, now, &b.spent_tokens())
+                .contains("already used"),
+            "the token was honoured twice"
+        );
+    }
+
+    /// **Reading the list does not spend anything.** Burning a token because
+    /// somebody looked at their inbox would make single-use mean something
+    /// nobody asked for.
+    #[test]
+    fn listing_requests_does_not_spend_an_introduction() {
+        let mut b = ready_node("nospend");
+        type_command(&mut b, "requests");
+        assert!(b.spent_tokens().is_empty());
+        assert!(
+            b.output.contains("no first-contact requests"),
+            "{}",
+            b.output
+        );
+    }
+
+    /// A token bound to somebody else is refused at the point it is offered,
+    /// not after a request has already gone out unvouched.
+    #[test]
+    fn a_token_for_somebody_else_is_refused_when_offered() {
+        let mut a = ready_node("bind-a");
+        let mut c = ready_node("bind-c");
+        let mut b = ready_node("bind-b");
+        let mut stranger = ready_node("bind-x");
+        peer_up(&mut a, &mut c);
+        peer_up(&mut a, &mut b);
+
+        let c_short = short_id(&c.identity.as_ref().unwrap().node_id());
+        let b_short = short_id(&b.identity.as_ref().unwrap().node_id());
+        type_command(&mut a, &format!("introduce {c_short} {b_short}"));
+        let token = minted(&a.output);
+
+        type_command(&mut stranger, &format!("introduce use {token}"));
+        assert!(
+            stranger.output.contains("vouches for somebody else"),
+            "{}",
+            stranger.output
+        );
+        assert!(stranger.introductions.is_empty());
+    }
+
+    /// Vouching requires a peering. A vouch for someone you have not peered
+    /// with is not evidence of anything, which is the whole basis of §10.
+    #[test]
+    fn vouching_requires_having_peered() {
+        let mut a = ready_node("vouch-a");
+        type_command(&mut a, "introduce ffffffff eeeeeeee");
+        assert!(a.output.contains("no peer-link"), "{}", a.output);
+    }
+
+    /// Held tokens do not survive a lock — they are private vouches other
+    /// people made, and a locked node has no business holding one.
+    #[test]
+    fn locking_releases_held_introductions() {
+        let mut a = ready_node("lock-intro");
+        let mut c = ready_node("lock-intro-c");
+        let mut b = ready_node("lock-intro-b");
+        peer_up(&mut a, &mut c);
+        peer_up(&mut a, &mut b);
+        let c_short = short_id(&c.identity.as_ref().unwrap().node_id());
+        let b_short = short_id(&b.identity.as_ref().unwrap().node_id());
+        type_command(&mut a, &format!("introduce {c_short} {b_short}"));
+        let token = minted(&a.output);
+        type_command(&mut c, &format!("introduce use {token}"));
+        assert_eq!(c.introductions.len(), 1);
+
+        c.lock();
+        assert!(c.introductions.is_empty(), "a locked node held a vouch");
     }
 
     /// Count this node's own rollcall entries in the corpus.

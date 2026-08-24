@@ -251,6 +251,67 @@ impl Default for Policy {
 }
 
 impl Policy {
+    /// Deterministic CBOR — RFC 1 §4.3.
+    ///
+    /// **One nested map, not fields spread across the parent.** RFC 3 §5.1
+    /// key 5 and §3 keys 6 and 7 each name "terms" as a single field, and an
+    /// earlier `peer-request` encoder flattened it across the parent's keys 5,
+    /// 6 and 7 — which collided with §5.1's own key 6 (introduction token) and
+    /// key 7 (note). Two implementations following the table and following that
+    /// encoder would have disagreed about every field after `to`.
+    ///
+    /// `shard_bits` is included. The flattened version omitted it, so a
+    /// proposal silently carried no sharding term at all — and sharding
+    /// divides the *peer's* anonymity set, which is exactly the kind of term
+    /// that belongs in a document both parties see.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = krab_core::cbor::Writer::new();
+        w.map(4)
+            .uint(1)
+            .uint(self.max_bucket as u64)
+            .uint(2)
+            .bool(self.relay)
+            .uint(3)
+            .uint(self.retention_bytes)
+            .uint(4)
+            .uint(self.shard_bits as u64);
+        w.finish()
+    }
+
+    /// Decode. **Pre-authentication input** — proposed terms arrive from
+    /// someone this node has never met.
+    ///
+    /// A `max_bucket` naming no bucket is refused rather than clamped: it is a
+    /// term in a document two implementations could read differently, and
+    /// `Policy::default`'s own note records that an earlier revision used a
+    /// value naming no bucket.
+    pub fn decode(bytes: &[u8]) -> Option<Policy> {
+        use krab_core::cbor::{Item, Reader};
+        let mut r = Reader::new(bytes);
+        let mut m = r.map().ok()?;
+        if m.left() != 4 {
+            return None;
+        }
+        let mut p = Policy::default();
+        for expect in 1..=4u64 {
+            let key = m.key().ok()??;
+            if key != expect {
+                return None;
+            }
+            match (expect, m.value().ok()?) {
+                (1, Item::Uint(v)) => p.max_bucket = u8::try_from(v).ok()?,
+                (2, Item::Bool(v)) => p.relay = v,
+                (3, Item::Uint(v)) => p.retention_bytes = v,
+                (4, Item::Uint(v)) => p.shard_bits = u8::try_from(v).ok()?,
+                _ => return None,
+            }
+        }
+        if p.max_bucket as usize >= krab_core::object::BUCKETS.len() {
+            return None;
+        }
+        Some(p)
+    }
+
     /// Whether two policies can form a link, and what the peer must respect.
     ///
     /// The effective ceiling is the **lower** of the two `max_bucket` values:

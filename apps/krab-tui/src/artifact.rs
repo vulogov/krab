@@ -56,11 +56,17 @@ pub enum Artifact {
     Reseal,
     /// The duress store — RFC 7 §10.
     DuressWrapped,
+    /// Introduction tokens already honoured — RFC 3 §10's "single-use".
+    ///
+    /// A membership-adjacent disclosure: it is a record of who was introduced
+    /// to this node and by whom. `introduction::Spent` forgets each nonce at
+    /// its token's expiry for that reason; this is what destroys the rest.
+    IntroductionsSpent,
 }
 
 impl Artifact {
     /// Every artifact. Used by the test that keeps this file honest.
-    pub const ALL: [Artifact; 11] = [
+    pub const ALL: [Artifact; 12] = [
         Artifact::IdentityWrapped,
         Artifact::KekParams,
         Artifact::Corpus,
@@ -72,6 +78,7 @@ impl Artifact {
         Artifact::Groups,
         Artifact::Reseal,
         Artifact::DuressWrapped,
+        Artifact::IntroductionsSpent,
     ];
 
     /// The name on disk.
@@ -88,6 +95,7 @@ impl Artifact {
             Artifact::Groups => "groups.sealed",
             Artifact::Reseal => "reseal.cbor",
             Artifact::DuressWrapped => "duress.wrapped",
+            Artifact::IntroductionsSpent => "introductions.spent",
         }
     }
 
@@ -109,7 +117,8 @@ impl Artifact {
             | Artifact::ChannelRoster
             | Artifact::Groups
             | Artifact::Reseal
-            | Artifact::DuressWrapped => true,
+            | Artifact::DuressWrapped
+            | Artifact::IntroductionsSpent => true,
         }
     }
 }

@@ -109,6 +109,10 @@ pub enum Command {
     Disconnect,
     /// Publish or refresh this node's self-attestation.
     Rollcall,
+    /// Mint or present an introduction token — RFC 3 §10.
+    Introduce,
+    /// First-contact requests waiting on this node's inbox tag.
+    Requests,
     /// Ingest a courier archive.
     Import,
     /// Write a courier archive.
@@ -149,6 +153,8 @@ impl Command {
             "connect" => Command::Connect,
             "disconnect" => Command::Disconnect,
             "rollcall" => Command::Rollcall,
+            "introduce" => Command::Introduce,
+            "requests" => Command::Requests,
             "import" => Command::Import,
             "pack" => Command::Pack,
             "send" => Command::Send,
@@ -207,6 +213,11 @@ impl Command {
             "rollcall [publish|withdraw]",
             "the public directory — listing yourself is opt-in (RFC 3 §9)",
         ),
+        (
+            "introduce <peer> <to>",
+            "vouch for someone, once, privately (RFC 3 §10)",
+        ),
+        ("requests", "first-contact requests waiting for you"),
         (
             "message <peer> [peer…]",
             "compose to one or more people; Ctrl-D seals and queues",
@@ -327,6 +338,8 @@ impl fmt::Display for Command {
             Command::Connect => "connect",
             Command::Disconnect => "disconnect",
             Command::Rollcall => "rollcall",
+            Command::Introduce => "introduce",
+            Command::Requests => "requests",
             Command::Import => "import",
             Command::Pack => "pack",
             Command::Send => "send",
@@ -528,6 +541,8 @@ mod tests {
             Command::Connect,
             Command::Disconnect,
             Command::Rollcall,
+            Command::Introduce,
+            Command::Requests,
             Command::Import,
             Command::Pack,
             Command::Send,
