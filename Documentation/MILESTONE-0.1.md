@@ -1,8 +1,10 @@
 # Milestone 0.1 — Implementation Plan
 
     Branch:   0.1
-    Status:   in progress
+    Status:   A–E done; F has one gate outstanding, and it needs a second
+              author (§2.2). Last checked against the tree 2026-08-24.
     Scope:    a message from A to B, over sim, TCP and courier, with lock
+              — plus what §5 records as having grown past that
 
 ---
 
@@ -69,7 +71,7 @@ acceptance test for this phase.
 | Ed25519 verification | **strict** — canonical `S`, canonical encodings, small-order `A` rejected |
 | HPKE | `mode_auth` and `mode_base` per RFC 1 §6.1–6.2; suite `0x0001` only |
 | prekeys | three-tier, deterministic index per RFC 2 §7.2, sized by correspondents per RFC 2 §7.3 |
-| reservoir | **not implemented** — `CRYPTO-REVIEW.md` §1 |
+| reservoir | **built after all** — see §2.1. `CRYPTO-REVIEW.md` §1 said defer; the post-quantum position was worth more than the deferral |
 
 ### C — transport
 
@@ -120,6 +122,71 @@ A relay is this same binary, unlocked once at startup and locked immediately
 - RFC 3 §11.3: full peering and first message with all interfaces down
 - SIM-2 against the implementations through the `sim` backend, not against a
   third model
+
+Status in §2.2.
+
+---
+
+## 2.1 Where the build actually is
+
+This section exists because §5 below was wrong for several months and nobody
+noticed. It listed groups, channels and the reservoir as 0.2 while all three
+were being built and tested, which means the document that defines the
+milestone stopped describing it. A plan that is not checked against the tree is
+not a plan, so the check is written down here.
+
+| phase | state | where |
+|---|---|---|
+| A — foundations | **done** | RFC 0 §9's property is `recon.rs`: converges in both modes, under reordering, under duplication, and through RBSR descent. Fuzz targets exist for CBOR, control frames, objects and ingest |
+| B — cryptography | **done, and past its scope** | all four decisions taken and pinned. The reservoir was to be deferred and was built |
+| C — transport | **done, and past its scope** | `sim`, `courier`, `tcp` as planned; `socks` (Tor) and `serial` were "later" and exist. Both sync modes now run over a session — see §2.2.1 for how long only one did |
+| D — node | **done** | Poisson scheduler, sync loop, peer metrics, lock. Both absence-tests hold: intervals uncorrelated with message events *and* with lock state |
+| E — TUI | **done, and past its scope** | shell, chords, zoom, commands, picture pipeline with an out-of-process decoder. Relay mode present |
+| F — gates | **one of three met** | §2.2 |
+
+Built although §5 called it 0.2: **groups** (`groups.rs`), **channels**
+(`channels.rs`), the **reservoir** (`krab-crypto/src/reservoir.rs`), **Tor** via
+the `socks` backend, and a serial backend against which the LoRa profile is
+modelled.
+
+Genuinely absent: **rollcall** — the command parses and reports, but nothing
+publishes an RFC 3 §9 entry — and **introduction tokens**, which appear nowhere
+in the tree.
+
+## 2.2 Gate status
+
+| gate | state |
+|---|---|
+| RFC 1 §12 vectors | vectors exist and are checked every run (`Documentation/vectors/rfc-1.txt`, `krab-tui/src/vectors.rs`). **The second implementation is not mine to write** — a second reading by the same author agrees with the first whether or not the first is right, and two agreeing implementations from one understanding look like evidence while being none |
+| RFC 3 §11.3, all interfaces down | **met.** `courier_only_peering_completes_with_no_network` drives offer, accept, pad and seal by file copy with no socket; `courier_only.rs` carries a sealed first message across with no round trip |
+| SIM-2 through the `sim` backend | **met.** All four items measure the real `Store`, `recon` and `Node`, and `sim2.rs` now drives every reconciliation through `SimFabric` — two halves, two threads, real opcodes — rather than calling `recon::reconcile` on two corpora it holds at once |
+
+### 2.2.1 What the third gate was hiding
+
+Worth recording, because "the test takes a shortcut" turned out to be the
+smaller half of it. Routing SIM-2 through the backend the gate names surfaced
+two defects that the shortcut had made unreachable:
+
+1. **`SimSession::recv` returned `None` for a momentarily empty queue.**
+   `Session::recv` reserves `None` for *"the peer is finished"*, and both
+   exchange drivers break on it. A reconciliation over this backend therefore
+   ended at the first gap and reported however many objects had crossed by
+   then — not an error, a **plausible smaller number**.
+
+2. **Nothing spoke RBSR over a session.** Opcodes 5 and 6 were defined, framed
+   and fuzzed, and no driver sent them. `recon::reconcile` implements the
+   descent between two corpora it holds simultaneously, which is the algorithm
+   but not the protocol. So a link whose `LinkProfile` says `Rbsr` — every TCP
+   and LoRa link, per RFC 5 §4.5 — spoke Manifest, and the module said so in
+   its own header without that being enough to get it fixed.
+
+Both are closed: `exchange::{initiate_rbsr, respond_rbsr}` drive the descent
+over a session, and the TUI now selects the mode from the link's profile
+instead of always passing Manifest.
+
+The pattern is §5.1's again. A gate that could not be met was recorded as
+unmet, in a milestone file, next to a module header that named the same gap —
+and the accurate record was not what closed it. Running the thing was.
 
 ---
 
@@ -176,7 +243,38 @@ any object exists.
 
 ## 5. What 0.1 is not
 
-No groups, no channels, no rollcall, no introduction tokens, no reservoir, no
-LoRa, no Tor. Those are 0.2 and they are specified — the constraint is that
-each one multiplies the surface that has to be right, and nothing here is
-right until F's test vectors say so.
+**This section previously said:** *"No groups, no channels, no rollcall, no
+introduction tokens, no reservoir, no LoRa, no Tor. Those are 0.2."* By the
+time anyone re-read it, five of those seven were built. It is corrected rather
+than deleted, because the way it went wrong is the more useful record.
+
+What is actually absent from 0.1:
+
+| item | why |
+|---|---|
+| rollcall — RFC 3 §9 | the command reports and nothing publishes. The bulletin mechanism it needs exists (`Class::Bulletin` already carries channels and prekey batches), so this is the smallest remaining feature, not a blocked one |
+| introduction tokens | not started, and not needed for a message from A to B |
+
+### 5.1 The scope argument, and what happened to it
+
+The original reasoning was sound: *each one multiplies the surface that has to
+be right, and nothing here is right until F's test vectors say so.* The
+vectors landed; the deferred features were then built anyway, one at a time,
+each for a local reason that was good on its own — the reservoir because the
+post-quantum position was worth more than the deferral, Tor because RFC 4
+specifies it and the backend seam already existed, groups and channels because
+RFC 8 §4.2's interface requirements needed something to be an interface *to*.
+
+None of those decisions is being reversed here. What is being recorded is that
+the scope grew by accretion and the document did not, so for a stretch nothing
+in the repository stated what the milestone contained. That failure has the
+same shape as the two `wipe` defects in `artifact.rs` and the third in
+`ADVERSARIAL-PASS.md` §7: **a rule written once, and thereafter enforced only
+over the things that existed when it was written.** It is the most common
+defect in this codebase by a wide margin, and it is now visible in the plan as
+well as in the code.
+
+The mitigation is the same as the one that worked for `wipe`: not more
+diligence, but a place where an omission fails something. §2.1's inventory is
+that place — it names what is built against what was planned, so the next
+divergence has to be written down to be missed.

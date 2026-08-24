@@ -994,6 +994,11 @@ impl App {
                 now.saturating_add(45 * 1440) + 1,
             )
         };
+        // **The link decides, not this function.** RFC 5 §4.5 derives the mode
+        // from `latency_class`, and a node that answered in whichever mode the
+        // code happened to implement would be the divergence RFC 0's editorial
+        // rule exists to prevent. Read before `take_session`, which removes it.
+        let mode = self.links.get(peer)?.profile.sync_mode();
         let session = self.links.take_session(peer)?;
         let view_store = self.store.clone();
         let carriage = self.roster.carriage;
@@ -1003,13 +1008,19 @@ impl App {
         std::thread::spawn(move || {
             let mut session = session;
             let mut view = shared::ExchangeView::new(view_store, window.0, carriage);
-            let event = match krab_node::exchange::respond_to(
-                &mut *session,
-                &mut view,
-                [0u8; 32],
-                window.0,
-                window.1,
-            ) {
+            let outcome = match mode {
+                krab_proto::recon::Mode::Rbsr => {
+                    krab_node::exchange::respond_rbsr(&mut *session, &mut view, [0u8; 32])
+                }
+                krab_proto::recon::Mode::Manifest => krab_node::exchange::respond_to(
+                    &mut *session,
+                    &mut view,
+                    [0u8; 32],
+                    window.0,
+                    window.1,
+                ),
+            };
+            let event = match outcome {
                 Ok(moved) => activity_log::Event::Reconciled {
                     peer: name,
                     received: moved.received,
@@ -1039,6 +1050,13 @@ impl App {
                 now.saturating_add(45 * 1440) + 1,
             )
         };
+        // As in `answer_reconciliation`: the profile picks the mode, and it is
+        // read before `take_session` removes the link's session.
+        let mode = self
+            .links
+            .get(peer)
+            .map(|l| l.profile.sync_mode())
+            .unwrap_or(krab_proto::recon::Mode::Manifest);
         let Some(session) = self.links.take_session(peer) else {
             return Some(activity_log::Event::Failed {
                 peer: peer.to_string(),
@@ -1077,14 +1095,24 @@ impl App {
         std::thread::spawn(move || {
             let mut session = session;
             let mut view = shared::ExchangeView::new(view_store, window.0, carriage);
-            let event = match krab_node::exchange::initiate(
-                &mut *session,
-                &mut view,
-                [0u8; 32],
-                window.0,
-                window.1,
-                salt,
-            ) {
+            let outcome = match mode {
+                krab_proto::recon::Mode::Rbsr => krab_node::exchange::initiate_rbsr(
+                    &mut *session,
+                    &mut view,
+                    [0u8; 32],
+                    window.0,
+                    window.1,
+                ),
+                krab_proto::recon::Mode::Manifest => krab_node::exchange::initiate(
+                    &mut *session,
+                    &mut view,
+                    [0u8; 32],
+                    window.0,
+                    window.1,
+                    salt,
+                ),
+            };
+            let event = match outcome {
                 Ok(moved) => activity_log::Event::Reconciled {
                     peer: name,
                     received: moved.received,

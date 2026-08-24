@@ -5,36 +5,40 @@
 //! has only one corpus locally and the other behind a socket, so the same
 //! state machine has to be driven over [`Control`] messages instead.
 //!
-//! # Manifest only, and that is a stated gap
+//! # Both modes, and what the second one cost to add
 //!
 //! RFC 5 §4.5 derives `sync_mode` from latency class: a courier link gets
-//! `Manifest`, a low-latency link gets `Rbsr`. **This implements Manifest
-//! only.** A TCP link therefore exchanges more than it needs to — it sends a
-//! full range manifest where RBSR would binary-search the divergence.
+//! `Manifest`, a low-latency link gets `Rbsr`. For a long time this module
+//! implemented Manifest only and said so, which was honest and still meant
+//! that **a node reading `Rbsr` off its own `LinkProfile` spoke Manifest** —
+//! opcodes 5 and 6 were defined, framed, fuzzed, and sent by nothing.
 //!
-//! That is a bandwidth cost, not a correctness one: both modes reach the same
-//! fixed point, which `manifest_and_rbsr_reach_the_same_corpus` in SIM-2
-//! checks. RBSR over a session needs a descend/respond loop across the wire
-//! and is the remaining piece; the two-corpus path already proves RBSR
-//! converges against real fingerprints.
+//! It also meant `MILESTONE-0.1.md`'s third gate could not be met. SIM-2 is
+//! required to measure the implementations through the `sim` backend, and its
+//! RBSR item had no session path to measure, so it reconciled two corpora in
+//! memory instead — the shortcut that made the gate's wording untrue.
 //!
-//! Recorded rather than silently substituted, because a node claiming `Rbsr`
-//! from its `LinkProfile` while speaking Manifest would be the kind of
-//! divergence RFC 0's editorial rule exists to prevent.
+//! [`initiate_rbsr`] and [`respond_rbsr`] close both. See [`descend`] for the
+//! one part that is not a transcription of `recon::reconcile`.
 //!
 //! # Who speaks first
 //!
-//! The initiator sends its manifest, the responder replies with what it wants
-//! and then its own manifest. Both sides finish having offered everything in
-//! the window and asked for everything they lacked.
+//! In manifest mode the initiator sends its manifest, the responder replies
+//! with what it wants and then its own manifest. In RBSR the initiator
+//! describes the window and the two ends descend into the disagreement. Both
+//! modes finish with each side having offered everything in the window and
+//! asked for everything it lacked, which is the only property the caller
+//! should depend on — RFC 5 §4.5 picks between them from `latency_class`, not
+//! from anything a caller says.
 //!
 //! Neither side is trusted: every object arriving here goes through
 //! `Store::ingest`, which applies RFC 1 §11's `I1`–`I6`. A peer that offers a
 //! manifest entry and then sends different bytes fails `I5`.
 
 use krab_fabric::{frame, Error, Session};
-use krab_proto::control::{Control, Entry, TRUNC};
-use krab_proto::recon::{wanted, Corpus};
+use krab_proto::control::{Control, Entry, Range, TRUNC};
+use krab_proto::recon::{describe, respond, wanted, Corpus, RBSR_MAX_ROUNDS};
+use std::collections::BTreeSet;
 
 /// What an exchange moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -320,6 +324,188 @@ fn take<C: Corpus + ?Sized>(corpus: &mut C, bytes: Vec<u8>) -> usize {
     usize::from(corpus.has(&trunc))
 }
 
+// ---------------------------------------------------------------------------
+// RBSR over a session — RFC 5 §4.4
+// ---------------------------------------------------------------------------
+
+/// Which half of the descent this end is driving.
+///
+/// The two differ in exactly one place — who closes the session — and nowhere
+/// else. See [`descend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Half {
+    /// Opens with a description of the whole window, and drains at the end.
+    Initiator,
+    /// Answers, and closes once both ends have said `RangeDone`.
+    Responder,
+}
+
+/// Drive an RBSR descent as the initiator — RFC 5 §4.4.
+///
+/// Opens by describing the whole window; everything after that is [`descend`].
+pub fn initiate_rbsr<C: Corpus + ?Sized>(
+    session: &mut dyn Session,
+    corpus: &mut C,
+    filter_digest: [u8; 32],
+    lo: u32,
+    hi: u32,
+) -> Result<Moved, Error> {
+    session.send(&Control::Range(vec![describe(corpus, lo, hi)]))?;
+    descend(session, corpus, filter_digest, Half::Initiator)
+}
+
+/// Drive an RBSR descent as the responder — RFC 5 §4.4.
+pub fn respond_rbsr<C: Corpus + ?Sized>(
+    session: &mut dyn Session,
+    corpus: &mut C,
+    filter_digest: [u8; 32],
+) -> Result<Moved, Error> {
+    descend(session, corpus, filter_digest, Half::Responder)
+}
+
+/// The descent loop, shared by both ends.
+///
+/// # The one part that is not a transcription
+///
+/// `recon::respond` returns `descend`, `list` **and** `leaves`, and its
+/// doc-comment explains why the third exists: a leaf binds *both* sides. Each
+/// side can only enumerate its own holdings, so when B resolves a range as a
+/// leaf and lists its rows, A must list A's rows for the same range or the
+/// descent is silently one-directional.
+///
+/// In `recon::reconcile` that is free — it holds both corpora and simply calls
+/// `a.entries(l, h)`. Over a session it is not: **A has to be told which range
+/// B leafed.** There is no opcode for "list this range", and inventing one
+/// would fork the wire format from RFC 5's frozen eight.
+///
+/// It does not need one. The leaf test is
+/// `mine.count.max(theirs.count) <= RBSR_LEAF`, which is a `max` over the same
+/// two numbers whichever end evaluates it — **symmetric**. So B echoes its own
+/// description of the leaf in the ordinary `Range` batch, A runs the ordinary
+/// `respond` over it, and A independently reaches leaf and lists its rows. No
+/// new opcode, and no second code path that could disagree with the first.
+///
+/// The cost is that an echo would ping-pong forever, since each side keeps
+/// concluding "leaf" about the same bounds. `resolved` is the whole of the
+/// fix: bounds this end has already listed are dropped from an incoming batch
+/// before `respond` sees them, so the echo dies after one return trip.
+///
+/// # Termination
+///
+/// `RBSR_MAX_ROUNDS` caps the descent — RFC 5 §12 names an unbounded one as an
+/// amplification vector, and a peer that manufactures divergence is the reason
+/// the cap is in the protocol rather than in a comment. Past it this end stops
+/// descending and says `RangeDone`, which degrades to whatever both sides have
+/// already exchanged rather than to a hung session.
+///
+/// Ending is the manifest driver's handshake, for the same reason: both ends
+/// say `RangeDone`, and only the **responder** closes. Getting this wrong is a
+/// deadlock rather than a visible bug — two ends each waiting for the other to
+/// finish looks exactly like a slow link.
+fn descend<C: Corpus + ?Sized>(
+    session: &mut dyn Session,
+    corpus: &mut C,
+    filter_digest: [u8; 32],
+    half: Half,
+) -> Result<Moved, Error> {
+    let mut moved = Moved::default();
+    let mut resolved: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut rounds = 0usize;
+    let mut said_done = false;
+
+    for _ in 0..MAX_MESSAGES {
+        match session.recv()? {
+            Some(Control::Range(offered)) => {
+                // Bounds already listed from this end are dropped before
+                // `respond` sees them: without this the symmetric leaf test
+                // makes both ends echo the same range forever.
+                let fresh: Vec<Range> = offered
+                    .into_iter()
+                    .filter(|r| !resolved.contains(&(r.lo, r.hi)))
+                    .collect();
+
+                rounds += 1;
+                let answer = if rounds > RBSR_MAX_ROUNDS {
+                    // RFC 5 §4.4's cap. Stop descending; what has already
+                    // crossed stands.
+                    krab_proto::recon::Response::default()
+                } else {
+                    respond(corpus, &fresh)
+                };
+
+                if !answer.list.is_empty() {
+                    session.send(&Control::Manifest {
+                        filter_digest,
+                        entries: answer.list,
+                    })?;
+                }
+
+                let mut out = answer.descend;
+                for (l, h) in answer.leaves {
+                    resolved.insert((l, h));
+                    out.push(describe(corpus, l, h));
+                }
+
+                if out.is_empty() {
+                    if !said_done {
+                        session.send(&Control::RangeDone)?;
+                        said_done = true;
+                    }
+                } else {
+                    session.send(&Control::Range(out))?;
+                }
+            }
+            Some(Control::Manifest {
+                filter_digest: theirs,
+                entries,
+            }) => {
+                // Same check as manifest mode, and for the same reason: rows
+                // computed under a different filter answer a different
+                // question, so they are not a smaller answer but a wrong one.
+                if theirs != filter_digest {
+                    return Err(Error::Frame);
+                }
+                let want = wanted(corpus, &entries);
+                if !want.is_empty() {
+                    session.send(&Control::Want(want))?;
+                }
+            }
+            Some(Control::Want(ids)) => moved.sent += serve_wants(session, corpus, &ids)?,
+            Some(Control::Obj(bytes)) => moved.received += take(corpus, bytes),
+            Some(Control::RangeDone) | Some(Control::Done) => {
+                if !said_done {
+                    session.send(&Control::RangeDone)?;
+                }
+                match half {
+                    // The responder closes. Anything the initiator asked for
+                    // arrived ahead of its `RangeDone` on a FIFO link, so it
+                    // has already been served by the `Want` arm above.
+                    Half::Responder => break,
+                    // The initiator keeps reading until the responder closes,
+                    // so objects served after the responder said `RangeDone`
+                    // are still collected rather than dropped on the floor.
+                    Half::Initiator => {
+                        for _ in 0..MAX_MESSAGES {
+                            match session.recv()? {
+                                Some(Control::Obj(bytes)) => moved.received += take(corpus, bytes),
+                                Some(Control::Want(ids)) => {
+                                    moved.sent += serve_wants(session, corpus, &ids)?
+                                }
+                                Some(_) => continue,
+                                None => break,
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            None => break,
+            Some(_) => continue,
+        }
+    }
+    Ok(moved)
+}
+
 /// Send the objects a peer asked for.
 ///
 /// A request for something not held is skipped, not an error: a peer may ask
@@ -562,6 +748,167 @@ mod tests {
             a.len(),
             "a corpus above one manifest did not converge"
         );
+    }
+
+    /// Run both RBSR halves against each other over the `sim` backend.
+    ///
+    /// **Both ends are opened before the responder thread starts.** A session
+    /// whose far end does not yet exist has no peer to wait for, so `recv`
+    /// answers `None` immediately — spawn first and the responder can finish
+    /// before the initiator has said anything, which passes and proves
+    /// nothing.
+    fn exchange_rbsr(a: &mut Store, b: &mut Store) -> (Moved, Moved) {
+        use krab_fabric::backend::sim::SimFabric;
+        let fabric = SimFabric::new(LinkProfile::tcp());
+        let mut end_a = fabric.end_a();
+        let mut end_b = fabric.end_b();
+
+        let mut b_owned = core::mem::replace(b, Store::new());
+        let handle = std::thread::spawn(move || {
+            let m = {
+                let mut vb = StoreView(&mut b_owned);
+                respond_rbsr(&mut end_b, &mut vb, [0; 32]).unwrap_or_default()
+            };
+            (b_owned, m)
+        });
+
+        let ma = {
+            let mut va = StoreView(a);
+            initiate_rbsr(&mut end_a, &mut va, [0; 32], 0, u32::MAX).unwrap_or_default()
+        };
+        let _ = end_a.close();
+
+        let (returned, mb) = handle.join().unwrap();
+        *b = returned;
+        (ma, mb)
+    }
+
+    /// **RBSR converges over a session, not over a shared pointer.** The gate
+    /// in `MILESTONE-0.1.md` §2.2 asks for the implementations measured through
+    /// the `sim` backend; before this existed there was no session path to
+    /// measure, because opcodes 5 and 6 were sent by nothing.
+    #[test]
+    fn two_stores_converge_over_a_session_in_rbsr_mode() {
+        let mut a = store_with(0..40);
+        let mut b = store_with(20..60);
+        for _ in 0..6 {
+            let (ma, mb) = exchange_rbsr(&mut a, &mut b);
+            if ma.received + mb.received == 0 {
+                break;
+            }
+        }
+        assert_eq!(a.len(), b.len(), "corpora did not converge");
+        assert_eq!(
+            a.range_fingerprint(0, u32::MAX),
+            b.range_fingerprint(0, u32::MAX),
+            "counts agree but contents do not"
+        );
+        assert_eq!(a.len(), 60, "the union is 0..60");
+    }
+
+    /// **A leaf binds both sides.** `recon::Response::leaves` exists because a
+    /// descent where only the responder lists its holdings moves objects one
+    /// way and looks like it worked — the corpora even converge, if the
+    /// initiator happened to hold nothing the responder lacked.
+    ///
+    /// Over a session that asymmetry is easier to reintroduce than in memory,
+    /// since listing the peer's side is no longer a local call. So this checks
+    /// the direction that a one-sided descent silently drops: objects the
+    /// **initiator** holds and the responder does not.
+    #[test]
+    fn rbsr_moves_objects_in_both_directions_over_a_session() {
+        let mut a = store_with(0..30);
+        let mut b = store_with(30..60);
+        let mut to_b = 0;
+        let mut to_a = 0;
+        for _ in 0..6 {
+            let (ma, mb) = exchange_rbsr(&mut a, &mut b);
+            to_b += ma.sent;
+            to_a += mb.sent;
+            if ma.received + mb.received == 0 {
+                break;
+            }
+        }
+        assert!(to_b > 0, "nothing travelled from the initiator");
+        assert!(to_a > 0, "nothing travelled from the responder");
+        assert_eq!(a.len(), 60);
+        assert_eq!(b.len(), 60);
+    }
+
+    /// **Both modes reach the same fixed point over the wire.** The in-memory
+    /// path already asserts this; the session path is where the two drivers
+    /// could drift apart, since they are now separate code.
+    #[test]
+    fn manifest_and_rbsr_sessions_reach_the_same_corpus() {
+        let (mut ma, mut mb) = (store_with(0..40), store_with(25..70));
+        for _ in 0..8 {
+            let (x, y) = exchange(&mut ma, &mut mb);
+            if x.received + y.received == 0 {
+                break;
+            }
+        }
+        let (mut ra, mut rb) = (store_with(0..40), store_with(25..70));
+        for _ in 0..8 {
+            let (x, y) = exchange_rbsr(&mut ra, &mut rb);
+            if x.received + y.received == 0 {
+                break;
+            }
+        }
+        assert_eq!(ma.len(), ra.len(), "the two modes disagree on the union");
+        assert_eq!(
+            ma.range_fingerprint(0, u32::MAX),
+            ra.range_fingerprint(0, u32::MAX),
+            "same count, different contents"
+        );
+        assert_eq!(
+            rb.range_fingerprint(0, u32::MAX),
+            mb.range_fingerprint(0, u32::MAX)
+        );
+    }
+
+    /// An empty responder catches up entirely through a descent.
+    #[test]
+    fn an_empty_node_catches_up_over_rbsr() {
+        let mut full = store_with(0..30);
+        let mut empty = Store::new();
+        for _ in 0..6 {
+            let (_, m) = exchange_rbsr(&mut full, &mut empty);
+            if m.received == 0 {
+                break;
+            }
+        }
+        assert_eq!(empty.len(), full.len());
+    }
+
+    /// Two corpora that already agree exchange no objects: every range prunes
+    /// on the first comparison. This is the whole of RBSR's advantage, so a
+    /// descent that transferred anything here would mean the fingerprints are
+    /// not doing the work.
+    #[test]
+    fn identical_corpora_descend_and_move_nothing() {
+        let mut a = store_with(0..40);
+        let mut b = store_with(0..40);
+        let (ma, mb) = exchange_rbsr(&mut a, &mut b);
+        assert_eq!(ma.received + mb.received, 0);
+        assert_eq!(ma.sent + mb.sent, 0, "objects moved between equal corpora");
+        assert_eq!(a.len(), 40);
+    }
+
+    /// **The echo terminates.** A leaf is decided by a `max` over both counts,
+    /// so each end reaches the same verdict about the same bounds — which is
+    /// what lets a leaf be announced with no new opcode, and also what would
+    /// ping-pong forever without `resolved`. The session ending at all is the
+    /// assertion; a regression here hangs rather than fails.
+    #[test]
+    fn a_leaf_is_announced_once_and_not_echoed_forever() {
+        // Divergence in a single narrow range: exactly the shape that reduces
+        // to one leaf and therefore to one echo.
+        let mut a = store_with(0..33);
+        let mut b = store_with(0..30);
+        let (ma, mb) = exchange_rbsr(&mut a, &mut b);
+        assert_eq!(ma.sent, 3, "the three objects B lacked");
+        assert_eq!(mb.received, 3);
+        assert_eq!(b.len(), 33);
     }
 
     /// **The loop terminates against a peer that never stops talking.** RFC 3

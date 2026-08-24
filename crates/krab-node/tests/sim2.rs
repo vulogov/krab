@@ -10,6 +10,24 @@
 //! so a divergence between the design and the build shows up as a failed
 //! measurement rather than as a correct number about the wrong system.
 //!
+//! # "Through the `sim` backend" is half the sentence, and it was the missing half
+//!
+//! For a long time this file drove those three directly and skipped the
+//! backend the gate names. It looked like the same measurement. It was not.
+//!
+//! `recon::reconcile` holds both corpora and moves objects between them, so
+//! everything that only exists once a peer is behind a socket — announcing a
+//! leaf range the peer must answer for, terminating a descent with two ends
+//! speaking rather than one function recursing — was untested by construction.
+//! Routing the helper through `SimFabric` found two defects immediately: the
+//! backend answered `None` for an empty queue when [`Session::recv`] reserves
+//! that for a finished peer, and **no RBSR session driver existed at all**, so
+//! opcodes 5 and 6 were framed and fuzzed and sent by nothing.
+//!
+//! Both are fixed and item 3 below now measures a descent that really crosses
+//! a link. The general shape is worth keeping: a shortcut inside a measurement
+//! does not report as a smaller number, it reports as a confident one.
+//!
 //! # The four items
 //!
 //! `RFC-5-blocking-items.md` §"SIM-2 now has four items":
@@ -30,6 +48,10 @@
 //! this file supports a statement about anonymity.
 
 use krab_core::object::{canonical_bytes, ObjectId, RoutingHeader, Tag};
+use krab_fabric::backend::sim::SimFabric;
+use krab_fabric::profile::LinkProfile;
+use krab_fabric::Session;
+use krab_node::exchange;
 use krab_node::node::StoreView;
 use krab_proto::recon::Mode;
 use krab_store::index::Store;
@@ -81,15 +103,68 @@ fn store_with(salts: impl Iterator<Item = u32>) -> Store {
     s
 }
 
-/// Reconcile two real stores through the real RBSR/manifest state machine.
+/// Reconcile two real stores **through the `sim` backend**.
 ///
-/// Uses `krab_node::node::StoreView` — the adapter the node itself uses — so
-/// nothing here is a reimplementation. A second adapter would be the "third
-/// model" phase F rules out.
-fn reconcile(a: &mut Store, b: &mut Store, mode: Mode) -> usize {
-    let mut va = StoreView(a);
-    let mut vb = StoreView(b);
-    krab_proto::recon::reconcile(&mut va, &mut vb, mode, 0, u32::MAX).transferred
+/// # Why this is not `recon::reconcile`
+///
+/// It used to be. `recon::reconcile` takes two `Corpus` values and moves
+/// objects between them directly, which is the real state machine but not the
+/// real *path*: no session, no framing, no opcodes, and no link.
+///
+/// Phase F asks for the implementations measured "through the `sim` backend",
+/// and the two are not the same measurement. Everything between a corpus and a
+/// peer — how a leaf range is announced when the peer's holdings are behind a
+/// socket, whether the descent terminates once both ends are speaking rather
+/// than one function calling itself — was outside what the old helper touched.
+/// The gap was not hypothetical: closing it turned up a `Session` contract
+/// violation in the backend and the absence of any RBSR session driver at all.
+///
+/// So this runs both halves of a real exchange, on two threads, over a real
+/// `SimFabric` wire, using the same `StoreView` adapter the node uses. A second
+/// adapter would be the "third model" phase F rules out.
+///
+/// `salt` varies the sub-range manifest mode advertises. RBSR ignores it: its
+/// descent covers the whole window every time.
+fn reconcile(a: &mut Store, b: &mut Store, mode: Mode, salt: u64) -> usize {
+    // The profile each mode is derived from, so a measurement is taken over the
+    // link class RFC 5 §4.5 assigns it rather than an arbitrary one.
+    let profile = match mode {
+        Mode::Rbsr => LinkProfile::tcp(),
+        Mode::Manifest => LinkProfile::courier(),
+    };
+    let fabric = SimFabric::new(profile);
+    // Both ends opened before the responder starts: a session whose far end
+    // does not exist yet has no peer to wait for, and would finish instantly
+    // against a peer that had not spoken.
+    let mut end_a = fabric.end_a();
+    let mut end_b = fabric.end_b();
+
+    let mut b_owned = core::mem::replace(b, Store::new());
+    let responder = std::thread::spawn(move || {
+        let moved = {
+            let mut vb = StoreView(&mut b_owned);
+            match mode {
+                Mode::Rbsr => exchange::respond_rbsr(&mut end_b, &mut vb, [0; 32]),
+                Mode::Manifest => exchange::respond_to(&mut end_b, &mut vb, [0; 32], 0, u32::MAX),
+            }
+            .unwrap_or_default()
+        };
+        (b_owned, moved)
+    });
+
+    let from_a = {
+        let mut va = StoreView(a);
+        match mode {
+            Mode::Rbsr => exchange::initiate_rbsr(&mut end_a, &mut va, [0; 32], 0, u32::MAX),
+            Mode::Manifest => exchange::initiate(&mut end_a, &mut va, [0; 32], 0, u32::MAX, salt),
+        }
+        .unwrap_or_default()
+    };
+    let _ = end_a.close();
+
+    let (returned, from_b) = responder.join().expect("responder panicked");
+    *b = returned;
+    from_a.received + from_b.received
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +187,7 @@ fn rbsr_converges_against_real_fingerprints() {
         let before = (a.len(), b.len());
         let mut rounds = 0;
         loop {
-            let moved = reconcile(&mut a, &mut b, Mode::Rbsr);
+            let moved = reconcile(&mut a, &mut b, Mode::Rbsr, rounds as u64);
             rounds += 1;
             if moved == 0 {
                 break;
@@ -149,8 +224,8 @@ fn manifest_and_rbsr_reach_the_same_corpus() {
     let run = |mode| {
         let mut a = store_with(salts.iter().copied());
         let mut b = store_with(other.iter().copied());
-        for _ in 0..20 {
-            if reconcile(&mut a, &mut b, mode) == 0 {
+        for round in 0..20 {
+            if reconcile(&mut a, &mut b, mode, round) == 0 {
                 break;
             }
         }
@@ -286,8 +361,8 @@ fn graduated_quota_makes_a_fresh_vantage_point_slow_to_become_useful() {
 fn without_quota_every_vantage_point_sees_everything() {
     let mut source = store_with(0..300);
     let mut fresh = Store::new();
-    for _ in 0..6 {
-        if reconcile(&mut source, &mut fresh, Mode::Rbsr) == 0 {
+    for round in 0..6 {
+        if reconcile(&mut source, &mut fresh, Mode::Rbsr, round) == 0 {
             break;
         }
     }
@@ -328,7 +403,7 @@ fn group_fanout_costs_one_object_per_member_and_replicates_once() {
         // Replication is corpus-wide and indifferent to the group: a relay
         // carrying them does not know they are related.
         let mut relay = Store::new();
-        let moved = reconcile(&mut sender, &mut relay, Mode::Rbsr);
+        let moved = reconcile(&mut sender, &mut relay, Mode::Rbsr, 0);
         assert_eq!(moved, members);
         assert_eq!(relay.len(), members);
 
@@ -373,8 +448,8 @@ fn eviction_raises_the_watermark_and_evicted_objects_do_not_return() {
 
     // A peer that still holds everything tries to give it all back.
     let mut hoarder = store_with(0..800);
-    for _ in 0..5 {
-        if reconcile(&mut full, &mut hoarder, Mode::Rbsr) == 0 {
+    for round in 0..5 {
+        if reconcile(&mut full, &mut hoarder, Mode::Rbsr, round) == 0 {
             break;
         }
     }
