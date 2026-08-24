@@ -134,15 +134,22 @@ pub enum PeerFile {
     Policy,
     /// How the peering was formed, and what it is worth.
     Terms,
+    /// The mutually signed `peer-link` credential — RFC 3 §3.
+    ///
+    /// The most sensitive per-peer file: RFC 3 §15 calls credentials at rest
+    /// "non-repudiable", so seizing a disk yields the peer list *with
+    /// cryptographic proof* — worse than an address book.
+    Credential,
 }
 
 impl PeerFile {
     /// Every per-peer file.
-    pub const ALL: [PeerFile; 4] = [
+    pub const ALL: [PeerFile; 5] = [
         PeerFile::Link,
         PeerFile::Reservoir,
         PeerFile::Policy,
         PeerFile::Terms,
+        PeerFile::Credential,
     ];
 
     /// The name on disk.
@@ -152,6 +159,7 @@ impl PeerFile {
             PeerFile::Reservoir => "reservoir",
             PeerFile::Policy => "policy",
             PeerFile::Terms => "terms",
+            PeerFile::Credential => "credential",
         }
     }
 }
@@ -171,6 +179,12 @@ pub fn wiped(name: &str) -> bool {
         || name.ends_with(".link")
         || name.ends_with(".reservoir")
         || name.ends_with(".krab")
+        // `<peer>.credential`, the half-signed proposal written into the home
+        // directory for handover. Operator-named in the sense that the peer
+        // decides the prefix, so it cannot be an `Artifact` variant — and it
+        // is a signed statement that this node peered with someone, which is
+        // exactly what RFC 3 §8.4 says to purge.
+        || name.ends_with(".credential")
 }
 
 #[cfg(test)]

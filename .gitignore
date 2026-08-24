@@ -77,4 +77,5 @@ peers/
 *.roster
 *.spent
 *.krab
+*.credential
 kek.*

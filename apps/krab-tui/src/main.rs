@@ -34,6 +34,7 @@ mod channels;
 mod command;
 mod compose;
 mod courier;
+mod credential;
 mod entropy;
 mod fanout;
 mod groups;
@@ -1969,6 +1970,21 @@ impl App {
             return "no introduction — nobody you know has vouched".into();
         };
         let name = short_id(&via);
+        // What the evidence proves, independently of whether this node knows
+        // the introducer. RFC 3 §10 makes this the *cryptographic* half; the
+        // token below is the vouch, and the operator makes the judgement.
+        let evidence = match req.evidence_verdict(now_s) {
+            request::Evidence::Absent => String::new(),
+            request::Evidence::Confirms => {
+                format!("; {name} and they provably peered, both signatures")
+            }
+            request::Evidence::WrongParties => {
+                "; the attached credential is between two other nodes and \
+                 proves nothing about this request"
+                    .into()
+            }
+            request::Evidence::Invalid(why) => format!("; the attached credential is {why:?}"),
+        };
         // **Resolved from this node's own peer-links, never from the token.**
         // A token carrying its own key would let a stranger vouch for
         // themselves with a perfectly valid signature, which is the Sybil case
@@ -1979,11 +1995,26 @@ impl App {
         match req.introduction(key.as_ref(), me, now_s, spent) {
             None => format!("names {name} as introducer but carries no token"),
             Some(introduction::Verdict::Good) => {
-                format!("introduced by {name}, who you peer with — unspent, unexpired")
+                format!("introduced by {name}, who you peer with — unspent, unexpired{evidence}")
             }
             Some(introduction::Verdict::UnknownIntroducer) => format!(
-                "claims an introduction by {name}, who you do not peer with — \
-                 so the signature could be anyone's and vouches for nothing"
+                "claims an introduction by {name}, who you do not peer with, so \
+                 the signature could be anyone's{}",
+                match req.evidence_verdict(now_s) {
+                    // **This is what evidence buys.** Without it an unknown
+                    // introducer is worth nothing at all. With it, the vouch
+                    // is still from a stranger — but the peering it rests on
+                    // is a real one, mutually signed, and that is a fact the
+                    // operator can weigh rather than a claim they cannot.
+                    request::Evidence::Confirms => format!(
+                        " — but the attached credential proves {name} and they \
+                         really did peer, signed by both. A stranger's vouch on \
+                         a real relationship; your judgement, not the protocol's"
+                    ),
+                    request::Evidence::Absent =>
+                        " and nothing is attached to check it against".into(),
+                    _ => evidence.clone(),
+                }
             ),
             Some(introduction::Verdict::BadSignature) => {
                 format!("claims an introduction by {name}; the signature is not theirs")
@@ -2034,6 +2065,159 @@ impl App {
             }
         }
         out
+    }
+
+    /// Propose RFC 3 §3's credential with `theirs`, signed by this node.
+    ///
+    /// The nonce is fresh: §3 says it "prevents replay of a superseded link",
+    /// so a value derived from the two identities — identical on every
+    /// renewal — would not do the one job it has.
+    fn propose_credential(&self, theirs: &peering::Card) -> Vec<u8> {
+        let Some(id) = self.identity.as_ref() else {
+            return Vec::new();
+        };
+        let mut nonce = [0u8; 16];
+        OsRng.fill(&mut nonce);
+        credential::Credential::propose(
+            id.signing_key(),
+            &id.card(peering::Policy::default()),
+            theirs,
+            self.now_s(),
+            credential::DEFAULT_TERM_DAYS,
+            nonce,
+        )
+        .encode()
+    }
+
+    /// `peer countersign <file>` — RFC 3 §3's second signature, §5.3's step.
+    ///
+    /// Runs on both ends and is idempotent, which is what lets one command
+    /// serve the whole exchange: the far end countersigns a proposal and hands
+    /// the complete document back, and the originator runs the same command on
+    /// what returns. A ceremony with two verbs for two directions is a
+    /// ceremony where operators use the wrong one.
+    fn peer_countersign(&mut self, path: Option<&str>) -> String {
+        let Some(path) = path else {
+            return "usage: peer countersign <file>\n\n\
+                    Adds your signature to a peer-link credential and writes \
+                    the result back. Run it on the file your peer hands you \
+                    after their `peer seal`, and again on what they return.\n\n\
+                    RFC 3 §3 requires both signatures: one signature lets a \
+                    party assert a relationship the other never agreed to, and \
+                    a credential is cited as evidence when someone introduces \
+                    you (§5.1)."
+                .into();
+        };
+        let Some(id) = self.identity.as_ref() else {
+            return "no identity — run `init` first".into();
+        };
+        if self.epoch_key.is_none() {
+            return "locked — unlock to countersign".into();
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            return format!("could not read {path}");
+        };
+        let Some(mut cred) = credential::Credential::decode(&bytes) else {
+            return format!("{path} is not a peer-link credential");
+        };
+
+        let me = id.node_id();
+        let Some(them) = cred.other_than(&me) else {
+            return "that credential is between two other nodes — it is not \
+                    yours to sign, and signing it would assert a relationship \
+                    you are not part of."
+                .into();
+        };
+        let short = short_id(&them.node_id());
+        // The other end must be someone this node actually peered with. A
+        // credential proposed by a stranger is a document asking for a
+        // signature on a relationship that does not exist.
+        if self.peer_card(&short).is_none() {
+            return format!(
+                "no peer-link for {short}.\n\n\
+                 Complete the ceremony first — `peer offer`, `peer accept`, \
+                 `peer seal`. A credential records a peering; it does not \
+                 create one."
+            );
+        }
+
+        let added = cred.sign(id.signing_key());
+        match cred.verify(self.now_s()) {
+            Ok(()) => {}
+            Err(credential::Invalid::NotCountersigned) => {
+                // We signed and the other end has not. Hand it back.
+                let out = self.home.join(format!("{short}.credential"));
+                if let Err(e) = atomic::write(&out, &cred.encode()) {
+                    return format!("could not write it: {e}");
+                }
+                return format!(
+                    "signed. Give {} to {short}, who runs `peer countersign` \
+                     on it.\n\n\
+                     It is not a link yet — one signature is a claim, and \
+                     RFC 3 §3 wants a contract.",
+                    out.display()
+                );
+            }
+            Err(why) => {
+                return format!(
+                    "refused: {}\n\n{}",
+                    match why {
+                        credential::Invalid::BadSignature =>
+                            "a signature does not verify under the key the document names",
+                        credential::Invalid::NotCanonical =>
+                            "the parties are not in canonical order — party A is the one \
+                             whose identity key sorts lower, and an implementation that \
+                             ordered them differently produces a document neither end can \
+                             verify",
+                        credential::Invalid::SelfLink => "it links a node to itself",
+                        credential::Invalid::Backwards => "it expires before it was established",
+                        credential::Invalid::TooLong =>
+                            "the term exceeds RFC 3 §4's 180-day ceiling, which \
+                             implementations MUST reject",
+                        credential::Invalid::Expired =>
+                            "it has expired. Revocation is non-renewal (RFC 3 §4), so \
+                             re-run `peer seal` to establish a fresh one",
+                        credential::Invalid::NotCountersigned => unreachable!(),
+                    },
+                    "Nothing was stored."
+                );
+            }
+        }
+
+        // Complete. Store it in the peer's directory and drop the handover
+        // copy — RFC 3 §15 calls credentials at rest non-repudiable, so one
+        // copy in the sealed layout beats two, one of them loose in home.
+        if let Err(e) = self.ensure_peer_dir(&short) {
+            return e;
+        }
+        if let Err(e) = atomic::write(
+            &self.peer_path(&short, artifact::PeerFile::Credential),
+            &cred.encode(),
+        ) {
+            return format!("could not store it: {e}");
+        }
+        let loose = self.home.join(format!("{short}.credential"));
+        if loose.exists() {
+            shred::remove(&loose, &mut OsRng);
+        }
+        let days = (cred.expires_s.saturating_sub(self.now_s())) / 86_400;
+        format!(
+            "peer-link with {short} is complete{}.\n\n\
+             Both signatures are on it, so it is a contract rather than a \
+             claim — and it is what someone introducing you to a third party \
+             cites as evidence (RFC 3 §5.1, §10).\n\n\
+             It expires in {days} days. There is no revocation list and never \
+             will be: revocation is non-renewal (RFC 3 §4), so re-run the \
+             ceremony before then.",
+            if added { "" } else { " (it already was)" }
+        )
+    }
+
+    /// This node's completed credential with `peer`, if there is one.
+    fn credential_with(&self, peer: &str) -> Option<credential::Credential> {
+        let bytes = std::fs::read(self.peer_path(peer, artifact::PeerFile::Credential)).ok()?;
+        let cred = credential::Credential::decode(&bytes)?;
+        cred.verify(self.now_s()).ok().map(|()| cred)
     }
 
     /// `rollcall` — the public tier, RFC 3 §9.
@@ -2988,6 +3172,7 @@ impl App {
                         let tail = rest.trim().strip_prefix("reseal").unwrap_or("").to_string();
                         self.peer_reseal(&tail)
                     }
+                    Some(Peering::Countersign) => self.peer_countersign(arg(rest, 1).as_deref()),
                     Some(Peering::Status) => self.peer_status(),
                     Some(Peering::Rekey) => self.peer_rekey(arg(rest, 1).as_deref()),
                     None => {
@@ -4192,6 +4377,29 @@ impl App {
             &self.peer_path(&short, artifact::PeerFile::Terms),
             &terms.encode(),
         );
+        // **RFC 3 §3's credential.** Proposed here, signed by this node only,
+        // and handed over for the other end to countersign — §5.3's step.
+        // Until both signatures exist it is a claim rather than a contract,
+        // which is why it goes to the home directory for handover and not
+        // into the peer directory as though it were finished.
+        let proposal = self.propose_credential(&their_card);
+        let _ = atomic::write(&self.home.join(format!("{short}.credential")), &proposal);
+        let credential_note = match credential::Credential::decode(&proposal) {
+            // Never complete at this point — this node has signed and the
+            // other end has not — so the note says what is still owed.
+            Some(c) if !c.is_complete() => format!(
+                "\n\nA peer-link credential is at {}, signed by you. \
+                 Give it to them; they run `peer countersign` and hand it \
+                 back, and you run the same command on what returns.\n\n\
+                 RFC 3 §3 needs both signatures — one signature lets a party \
+                 assert a relationship the other never agreed to. It is also \
+                 what someone introducing you to a third party cites as \
+                 evidence (§5.1), so a peering without it can be vouched for \
+                 but not proved.",
+                self.home.join(format!("{short}.credential")).display()
+            ),
+            _ => String::new(),
+        };
         shred::remove(&self.path(artifact::Artifact::Ceremony), &mut OsRng);
         // `peer.pad` is this node's own contribution, written in the clear
         // because it has to be handed over. Once the reservoir exists it has no
@@ -4242,6 +4450,7 @@ impl App {
         if !pending.fingerprint_verified {
             msg.push_str("\n\nfingerprints were never compared. Recorded on the link.");
         }
+        msg.push_str(&credential_note);
         msg
     }
 
@@ -4920,6 +5129,15 @@ impl App {
             .find(|t| t.target == card.node_id())
             .cloned();
         let vouched = token.as_ref().map(|t| short_id(&t.introducer));
+        // **The evidence for that vouch** — RFC 3 §5.1 key 4. This node's own
+        // credential with the introducer, which is mutually signed and so
+        // proves the peering rather than asserting it. Sent only alongside the
+        // token it supports: a credential is a graph edge, and disclosing one
+        // that backs no claim is a disclosure for nothing.
+        let evidence = vouched
+            .as_ref()
+            .and_then(|introducer| self.credential_with(introducer));
+        let evidenced = evidence.is_some();
         // Spent on this node's side the moment it leaves: a token is scoped to
         // one introduction, and holding it after using it would let a second
         // request go out carrying a vouch the recipient will refuse.
@@ -4931,6 +5149,7 @@ impl App {
             Policy::default(),
             note,
             token,
+            evidence,
         );
 
         let composed = match compose::seal_to(
@@ -4966,12 +5185,30 @@ impl App {
                     card.fingerprint()
                 );
                 match vouched {
-                    Some(who) => out.push_str(&format!(
-                        "\n\n{who}'s introduction travelled with it, and is now \
-                         released from this node — a token is good for one \
-                         introduction (RFC 3 §10). Whether it counts for \
-                         anything is their decision, not the protocol's."
-                    )),
+                    Some(who) => {
+                        out.push_str(&format!(
+                            "\n\n{who}'s introduction travelled with it, and is now \
+                             released from this node — a token is good for one \
+                             introduction (RFC 3 §10). Whether it counts for \
+                             anything is their decision, not the protocol's."
+                        ));
+                        out.push_str(if evidenced {
+                            "\n\nYour peer-link credential with them went too, as \
+                             evidence (RFC 3 §5.1). It is mutually signed, so it \
+                             proves the peering rather than asserting it — which \
+                             is what lets someone who has never met your \
+                             introducer check that the vouch is real.\n\n\
+                             It also tells the recipient that you peer with them. \
+                             That is one edge of your graph, disclosed to one \
+                             person, because you chose to."
+                        } else {
+                            "\n\nNo evidence went with it: there is no completed \
+                             credential with them on this node. `peer countersign` \
+                             finishes one. Without it the vouch is worth something \
+                             only to a recipient who already peers with your \
+                             introducer."
+                        });
+                    }
                     None => out.push_str(
                         "\n\nNo introduction. Nothing is wrong with an unvouched \
                          request — it just arrives with only your note to \
@@ -7052,6 +7289,22 @@ mod tests {
         short
     }
 
+    /// A completed RFC 3 §3 credential between two nodes: proposed by one,
+    /// countersigned by the other.
+    fn completed_credential(x: &App, y: &App, now_s: u64) -> credential::Credential {
+        let (xi, yi) = (x.identity.as_ref().unwrap(), y.identity.as_ref().unwrap());
+        let mut c = credential::Credential::propose(
+            xi.signing_key(),
+            &xi.card(peering::Policy::default()),
+            &yi.card(peering::Policy::default()),
+            now_s,
+            credential::DEFAULT_TERM_DAYS,
+            [5u8; 16],
+        );
+        assert!(c.sign(yi.signing_key()));
+        c
+    }
+
     /// The token text out of an `introduce` output pane.
     fn minted(out: &str) -> String {
         out.lines()
@@ -7129,13 +7382,210 @@ mod tests {
             Policy::default(),
             "let me in",
             Some(token),
+            None,
         );
         assert!(req.verify());
 
-        // B does not peer with A, so B cannot resolve the introducer.
+        // B does not peer with A, so B cannot resolve the introducer, and
+        // nothing is attached that would let B check the vouch another way.
         let line = b.introduction_line(&req, &me, b.now_s(), &introduction::Spent::default());
         assert!(line.contains("you do not peer with"), "{line}");
-        assert!(line.contains("vouches for nothing"), "{line}");
+        assert!(line.contains("could be anyone's"), "{line}");
+        assert!(line.contains("nothing is attached"), "{line}");
+    }
+
+    /// **What evidence buys** — RFC 3 §5.1 key 4, §10.
+    ///
+    /// The same stranger's vouch as above, with the introducer's mutually
+    /// signed credential attached. It is still a stranger's vouch, and the
+    /// evaluator now has a *fact*: those two really did peer, both signatures.
+    /// §10 gives the protocol the facts and the operator the judgement, so the
+    /// verdict changes and the decision does not.
+    #[test]
+    fn evidence_turns_an_unknown_introducers_vouch_into_a_checkable_fact() {
+        let a = ready_node("ev-a");
+        let b = ready_node("ev-b");
+        let c = ready_node("ev-c");
+        let me = b.identity.as_ref().unwrap().node_id();
+
+        // A vouches for C, to B. B has never met A.
+        let token = introduction::Token::create(
+            a.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().node_id(),
+            me,
+            b.now_s(),
+            introduction::MAX_LIFETIME_S,
+            &mut OsRng,
+        );
+        // And A and C really did peer: a credential both of them signed.
+        let cred = completed_credential(&a, &c, b.now_s());
+
+        let req = request::PeerRequest::create_introduced(
+            c.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().card(Policy::default()),
+            me,
+            Policy::default(),
+            "we have a friend in common",
+            Some(token),
+            Some(cred),
+        );
+        assert!(req.verify(), "evidence is inside the signature");
+        assert_eq!(req.evidence_verdict(b.now_s()), request::Evidence::Confirms);
+
+        let line = b.introduction_line(&req, &me, b.now_s(), &introduction::Spent::default());
+        assert!(line.contains("really did peer"), "{line}");
+        assert!(line.contains("signed by both"), "{line}");
+        // And it still refuses to make the decision.
+        assert!(line.contains("your judgement"), "{line}");
+    }
+
+    /// **Any real credential verifies.** So the check that matters is not
+    /// whether the evidence is valid but whether it is about *these two* —
+    /// otherwise an attacker attaches somebody else's genuine peering.
+    #[test]
+    fn a_credential_between_other_people_proves_nothing() {
+        let a = ready_node("wp-a");
+        let b = ready_node("wp-b");
+        let c = ready_node("wp-c");
+        let d = ready_node("wp-d");
+        let me = b.identity.as_ref().unwrap().node_id();
+
+        let token = introduction::Token::create(
+            a.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().node_id(),
+            me,
+            b.now_s(),
+            introduction::MAX_LIFETIME_S,
+            &mut OsRng,
+        );
+        // A genuine, fully valid credential — between A and D, not A and C.
+        let unrelated = completed_credential(&a, &d, b.now_s());
+        assert_eq!(unrelated.verify(b.now_s()), Ok(()));
+
+        let req = request::PeerRequest::create_introduced(
+            c.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().card(Policy::default()),
+            me,
+            Policy::default(),
+            "",
+            Some(token),
+            Some(unrelated),
+        );
+        assert_eq!(
+            req.evidence_verdict(b.now_s()),
+            request::Evidence::WrongParties,
+            "someone else's peering was accepted as evidence for this one"
+        );
+        let line = b.introduction_line(&req, &me, b.now_s(), &introduction::Spent::default());
+        assert!(line.contains("proves nothing"), "{line}");
+    }
+
+    /// Evidence is inside the request's signature, like every other field.
+    #[test]
+    fn evidence_cannot_be_added_to_a_signed_request() {
+        let a = ready_node("ea-a");
+        let b = ready_node("ea-b");
+        let c = ready_node("ea-c");
+        let me = b.identity.as_ref().unwrap().node_id();
+        let token = introduction::Token::create(
+            a.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().node_id(),
+            me,
+            b.now_s(),
+            introduction::MAX_LIFETIME_S,
+            &mut OsRng,
+        );
+        let req = request::PeerRequest::create_introduced(
+            c.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().card(Policy::default()),
+            me,
+            Policy::default(),
+            "",
+            Some(token),
+            None,
+        );
+        assert!(req.verify());
+        let bolted = request::PeerRequest {
+            evidence: Some(completed_credential(&a, &c, b.now_s())),
+            ..req
+        };
+        assert!(!bolted.verify(), "evidence was outside the signature");
+    }
+
+    /// An expired credential proves a peering that has lapsed, and RFC 3 §4
+    /// makes revocation non-renewal — so it is refused rather than aged.
+    #[test]
+    fn expired_evidence_is_refused() {
+        let a = ready_node("ee-a");
+        let b = ready_node("ee-b");
+        let c = ready_node("ee-c");
+        let me = b.identity.as_ref().unwrap().node_id();
+        let long_ago = b.now_s() - credential::MAX_TERM_DAYS * 86_400 - 1;
+        let stale = completed_credential(&a, &c, long_ago);
+
+        let token = introduction::Token::create(
+            a.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().node_id(),
+            me,
+            b.now_s(),
+            introduction::MAX_LIFETIME_S,
+            &mut OsRng,
+        );
+        let req = request::PeerRequest::create_introduced(
+            c.identity.as_ref().unwrap().signing_key(),
+            c.identity.as_ref().unwrap().card(Policy::default()),
+            me,
+            Policy::default(),
+            "",
+            Some(token),
+            Some(stale),
+        );
+        assert_eq!(
+            req.evidence_verdict(b.now_s()),
+            request::Evidence::Invalid(credential::Invalid::Expired)
+        );
+    }
+
+    /// `peer countersign` completes a credential and stores it where the
+    /// request path finds it, and refuses one between two other nodes.
+    #[test]
+    fn countersigning_completes_a_credential_and_refuses_a_strangers() {
+        let mut x = ready_node("cs-x");
+        let mut y = ready_node("cs-y");
+        let short_y = peer_up(&mut x, &mut y);
+        let _ = peer_up(&mut y, &mut x);
+
+        // X proposes; the file lands in X's home.
+        let proposal = x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default()));
+        let path = x.home.join("proposal.credential");
+        std::fs::write(&path, &proposal).unwrap();
+
+        // Y countersigns it.
+        let ypath = y.home.join("proposal.credential");
+        std::fs::write(&ypath, &proposal).unwrap();
+        let out = y.peer_countersign(Some(ypath.to_str().unwrap()));
+        assert!(out.contains("is complete"), "{out}");
+        let short_x = short_id(&x.identity.as_ref().unwrap().node_id());
+        assert!(
+            y.credential_with(&short_x).is_some(),
+            "Y did not store the completed credential"
+        );
+
+        // And X, given the returned document, stores it too.
+        let done = std::fs::read(y.peer_path(&short_x, artifact::PeerFile::Credential)).unwrap();
+        std::fs::write(&path, &done).unwrap();
+        let out = x.peer_countersign(Some(path.to_str().unwrap()));
+        assert!(out.contains("is complete"), "{out}");
+        assert!(x.credential_with(&short_y).is_some());
+
+        // A credential between two other nodes is refused.
+        let z = ready_node("cs-z");
+        let w = ready_node("cs-w");
+        let theirs = completed_credential(&z, &w, x.now_s());
+        let p = x.home.join("theirs.credential");
+        std::fs::write(&p, theirs.encode()).unwrap();
+        let out = x.peer_countersign(Some(p.to_str().unwrap()));
+        assert!(out.contains("not yours to sign"), "{out}");
     }
 
     /// An introduction is honoured once — RFC 3 §10's "single-use" — and the
@@ -7163,6 +7613,7 @@ mod tests {
             Policy::default(),
             "",
             Some(token.clone()),
+            None,
         );
 
         let now = b.now_s();

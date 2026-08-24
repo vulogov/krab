@@ -410,6 +410,13 @@ pub enum Peering {
     /// Ingest the peer's contribution and sign the peer-link, recording how it
     /// arrived and therefore what the reservoir is actually worth.
     Seal,
+    /// Countersign the peer's `peer-link` credential — RFC 3 §3, §5.3.
+    ///
+    /// The second signature. Until it exists the document is a proposal: §3 is
+    /// explicit that "a singly-signed document lets one party assert a
+    /// relationship the other never agreed to", and the credential is cited as
+    /// evidence by §5.1, so a claim is not good enough.
+    Countersign,
     /// Show the state of an in-progress ceremony.
     Status,
     /// Mix fresh entropy into an established peering — `krab_crypto::rekey`.
@@ -432,6 +439,7 @@ impl Peering {
             "reseal" => Peering::Reseal,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,
+            "countersign" => Peering::Countersign,
             "status" => Peering::Status,
             "rekey" => Peering::Rekey,
             _ => return None,

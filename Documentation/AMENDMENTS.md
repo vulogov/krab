@@ -13,6 +13,48 @@ out of implementing the thing the paragraph describes.
 | 6 | RFC 1 §11 | the checks are prose; three of six were never implemented | **ADOPTED** 2026-08-07 |
 | 7 | RFC 3 §9.1 | "153 bytes computed" for a rollcall entry, with no field list to compute it from | open — see below |
 | 8 | RFC 3 §5.1 | the table numbers keys 0–7 and never numbers the signature | open — see below |
+| 9 | RFC 3 §3 | nothing says which party is A, and both must agree or neither can verify | open — see below |
+
+## 9. RFC 3 §3 does not say which party is A
+
+§3's credential has "party A" at key 1 and "party B" at key 2, and both
+parties sign the same body. **Nothing says which is which.**
+
+It cannot be "whoever started it": the two ends of a courier exchange do not
+agree on who started anything, and §5's negotiation is explicitly a chain of
+static documents where "none requires the other party to be online". Two
+implementations choosing differently produce bodies that differ, so neither
+side's signature verifies against the other's document — and the symptom is
+that peering stops working, silently, with both ends believing they signed.
+
+This implementation orders them: **party A is the one whose `sig_pk` sorts
+lower**, compared byte by byte. Deterministic, needs no coordination, and
+identical on both sides whichever one assembles the document.
+
+Suggested text for §3, after the table:
+
+> The parties MUST be ordered canonically: **party A is the party whose
+> `sig_pk` is lexicographically smaller** when the two 32-byte keys are
+> compared as unsigned byte strings. This is not a matter of who initiated —
+> a credential is a static document and either party may assemble it — and an
+> implementation that orders the parties otherwise produces a body that the
+> counterparty cannot verify.
+>
+> `terms A→B` (key 6) are the terms party A will accept from party B, and key
+> 7 the converse, so the direction of each is fixed by the ordering above and
+> not by who wrote the document.
+
+The second paragraph closes a smaller version of the same hole: with the
+parties ordered but the terms not, an implementation could still put its own
+terms in key 6 regardless of which party it was.
+
+**Related, and worth stating in §5.3.** §3 requires both signatures and §5.3
+says "X countersigns the terms in the final counter, producing the
+`peer-link`", but no section describes how the partly-signed document travels
+or what a recipient does with one that carries a single signature. This
+implementation treats one signature as a proposal and refuses it as a
+credential, which seems the only safe reading of §3's own argument — but it is
+a reading, not something the text says.
 
 ## 8. RFC 3 §5.1's `peer-request` has an unnumbered field
 

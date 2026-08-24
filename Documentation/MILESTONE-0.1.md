@@ -316,13 +316,31 @@ channels and prekey batches, so RFC 3 §9's whole public tier came to one
 payload type, a fourth signing domain and a command. That is the shape the
 design predicted, and some evidence the bulletin abstraction is the right one.
 
-Introduction tokens cost more, and the extra was not the tokens. RFC 3 §5.1
+Introduction tokens cost more, and the extra was never the tokens. RFC 3 §5.1
 puts one at `peer-request` key 6, which was occupied — see `AMENDMENTS.md` #8 —
 and evaluating one needs a node that can *see* an inbound request, which none
 could: `receive::scan_requests` existed, was tested, and had no caller in the
 application. A node could send a first-contact request and never observe one
-arriving. Both are fixed, and neither would have surfaced without something
-needing them.
+arriving.
+
+Then §5.1's `evidence` field turned out to rest on a document that did not
+exist at all. **RFC 3 §3's mutually signed `peer-link` credential was never
+built**: a completed peering stored the counterparty's card, which carries one
+signature — theirs — and §3 is explicit that "a singly-signed document lets one
+party assert a relationship the other never agreed to … which matters because
+these propagate one hop (§8) and are cited as evidence (§5.1)". Sending a card
+as evidence would have shipped exactly the forgeable claim §3 forbids.
+
+So `credential.rs` builds §3: both signatures, canonical party order, §4's
+60–90 day term with the 180-day ceiling enforced rather than warned about, and
+§8.3's share bits defaulting to false. `peer seal` proposes one and `peer
+countersign` completes it. `AMENDMENTS.md` #9 records that §3 never says which
+party is A, which two implementations must agree on or neither can verify the
+other.
+
+None of the three would have surfaced without something needing them. That is
+the argument for building the last feature on the list rather than declaring it
+optional.
 
 ### 5.1 The scope argument, and what happened to it
 

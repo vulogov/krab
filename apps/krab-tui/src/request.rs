@@ -35,10 +35,33 @@
 //! reachable only by courier (RFC 3 §5.1). That is why rollcall entries carry
 //! no endpoints — a request does not need one.
 
+use crate::credential;
 use crate::introduction;
 use crate::peering::{Card, Policy};
 use krab_core::cbor::{Error as CborError, Item, Reader, Writer};
 use krab_crypto::sign::{Sig, SigningKey, VerifyingKey};
+
+/// What a request's `evidence` field establishes — RFC 3 §5.1 key 4.
+///
+/// No variant means "accept". §10 gives the protocol the facts and the
+/// operator the judgement, and a verdict called `Trusted` would be this module
+/// making the second one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// No credential attached. Common and not a failure — most first contact
+    /// is unvouched, and §5.1 makes the field optional.
+    Absent,
+    /// A credential that does not verify. See [`credential::Invalid`].
+    Invalid(credential::Invalid),
+    /// It verifies, and is between two nodes other than the introducer and
+    /// the requester. **Any real credential verifies**, so this is the check
+    /// that matters: without it, an attacker attaches somebody else's genuine
+    /// peering and it passes.
+    WrongParties,
+    /// The introducer and the requester really did peer, mutually signed by
+    /// both, unexpired. **Still not a reason to say yes.**
+    Confirms,
+}
 
 /// Domain label for the inner signature. Frozen.
 ///
@@ -73,6 +96,23 @@ pub struct PeerRequest {
     /// an introducer with no token is visibly that rather than silently
     /// unvouched.
     pub via: Option<[u8; 32]>,
+    /// Key 4 — the introducer's `peer-link` with the requester (RFC 3 §5.1).
+    ///
+    /// **What makes the vouch checkable rather than merely signed.** §10 calls
+    /// it "the cryptographic component: the introducer's signed link with the
+    /// requester proves the vouch is real."
+    ///
+    /// A token alone says *someone* vouched. It is worth something only to an
+    /// evaluator who already peers with that someone. Evidence adds a second,
+    /// independent fact — that the introducer and the requester really did
+    /// peer, mutually signed by both — which is checkable by anyone, including
+    /// an evaluator who has never met the introducer.
+    ///
+    /// It is a deliberate disclosure of one graph edge to one party. RFC 3
+    /// §9.1 forbids *publishing* a link; this is the opposite of publishing —
+    /// it travels inside a sealed object addressed to the single node
+    /// evaluating it, and only because the requester chose to send it.
+    pub evidence: Option<credential::Credential>,
     /// Key 5 — proposed terms.
     pub terms: Policy,
     /// Key 6 — an introduction token (RFC 3 §10), when there is one.
@@ -105,12 +145,16 @@ impl PeerRequest {
         from: &Card,
         to: &[u8; 32],
         via: Option<&[u8; 32]>,
+        evidence: Option<&credential::Credential>,
         terms: &Policy,
         token: Option<&introduction::Token>,
         note: &str,
     ) -> Vec<u8> {
-        // Keys 0, 1, 2, 5 and 7 always appear; 3 and 6 only when present.
-        let n = 5 + usize::from(via.is_some()) + usize::from(token.is_some());
+        // Keys 0, 1, 2, 5 and 7 always appear; 3, 4 and 6 only when present.
+        let n = 5
+            + usize::from(via.is_some())
+            + usize::from(evidence.is_some())
+            + usize::from(token.is_some());
         let mut w = Writer::new();
         w.map(n);
         w.uint(0).uint(1); // version
@@ -118,6 +162,9 @@ impl PeerRequest {
         w.uint(2).bstr(to);
         if let Some(v) = via {
             w.uint(3).bstr(v);
+        }
+        if let Some(e) = evidence {
+            w.uint(4).bstr(&e.encode());
         }
         w.uint(5).bstr(&terms.encode());
         if let Some(t) = token {
@@ -148,14 +195,29 @@ impl PeerRequest {
         terms: Policy,
         note: &str,
         token: Option<introduction::Token>,
+        evidence: Option<credential::Credential>,
     ) -> PeerRequest {
         let via = token.as_ref().map(|t| t.introducer);
-        let msg = PeerRequest::signed_bytes(&from, &to, via.as_ref(), &terms, token.as_ref(), note);
+        // Evidence without a token names an introducer who vouched for
+        // nothing, so it is dropped rather than sent: a credential is a graph
+        // edge, and disclosing one that supports no claim is a disclosure for
+        // no reason.
+        let evidence = token.as_ref().and(evidence);
+        let msg = PeerRequest::signed_bytes(
+            &from,
+            &to,
+            via.as_ref(),
+            evidence.as_ref(),
+            &terms,
+            token.as_ref(),
+            note,
+        );
         let sig = signing.sign(&msg).0;
         PeerRequest {
             from,
             to,
             via,
+            evidence,
             terms,
             token,
             note: note.to_string(),
@@ -189,11 +251,41 @@ impl PeerRequest {
             &self.from,
             &self.to,
             self.via.as_ref(),
+            self.evidence.as_ref(),
             &self.terms,
             self.token.as_ref(),
             &self.note,
         );
         VerifyingKey::from_bytes(self.from.identity_pk).verify(&msg, &Sig(self.sig))
+    }
+
+    /// What the attached evidence proves — RFC 3 §5.1 key 4, §10.
+    ///
+    /// **Facts, not a judgement.** §10 divides the two deliberately: "the
+    /// protocol establishes facts, the operator makes judgements." So this
+    /// answers whether the introducer and the requester provably peered, and
+    /// says nothing about whether that is reason enough.
+    pub fn evidence_verdict(&self, now_s: u64) -> Evidence {
+        let Some(cred) = &self.evidence else {
+            return Evidence::Absent;
+        };
+        let Some(via) = self.via else {
+            // Evidence naming no introducer supports no claim. `verify`
+            // already refuses a `via` that disagrees with the token, so this
+            // is a request assembled somewhere other than by this program.
+            return Evidence::WrongParties;
+        };
+        if let Err(why) = cred.verify(now_s) {
+            return Evidence::Invalid(why);
+        }
+        // **The parties must be the two this request is about.** A valid
+        // credential between two other nodes proves a peering that has nothing
+        // to do with the person asking — and it is exactly what an attacker
+        // would attach, because any real credential verifies.
+        if !cred.is_between(&via, &self.from.node_id()) {
+            return Evidence::WrongParties;
+        }
+        Evidence::Confirms
     }
 
     /// Evaluate the introduction this request carries, if any — RFC 3 §10.
@@ -230,7 +322,10 @@ impl PeerRequest {
     /// Deterministic CBOR, signature included.
     pub fn encode(&self) -> Vec<u8> {
         // As `signed_bytes`, plus key 8 for the signature.
-        let n = 6 + usize::from(self.via.is_some()) + usize::from(self.token.is_some());
+        let n = 6
+            + usize::from(self.via.is_some())
+            + usize::from(self.evidence.is_some())
+            + usize::from(self.token.is_some());
         let mut w = Writer::new();
         w.map(n);
         w.uint(0).uint(1);
@@ -238,6 +333,9 @@ impl PeerRequest {
         w.uint(2).bstr(&self.to);
         if let Some(v) = &self.via {
             w.uint(3).bstr(v);
+        }
+        if let Some(e) = &self.evidence {
+            w.uint(4).bstr(&e.encode());
         }
         w.uint(5).bstr(&self.terms.encode());
         if let Some(t) = &self.token {
@@ -254,6 +352,7 @@ impl PeerRequest {
         let mut m = r.map()?;
         let (mut from, mut to, mut note, mut sig) = (None, None, String::new(), None);
         let (mut via, mut token, mut terms) = (None, None, None);
+        let mut evidence = None;
         // Keys 0, 1, 2, 5, 7 and 8 are required; 3 and 6 are optional, so the
         // mask covers the six that must appear and nothing else.
         let mut seen = 0u8;
@@ -270,6 +369,9 @@ impl PeerRequest {
                 }
                 (3, Item::Bstr(b)) => {
                     via = Some(<[u8; 32]>::try_from(b).map_err(|_| CborError::Malformed)?);
+                }
+                (4, Item::Bstr(b)) => {
+                    evidence = Some(credential::Credential::decode(b).ok_or(CborError::Malformed)?);
                 }
                 (5, Item::Bstr(b)) => {
                     terms = Some(Policy::decode(b).ok_or(CborError::Malformed)?);
@@ -296,6 +398,7 @@ impl PeerRequest {
             from: from.ok_or(CborError::Truncated)?,
             to: to.ok_or(CborError::Truncated)?,
             via,
+            evidence,
             terms: terms.ok_or(CborError::Truncated)?,
             token,
             note,
@@ -320,7 +423,7 @@ mod tests {
     fn request(seed: u64, to: [u8; 32], note: &str) -> PeerRequest {
         let k = signer(seed);
         let c = card_for(&k, seed as u8);
-        PeerRequest::create_introduced(&k, c, to, Policy::default(), note, None)
+        PeerRequest::create_introduced(&k, c, to, Policy::default(), note, None, None)
     }
 
     #[test]
@@ -428,7 +531,7 @@ mod tests {
         assert_ne!(DOMAIN_REQUEST, crate::peering::DOMAIN_CARD);
         let r = request(10, [4; 32], "n");
         assert!(
-            PeerRequest::signed_bytes(&r.from, &r.to, None, &r.terms, None, &r.note)
+            PeerRequest::signed_bytes(&r.from, &r.to, None, None, &r.terms, None, &r.note)
                 .starts_with(DOMAIN_REQUEST)
         );
     }
