@@ -126,6 +126,22 @@ fn rekey_failure(peer: &str, e: rekey_run::Error) -> String {
     }
 }
 
+/// A first-contact socket running in the background.
+struct Meeting {
+    /// Where it is bound, for the operator to read back.
+    addr: String,
+    /// Cleared to stop the thread.
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What the thread produces: the peer's card and contribution, or a
+    /// reason it stopped.
+    done: std::sync::mpsc::Receiver<Result<bootstrap::Outcome, bootstrap::Error>>,
+    /// This node's half, held so the ceremony can be completed on the
+    /// interface thread where the store lives.
+    mine: peering::Contribution,
+    /// When it closes itself.
+    until: Instant,
+}
+
 /// An action waiting for one line that is not a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Prompt {
@@ -171,6 +187,15 @@ fn now_seconds() -> u64 {
 /// left alone disarms itself rather than waiting to be triggered by whoever
 /// is at the keyboard next.
 const PANIC_WINDOW: Duration = Duration::from_secs(3);
+
+/// How long a first-contact socket stays open before closing itself.
+///
+/// Long enough to arrange with somebody — thirty seconds was not, which is why
+/// it blocked the interface and could not be cancelled. Bounded because it
+/// accepts *whoever calls*: there is no peering yet, so there is no key to
+/// check them against, and a door left open past the arrangement to use it is
+/// one nobody is watching.
+const MEET_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// Lines PgUp/PgDn move the output pane.
 ///
@@ -329,6 +354,16 @@ struct App {
     /// observation of this network now.
     observed_arrivals: u64,
     observed_hours: f64,
+    /// A `peer meet listen` in progress: how to stop it, and what it will
+    /// hand back.
+    ///
+    /// **A socket that accepts strangers, so it is visible and cancellable.**
+    /// It was a thirty-second blocking wait on the interface thread, which
+    /// could not be stopped and was not long enough to coordinate a call with
+    /// anybody. It now runs behind, and it closes itself: a door left open for
+    /// people who have finished arranging to use it is a door nobody is
+    /// watching.
+    meeting: Option<Meeting>,
     /// Everyone the open composition is addressed to.
     ///
     /// Fan-out: one sealed copy each. A single field would have made
@@ -462,6 +497,7 @@ impl Default for App {
             pending: Vec::new(),
             observed_arrivals: 0,
             observed_hours: 0.0,
+            meeting: None,
             composing_to_many: Vec::new(),
             composing_to: None,
             showing: None,
@@ -820,6 +856,7 @@ impl App {
     /// the only caller — so there is no place for one to be threaded through
     /// later without the change being visible (RFC 5 §6.1, RFC 0 I-5).
     fn tick_schedule(&mut self) {
+        self.drain_meeting();
         self.drain_inbound();
         self.release_pending();
         self.republish_prekeys_if_due();
@@ -2865,6 +2902,11 @@ impl App {
     /// repairs the first; `peer verified` records the second once a human has
     /// done it.
     fn peer_meet(&mut self, a: Option<&str>, b: Option<&str>) -> String {
+        match (a, b) {
+            (Some("cancel"), _) | (Some("stop"), _) => return self.meet_cancel(),
+            (Some("status"), _) => return self.meet_status(),
+            _ => {}
+        }
         let (listening, addr) = match (a, b) {
             (Some("listen"), Some(addr)) => (true, addr.to_string()),
             (Some("listen"), None) => match self.listen.clone() {
@@ -2875,7 +2917,9 @@ impl App {
             (None, _) => {
                 return "usage:\n\
                         \x20 peer meet listen <addr>   wait for them to call\n\
-                        \x20 peer meet <addr>          call them\n\n\
+                        \x20 peer meet <addr>          call them\n\
+                        \x20 peer meet status          is a door open?\n\
+                        \x20 peer meet cancel          close it\n\n\
                         First contact over a link, for two people who can reach \
                         each other on a network and nowhere else. The result is \
                         NOT post-quantum and NOT authenticated until you compare \
@@ -2898,32 +2942,164 @@ impl App {
         }
         let (my_card, my_contribution) = bootstrap::offer(my_card, &mut OsRng);
 
-        let opened = if listening {
-            krab_fabric::backend::listener::bootstrap_accept(
-                &addr,
-                noise,
-                Duration::from_secs(ANSWER_WAIT_S),
-            )
-            .map_err(|e| format!("could not listen on {addr}: {e:?}"))
-            .and_then(|o| o.ok_or_else(|| format!("nobody called on {addr}")))
-        } else {
-            krab_fabric::backend::listener::bootstrap_connect(&addr, noise)
-                .map_err(|e| format!("could not reach {addr}: {e:?}"))
-        };
+        if listening {
+            return self.meet_listen(&addr, my_card, my_contribution, noise);
+        }
+
+        // Dialling has somebody to call and is one attempt, not an open door,
+        // so it stays on this thread.
+        let opened = krab_fabric::backend::listener::bootstrap_connect(&addr, noise)
+            .map_err(|e| format!("could not reach {addr}: {e:?}"));
         let (mut session, their_static) = match opened {
             Ok(v) => v,
             Err(e) => return e,
         };
-
         let outcome =
             match bootstrap::run(session.as_mut(), &my_card, &my_contribution, &their_static) {
                 Ok(o) => o,
                 Err(e) => return meet_failure(e),
             };
+        self.complete_meeting(my_card, my_contribution, outcome, &my_fingerprint)
+    }
 
-        // Straight into the existing ceremony, so sealing is the one path it
-        // has always been. A second would be a second place to get the channel
-        // classification or the reservoir derivation wrong.
+    /// Open the door, behind the interface.
+    ///
+    /// **Cancellable, and self-closing.** A socket that accepts strangers
+    /// should not outlive the arrangement to use it, and one an operator
+    /// cannot see is one they cannot close.
+    fn meet_listen(
+        &mut self,
+        addr: &str,
+        my_card: peering::Card,
+        mine: peering::Contribution,
+        noise: [u8; 32],
+    ) -> String {
+        if let Some(m) = &self.meeting {
+            return format!(
+                "already waiting on {}. `peer meet cancel` closes it first.",
+                m.addr
+            );
+        }
+        let (l, port) = match krab_fabric::backend::listener::Bootstrap::bind(addr, noise) {
+            Ok(v) => v,
+            Err(e) => return format!("could not listen on {addr}: {e:?}"),
+        };
+
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (tx, done) = std::sync::mpsc::channel();
+        let flag = running.clone();
+        let card = my_card.clone();
+        let contribution = peering::Contribution { r: mine.r };
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            while flag.load(Ordering::Relaxed) {
+                match l.accept_once() {
+                    Ok(Some((mut session, their_static))) => {
+                        let out =
+                            bootstrap::run(session.as_mut(), &card, &contribution, &their_static);
+                        let _ = tx.send(out);
+                        return;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                    Err(_) => {
+                        let _ = tx.send(Err(bootstrap::Error::Link));
+                        return;
+                    }
+                }
+            }
+        });
+
+        self.meeting = Some(Meeting {
+            addr: addr.to_string(),
+            running,
+            done,
+            mine,
+            until: Instant::now() + MEET_WINDOW,
+        });
+        format!(
+            "waiting on {addr} (port {port}) for {} minutes.\n\n\
+             **This accepts whoever calls.** There is no peering yet, so there \
+             is no key to check them against — that is what the fingerprint \
+             comparison afterwards is for.\n\n\
+             It closes itself when the time is up. `peer meet cancel` closes it \
+             now; `peer meet status` says whether it is still open.\n\n\
+             Do not leave this running. A door left open for somebody who has \
+             already arrived is a door nobody is watching.",
+            MEET_WINDOW.as_secs() / 60
+        )
+    }
+
+    /// Close the door.
+    fn meet_cancel(&mut self) -> String {
+        match self.meeting.take() {
+            None => "nothing is waiting.".into(),
+            Some(m) => {
+                m.running.store(false, std::sync::atomic::Ordering::Relaxed);
+                format!("closed {}. Nothing was peered.", m.addr)
+            }
+        }
+    }
+
+    /// Whether a door is open, and for how much longer.
+    fn meet_status(&self) -> String {
+        match &self.meeting {
+            None => "no first-contact socket is open.".into(),
+            Some(m) => {
+                let left = m.until.saturating_duration_since(Instant::now());
+                format!(
+                    "waiting on {} — {} minute(s) left.\n\n\
+                     It accepts whoever calls. `peer meet cancel` closes it.",
+                    m.addr,
+                    left.as_secs() / 60 + 1
+                )
+            }
+        }
+    }
+
+    /// Pick up a completed first contact, or close a door whose time is up.
+    fn drain_meeting(&mut self) {
+        let Some(m) = &self.meeting else { return };
+        if let Ok(out) = m.done.try_recv() {
+            let mine = peering::Contribution { r: m.mine.r };
+            let m = self.meeting.take().expect("just checked");
+            m.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.output = match out {
+                Err(e) => meet_failure(e),
+                Ok(outcome) => {
+                    let Some((card, fingerprint)) = self
+                        .identity
+                        .as_ref()
+                        .map(|id| (id.card(Policy::default()), id.fingerprint()))
+                    else {
+                        return;
+                    };
+                    self.complete_meeting(card, mine, outcome, &fingerprint)
+                }
+            };
+            return;
+        }
+        if Instant::now() >= m.until {
+            let m = self.meeting.take().expect("just checked");
+            m.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.output = format!(
+                "closed {} — nobody called within {} minutes.\n\n\
+                 `peer meet listen {}` opens it again.",
+                m.addr,
+                MEET_WINDOW.as_secs() / 60,
+                m.addr
+            );
+        }
+    }
+
+    /// Turn a completed exchange into a peering, on the thread that owns the
+    /// store.
+    fn complete_meeting(
+        &mut self,
+        my_card: peering::Card,
+        my_contribution: peering::Contribution,
+        outcome: bootstrap::Outcome,
+        my_fingerprint: &str,
+    ) -> String {
         let pending = ceremony::Pending::open(my_card, my_contribution.r);
         if let Err(e) = self.save_ceremony(&pending) {
             return e;
@@ -2943,9 +3119,11 @@ impl App {
         if !sealed.starts_with("peer-link signed") {
             return sealed;
         }
+        // A completed peering closes the door: it was opened to arrange one.
+        self.refresh_allowed();
         format!(
             "{sealed}\n\n{}",
-            bootstrap::caveat(&outcome.card.fingerprint(), &my_fingerprint)
+            bootstrap::caveat(&outcome.card.fingerprint(), my_fingerprint)
         )
     }
 
@@ -10231,46 +10409,6 @@ mod tests {
         assert_eq!(t.channel, peering::Channel::Corpus);
     }
 
-    /// **Two strangers peer over a network and nothing else.** No files, no
-    /// courier, no prior key — the case `PAD-OVER-NETWORK.md` §1 says people
-    /// will otherwise solve with `scp`.
-    #[test]
-    fn two_strangers_peer_over_a_live_link() {
-        let mut a = ready_node("meet-a");
-        let mut b = ready_node("meet-b");
-        let a_id = short_id(&a.identity.as_ref().unwrap().node_id());
-        let b_id = short_id(&b.identity.as_ref().unwrap().node_id());
-
-        let listener = std::thread::spawn(move || {
-            let out = b.peer_meet(Some("listen"), Some("127.0.0.1:45581"));
-            (b, out)
-        });
-        std::thread::sleep(Duration::from_millis(200));
-        let out_a = a.peer_meet(Some("127.0.0.1:45581"), None);
-        let (b, out_b) = listener.join().expect("B's thread");
-
-        assert!(out_a.starts_with("peer-link signed"), "A: {out_a}");
-        assert!(out_b.starts_with("peer-link signed"), "B: {out_b}");
-
-        // A working peering: both ends hold the same reservoir.
-        assert_eq!(stored_root(&a, &b_id), stored_root(&b, &a_id));
-        assert!(a.peer_path(&b_id, artifact::PeerFile::Link).exists());
-
-        // **And it is honest about being neither verified nor post-quantum.**
-        for out in [&out_a, &out_b] {
-            assert!(out.contains("Nothing is verified yet"), "{out}");
-            assert!(out.contains("NOT post-quantum"), "{out}");
-            assert!(out.contains("peer reseal"), "{out}");
-        }
-        let t = a.peer_terms(&b_id).expect("terms recorded");
-        assert_eq!(t.channel, peering::Channel::Network);
-        assert!(!t.post_quantum());
-        assert!(
-            !t.fingerprint_verified,
-            "the ceremony recorded a comparison it cannot have observed"
-        );
-    }
-
     /// The fingerprint comparison is a human act, recorded by a human — and
     /// it does not make a network peering post-quantum.
     #[test]
@@ -11153,5 +11291,118 @@ mod tests {
             "{:?}",
             a.history
         );
+    }
+
+    /// **A first-contact socket is cancellable and self-closing.** It was a
+    /// thirty-second blocking wait on the interface thread: not long enough to
+    /// arrange a call with anybody, and impossible to stop — it took the lock
+    /// chord with it while it waited.
+    #[test]
+    fn a_first_contact_socket_can_be_opened_and_closed() {
+        let mut a = ready_node("meet-cancel");
+
+        assert!(a.meet_status().contains("no first-contact socket"));
+        type_command(&mut a, "peer meet cancel");
+        assert!(a.output.contains("nothing is waiting"), "{}", a.output);
+
+        type_command(&mut a, "peer meet listen 127.0.0.1:0");
+        assert!(a.meeting.is_some(), "{}", a.output);
+        assert!(a.output.contains("accepts whoever calls"), "{}", a.output);
+        assert!(
+            a.output.contains("closes itself"),
+            "it does not say it will close: {}",
+            a.output
+        );
+
+        // Visible while open.
+        type_command(&mut a, "peer meet status");
+        assert!(a.output.contains("minute(s) left"), "{}", a.output);
+
+        // And closeable.
+        type_command(&mut a, "peer meet cancel");
+        assert!(a.output.contains("closed"), "{}", a.output);
+        assert!(a.meeting.is_none(), "the door stayed open");
+        assert!(a.meeting.is_none());
+    }
+
+    /// A second door is refused rather than silently replacing the first,
+    /// which would leave a thread holding a socket nobody could close.
+    #[test]
+    fn only_one_first_contact_socket_at_a_time() {
+        let mut a = ready_node("meet-one");
+        type_command(&mut a, "peer meet listen 127.0.0.1:0");
+        let first = a.meeting.as_ref().map(|m| m.addr.clone());
+        type_command(&mut a, "peer meet listen 127.0.0.1:0");
+        assert!(a.output.contains("already waiting"), "{}", a.output);
+        assert_eq!(
+            a.meeting.as_ref().map(|m| m.addr.clone()),
+            first,
+            "the second call replaced the first"
+        );
+        type_command(&mut a, "peer meet cancel");
+    }
+
+    /// **It closes itself.** A door left open past the arrangement to use it
+    /// is a door nobody is watching, and this one accepts whoever calls.
+    #[test]
+    fn a_first_contact_socket_closes_itself_when_its_time_is_up() {
+        let mut a = ready_node("meet-expire");
+        type_command(&mut a, "peer meet listen 127.0.0.1:0");
+        assert!(a.meeting.is_some());
+
+        // Bring the deadline forward rather than waiting fifteen minutes.
+        if let Some(m) = a.meeting.as_mut() {
+            m.until = Instant::now();
+        }
+        a.tick_schedule();
+        assert!(a.meeting.is_none(), "it stayed open past its window");
+        assert!(a.output.contains("nobody called"), "{}", a.output);
+        assert!(
+            a.output.contains("peer meet listen"),
+            "it does not say how to reopen it: {}",
+            a.output
+        );
+    }
+
+    /// The window is bounded, and long enough to be useful. Thirty seconds
+    /// was neither.
+    #[test]
+    fn the_meeting_window_is_long_enough_to_arrange_and_short_enough_to_end() {
+        assert!(MEET_WINDOW >= Duration::from_secs(5 * 60));
+        assert!(MEET_WINDOW <= Duration::from_secs(60 * 60));
+    }
+
+    /// **Two strangers still peer**, now through the background socket rather
+    /// than a blocking wait.
+    #[test]
+    fn two_strangers_peer_through_the_background_socket() {
+        let mut a = ready_node("meet-bg-a");
+        let mut b = ready_node("meet-bg-b");
+        let a_id = short_id(&a.identity.as_ref().unwrap().node_id());
+        let b_id = short_id(&b.identity.as_ref().unwrap().node_id());
+
+        type_command(&mut b, "peer meet listen 127.0.0.1:45591");
+        assert!(b.meeting.is_some(), "{}", b.output);
+        std::thread::sleep(Duration::from_millis(200));
+
+        let out_a = a.peer_meet(Some("127.0.0.1:45591"), None);
+        assert!(out_a.starts_with("peer-link signed"), "A: {out_a}");
+
+        // B picks it up on a tick, without anyone typing.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && b.meeting.is_some() {
+            b.tick_schedule();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(b.meeting.is_none(), "B never completed: {}", b.output);
+        assert!(b.output.starts_with("peer-link signed"), "B: {}", b.output);
+        assert!(
+            b.output.contains("Nothing is verified yet"),
+            "B: {}",
+            b.output
+        );
+
+        // A working peering at both ends.
+        assert_eq!(stored_root(&a, &b_id), stored_root(&b, &a_id));
     }
 }

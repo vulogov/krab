@@ -33,32 +33,50 @@
 //! happens to be digits.
 
 /// One token from a command line.
+///
+/// **The original text is kept.** An earlier version stored a parsed `i64`
+/// and rendered it back for `text()`, which silently rewrote any identifier
+/// that happened to be all digits: a short id of `09437082` became
+/// `9437082`, and the verb addressed a peer that did not exist — or, worse,
+/// a different one. Hex identifiers are digits eight times out of sixteen.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Word {
-    /// A bare or quoted string.
-    Str(String),
-    /// A bare token that parsed as an integer.
-    Int(i64),
+pub struct Word {
+    raw: String,
+    /// The value, if this was written as a bare number. Never used to
+    /// reconstruct the text.
+    num: Option<i64>,
 }
 
 impl Word {
-    /// The text, whatever the token was.
+    /// A bare token, classified.
+    fn bare(raw: String) -> Word {
+        // A leading zero means the operator wrote an identifier, whatever the
+        // characters are. Numbers do not have leading zeros and identifiers
+        // do, so this is the one place the distinction is decidable.
+        let num = if raw.len() > 1 && raw.starts_with('0') {
+            None
+        } else {
+            raw.parse::<i64>().ok()
+        };
+        Word { raw, num }
+    }
+
+    /// A quoted token. Always text, never a number.
+    fn quoted(raw: String) -> Word {
+        Word { raw, num: None }
+    }
+
+    /// The text exactly as it was typed, minus quoting.
     pub fn text(&self) -> String {
-        match self {
-            Word::Str(s) => s.clone(),
-            Word::Int(n) => n.to_string(),
-        }
+        self.raw.clone()
     }
 
     /// The value, if this token was written as a bare number.
     ///
-    /// A quoted `"40000"` is a string and stays one. A port and a filename
-    /// are different kinds of thing, and the operator said which.
+    /// A quoted `"40000"` is a string and stays one; so is `040000`, because
+    /// a leading zero is how an identifier is written and not how a number is.
     pub fn int(&self) -> Option<i64> {
-        match self {
-            Word::Int(n) => Some(*n),
-            Word::Str(_) => None,
-        }
+        self.num
     }
 }
 
@@ -117,7 +135,7 @@ pub fn split(line: &str) -> Result<Vec<Word>, Error> {
                 }
             }
             // A quoted token is always a string, never a number.
-            out.push(Word::Str(s));
+            out.push(Word::quoted(s));
             continue;
         }
         let mut s = String::new();
@@ -128,10 +146,7 @@ pub fn split(line: &str) -> Result<Vec<Word>, Error> {
             s.push(c);
             chars.next();
         }
-        out.push(match s.parse::<i64>() {
-            Ok(n) => Word::Int(n),
-            Err(_) => Word::Str(s),
-        });
+        out.push(Word::bare(s));
     }
     Ok(out)
 }
@@ -194,9 +209,9 @@ mod tests {
     #[test]
     fn quoting_decides_whether_a_digit_string_is_a_number() {
         let w = split(r#"listen 40000 "40000""#).unwrap();
-        assert_eq!(w[1], Word::Int(40_000));
         assert_eq!(w[1].int(), Some(40_000));
-        assert_eq!(w[2], Word::Str("40000".into()));
+        assert_eq!(w[1].int(), Some(40_000));
+        assert_eq!(w[2].text(), "40000");
         assert_eq!(w[2].int(), None, "a quoted number is a string");
         // And both still render the same when only the text is wanted.
         assert_eq!(w[1].text(), w[2].text());
@@ -205,16 +220,15 @@ mod tests {
     /// Negative numbers, and things that only look numeric.
     #[test]
     fn numbers_are_recognised_conservatively() {
-        assert_eq!(split("-5").unwrap()[0], Word::Int(-5));
+        assert_eq!(split("-5").unwrap()[0].int(), Some(-5));
         // An address is not a number, and neither is a version.
-        assert_eq!(
-            split("127.0.0.1:40000").unwrap()[0],
-            Word::Str("127.0.0.1:40000".into())
-        );
+        assert_eq!(split("127.0.0.1:40000").unwrap()[0].int(), None);
         // Nor is something that would overflow — it stays the text it was,
         // rather than saturating into a different value.
         let big = "99999999999999999999999";
-        assert_eq!(split(big).unwrap()[0], Word::Str(big.into()));
+        let w = &split(big).unwrap()[0];
+        assert_eq!(w.int(), None);
+        assert_eq!(w.text(), big, "an overflowing number lost its digits");
     }
 
     /// An unclosed quote is refused, not assumed closed at the end of the
@@ -244,7 +258,7 @@ mod tests {
     fn an_empty_quoted_word_is_still_a_word() {
         let w = split(r#"a "" b"#).unwrap();
         assert_eq!(w.len(), 3);
-        assert_eq!(w[1], Word::Str(String::new()));
+        assert_eq!(w[1].text(), "");
     }
 
     /// Free text keeps its spacing intent, for the one command that takes a
@@ -269,5 +283,39 @@ mod tests {
         // recursive.
         let long = "x".repeat(100_000);
         assert_eq!(split(&long).unwrap().len(), 1);
+    }
+
+    /// **An identifier that is all digits keeps its leading zeros.**
+    ///
+    /// A short id is four hex bytes, so eight times in sixteen every
+    /// character is a digit. Parsing one as an integer and rendering it back
+    /// dropped the leading zero — and the verb then addressed a peer that did
+    /// not exist, or a different one, with nothing to say so.
+    #[test]
+    fn an_identifier_of_digits_survives_intact() {
+        for id in ["09437082", "00000001", "0123456789abcdef", "007"] {
+            let w = &split(id).unwrap()[0];
+            assert_eq!(w.text(), id, "{id} was rewritten");
+            assert_eq!(w.int(), None, "{id} was taken for a number");
+        }
+        // And a genuine number is still a number.
+        assert_eq!(split("40000").unwrap()[0].int(), Some(40_000));
+        assert_eq!(split("40000").unwrap()[0].text(), "40000");
+    }
+
+    /// Every token round-trips to exactly what was typed. A tokeniser that
+    /// rewrites its input is one that addresses the wrong thing.
+    #[test]
+    fn every_token_renders_back_to_what_was_typed() {
+        for line in [
+            "connect 09437082 tcp 127.0.0.1:40000",
+            "peer verified 00ff00ff",
+            "message 007 0042",
+            "listen bob 40000",
+        ] {
+            let got: Vec<String> = split(line).unwrap().iter().map(|w| w.text()).collect();
+            let want: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(got, want, "{line} was rewritten");
+        }
     }
 }

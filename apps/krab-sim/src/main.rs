@@ -7,6 +7,12 @@
 //! If the delivery rate here is low, no amount of protocol quality fixes it,
 //! and the design has to change before any RFC asserts otherwise.
 
+// A simulator keeps the quantities its model defines, whether or not the
+// current experiment reads them. An unused one is a parameter of the model,
+// not a code path — and removing it would make the model harder to compare
+// against the runs already published.
+#![allow(dead_code)]
+
 mod graph;
 mod model;
 mod rng;
@@ -225,9 +231,8 @@ fn aggregate(label: &str, cfg: &Config) -> Agg {
     });
 
     let n = results.len().max(1) as f64;
-    let mean = |f: &dyn Fn(&sim::RunResult) -> f64| -> f64 {
-        results.iter().map(|r| f(r)).sum::<f64>() / n
-    };
+    let mean =
+        |f: &dyn Fn(&sim::RunResult) -> f64| -> f64 { results.iter().map(f).sum::<f64>() / n };
     Agg {
         label: label.to_string(),
         runs: results.len(),
@@ -639,12 +644,12 @@ fn to_json(aggs: &[Agg], cfg: &Config) -> String {
         cfg.seeds
     );
     for (i, a) in aggs.iter().enumerate() {
-        let _ = write!(
+        let _ = writeln!(
             s,
             "    {{\"case\": \"{}\", \"runs\": {}, \"delivery\": {:.4}, \"lat_p50_h\": {:.2}, \
              \"lat_p90_h\": {:.2}, \"lat_p99_h\": {:.2}, \"coverage\": {:.4}, \
              \"coverage_p10\": {:.4}, \"store_mb_p50\": {:.2}, \"store_mb_p99\": {:.2}, \
-             \"rx_mb_day_p50\": {:.3}, \"rx_mb_day_p99\": {:.3}}}{}\n",
+             \"rx_mb_day_p50\": {:.3}, \"rx_mb_day_p99\": {:.3}}}{}",
             json_escape(&a.label),
             a.runs,
             a.delivery,

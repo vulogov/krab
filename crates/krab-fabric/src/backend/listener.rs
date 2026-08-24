@@ -133,37 +133,76 @@ pub fn bootstrap_connect(addr: &str, local_static: [u8; 32]) -> Result<Accepted,
     Ok((Box::new(StreamSession::new(stream, noise)), peer))
 }
 
-/// Wait for one first-contact call on `addr`.
+/// A bound socket waiting for one first-contact call.
 ///
-/// Bounded, and one call only: a socket that accepts strangers indefinitely is
-/// a different thing from a node that is expecting a friend at an agreed time,
-/// and only the second is what RFC 3 §11 describes.
+/// **Bind and wait are separate.** They were one call with a deadline, which
+/// meant the wait could not be cancelled and had to be short enough to run on
+/// the interface thread — thirty seconds, which is not long enough to
+/// coordinate a call with somebody. A caller that owns the socket can poll it
+/// on a thread of its own and stop when told.
+pub struct Bootstrap {
+    inner: TcpListener,
+    local_static: [u8; 32],
+}
+
+impl Bootstrap {
+    /// Bind, and report the port taken.
+    pub fn bind(addr: &str, local_static: [u8; 32]) -> Result<(Bootstrap, u16), Error> {
+        let inner = TcpListener::bind(addr)?;
+        let port = inner.local_addr()?.port();
+        inner.set_nonblocking(true)?;
+        Ok((
+            Bootstrap {
+                inner,
+                local_static,
+            },
+            port,
+        ))
+    }
+
+    /// Take one first-contact call, if one is waiting.
+    ///
+    /// `Ok(None)` means nobody called — the normal case. A caller that fails
+    /// the handshake is dropped and also reported as `Ok(None)`: this socket
+    /// accepts strangers by design, so a failed one is not an event, and
+    /// making it one would let anyone fill the operator's log from outside.
+    pub fn accept_once(&self) -> Result<Option<Accepted>, Error> {
+        let mut stream = match self.inner.accept() {
+            Ok((s, _)) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        stream.set_nonblocking(false)?;
+        let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
+        stream.set_read_timeout(t)?;
+        stream.set_write_timeout(t)?;
+        match crate::noise::handshake_responder_xx(&mut stream, &self.local_static) {
+            Ok((noise, peer)) => {
+                stream.set_read_timeout(None)?;
+                stream.set_write_timeout(None)?;
+                Ok(Some((Box::new(StreamSession::new(stream, noise)), peer)))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+/// Open a first-contact session to `addr`, waiting up to `wait`.
+///
+/// Kept for the dialling side, which has somebody to call and does not need
+/// to be cancellable — it is one connection attempt, not an open door.
 pub fn bootstrap_accept(
     addr: &str,
     local_static: [u8; 32],
     wait: std::time::Duration,
 ) -> Result<Option<Accepted>, Error> {
-    let inner = TcpListener::bind(addr)?;
-    inner.set_nonblocking(true)?;
+    let (l, _) = Bootstrap::bind(addr, local_static)?;
     let deadline = std::time::Instant::now() + wait;
     while std::time::Instant::now() < deadline {
-        match inner.accept() {
-            Ok((mut stream, _)) => {
-                stream.set_nonblocking(false)?;
-                let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
-                stream.set_read_timeout(t)?;
-                stream.set_write_timeout(t)?;
-                let (noise, peer) =
-                    crate::noise::handshake_responder_xx(&mut stream, &local_static)?;
-                stream.set_read_timeout(None)?;
-                stream.set_write_timeout(None)?;
-                return Ok(Some((Box::new(StreamSession::new(stream, noise)), peer)));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => return Err(e.into()),
+        if let Some(a) = l.accept_once()? {
+            return Ok(Some(a));
         }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
     Ok(None)
 }

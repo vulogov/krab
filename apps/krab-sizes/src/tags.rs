@@ -12,10 +12,12 @@
 //! [`prekey_batch_for_correspondents`] implements the corrected rule and
 //! [`tests::erratum_removes_the_max_object_ceiling`] checks the consequence.
 
+/// Bytes per precomputed tag-table entry: 8-byte tag plus a 4-byte index.
+#[cfg(test)]
 use crate::keys::prekey_batch_wire;
+#[cfg(test)]
 use crate::object::{bucket_for, MAX_OBJECT};
 
-/// Bytes per precomputed tag-table entry: 8-byte tag plus a 4-byte index.
 pub const TAG_ENTRY: usize = 12;
 /// Microseconds for one static-static X25519, RFC 2 §4.3.
 pub const ECDH_US: f64 = 60.0;

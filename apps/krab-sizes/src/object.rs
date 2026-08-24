@@ -160,7 +160,7 @@ pub fn max_body_for(
     }
     let (mut lo, mut hi) = (0usize, bucket);
     while lo < hi {
-        let mid = (lo + hi + 1) / 2;
+        let mid = (lo + hi).div_ceil(2);
         if sealed(mid, addr, ctype, suite, m).on_wire <= bucket {
             lo = mid;
         } else {

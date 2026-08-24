@@ -301,7 +301,7 @@ pub struct BitSet {
 impl BitSet {
     pub fn new(bits: usize) -> BitSet {
         BitSet {
-            w: vec![0u64; (bits + 63) / 64],
+            w: vec![0u64; bits.div_ceil(64)],
         }
     }
     #[inline]

@@ -296,7 +296,7 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
     // ---- event queue -------------------------------------------------------
     let mut q: BinaryHeap<Sched> = BinaryHeap::new();
     let mut seq: u64 = 0;
-    let mut push = |q: &mut BinaryHeap<Sched>, seq: &mut u64, t: u64, ev: Ev| {
+    let push = |q: &mut BinaryHeap<Sched>, seq: &mut u64, t: u64, ev: Ev| {
         *seq += 1;
         q.push(Sched { t, seq: *seq, ev });
     };
@@ -391,12 +391,11 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
                 push(&mut q, &mut seq, next, Ev::Sync(li));
 
                 // A courier does not require either endpoint to be up.
-                if l.kind != LinkKind::Courier {
-                    if !is_online(&windows[l.a as usize], t)
-                        || !is_online(&windows[l.b as usize], t)
-                    {
-                        continue;
-                    }
+                if l.kind != LinkKind::Courier
+                    && (!is_online(&windows[l.a as usize], t)
+                        || !is_online(&windows[l.b as usize], t))
+                {
+                    continue;
                 }
 
                 // Live window: expiry is monotonic in index because objects
@@ -564,8 +563,8 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
     // count-vs-byte weighting, and the fact that objects created near the
     // horizon have had no time to propagate at all.
     const NB: usize = 8;
-    let mut age_hold = vec![0u64; NB];
-    let mut age_tot = vec![0u64; NB];
+    let mut age_hold = [0u64; NB];
+    let mut age_tot = [0u64; NB];
     let mut held_total: u128 = 0;
     let mut bytes_held: u128 = 0;
     let mut bytes_live: u128 = 0;

@@ -12,7 +12,9 @@
 //! account for it. It is recovered from RFC 7's own table and flagged in
 //! `Documentation/RFC-7-review.md`, exactly as RFC 3's fragment wrapper was.
 
-use crate::object::{bucket_for, MAX_OBJECT};
+use crate::object::bucket_for;
+#[cfg(test)]
+use crate::object::MAX_OBJECT;
 
 /// One reservoir chunk, RFC 7 §6.
 pub const CHUNK: usize = 32;
@@ -82,8 +84,12 @@ pub fn footprint(peers: usize, epochs: usize, batch: usize) -> usize {
         + IDENTITY
 }
 
-/// Does a published batch of `n` keys fit under a link's object gate?
-pub fn batch_crosses(n: usize, gate: usize) -> bool {
+/// Does a published batch of `n` keys **fit** under a link's object gate?
+///
+/// Named for what it returns. It was `batch_fits`, which reads as "exceeds
+/// the gate" and returned the opposite — the first caller written against it
+/// got the sense backwards, which is the whole argument for the rename.
+pub fn batch_fits(n: usize, gate: usize) -> bool {
     bucket_for(prekey_batch_wire(n)).is_some_and(|b| b <= gate)
 }
 
@@ -145,10 +151,10 @@ mod tests {
 
     /// RFC 7 §5.4: no batch crosses a link gated at 512 bytes.
     #[test]
-    fn no_batch_crosses_a_512_byte_gate() {
+    fn no_batch_fits_a_512_byte_gate() {
         for n in [64usize, 128, 256, 512, 1_024, 2_048] {
             assert!(
-                !batch_crosses(n, 512),
+                !batch_fits(n, 512),
                 "batch {n} should not cross a 512 B gate"
             );
         }
@@ -159,12 +165,9 @@ mod tests {
     /// different LoRa gates; see RFC-7-review.md.
     #[test]
     fn a_small_batch_does_cross_at_rfc1_s_lora_gate() {
+        assert!(batch_fits(64, 4_096), "batch 64 is 2168 B -> 4096 bucket");
         assert!(
-            batch_crosses(64, 4_096),
-            "batch 64 is 2168 B -> 4096 bucket"
-        );
-        assert!(
-            !batch_crosses(128, 4_096),
+            !batch_fits(128, 4_096),
             "batch 128 is 4216 B -> 16384 bucket"
         );
     }

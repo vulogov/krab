@@ -8,6 +8,17 @@
 //! an item's encoded length a pure function of its type and magnitude, which
 //! is exactly the property that lets a parameter table be frozen.
 
+// **Every figure an RFC publishes is in `--check`.** What remains here is
+// arithmetic the RFC series derives from but does not tabulate — intermediate
+// steps, and quantities a later revision may cite. Those are kept and are
+// unused, which the compiler reports and which is correct: they are
+// derivations, not code paths.
+//
+// The rule is the important part, and it is enforceable by review: if a number
+// appears in an RFC and not in `check`, that is a defect. `--check` verifies
+// 142 of them.
+#![allow(dead_code)]
+
 mod cbor;
 mod creds;
 mod groups;
@@ -324,7 +335,168 @@ fn check(m: Magnitudes) -> i32 {
         }
     }
 
+    // ---- RFC 6 §2 — groups. Every figure the RFC publishes, checked. ----
+    //
+    // These were computed here and cited there, and then nothing verified
+    // them: the module's constants read as dead code because `--check` only
+    // covered RFC 1 and RFC 3. A figure nobody checks is an assertion, which
+    // is precisely what this program exists to replace.
+    for (g, objects, mb, received) in [
+        (5usize, 40usize, 0.04f64, 8usize),
+        (10, 180, 0.18, 18),
+        (20, 760, 0.78, 38),
+        (30, 1_740, 1.78, 58),
+        (50, 4_900, 5.02, 98),
+        (100, 19_800, 20.28, 198),
+        (200, 79_600, 81.51, 398),
+    ] {
+        cmp(
+            &format!("RFC6 §2.3 objects/day, G={g}"),
+            groups::group_objects_per_day(g),
+            objects,
+        );
+        cmp(
+            &format!("RFC6 §2.3 corpus MB/day, G={g}"),
+            (groups::group_mb_day(g) * 100.0).round() as usize,
+            (mb * 100.0).round() as usize,
+        );
+        cmp(
+            &format!("RFC6 §2.3 received/member/day, G={g}"),
+            groups::received_per_day(g),
+            received,
+        );
+    }
+
+    // §2.4's fan-out ratio: (G−1)× a shared-sender-key scheme.
+    for (g, ratio) in [(5usize, 4usize), (20, 19), (50, 49), (100, 99)] {
+        cmp(
+            &format!("RFC6 §2.4 fan-out ratio, G={g}"),
+            groups::group_objects_per_day(g) / groups::shared_key_objects_per_day(g),
+            ratio,
+        );
+    }
+
+    // §2.7's stagger window, at a ten percent local rate lift. This is the
+    // table `krab-tui`'s `fanout` module reproduces; both derive it from the
+    // same formula and neither had checked it against the RFC until now.
+    for (n, g, hours_tenths) in [
+        (100usize, 10usize, 108usize),
+        (100, 20, 228),
+        (100, 50, 588),
+        (500, 10, 22),
+        (500, 20, 46),
+        (500, 50, 118),
+        (2_000, 10, 5),
+        (2_000, 20, 11),
+        (2_000, 50, 29),
+    ] {
+        cmp(
+            &format!("RFC6 §2.7 stagger hours, n={n} G={g}"),
+            (groups::stagger_hours(g, n, 0.10) * 10.0).round() as usize,
+            hours_tenths,
+        );
+    }
+
+    // §2.8's prekey burn: group size dominates consumption.
+    for (g, per_day, seven, thirty) in [
+        (5usize, 8usize, 128usize, 512usize),
+        (10, 18, 256, 1_024),
+        (20, 38, 512, 2_048),
+        (50, 98, 2_048, 8_192),
+    ] {
+        cmp(
+            &format!("RFC6 §2.8 received/day, G={g}"),
+            groups::received_per_day(g),
+            per_day,
+        );
+        cmp(
+            &format!("RFC6 §2.8 batch for 7d, G={g}"),
+            keys::batch_for(keys::prekeys_needed(per_day, 7)),
+            seven,
+        );
+        cmp(
+            &format!("RFC6 §2.8 batch for 30d, G={g}"),
+            keys::batch_for(keys::prekeys_needed(per_day, 30)),
+            thirty,
+        );
+    }
+    // And §2.8's conclusion: a 50-member group cannot republish monthly,
+    // because the batch would not fit in one object.
+    cmp(
+        "RFC6 §2.8 G=50 monthly batch does NOT fit one object",
+        keys::batch_fits(8_192, object::MAX_OBJECT) as usize,
+        0,
+    );
+    // And the sizes below it do fit, or the conclusion would be about the
+    // gate rather than about the group.
+    cmp(
+        "RFC6 §2.8 G=20 monthly batch fits one object",
+        keys::batch_fits(2_048, object::MAX_OBJECT) as usize,
+        1,
+    );
+
+    // ---- RFC 7 §5.3 — prekey batch wire sizes. ----
+    for (n, wire) in [
+        (256usize, 8_312usize),
+        (1_024, 32_888),
+        (2_048, 65_656),
+        (8_192, 262_264),
+    ] {
+        cmp(
+            &format!("RFC7 §5.3 batch wire, {n} keys"),
+            keys::prekey_batch_wire(n),
+            wire,
+        );
+    }
+
+    // ---- RFC 2 §4.3 — the precomputation table, as published. ----
+    for (correspondents, window, entries, kb) in [
+        (25usize, 30usize, 1_525usize, 18usize),
+        (50, 30, 3_050, 37),
+        (50, 45, 4_550, 55),
+        (200, 30, 12_200, 146),
+        (500, 45, 45_500, 546),
+    ] {
+        cmp(
+            &format!("RFC2 §4.3 entries, {correspondents} at ±{window}"),
+            tags::table_entries(correspondents, window),
+            entries,
+        );
+        // **Decimal KB, rounded.** The RFC's figures are bytes ÷ 1000 to the
+        // nearest whole — 1 525 entries is 18 300 bytes, printed as "18 KB",
+        // which is 17.9 KiB. Checking against 1024 would report five
+        // mismatches that are a unit convention rather than an error.
+        cmp(
+            &format!("RFC2 §4.3 table KB, {correspondents} at ±{window}"),
+            (tags::table_bytes(correspondents, window) as f64 / 1000.0).round() as usize,
+            kb,
+        );
+        cmp(
+            &format!("RFC2 §4.3 ECDH ms×10, {correspondents}"),
+            (tags::ecdh_ms(correspondents) * 10.0).round() as usize,
+            (correspondents as f64 * 0.06 * 10.0).round() as usize,
+        );
+    }
+
+    // ---- RFC 4 — transport. ----
+    cmp("RFC4 §4.1 Noise handshake", transport::NOISE_HANDSHAKE, 144);
+    cmp(
+        "RFC4 §8 largest object spans more than one frame",
+        (transport::frames(object::MAX_OBJECT) > 1) as usize,
+        1,
+    );
+    // §5.4's conclusion, and the reason RFC 8 §6 refuses a picture on LoRa:
+    // the largest object does not cross the slowest profile in usable time.
+    for l in transport::LORA.iter().take(1) {
+        cmp(
+            "RFC4 §5.4 largest object exceeds an hour on the slowest LoRa",
+            (l.elapsed_s(object::MAX_OBJECT) > 3_600.0) as usize,
+            1,
+        );
+    }
+
     println!("\n{ok} figures verified, {bad} mismatched");
+
     if bad == 0 {
         println!("RFC 1's published byte counts are reproduced exactly.");
     }
