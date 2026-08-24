@@ -113,7 +113,17 @@ pub enum Command {
     Import,
     /// Write a courier archive.
     Pack,
-    /// Compose and emit.
+    /// **Not in RFC 8 §5.** Compose a sealed message to one or more people.
+    ///
+    /// The verb this program is for. Opens the composer addressed to everyone
+    /// named; `Ctrl-D` seals one copy per recipient and queues them; `Esc`
+    /// discards the draft.
+    ///
+    /// Separate from [`Command::Send`], which takes its text on the command
+    /// line — that is for one line to one person, and a command line is the
+    /// wrong place for a message: it has a history.
+    Message,
+    /// Compose and emit — one line, on the command line.
     Send,
     /// Prekey burn rate, reservoir state, identity backup status.
     Keys,
@@ -142,6 +152,7 @@ impl Command {
             "import" => Command::Import,
             "pack" => Command::Pack,
             "send" => Command::Send,
+            "message" | "msg" => Command::Message,
             "keys" => Command::Keys,
             "reach" => Command::Reach,
             "peers" => Command::Peers,
@@ -193,7 +204,11 @@ impl Command {
         ("disconnect", "close the link"),
         ("reach", "what this node can reach, and how far"),
         ("rollcall", "ask peers who is present"),
-        ("send", "compose and queue a sealed message"),
+        (
+            "message <peer> [peer…]",
+            "compose to one or more people; Ctrl-D seals and queues",
+        ),
+        ("send <peer> <text>", "one line to one person"),
         ("request", "ask a peer for an object by name"),
         ("pack <file>", "write queued objects out for a courier"),
         ("import <file>", "take in what a courier brought"),
@@ -312,6 +327,7 @@ impl fmt::Display for Command {
             Command::Import => "import",
             Command::Pack => "pack",
             Command::Send => "send",
+            Command::Message => "message",
             Command::Keys => "keys",
             Command::Reach => "reach",
             Command::Peers => "peers",

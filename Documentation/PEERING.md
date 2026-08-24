@@ -9,7 +9,6 @@ There is no discovery, no directory, and no trust-on-first-use. RFC 4 §4.1
 makes a static-key mismatch a hard failure and never a prompt.
 
 ---
-
 ## The shape of it, A to B
 
 Peering is **symmetric** — Alice and Bob run the same five verbs, in the same
@@ -259,75 +258,6 @@ exactly as `in-person` does.
 
 ---
 
-## 5. Both ends: `peer seal <their.pad> <channel>`
-
-```
-> peer seal /Volumes/usb/bob.pad in-person
-peer-link signed with <their fingerprint>
-
-agreed: buckets to 65536, relaying for others, 1073741824 retained
-```
-
-This mixes both contributions into a reservoir, seals it under the current
-epoch wrapper, and writes two files into your `--home`:
-
-| File | What |
-|---|---|
-| `<short-id>.link` | their signed card — the peer-link |
-| `<short-id>.reservoir` | the shared reservoir, sealed |
-
-`<short-id>` is the first four bytes of their node id, in hex — `3f9a2c01`.
-**That is the name you use in every later verb.** `connect 3f9a2c01 …`, not
-`connect bob`.
-
-The ceremony and your `peer.pad` are both **shredded** — overwritten, then
-removed. The pad has no further use once the reservoir exists, and it is the
-one file in the layout that is neither signed nor sealed.
-
-The agreed terms are the *lower* of what each end offered, since a link is
-only as capable as its least capable end (RFC 4 §5.4).
-
-If the link would be unusable you get `refused:` and the caveats, and nothing
-is written.
-
----
-
-## 5b. Where policy comes from
-
-You never type a policy. There is no policy file — Krab reads no
-configuration (`NO-CONFIG.md`).
-
-**At peering**, each end's `Policy` is signed *into the card*, so `peer offer`
-publishes yours and `peer accept` takes in theirs. `peer seal` reports the
-agreed terms, which are the **lower** of the two on every field, since a link
-is only as capable as its least capable end (RFC 4 §5.4):
-
-```
-agreed: buckets to 5, relaying for others, 1073741824 retained
-```
-
-| Field | Means |
-|---|---|
-| `max_bucket` | largest object size accepted, as an RFC 1 §8.1 bucket index |
-| `relay` | whether this node carries objects not addressed to it |
-| `retention_bytes` | how much it holds for the shared corpus |
-| `shard_bits` | RFC 2 §6 sharding — divides your load *and your anonymity set* |
-
-Today these are the defaults: full participation, no sharding, 1 GB, all
-buckets. There is no verb to change them yet.
-
-**After peering**, terms travel on each re-key (`peer rekey`, and the
-automatic one). That payload also carries what the card cannot: the node's
-`CarriagePolicy` (RFC 6 §3.6 — whether it hosts channel content at all) and
-its accepted TTL. The peer's current terms land in `peers/<their-id>/policy`,
-and `peers` shows whether you are holding terms as of peering or terms as of
-the last re-key.
-
-Before re-keying existed, a policy was agreed once and never spoken of again:
-a peer who stopped relaying had no way to say so.
-
----
-
 ## 4c. Neither of you can meet or call: `peer meet`
 
 First contact over a live link. No files, no courier, no prior key — one
@@ -463,6 +393,43 @@ Neither does, in most home networks. `peer meet` needs one end reachable, so:
 `peer meet` is the route for *"we can open a socket to each other and nothing
 else"*. It is not the strongest route and is not meant to be — see below.
 
+### `peer meet listen` is not `--listen`
+
+They bind the same kind of socket and are otherwise opposites.
+
+| | `--listen <addr>` | `peer meet listen <addr>` |
+|---|---|---|
+| Runs | for the life of the process | once, for 30 seconds |
+| Accepts | **only nodes you have peered with** | **anyone who calls** |
+| Handshake | Noise IK, against a stored key | Noise XX, no prior key |
+| Result | a link, for reconciliation | a *new peering* |
+| Authenticated | yes, by the stored peer-link | **no**, until you compare fingerprints |
+
+`--listen` is the everyday one: it is how mail moves between people who have
+already peered, and it refuses a stranger outright because it checks the
+caller's static key against a link on disk. It cannot create a peering, and
+that refusal is the point — RFC 4 §4.1 makes a mismatch a hard failure and
+never a prompt.
+
+`peer meet listen` is the ceremony, and it is deliberately the opposite: there
+is no stored key yet, so it accepts whoever calls in the next thirty seconds
+and the authentication is the voice call afterwards.
+
+So they can use the same port and generally should not be running at once. In
+practice:
+
+```
+# Every day
+$ krab --home ~/krab-bob --listen 0.0.0.0:40000
+
+# The one time you are peering with somebody new, at an agreed moment
+> peer meet listen 0.0.0.0:40001
+```
+
+A different port for the ceremony, because a socket that accepts strangers is
+a different thing from one that does not, and the two should not be confused
+by an operator or by a port scanner.
+
 ### What it costs
 
 This uses Noise **XX** rather than IK, because IK needs the responder's static
@@ -492,6 +459,75 @@ completed a handshake with you and forwarded a genuine card belonging to
 somebody else — so the fingerprint you were about to compare is not theirs.
 Krab refuses, records nothing, and says not to retry on that address until you
 have spoken to your friend.
+
+---
+
+## 5. Both ends: `peer seal <their.pad> <channel>`
+
+```
+> peer seal /Volumes/usb/bob.pad in-person
+peer-link signed with <their fingerprint>
+
+agreed: buckets to 65536, relaying for others, 1073741824 retained
+```
+
+This mixes both contributions into a reservoir, seals it under the current
+epoch wrapper, and writes two files into your `--home`:
+
+| File | What |
+|---|---|
+| `<short-id>.link` | their signed card — the peer-link |
+| `<short-id>.reservoir` | the shared reservoir, sealed |
+
+`<short-id>` is the first four bytes of their node id, in hex — `3f9a2c01`.
+**That is the name you use in every later verb.** `connect 3f9a2c01 …`, not
+`connect bob`.
+
+The ceremony and your `peer.pad` are both **shredded** — overwritten, then
+removed. The pad has no further use once the reservoir exists, and it is the
+one file in the layout that is neither signed nor sealed.
+
+The agreed terms are the *lower* of what each end offered, since a link is
+only as capable as its least capable end (RFC 4 §5.4).
+
+If the link would be unusable you get `refused:` and the caveats, and nothing
+is written.
+
+---
+
+## 5b. Where policy comes from
+
+You never type a policy. There is no policy file — Krab reads no
+configuration (`NO-CONFIG.md`).
+
+**At peering**, each end's `Policy` is signed *into the card*, so `peer offer`
+publishes yours and `peer accept` takes in theirs. `peer seal` reports the
+agreed terms, which are the **lower** of the two on every field, since a link
+is only as capable as its least capable end (RFC 4 §5.4):
+
+```
+agreed: buckets to 5, relaying for others, 1073741824 retained
+```
+
+| Field | Means |
+|---|---|
+| `max_bucket` | largest object size accepted, as an RFC 1 §8.1 bucket index |
+| `relay` | whether this node carries objects not addressed to it |
+| `retention_bytes` | how much it holds for the shared corpus |
+| `shard_bits` | RFC 2 §6 sharding — divides your load *and your anonymity set* |
+
+Today these are the defaults: full participation, no sharding, 1 GB, all
+buckets. There is no verb to change them yet.
+
+**After peering**, terms travel on each re-key (`peer rekey`, and the
+automatic one). That payload also carries what the card cannot: the node's
+`CarriagePolicy` (RFC 6 §3.6 — whether it hosts channel content at all) and
+its accepted TTL. The peer's current terms land in `peers/<their-id>/policy`,
+and `peers` shows whether you are holding terms as of peering or terms as of
+the last re-key.
+
+Before re-keying existed, a policy was agreed once and never spoken of again:
+a peer who stopped relaying had no way to say so.
 
 ---
 
@@ -641,6 +677,35 @@ follow your keypresses (RFC 8 §5.1).
 This is not a bug. Reconciliation runs on a schedule whose first interval is
 drawn from entropy, not from the moment you connected — RFC 5 §6.1. A node
 that synced when you pressed a key would leak when you pressed keys.
+
+---
+
+## Writing a message
+
+```
+> message alice bob
+composing to alice, bob.
+
+PRIVATE — sealed once per recipient. Enter is a newline; Ctrl-D seals and
+queues; Esc discards, and a discarded draft is overwritten rather than
+dropped (RFC 7 §8).
+
+2 copies leave over a randomised window, so they do not announce
+themselves as one fan-out (RFC 6 §2.7).
+```
+
+Type. `Enter` is a newline, so a message can be as long as it needs to be.
+`Ctrl-D` seals it. `Esc` discards it.
+
+**One sealed copy per recipient**, to that recipient. There is no shared key,
+so a compromised recipient exposes that recipient and nobody else — and every
+recipient is checked *before* you write anything, because a recipient that
+cannot be sealed to would receive nothing while nothing said so.
+
+`send <peer> <text>` still exists for one line to one person. The body does
+not enter the command history — only `send <peer> ` does, since recalling the
+recipient is useful and recalling the message is a copy of plaintext RFC 7 §8
+says should exist only while displayed.
 
 ---
 

@@ -136,6 +136,12 @@ pub enum Binding {
     Reply,
     /// Publish to a channel. A separate keystroke from [`Binding::Reply`].
     Publish,
+    /// Seal and queue what is in the composer — `Ctrl-D`.
+    ///
+    /// A separate key from `Enter`, which inserts a newline, because a message
+    /// worth composing over several lines is one where Enter must not send it
+    /// halfway through.
+    Deliver,
     /// A character typed into the composer or the command line.
     Input(char),
     /// An edit to the line being typed. See [`crate::line::Line`].
@@ -204,6 +210,13 @@ impl Binding {
         // certainty, and guessing wrong publishes.
         if key.ctrl && key.code == Key::Char('o') {
             return Binding::ToggleFullScreen;
+        }
+        // Sending, before any mode: the composer is reachable from a body
+        // pane and from the command line, and `Ctrl-D` must mean the same in
+        // both. `d` for deliver, and it is the one chord an operator presses
+        // having decided.
+        if key.ctrl && key.code == Key::Char('d') {
+            return Binding::Deliver;
         }
         // **Ctrl-M for Messages, Ctrl-G for Groups.** Letters, so they have a
         // control encoding every terminal sends. `Ctrl-1` does not: the

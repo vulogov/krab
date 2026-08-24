@@ -329,6 +329,16 @@ struct App {
     /// observation of this network now.
     observed_arrivals: u64,
     observed_hours: f64,
+    /// Everyone the open composition is addressed to.
+    ///
+    /// Fan-out: one sealed copy each. A single field would have made
+    /// `message alice bob` quietly a message to Alice.
+    composing_to_many: Vec<String>,
+    /// Who the open composition is addressed to.
+    ///
+    /// A composition with no recipient cannot be sent — the alternative is a
+    /// prompt at the moment of sending, which is the worst time to ask.
+    composing_to: Option<String>,
     /// A picture currently drawn in the message pane, as character cells.
     ///
     /// **Plaintext-adjacent**, so `lock` drops it with everything else: a
@@ -452,6 +462,8 @@ impl Default for App {
             pending: Vec::new(),
             observed_arrivals: 0,
             observed_hours: 0.0,
+            composing_to_many: Vec::new(),
+            composing_to: None,
             showing: None,
             prompt: None,
             history: Vec::new(),
@@ -699,7 +711,20 @@ impl App {
                 let n = self.output.lines().count() as i64;
                 self.output_scroll = (self.output_scroll + d as i64 * step).clamp(0, n);
             }
-            Binding::Compose if !self.locked => self.ui.compose(),
+            Binding::Compose if !self.locked => {
+                self.ui.compose();
+                self.output = match &self.composing_to {
+                    Some(to) => format!(
+                        "composing to {to}. Enter is a newline; Ctrl-D seals and \
+                         queues it; Esc discards it."
+                    ),
+                    None => "composing — but to nobody yet.\n\n\
+                             `send <peer>` opens a composition addressed to \
+                             them. Ctrl-D seals it, Esc discards it."
+                        .into(),
+                };
+            }
+            Binding::Deliver if !self.locked => self.deliver(),
             // **RFC 8 §4.2 requirement 3.** In the channels tab `r` is
             // ambiguous between "privately message the author" and "publish a
             // response to my own channel". It resolves to the private
@@ -1518,6 +1543,176 @@ impl App {
         }
     }
 
+    /// Seal one copy per recipient and queue them, staggered.
+    ///
+    /// Shares `group_send`'s emission window and its reasoning: `N` objects
+    /// appearing together in one size bucket announces both the fan-out and
+    /// its size, whether the recipients are a named group or an ad-hoc list.
+    fn fan_out(&mut self, to: &[String], text: &str) -> String {
+        let mut sealed = Vec::new();
+        let mut refused = Vec::new();
+        for peer in to {
+            match self.seal_one(peer, text.as_bytes()) {
+                Some(pair) => sealed.push(pair),
+                None => refused.push(peer.clone()),
+            }
+        }
+        if sealed.is_empty() {
+            return format!("nothing could be sealed for {}", refused.join(", "));
+        }
+
+        let now_min = now_epoch().0 * 1440;
+        let mut note = String::new();
+        if sealed.len() == 1 {
+            // One recipient is not a fan-out and has nothing to hide among a
+            // window; it goes straight into the corpus like any other message.
+            let (id, bytes) = sealed.remove(0);
+            if let Err(e) = self.store.with(|s| s.ingest(id, bytes, now_min, u32::MAX)) {
+                return format!("the store refused it: {e:?}");
+            }
+        } else {
+            let rate = self.background_rate();
+            let window = fanout::window_seconds(sealed.len() + 1, rate);
+            let offsets = fanout::offsets(sealed.len() + 1, rate, &mut OsRng);
+            let now_s = now_seconds();
+            for ((id, bytes), off) in sealed.iter().zip(offsets.iter()) {
+                self.pending.push(fanout::Pending {
+                    release_at_s: now_s + off,
+                    id: *id,
+                    bytes: bytes.clone(),
+                });
+            }
+            note = format!(
+                "\n\n{} copies, released over about {:.1} hours so they do not \
+                 announce themselves as one fan-out (RFC 6 §2.7).",
+                sealed.len(),
+                window as f64 / 3600.0
+            );
+        }
+        self.save_corpus();
+        self.refresh_inbox();
+        let mut out = format!(
+            "composed for {}.\n\nIt leaves on a scheduled reconciliation — not \
+             now, and not because you pressed a key (RFC 5 §6.1).{note}",
+            to.join(", ")
+        );
+        if !refused.is_empty() {
+            out.push_str(&format!(
+                "\n\nNOT sent to {} — nothing could be sealed for them, and \
+                 nothing will tell them so.",
+                refused.join(", ")
+            ));
+        }
+        out
+    }
+
+    /// Open a composition addressed to one or more people — the main verb.
+    ///
+    /// **Fan-out, like a group.** One sealed copy per recipient, to that
+    /// recipient: there is no shared key, so a compromised recipient exposes
+    /// that recipient and nobody else. And the copies are staggered for the
+    /// same reason RFC 6 §2.7 staggers a group's — `N` objects appearing at
+    /// once in one size bucket announces both the fan-out and how many people
+    /// are in it.
+    fn message(&mut self, line: &str) -> String {
+        let Ok(words) = words::split(line) else {
+            return "unbalanced quotes".into();
+        };
+        let to: Vec<String> = words.iter().skip(1).map(|w| w.text()).collect();
+        if to.is_empty() {
+            return "usage: message <peer> [peer…]\n\n\
+                    Opens a composition addressed to everyone named. Ctrl-D \
+                    seals one copy per recipient and queues them; Esc discards \
+                    the draft."
+                .into();
+        }
+        if self.epoch_key.is_none() {
+            return "locked — unlock to compose".into();
+        }
+        // Every recipient must be someone this node can seal to. Checked
+        // before the operator writes anything, not after: fan-out seals
+        // individually, and a recipient that cannot be sealed to would
+        // silently receive nothing.
+        let unknown: Vec<&String> = to
+            .iter()
+            .filter(|p| !self.peer_path(p, artifact::PeerFile::Link).exists())
+            .collect();
+        if !unknown.is_empty() {
+            return format!(
+                "no peer-link for {}.\n\n\
+                 Every recipient has to be someone you have peered with — each \
+                 gets their own sealed copy, and one you cannot seal to would \
+                 receive nothing while nothing said so.",
+                unknown
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        self.composing_to_many = to.clone();
+        self.composing_to = to.first().cloned();
+        self.ui.compose();
+        while self.ui.focus() != layout::Pane::View {
+            self.ui.cycle_focus();
+        }
+        format!(
+            "composing to {}.\n\n\
+             PRIVATE — sealed once per recipient. Enter is a newline; Ctrl-D \
+             seals and queues; Esc discards, and a discarded draft is \
+             overwritten rather than dropped (RFC 7 §8).{}",
+            to.join(", "),
+            if to.len() > 1 {
+                format!(
+                    "\n\n{} copies leave over a randomised window, so they do \
+                     not announce themselves as one fan-out (RFC 6 §2.7).",
+                    to.len()
+                )
+            } else {
+                String::new()
+            }
+        )
+    }
+
+    /// Seal and queue what is in the composer.
+    ///
+    /// **`Ctrl-D`, not `Enter`.** Enter inserts a newline, because a message
+    /// worth composing over several lines is one where Enter must not send it
+    /// halfway through — and a message sent early cannot be recalled, since
+    /// RFC 3 §6.1 forbids any mechanism that could.
+    fn deliver(&mut self) {
+        if self.ui.mode() != Mode::Compose {
+            self.output = "nothing is being composed. `send <peer>` starts one.".into();
+            return;
+        }
+        let to = if self.composing_to_many.is_empty() {
+            self.composing_to.clone().into_iter().collect::<Vec<_>>()
+        } else {
+            self.composing_to_many.clone()
+        };
+        if to.is_empty() {
+            self.output = "this composition is not addressed to anyone.\n\n\
+                 Esc discards it, then `message <peer>` starts one that is."
+                .into();
+            return;
+        }
+        let text = self.composer.trim().to_string();
+        if text.is_empty() {
+            self.output = "nothing to send. Esc discards the composition.".into();
+            return;
+        }
+
+        let out = self.fan_out(&to, &text);
+        // The draft is gone either way: RFC 7 §8 keeps plaintext only while
+        // displayed, and a failed send is not a reason to hold it longer.
+        overwrite(&mut self.composer);
+        self.ui.end_compose();
+        self.composing_to = None;
+        self.composing_to_many.clear();
+        self.output = out;
+    }
+
     /// Send a picture — RFC 8 §6's pipeline, then the ordinary send path.
     ///
     /// The bytes on the wire are **the ones this program produced**, never the
@@ -2082,6 +2277,19 @@ impl App {
         if line.is_empty() {
             return;
         }
+        // **A message body is not a command.** `send bob the meeting is moved`
+        // put the plaintext in the history, where Up-arrow recalled it — and
+        // RFC 7 §8 says plaintext exists only while displayed. The verb and
+        // the recipient are kept, because recalling `send bob ` is what an
+        // operator actually wants; the message is dropped.
+        let line = match words::split(line).ok().and_then(|w| {
+            let verb = w.first()?.text();
+            (verb == "send" && w.len() > 2).then(|| format!("send {} ", w[1].text()))
+        }) {
+            Some(trimmed) => trimmed,
+            None => line.to_string(),
+        };
+        let line = line.as_str();
         if self.history.last().map(String::as_str) != Some(line) {
             self.history.push(line.to_string());
         }
@@ -2420,6 +2628,7 @@ impl App {
                     None => "no identity — run `init` first".into(),
                 };
             }
+            Command::Message => self.output = self.message(line),
             Command::Send => self.output = self.send(line),
             Command::Request => self.output = self.peer_request(line),
             Command::Pack => self.output = self.pack(line),
@@ -3805,11 +4014,36 @@ impl App {
     /// RFC 6 §2.7 reinforces: emitting on send would make transmission timing
     /// a function of composition timing.
     fn send(&mut self, line: &str) -> String {
-        let (Some(peer), Some(_)) = (arg(line, 1), arg(line, 2)) else {
-            return "usage: send <peer> <message>\n\
+        let Some(peer) = arg(line, 1) else {
+            return "usage: send <peer>                  compose, then Ctrl-D\n\
+                    \x20      send <peer> <message>        one line\n\
                     \x20      send <peer> --picture <file>"
                 .into();
         };
+        // **`send <peer>` with no message opens the composer.** A message
+        // worth writing is rarely one line, and typing it on the command line
+        // put it in the history — where Up-arrow recalled it, and RFC 7 §8
+        // says plaintext exists only while displayed.
+        if arg(line, 2).is_none() {
+            if !self.peer_path(&peer, artifact::PeerFile::Link).exists() {
+                return format!("no peer-link for {peer} — complete a peering first");
+            }
+            self.composing_to = Some(peer.clone());
+            self.ui.compose();
+            // Focus the pane the composer is drawn in. On the command line a
+            // character is a command character — that is what makes a command
+            // containing a letter typeable — so leaving focus there would send
+            // every keystroke to the wrong buffer.
+            while self.ui.focus() != layout::Pane::View {
+                self.ui.cycle_focus();
+            }
+            return format!(
+                "composing to {peer}.\n\n\
+                 Enter is a newline. Ctrl-D seals it and queues it. Esc \
+                 discards it — and a discarded draft is overwritten, not \
+                 dropped (RFC 7 §8)."
+            );
+        }
         // RFC 8 §6 permits pictures and no other attachment type.
         if arg(line, 2).as_deref() == Some("--picture") {
             let Some(path) = arg(line, 3) else {
@@ -10703,5 +10937,221 @@ mod tests {
         r.unlock(b"a passphrase").expect("reopens");
         assert!(!r.locked, "it would not come back");
         assert!(r.epoch_key.is_some(), "it has no content key");
+    }
+
+    /// **You can write a message.** The composer opened, accepted text, and
+    /// nothing sent it — there was no path from a composition to a sealed
+    /// object at all. `send <peer> <text>` was the only way, one line, on the
+    /// command line.
+    #[test]
+    fn a_message_can_be_composed_over_several_lines_and_sent() {
+        let (mut a, mut b, _a_id, b_id) = peered_pair("compose-send");
+
+        type_command(&mut a, &format!("send {b_id}"));
+        assert!(a.output.contains("composing to"), "{}", a.output);
+        assert_eq!(a.ui.mode(), Mode::Compose);
+        assert_eq!(
+            a.ui.focus(),
+            layout::Pane::View,
+            "keystrokes would have gone to the command line"
+        );
+
+        for c in "the meeting is moved".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        for c in "to Thursday".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(a.composer.contains('\n'), "Enter did not make a newline");
+        assert!(a.command.is_empty(), "the text went to the command line");
+
+        // Ctrl-D seals it.
+        a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(a.output.contains("composed"), "{}", a.output);
+        assert_eq!(a.ui.mode(), Mode::Browse, "the composer stayed open");
+        assert!(a.composer.is_empty(), "the draft was not cleared");
+
+        // And it arrives, both lines.
+        let now_min = now_epoch().0 * 1440;
+        let carried: Vec<(krab_core::object::ObjectId, Vec<u8>)> = a.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|x| (i, x.to_vec())))
+                .collect()
+        });
+        for (i, bytes) in carried {
+            let _ = b.store.with(|s| s.ingest(i, bytes, now_min, u32::MAX));
+        }
+        b.refresh_inbox();
+        let got = b
+            .messages
+            .iter()
+            .find(|m| m.body.contains("meeting is moved"))
+            .expect("it did not arrive");
+        assert!(got.body.contains("Thursday"), "the second line was lost");
+    }
+
+    /// **A message body must not reach the command history.** `send bob the
+    /// meeting is moved` recorded the plaintext, and Up-arrow brought it
+    /// back — RFC 7 §8 says plaintext exists only while displayed.
+    #[test]
+    fn a_message_body_never_reaches_the_command_history() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("compose-history");
+        type_command(
+            &mut a,
+            &format!("send {b_id} the safe house is on Rua Augusta"),
+        );
+
+        assert!(
+            !a.history.iter().any(|h| h.contains("Rua Augusta")),
+            "the message body is in the history: {:?}",
+            a.history
+        );
+        // The verb and the recipient are kept, because recalling `send bob `
+        // is what an operator actually wants.
+        assert!(
+            a.history.iter().any(|h| h == &format!("send {b_id} ")),
+            "the recipient was dropped too: {:?}",
+            a.history
+        );
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert!(!a.command.as_string().contains("Rua Augusta"));
+    }
+
+    /// Ctrl-D is not Enter. A message worth composing over several lines is
+    /// one where Enter must not send it halfway through — and RFC 3 §6.1
+    /// forbids any mechanism that could recall it.
+    #[test]
+    fn enter_does_not_send_a_composition() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("compose-enter");
+        let before = a.store.len();
+        type_command(&mut a, &format!("send {b_id}"));
+        for c in "half a thought".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        for _ in 0..3 {
+            a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        }
+        assert_eq!(a.store.len(), before, "Enter sent it");
+        assert_eq!(a.ui.mode(), Mode::Compose, "Enter closed the composer");
+    }
+
+    /// A composition addressed to nobody cannot be sent, and Esc overwrites
+    /// the draft rather than dropping it.
+    #[test]
+    fn an_unaddressed_composition_is_not_sent_and_esc_overwrites_it() {
+        let mut a = ready_node("compose-nobody");
+        a.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        a.ui.compose();
+        a.composer.push_str("to nobody");
+        a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(a.output.contains("not addressed"), "{}", a.output);
+
+        a.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(a.composer.is_empty(), "the draft survived Esc");
+        assert_eq!(a.ui.mode(), Mode::Browse);
+    }
+
+    /// Sending to someone this node has not peered with says so up front,
+    /// rather than after the operator has written a message.
+    #[test]
+    fn composing_to_a_stranger_is_refused_before_the_message_is_written() {
+        let mut a = ready_node("compose-stranger");
+        type_command(&mut a, "send deadbeef");
+        assert!(a.output.contains("no peer-link"), "{}", a.output);
+        assert_eq!(a.ui.mode(), Mode::Browse, "it opened a composer anyway");
+    }
+
+    /// **The main verb.** `message <peer> [peer…]` opens a composition, and
+    /// Ctrl-D seals one copy per recipient and queues them.
+    #[test]
+    fn message_composes_to_several_people_and_seals_one_copy_each() {
+        let (mut a, mut b, _a_id, b_id) = peered_pair("message-many");
+        type_command(&mut a, &format!("message {b_id}"));
+        assert!(a.output.contains("PRIVATE"), "{}", a.output);
+        assert_eq!(a.ui.mode(), Mode::Compose);
+
+        for ch in "the meeting is moved".chars() {
+            a.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(a.output.contains("composed for"), "{}", a.output);
+
+        let now_min = now_epoch().0 * 1440;
+        let carried: Vec<(krab_core::object::ObjectId, Vec<u8>)> = a.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|x| (i, x.to_vec())))
+                .collect()
+        });
+        for (i, bytes) in carried {
+            let _ = b.store.with(|s| s.ingest(i, bytes, now_min, u32::MAX));
+        }
+        b.refresh_inbox();
+        assert!(
+            b.messages
+                .iter()
+                .any(|m| m.body.contains("meeting is moved")),
+            "it did not arrive"
+        );
+    }
+
+    /// **Every recipient is checked before the operator writes anything.**
+    /// Fan-out seals individually, so one that cannot be sealed to would
+    /// receive nothing while nothing said so.
+    #[test]
+    fn message_refuses_an_unknown_recipient_up_front() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("message-unknown");
+        type_command(&mut a, &format!("message {b_id} deadbeef"));
+        assert!(a.output.contains("no peer-link"), "{}", a.output);
+        assert!(
+            a.output.contains("deadbeef"),
+            "it does not say who: {}",
+            a.output
+        );
+        assert_eq!(
+            a.ui.mode(),
+            Mode::Browse,
+            "it opened a composer the operator could not send"
+        );
+    }
+
+    /// A message to several people is staggered, for the reason a group's is:
+    /// N objects together in one bucket announce the fan-out and its size.
+    #[test]
+    fn a_message_to_several_people_is_staggered() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("message-stagger");
+        // Two recipients, both reachable: the same peer twice is enough to
+        // exercise the fan-out without a second peering.
+        let to = vec![b_id.clone(), b_id.clone()];
+        let before = a.store.len();
+        let out = a.fan_out(&to, "hello");
+        assert!(out.contains("composed for"), "{out}");
+        assert_eq!(a.pending.len(), 2, "the copies were not held");
+        assert_eq!(a.store.len(), before, "they went out immediately");
+        assert!(out.contains("RFC 6 §2.7"), "{out}");
+
+        // One recipient is not a fan-out and goes straight in.
+        let out = a.fan_out(&[b_id], "hello again");
+        assert!(!out.contains("copies"), "{out}");
+        assert!(a.store.len() > before, "a single message was held back");
+    }
+
+    /// `message` takes no text on the command line, so no message body can
+    /// reach the history through it at all.
+    #[test]
+    fn message_puts_no_body_in_the_history() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("message-history");
+        type_command(&mut a, &format!("message {b_id}"));
+        for ch in "the safe house is on Rua Augusta".chars() {
+            a.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(
+            !a.history.iter().any(|h| h.contains("Rua Augusta")),
+            "{:?}",
+            a.history
+        );
     }
 }
