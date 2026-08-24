@@ -203,7 +203,10 @@ impl Command {
         ),
         ("disconnect", "close the link"),
         ("reach", "what this node can reach, and how far"),
-        ("rollcall", "ask peers who is present"),
+        (
+            "rollcall [publish|withdraw]",
+            "the public directory — listing yourself is opt-in (RFC 3 §9)",
+        ),
         (
             "message <peer> [peer…]",
             "compose to one or more people; Ctrl-D seals and queues",

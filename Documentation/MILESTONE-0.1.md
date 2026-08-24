@@ -149,9 +149,10 @@ Built although §5 called it 0.2: **groups** (`groups.rs`), **channels**
 the `socks` backend, and a serial backend against which the LoRa profile is
 modelled.
 
-Genuinely absent: **rollcall** — the command parses and reports, but nothing
-publishes an RFC 3 §9 entry — and **introduction tokens**, which appear nowhere
-in the tree.
+**Rollcall** was the last of these to be listed as absent and is now built —
+`rollcall.rs`, `bulletin::Kind::Rollcall`, and `rollcall [publish|withdraw]`.
+Genuinely absent: **introduction tokens**, which appear nowhere in the tree and
+are not needed for a message from A to B.
 
 ## 2.2 Gate status
 
@@ -252,8 +253,13 @@ What is actually absent from 0.1:
 
 | item | why |
 |---|---|
-| rollcall — RFC 3 §9 | the command reports and nothing publishes. The bulletin mechanism it needs exists (`Class::Bulletin` already carries channels and prekey batches), so this is the smallest remaining feature, not a blocked one |
 | introduction tokens | not started, and not needed for a message from A to B |
+
+Rollcall was on this list until it was built. It is worth noting what it cost:
+nothing that was not already there. `Class::Bulletin` already carried channels
+and prekey batches, so RFC 3 §9's whole public tier came to one payload type, a
+fourth signing domain, and a command — which is the shape the design predicted
+and is some evidence the bulletin abstraction is the right one.
 
 ### 5.1 The scope argument, and what happened to it
 

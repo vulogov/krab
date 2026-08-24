@@ -50,6 +50,13 @@ pub enum Kind {
     /// — which is the whole point: divergence is meaningless without knowing
     /// who diverges.
     Roster = 3,
+    /// A public rollcall entry — RFC 3 §9.
+    ///
+    /// The one kind that is **opt-in**. A node that has never published one is
+    /// invisible to the rollcall and reachable only through hand-exchanged
+    /// credentials, and §9 says that MUST be the default. See
+    /// [`crate::rollcall`].
+    Rollcall = 4,
 }
 
 impl Kind {
@@ -58,6 +65,7 @@ impl Kind {
             1 => Some(Kind::Prekeys),
             2 => Some(Kind::Post),
             3 => Some(Kind::Roster),
+            4 => Some(Kind::Rollcall),
             _ => None,
         }
     }
@@ -69,6 +77,7 @@ impl Kind {
             Kind::Prekeys => b"krab/bulletin/prekeys/v1",
             Kind::Post => b"krab/bulletin/post/v1",
             Kind::Roster => b"krab/bulletin/roster/v1",
+            Kind::Rollcall => b"krab/bulletin/rollcall/v1",
         }
     }
 }

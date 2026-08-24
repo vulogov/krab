@@ -53,6 +53,7 @@ mod rekey;
 mod rekey_run;
 mod render;
 mod request;
+mod rollcall;
 mod shared;
 mod shred;
 mod spoken;
@@ -345,6 +346,13 @@ struct App {
     home: PathBuf,
     /// Channels owned and followed — RFC 6 §3.
     roster: channels::Roster,
+    /// Whether this node lists itself in the public rollcall — RFC 3 §9.
+    ///
+    /// Default is not listed, which §9 requires. Not persisted: there is no
+    /// config file that could carry an opt-in across a restart unnoticed
+    /// (`NO-CONFIG.md`), and a lock clears it, so a node comes back invisible
+    /// unless its operator says otherwise.
+    rollcall: rollcall::Listing,
     /// Groups — RFC 6 §2. Closed rosters, sealed per member.
     groups: Vec<groups::Group>,
     /// Fan-out copies waiting for their release time — RFC 6 §2.7.
@@ -493,6 +501,7 @@ impl Default for App {
             relay: false,
             listen: None,
             roster: channels::Roster::default(),
+            rollcall: rollcall::Listing::default(),
             groups: Vec::new(),
             pending: Vec::new(),
             observed_arrivals: 0,
@@ -860,6 +869,7 @@ impl App {
         self.drain_inbound();
         self.release_pending();
         self.republish_prekeys_if_due();
+        self.republish_rollcall_if_due();
         self.shred_expired_epochs();
         self.enforce_retention();
         let now_s = std::time::SystemTime::now()
@@ -1534,6 +1544,29 @@ impl App {
         }
     }
 
+    /// Refresh the rollcall entry, if this node is listed and one is due.
+    ///
+    /// **Only ever for a node that opted in.** `Listing::due` returns false
+    /// whenever `publishing` is false, which is its default and the state a
+    /// lock restores — so the path from "the schedule fired" to "an entry was
+    /// published" cannot be walked by a node whose operator never asked.
+    ///
+    /// Refreshing before expiry rather than after is the whole reason this
+    /// exists: an entry lives seven days (RFC 3 §9.1), and a node that waited
+    /// for one to lapse would drop out of the directory every week for no
+    /// reason. Which also means the promise `rollcall publish` prints — that
+    /// the node keeps it fresh — has a mechanism behind it, rather than being
+    /// a sentence about one.
+    fn republish_rollcall_if_due(&mut self) {
+        if self.identity.is_none() || self.epoch_key.is_none() {
+            return;
+        }
+        if !self.rollcall.due(now_epoch().0.saturating_mul(1440)) {
+            return;
+        }
+        self.rollcall_publish();
+    }
+
     /// Draw the selected picture in the message pane.
     ///
     /// **Decoded here, by this program's own decoder**, and what reaches the
@@ -1679,6 +1712,164 @@ impl App {
     /// same reason RFC 6 §2.7 staggers a group's — `N` objects appearing at
     /// once in one size bucket announces both the fan-out and how many people
     /// are in it.
+    /// `rollcall` — the public tier, RFC 3 §9.
+    ///
+    /// Three forms, and the bare one is a *read*. Listing yourself is
+    /// something you have to ask for in words, because §9's requirement is not
+    /// merely that the default is off but that a node is invisible until its
+    /// operator decides otherwise — and a command that published as a side
+    /// effect of being curious about who else is out there would defeat it.
+    fn rollcall_command(&mut self, line: &str) -> String {
+        let Ok(words) = words::split(line) else {
+            return "unbalanced quotes".into();
+        };
+        match words.get(1).map(|w| w.text()).as_deref() {
+            None => self.rollcall_status(),
+            Some("publish") => self.rollcall_publish(),
+            Some("withdraw") => self.rollcall_withdraw(),
+            Some(other) => format!(
+                "no rollcall subcommand `{other}`.\n\n\
+                 \x20 rollcall            who is listed, and whether you are\n\
+                 \x20 rollcall publish    list this node — RFC 3 §9 is opt-in\n\
+                 \x20 rollcall withdraw   stop republishing"
+            ),
+        }
+    }
+
+    /// Who is listed, and whether this node is.
+    fn rollcall_status(&self) -> String {
+        let mut seen: Vec<(String, rollcall::Entry, u32)> = Vec::new();
+        let me = self.identity.as_ref().map(|i| i.node_id());
+        self.store.with(|s| {
+            for (_, id) in s.entries_in_range(0, u32::MAX) {
+                let Some(bytes) = s.get(&id) else { continue };
+                // `from_object` yields nothing unless the bulletin verifies,
+                // so an unsigned entry cannot be listed by forgetting to check
+                // — and this is the one tier strangers write into.
+                let Some(b) = bulletin::from_object(bytes) else {
+                    continue;
+                };
+                if b.kind != bulletin::Kind::Rollcall {
+                    continue;
+                }
+                let Some(e) = rollcall::Entry::decode(&b.payload) else {
+                    continue;
+                };
+                let node = b.node_id();
+                let short = short_id(&node);
+                // Newest wins: entries are flooded and republished, so the
+                // same node appears more than once until the old copy expires.
+                match seen.iter_mut().find(|(n, _, _)| *n == short) {
+                    Some(slot) if slot.2 < b.epoch => *slot = (short, e, b.epoch),
+                    Some(_) => {}
+                    None => seen.push((short, e, b.epoch)),
+                }
+            }
+        });
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut out = String::new();
+        if seen.is_empty() {
+            out.push_str("no rollcall entries in the corpus.\n\n");
+        } else {
+            out.push_str(&format!("{} node(s) listed:\n\n", seen.len()));
+            for (short, e, epoch) in &seen {
+                let mine = if me.map(|m| short_id(&m) == *short).unwrap_or(false) {
+                    "  (you)"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "\x20 {short}{mine}\n\x20   {}\n\x20   epoch {epoch}\n",
+                    e.summary()
+                ));
+            }
+            out.push('\n');
+        }
+        out.push_str(if self.rollcall.publishing {
+            "You are publishing. `rollcall withdraw` stops it."
+        } else {
+            "You are not listed. RFC 3 §9's default is invisible: a node that \
+             never publishes is reachable only through hand-exchanged \
+             credentials.\n\n`rollcall publish` lists this node's keys and \
+             terms — never its endpoints, and never who it peers with."
+        });
+        out
+    }
+
+    /// Opt in, and publish an entry.
+    fn rollcall_publish(&mut self) -> String {
+        let Some(id) = self.identity.as_ref() else {
+            return "no identity — run `init` first".into();
+        };
+        if self.epoch_key.is_none() {
+            return "locked — unlock to publish".into();
+        }
+        let policy = peering::Policy::default();
+        let epoch = now_epoch();
+        let entry = rollcall::Entry {
+            kx_pk: id.correspondence_bytes(),
+            max_bucket: policy.max_bucket,
+            shard_bits: policy.shard_bits,
+            relay: policy.relay,
+            watermark: self.store.with(|s| s.watermark()),
+        };
+
+        let b = bulletin::Bulletin::create(
+            bulletin::Kind::Rollcall,
+            id.signing_key(),
+            epoch.0,
+            entry.encode(),
+        );
+        let now_min = epoch.0 * 1440;
+        // ~7 days, not `MAX_TTL`. An entry has to lapse quickly, because
+        // lapsing is the only way one is ever removed (RFC 3 §6.1).
+        let Some((oid, bytes)) = bulletin::into_object(&b, now_min, rollcall::TTL_MINUTES) else {
+            return "the entry does not fit an object".into();
+        };
+        if let Err(e) = self.store.with(|s| s.ingest(oid, bytes, now_min, u32::MAX)) {
+            return format!("could not publish: {e:?}");
+        }
+        self.save_corpus();
+
+        self.rollcall.publishing = true;
+        self.rollcall.last_epoch = Some(epoch.0);
+        format!(
+            "listed in the rollcall as {short}.\n\n\
+             It carries your identity and correspondence keys, and the terms \
+             you would peer on: {summary}.\n\n\
+             It carries **no endpoint** — not an address, a port, a transport \
+             or an onion (RFC 3 §9.2). A peer-request reaches you through the \
+             corpus, so being findable never required being locatable.\n\n\
+             It also says nothing about who you already peer with. A directory \
+             of nodes is a public key directory; a directory of links is the \
+             social graph (RFC 3 §9.1).\n\n\
+             It expires in 7 days and this node refreshes it while you stay \
+             listed. `rollcall withdraw` stops that.",
+            short = id.short_id(),
+            summary = entry.summary(),
+        )
+    }
+
+    /// Stop republishing. There is no recall.
+    fn rollcall_withdraw(&mut self) -> String {
+        if !self.rollcall.publishing {
+            return "not listed — nothing to withdraw.".into();
+        }
+        self.rollcall.publishing = false;
+        format!(
+            "withdrawn: this node will not republish.\n\n\
+             **The entry already out there cannot be recalled.** RFC 3 §6.1 \
+             forbids a recall mechanism permanently, because a recall \
+             mechanism is a censorship mechanism and cannot be made \
+             selective — so it stands until it expires, within {days} days of \
+             when it was published.\n\n\
+             Nothing in it was an endpoint or a relationship, so what remains \
+             visible is a key and the terms you offered.",
+            days = rollcall::TTL_MINUTES / 1440,
+        )
+    }
+
     fn message(&mut self, line: &str) -> String {
         let Ok(words) = words::split(line) else {
             return "unbalanced quotes".into();
@@ -2682,17 +2873,7 @@ impl App {
             Command::Peers => self.output = self.peers_panel(),
             Command::Reach => self.output = self.reach_report(line),
             Command::Keys => self.output = self.keys_report(),
-            Command::Rollcall => {
-                self.output = match &self.identity {
-                    Some(id) => format!(
-                        "rollcall entry for {} refreshed.\n\nIt carries your statics \
-                         and policy, signed. It does not carry endpoints — those are \
-                         exchanged inside a peering (RFC 3 §9).",
-                        id.short_id()
-                    ),
-                    None => "no identity — run `init` first".into(),
-                };
-            }
+            Command::Rollcall => self.output = self.rollcall_command(line),
             Command::Message => self.output = self.message(line),
             Command::Send => self.output = self.send(line),
             Command::Request => self.output = self.peer_request(line),
@@ -5660,6 +5841,12 @@ impl App {
         // of a node that is supposed to be unable to read anything.
         self.roster = channels::Roster::default();
         self.groups.clear();
+        // Listing in the rollcall is opt-in per RFC 3 §9, and a lock is the
+        // point at which nothing about the operator's intent is still known.
+        // Clearing it means the node stops republishing; the entry already
+        // flooded stands until it expires, because there is no recall
+        // (RFC 3 §6.1) and pretending otherwise would be worse than saying so.
+        self.rollcall = rollcall::Listing::default();
         self.list = vec!["(locked)".into()];
         self.passphrase.clear();
         overwrite(&mut self.composer);
@@ -6487,18 +6674,172 @@ mod tests {
         );
     }
 
-    /// `rollcall` publishes statics and policy, not endpoints — RFC 3 §9
-    /// keeps endpoints inside a peering, so a public attestation is not a
-    /// location beacon.
+    /// Count this node's own rollcall entries in the corpus.
+    fn listed_entries(a: &App) -> Vec<rollcall::Entry> {
+        let me = a.identity.as_ref().map(|i| i.node_id());
+        let mut out = Vec::new();
+        a.store.with(|s| {
+            for (_, oid) in s.entries_in_range(0, u32::MAX) {
+                if let Some(b) = s.get(&oid).and_then(bulletin::from_object) {
+                    if b.kind == bulletin::Kind::Rollcall && Some(b.node_id()) == me {
+                        if let Some(e) = rollcall::Entry::decode(&b.payload) {
+                            out.push(e);
+                        }
+                    }
+                }
+            }
+        });
+        out
+    }
+
+    /// **A fresh node is invisible, and reading the directory does not change
+    /// that.** RFC 3 §9: "a node that never publishes an entry is invisible to
+    /// it … That MUST be the default."
+    ///
+    /// The second half is the part worth a test. A bare `rollcall` is a query,
+    /// and if it published as a side effect of answering, the default would be
+    /// off only until the first time anyone looked.
     #[test]
-    fn rollcall_does_not_publish_endpoints() {
+    fn a_node_is_not_listed_until_it_says_so() {
         let mut a = ready_node("rollcall");
+        assert!(!a.rollcall.publishing);
         type_command(&mut a, "rollcall");
-        assert!(
-            a.output.contains("does not carry endpoints"),
-            "{}",
-            a.output
+        assert!(a.output.contains("not listed"), "{}", a.output);
+        assert!(!a.rollcall.publishing, "reading the directory opted us in");
+        assert!(listed_entries(&a).is_empty(), "an entry was published");
+    }
+
+    /// `rollcall publish` lists the node, and the entry carries keys and terms.
+    #[test]
+    fn publishing_lists_the_node_with_its_terms() {
+        let mut a = ready_node("rollcall");
+        type_command(&mut a, "rollcall publish");
+        assert!(a.rollcall.publishing, "{}", a.output);
+
+        let entries = listed_entries(&a);
+        assert_eq!(entries.len(), 1, "{}", a.output);
+        let (kx, short) = {
+            let id = a.identity.as_ref().unwrap();
+            (id.correspondence_bytes(), id.short_id())
+        };
+        assert_eq!(entries[0].kx_pk, kx);
+
+        // And it now shows in the directory, as us.
+        type_command(&mut a, "rollcall");
+        assert!(a.output.contains(&short), "{}", a.output);
+        assert!(a.output.contains("(you)"), "{}", a.output);
+    }
+
+    /// **RFC 3 §9.2 — no reachability information, ever.**
+    ///
+    /// Checked against the published *object*, not the struct: the entry is
+    /// wrapped in a bulletin and a routing header before it floods, and this
+    /// is the artifact a stranger actually receives.
+    #[test]
+    fn a_published_entry_carries_no_endpoint() {
+        let mut a = ready_node("rollcall");
+        // Give the node a link, so there is an endpoint in memory that could
+        // leak into an entry built carelessly.
+        type_command(&mut a, "connect beacon tcp 127.0.0.1:40404");
+        type_command(&mut a, "rollcall publish");
+
+        let mut published: Vec<Vec<u8>> = Vec::new();
+        let me = a.identity.as_ref().map(|i| i.node_id());
+        a.store.with(|s| {
+            for (_, oid) in s.entries_in_range(0, u32::MAX) {
+                let Some(bytes) = s.get(&oid) else { continue };
+                if let Some(b) = bulletin::from_object(bytes) {
+                    if b.kind == bulletin::Kind::Rollcall && Some(b.node_id()) == me {
+                        published.push(bytes.to_vec());
+                    }
+                }
+            }
+        });
+        assert_eq!(published.len(), 1);
+
+        for needle in ["127.0.0.1", "40404", "tcp", "beacon"] {
+            assert!(
+                !published[0]
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes()),
+                "the entry carries `{needle}` — RFC 3 §9.2 forbids reachability"
+            );
+        }
+    }
+
+    /// **No statement that A peers with B** — RFC 3 §9.1's other column. A
+    /// directory of links is the social graph.
+    #[test]
+    fn a_published_entry_names_no_peer() {
+        let mut a = ready_node("rollcall");
+        let b = ready_node("counterpart");
+        let peer = b.identity.as_ref().unwrap().short_id();
+        type_command(&mut a, "rollcall publish");
+
+        let entries = listed_entries(&a);
+        assert_eq!(entries.len(), 1);
+        // The entry has no field that could name one, so the check is on the
+        // encoding: nothing that identifies another node appears in it.
+        let bytes = entries[0].encode();
+        assert!(!bytes.windows(peer.len()).any(|w| w == peer.as_bytes()));
+        assert!(!bytes
+            .windows(32)
+            .any(|w| w == b.identity.as_ref().unwrap().node_id()));
+    }
+
+    /// **Withdrawal is not recall, and the text must not suggest it is.**
+    /// RFC 3 §6.1 forbids a recall mechanism permanently. The likeliest
+    /// failure here is an operator believing `withdraw` removed something.
+    #[test]
+    fn withdrawing_stops_republication_and_says_recall_is_impossible() {
+        let mut a = ready_node("rollcall");
+        type_command(&mut a, "rollcall publish");
+        let before = listed_entries(&a).len();
+
+        type_command(&mut a, "rollcall withdraw");
+        assert!(!a.rollcall.publishing);
+        assert!(a.output.contains("cannot be recalled"), "{}", a.output);
+        assert!(a.output.contains("expires"), "{}", a.output);
+        assert_eq!(
+            listed_entries(&a).len(),
+            before,
+            "withdrawing deleted the published entry, which is a recall"
         );
+    }
+
+    /// A lock stops republication. Listing is an operator decision, and a lock
+    /// is the moment nothing about the operator's intent is still known.
+    #[test]
+    fn locking_stops_republishing_to_the_rollcall() {
+        let mut a = ready_node("rollcall");
+        type_command(&mut a, "rollcall publish");
+        assert!(a.rollcall.publishing);
+        a.lock();
+        assert!(!a.rollcall.publishing, "a locked node kept publishing");
+        assert!(!a.rollcall.due(u32::MAX));
+    }
+
+    /// The refresh only runs for a node that opted in — the schedule must not
+    /// be a path to publication for a node that never asked.
+    #[test]
+    fn the_schedule_does_not_list_a_node_that_never_opted_in() {
+        let mut a = ready_node("rollcall");
+        for _ in 0..4 {
+            a.republish_rollcall_if_due();
+        }
+        assert!(listed_entries(&a).is_empty());
+        assert!(!a.rollcall.publishing);
+    }
+
+    /// An unknown subcommand is refused with the three forms, rather than
+    /// falling through to the one that publishes.
+    #[test]
+    fn an_unknown_rollcall_subcommand_publishes_nothing() {
+        let mut a = ready_node("rollcall");
+        type_command(&mut a, "rollcall enable");
+        assert!(a.output.contains("no rollcall subcommand"), "{}", a.output);
+        assert!(!a.rollcall.publishing);
+        assert!(listed_entries(&a).is_empty());
     }
 
     /// An unknown transport is refused rather than silently defaulted, since a

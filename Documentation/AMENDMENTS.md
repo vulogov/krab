@@ -11,6 +11,39 @@ out of implementing the thing the paragraph describes.
 | 4 | RFC 3 §2.1 | the credential is the one signed document with no signature domain | **ADOPTED** 2026-08-07 |
 | 5 | RFC 4 §5.5 | nothing says an archive must be a window rather than a diff | **ADOPTED** 2026-08-07 |
 | 6 | RFC 1 §11 | the checks are prose; three of six were never implemented | **ADOPTED** 2026-08-07 |
+| 7 | RFC 3 §9.1 | "153 bytes computed" for a rollcall entry, with no field list to compute it from | open — see below |
+
+## 7. RFC 3 §9.1's rollcall entry size
+
+§9.1 says an entry is "153 bytes computed". Implementing §9 produces **160**.
+
+The seven bytes are not the finding. The finding is that there is no way to
+find out which of us is right: §9.1 gives a number and not the fields it came
+from, so a reader cannot tell whether 153 omits the corpus watermark, packs the
+capability bits more tightly, or assumed a different signature envelope.
+`apps/krab-sizes/src/creds.rs` already records the same about RFC 3 §3's
+credential figures — they "cannot be recomputed from the document … and are
+taken here as stated inputs".
+
+This is the shape named below. Two implementations can satisfy §9.1
+differently, and **neither would ever discover it**: an entry is
+self-describing CBOR, so a 160-byte one is read perfectly well by a node
+expecting 153, and nothing reports a size mismatch because nothing checks one.
+It surfaces, if at all, as an entry that unexpectedly does not fit somebody's
+buffer.
+
+Suggested text — state the composition, not the total:
+
+> A rollcall entry is a `bulletin` object (RFC 1 §5.2) whose payload is the
+> deterministic CBOR map: `1` correspondence key (32 bytes), `2` max bucket
+> index, `3` shard bits, `4` relay flag, `5` corpus watermark. The author's
+> `sig_pk` is the bulletin's author field and the node id derives from it;
+> neither is repeated in the payload. Implementations MUST NOT include any
+> further field: §9.2 forbids reachability, and §9.1's second column forbids
+> the rest.
+
+A total that can be recomputed is worth more than a total that is asserted, and
+this one currently cannot be.
 
 Findings 1–3 land in one section, so `RFC-7-section-6-proposed.md` closes all
 three in a single edit.
