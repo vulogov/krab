@@ -87,15 +87,12 @@ use krab_crypto::sign::{Sig, SigningKey, VerifyingKey};
 pub const DOMAIN: &[u8] = b"krab/fragment/v1";
 
 /// Domain for a delta's signature.
-#[allow(dead_code)]
 pub const DOMAIN_DELTA: &[u8] = b"krab/nodediff/v1";
 
 /// Domain for the hash a delta references its base by.
-#[allow(dead_code)]
 pub const DOMAIN_BASE: &[u8] = b"krab/fragment-base/v1";
 
 /// RFC 3 §8.2 — how often a full fragment should go out.
-#[allow(dead_code)]
 pub const FULL_INTERVAL_DAYS: u64 = 7;
 
 /// The most links a fragment may list.
@@ -165,7 +162,6 @@ pub enum Bad {
     TooLong,
     /// A delta whose base this reader does not hold — §8.2's "requests the
     /// full fragment".
-    #[allow(dead_code)]
     UnknownBase,
 }
 
@@ -226,7 +222,6 @@ impl Fragment {
     }
 
     /// What a delta references this fragment by — §8.2.
-    #[allow(dead_code)]
     pub fn base_hash(&self) -> [u8; 32] {
         krab_crypto::hash::domain_hash(DOMAIN_BASE, &self.encode())
     }
@@ -315,33 +310,23 @@ impl Fragment {
 /// > "Deltas MUST reference the last full fragment by hash. A peer that has
 /// > missed a delta requests the full fragment."
 ///
-/// # Built, tested, and **not yet wired** — stated rather than left to be found
+/// # The cadence, and where the base lives
 ///
-/// `peer fragment` sends a full fragment every time. Nothing constructs a
-/// `Delta` outside this module's tests, and `Fragment::base_hash` has no
-/// production caller.
+/// `peer fragment` sends a full fragment when none has gone out within
+/// [`FULL_INTERVAL_DAYS`], and a delta otherwise. One base serves every peer:
+/// a fragment's contents are the node's own links, so all peers are sent the
+/// same document at the same moment and are therefore on the same base.
 ///
-/// Two things are missing, both bookkeeping rather than protocol:
+/// The sender records it as `Artifact::Nodelist`; a reader records each peer's
+/// as `PeerFile::Nodelist`. Both sealed under `W_N`, because §15 calls a
+/// fragment the graph.
 ///
-/// 1. **The base, per peer, on both sides.** A sender must remember which full
-///    fragment each peer last received, and a reader must hold the base a
-///    delta names — `apply` already refuses one it does not, which is §8.2's
-///    "requests the full fragment" made checkable.
-/// 2. **The cadence hook.** §8.2 says full fragments weekly
-///    ([`FULL_INTERVAL_DAYS`]) with deltas between, which needs a decision in
-///    the scheduler rather than in a command.
+/// A reader that does not hold the base a delta names **drops it** rather than
+/// guessing. That is §8.2's "a peer that has missed a delta requests the full
+/// fragment", expressed as a check: applying one to the wrong base would build
+/// a nodelist neither party ever signed, and the next weekly full fragment
+/// repairs it anyway.
 ///
-/// The cost of not having it is bandwidth and only bandwidth: §8.2's table
-/// puts a one-link delta at 8× to 34× cheaper than a full fragment, which
-/// matters on the austere links §8.1 prices and nowhere else. **No security
-/// property depends on it** — a full fragment carries exactly what a delta
-/// would and is checked identically.
-///
-/// Recorded here and in `MILESTONE-0.1.md` because this codebase's most common
-/// defect is a thing built with no caller, and the two previous instances
-/// (`exchange::respond_to`, `receive::scan_requests`) were both found by
-/// accident months later.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delta {
     /// Key 1 — the author's identity key.
@@ -362,7 +347,6 @@ pub struct Delta {
     pub sig: [u8; 64],
 }
 
-#[allow(dead_code)]
 impl Delta {
     fn signed_bytes(
         author: &[u8; 32],

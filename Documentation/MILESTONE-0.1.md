@@ -311,21 +311,10 @@ What is actually absent from 0.1:
 
 Nothing from §5's list, and nothing from RFC 3.
 
-One piece is **built and not wired**, stated here because a thing built with no
-caller is this codebase's most common defect and the two previous instances
-(`exchange::respond_to`, `receive::scan_requests`) were each found by accident
-months later:
-
-| item | state |
-|---|---|
-| `fragment::Delta` — RFC 3 §8.2's `NODEDIFF` | encoded, signed, verified and tested; nothing constructs one. `peer fragment` sends a full fragment every time |
-
-What it needs is bookkeeping rather than protocol: the last full fragment
-remembered per peer on both sides, and §8.2's weekly cadence decided in the
-scheduler rather than in a command. The cost of not having it is bandwidth
-only — §8.2's table puts a one-link delta at 8× to 34× cheaper than a full
-fragment — and **no security property depends on it**, because a full fragment
-carries exactly what a delta would and is checked identically.
+Nothing is built-and-unwired. §8.2's `NODEDIFF` was, for one commit, and is
+recorded here because that state is worth naming rather than discovering:
+`peer fragment` now sends a full fragment weekly and a delta between, and a
+reader applies one against the base it stored or drops it.
 
 Rollcall cost nothing that was not already there: `Class::Bulletin` carried
 channels and prekey batches, so RFC 3 §9's whole public tier came to one

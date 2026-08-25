@@ -118,7 +118,16 @@ impl TagTable {
     }
 }
 
-type Opened = (String, Epoch, String, Option<Vec<u8>>, bool);
+/// What one opened object yielded: sender, epoch, body, nodelist, picture,
+/// and whether the reservoir was in play.
+type Opened = (
+    String,
+    Epoch,
+    String,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    bool,
+);
 
 /// A message this node could open.
 pub struct Message {
@@ -141,6 +150,14 @@ pub struct Message {
     /// destroyed PNG. **Lives only as long as this value does** (RFC 7 §8),
     /// like the body beside it.
     pub picture: Option<Vec<u8>>,
+    /// A nodelist fragment or `NODEDIFF`, if this message is one — RFC 3 §8.
+    ///
+    /// Held as bytes for the same reason a picture is, and it is not a
+    /// theoretical reason: a fragment is 32-byte keys and 64-byte signatures,
+    /// so `from_utf8_lossy` replaces most of it with U+FFFD and every
+    /// signature check fails. The first version of the fragment read path
+    /// decoded `body.as_bytes()` and could never have worked.
+    pub nodelist: Option<Vec<u8>>,
     /// Plaintext. **Lives only as long as this value does** (RFC 7 §8).
     pub body: String,
     /// Whether the reservoir was in play, so the interface can say what the
@@ -160,6 +177,16 @@ pub struct Scan {
     pub tag_match_decrypt_fail: usize,
     /// Objects examined.
     pub examined: usize,
+}
+
+/// Whether a plaintext is a nodelist fragment or a `NODEDIFF` — RFC 3 §8.
+///
+/// Recognised **before** the lossy text conversion, like a picture, because
+/// afterwards there is nothing left to recognise. Decoding both is the
+/// discriminator: neither is valid text and neither collides with the other,
+/// and both are verified by the caller before anything is believed.
+fn is_nodelist(pt: &[u8]) -> bool {
+    crate::fragment::Fragment::decode(pt).is_some() || crate::fragment::Delta::decode(pt).is_some()
 }
 
 /// A first-contact document this node could open — RFC 3 §5.
@@ -313,11 +340,12 @@ impl Inbox {
             }
 
             match Self::open_object(bytes, &header, candidates, correspondents, ours) {
-                Some((from, epoch, body, picture, pq)) => out.messages.push(Message {
+                Some((from, epoch, body, nodelist, picture, pq)) => out.messages.push(Message {
                     id,
                     from,
                     epoch,
                     body,
+                    nodelist,
                     picture,
                     post_quantum: pq,
                 }),
@@ -391,17 +419,29 @@ impl Inbox {
                             // A picture keeps its bytes; anything else is
                             // text. `from_utf8_lossy` on a PNG produces a
                             // string that is not the picture.
-                            let (body, picture) = match crate::picture::from_plaintext(&pt) {
-                                Some(png) => (
-                                    format!("[picture, {} bytes — `picture save`]", png.len()),
-                                    Some(png.to_vec()),
-                                ),
-                                None => (String::from_utf8_lossy(&pt).into_owned(), None),
-                            };
+                            // Binary payloads keep their bytes; anything
+                            // else is text. Both checks happen *before* the
+                            // lossy conversion, because after it there is
+                            // nothing left to recognise.
+                            let (body, picture, nodelist) =
+                                match crate::picture::from_plaintext(&pt) {
+                                    Some(png) => (
+                                        format!("[picture, {} bytes — `picture save`]", png.len()),
+                                        Some(png.to_vec()),
+                                        None,
+                                    ),
+                                    None if is_nodelist(&pt) => (
+                                        "[nodelist — see `peers`]".to_string(),
+                                        None,
+                                        Some(pt.clone()),
+                                    ),
+                                    None => (String::from_utf8_lossy(&pt).into_owned(), None, None),
+                                };
                             opened = Some((
                                 c.name.clone(),
                                 epoch,
                                 body,
+                                nodelist,
                                 picture,
                                 n == 0 && chunk.is_some(),
                             ));

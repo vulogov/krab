@@ -56,6 +56,12 @@ pub enum Artifact {
     Reseal,
     /// The duress store — RFC 7 §10.
     DuressWrapped,
+    /// The last full nodelist fragment this node published — RFC 3 §8.2.
+    ///
+    /// The base a `NODEDIFF` references. One record for every peer, because a
+    /// fragment's contents are the same for all of them and they are all sent
+    /// the same one at the same moment.
+    Nodelist,
     /// Introduction tokens already honoured — RFC 3 §10's "single-use".
     ///
     /// A membership-adjacent disclosure: it is a record of who was introduced
@@ -66,7 +72,7 @@ pub enum Artifact {
 
 impl Artifact {
     /// Every artifact. Used by the test that keeps this file honest.
-    pub const ALL: [Artifact; 12] = [
+    pub const ALL: [Artifact; 13] = [
         Artifact::IdentityWrapped,
         Artifact::KekParams,
         Artifact::Corpus,
@@ -79,6 +85,7 @@ impl Artifact {
         Artifact::Reseal,
         Artifact::DuressWrapped,
         Artifact::IntroductionsSpent,
+        Artifact::Nodelist,
     ];
 
     /// The name on disk.
@@ -96,6 +103,7 @@ impl Artifact {
             Artifact::Reseal => "reseal.cbor",
             Artifact::DuressWrapped => "duress.wrapped",
             Artifact::IntroductionsSpent => "introductions.spent",
+            Artifact::Nodelist => "nodelist.sent",
         }
     }
 
@@ -118,7 +126,8 @@ impl Artifact {
             | Artifact::Groups
             | Artifact::Reseal
             | Artifact::DuressWrapped
-            | Artifact::IntroductionsSpent => true,
+            | Artifact::IntroductionsSpent
+            | Artifact::Nodelist => true,
         }
     }
 }
@@ -134,6 +143,12 @@ pub enum PeerFile {
     Policy,
     /// How the peering was formed, and what it is worth.
     Terms,
+    /// The last full fragment received from this peer — RFC 3 §8.2.
+    ///
+    /// The base their deltas reference. A reader that does not hold it cannot
+    /// apply one, which is §8.2's "requests the full fragment" as a check
+    /// rather than as advice.
+    Nodelist,
     /// The negotiation that produced this peering — RFC 3 §5.3.
     ///
     /// "Both parties store the full chain: `request → counter(s) → link`. The
@@ -156,7 +171,7 @@ pub enum PeerFile {
 
 impl PeerFile {
     /// Every per-peer file.
-    pub const ALL: [PeerFile; 7] = [
+    pub const ALL: [PeerFile; 8] = [
         PeerFile::Link,
         PeerFile::Reservoir,
         PeerFile::Policy,
@@ -164,6 +179,7 @@ impl PeerFile {
         PeerFile::Credential,
         PeerFile::Quota,
         PeerFile::Chain,
+        PeerFile::Nodelist,
     ];
 
     /// The name on disk.
@@ -176,6 +192,7 @@ impl PeerFile {
             PeerFile::Credential => "credential",
             PeerFile::Quota => "quota",
             PeerFile::Chain => "chain",
+            PeerFile::Nodelist => "nodelist",
         }
     }
 }

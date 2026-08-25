@@ -352,6 +352,12 @@ struct App {
     home: PathBuf,
     /// Channels owned and followed — RFC 6 §3.
     roster: channels::Roster,
+    /// Full fragments seen this scan, waiting to be recorded as delta bases.
+    ///
+    /// Held across the borrow rather than dropped: a base that is not stored
+    /// makes next week's delta unapplicable, which presents as a peer who
+    /// stopped sharing (RFC 3 §8.2).
+    pending_bases: Vec<(String, fragment::Fragment)>,
     /// Two-hop reachability, from nodelist fragments peers have sent —
     /// RFC 3 §8.
     ///
@@ -531,6 +537,7 @@ impl Default for App {
             introductions: Vec::new(),
             spends: std::collections::HashMap::new(),
             reach: Vec::new(),
+            pending_bases: Vec::new(),
             groups: Vec::new(),
             pending: Vec::new(),
             observed_arrivals: 0,
@@ -1317,14 +1324,64 @@ impl App {
         // is not party to, and one whose counterparty never agreed to be
         // listed.
         self.reach.clear();
+        let now_s = self.now_s();
+        // Collected first, because recording a base needs `&mut self` and the
+        // scan borrows the messages.
+        let mut bases: Vec<(String, fragment::Fragment)> = Vec::new();
+        // **Newest per peer, not one entry per document.**
+        //
+        // A peer's older full fragment stays in the corpus after its delta
+        // arrives, so both open on the same scan. Pushing one entry each left
+        // two rows for one peer and a reader taking the first got whichever
+        // the scan happened to reach — usually the stale one, which presents
+        // as a peer whose nodelist stopped growing.
+        //
+        // `published_s` is inside the author's signature, so it orders their
+        // own documents without this node recording an arrival time (§12).
+        let mut reach: Vec<(String, u64, Vec<[u8; 32]>)> = Vec::new();
+        let mut note = |who: &str, at: u64, r: Vec<[u8; 32]>| match reach
+            .iter_mut()
+            .find(|(w, _, _)| w == who)
+        {
+            Some(slot) if slot.1 <= at => *slot = (who.to_string(), at, r),
+            Some(_) => {}
+            None => reach.push((who.to_string(), at, r)),
+        };
         for m in &scan.messages {
-            let Some(frag) = fragment::Fragment::decode(m.body.as_bytes()) else {
+            let Some(raw) = &m.nodelist else { continue };
+            if let Some(frag) = fragment::Fragment::decode(raw) {
+                // A full fragment replaces whatever base was held, and is the
+                // base every later delta references — RFC 3 §8.2.
+                if frag.verify(now_s).is_ok() {
+                    note(&m.from, frag.published_s, frag.reaches());
+                    bases.push((m.from.clone(), frag));
+                }
                 continue;
-            };
-            if frag.verify(self.now_s()).is_ok() {
-                self.reach.push((m.from.clone(), frag.reaches()));
+            }
+            if let Some(delta) = fragment::Delta::decode(raw) {
+                // **Applied against the base this node holds, or not at all.**
+                // §8.2: "a peer that has missed a delta requests the full
+                // fragment." `apply` refuses a base it was not built against,
+                // so a missed delta degrades to no update rather than to a
+                // nodelist neither party signed.
+                let Some(base) = self.read_peer_base(&m.from) else {
+                    continue;
+                };
+                if let Ok(links) = delta.apply(&base, now_s) {
+                    let id = delta.node_id();
+                    note(
+                        &m.from,
+                        delta.published_s,
+                        links
+                            .iter()
+                            .filter_map(|c| c.other_than(&id).map(|p| p.node_id()))
+                            .collect(),
+                    );
+                }
             }
         }
+        self.reach = reach.into_iter().map(|(w, _, r)| (w, r)).collect();
+        self.pending_bases = bases;
         self.list = if scan.messages.is_empty() {
             vec![format!(
                 "(no messages — {} objects examined)",
@@ -1353,6 +1410,14 @@ impl App {
                 })
                 .collect()
         };
+        // Bases recorded now that the scan's borrow has ended. Deferred rather
+        // than skipped: without them, a delta arriving next week has nothing
+        // to apply against and is dropped, which reads as a peer who stopped
+        // sharing.
+        for (peer, frag) in &self.pending_bases {
+            self.save_peer_base(peer, frag);
+        }
+
         // First-contact requests, on our own inbox tag. Shown at the top: a
         // request needs a human decision (RFC 3 §11's ceremony is a deliberate
         // act), and burying it under mail would mean it is never made.
@@ -2831,7 +2896,41 @@ impl App {
             );
         }
 
-        let body = frag.encode();
+        // **Full weekly, deltas between** — RFC 3 §8.2, FidoNet's cadence and
+        // the arithmetic behind it: a one-link delta is 8× to 34× cheaper than
+        // a full fragment, which matters on the austere links §8.1 prices.
+        //
+        // One base for everyone: a fragment's contents are the node's own
+        // links, so every peer is sent the same document at the same moment
+        // and is therefore on the same base.
+        let base = self.read_nodelist_base();
+        let due_full = match &base {
+            Some(b) => {
+                now_s.saturating_sub(b.published_s)
+                    >= fragment::FULL_INTERVAL_DAYS.saturating_mul(86_400)
+            }
+            None => true,
+        };
+        let (body, kind, listed) = if due_full {
+            let b = frag.encode();
+            self.save_nodelist_base(&frag);
+            (b, "full nodelist", frag.links.len())
+        } else {
+            let b = base.as_ref().expect("not due means a base exists");
+            let delta = fragment::Delta::create(signing, b, now_s, &creds, now_s);
+            let n = delta.added.len() + delta.removed.len();
+            if n == 0 {
+                return format!(
+                    "nothing has changed since your last nodelist.\n\n\
+                     RFC 3 §8.2 sends a full fragment weekly and deltas \
+                     between; there is no delta to send, and re-sending the \
+                     same {} link(s) would cost {} peer-copies for no news.",
+                    frag.links.len(),
+                    peers.len()
+                );
+            }
+            (delta.encode(), "NODEDIFF", n)
+        };
         let mut sent = 0;
         for p in &peers {
             // Individually, pairwise, by the same path a private message
@@ -2850,7 +2949,7 @@ impl App {
         }
         self.save_corpus();
         format!(
-            "nodelist sent to {sent} of {} peer(s), {} link(s) listed.\n\n\
+            "{kind} sent to {sent} of {} peer(s), {listed} link(s).\n\n\
              Each copy is sealed to one peer — not published, not flooded, and \
              not readable by anyone at three hops (RFC 3 §8). That costs \
              O(P²) bytes, which is the term bounding how many peers a node \
@@ -2859,13 +2958,51 @@ impl App {
              Everyone else you peer with is absent, because they have not \
              opted in.",
             peers.len(),
-            frag.links.len(),
             frag.reaches()
                 .iter()
                 .map(short_id)
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    }
+
+    /// The last full fragment this node published — RFC 3 §8.2's base.
+    fn read_nodelist_base(&self) -> Option<fragment::Fragment> {
+        let w = self.epoch_key?;
+        let sealed = std::fs::read(self.path(artifact::Artifact::Nodelist)).ok()?;
+        let raw = krab_crypto::kek::open_under(&w, b"krab/nodelist", &sealed).ok()?;
+        fragment::Fragment::decode(&raw)
+    }
+
+    /// Record it, sealed. A fragment is the graph (RFC 3 §15), so it is no
+    /// more readable at rest than a credential is.
+    fn save_nodelist_base(&mut self, frag: &fragment::Fragment) -> Option<()> {
+        let w = self.epoch_key?;
+        let sealed =
+            krab_crypto::kek::seal_under(&w, b"krab/nodelist", &frag.encode(), &mut OsRng).ok()?;
+        atomic::write(&self.path(artifact::Artifact::Nodelist), &sealed).ok()
+    }
+
+    /// The last full fragment received from `peer` — the base their deltas
+    /// reference.
+    fn read_peer_base(&self, peer: &str) -> Option<fragment::Fragment> {
+        let w = self.epoch_key?;
+        let sealed = std::fs::read(self.peer_path(peer, artifact::PeerFile::Nodelist)).ok()?;
+        let raw = krab_crypto::kek::open_under(&w, b"krab/nodelist", &sealed).ok()?;
+        fragment::Fragment::decode(&raw)
+    }
+
+    /// Record a peer's full fragment as the base for their deltas.
+    ///
+    /// Takes `&self` rather than `&mut self` so it can run inside
+    /// `refresh_inbox`, where the identity is borrowed for the whole scan.
+    fn save_peer_base(&self, peer: &str, frag: &fragment::Fragment) -> Option<()> {
+        let w = self.epoch_key?;
+        let dir = self.home.join("peers").join(peer);
+        std::fs::create_dir_all(&dir).ok()?;
+        let sealed =
+            krab_crypto::kek::seal_under(&w, b"krab/nodelist", &frag.encode(), &mut OsRng).ok()?;
+        atomic::write(&dir.join(artifact::PeerFile::Nodelist.name()), &sealed).ok()
     }
 
     /// The negotiation chain with `peer`, if one was stored — RFC 3 §5.3.
@@ -7197,6 +7334,7 @@ impl App {
         // The graph, which is what RFC 3 §15 calls a fragment. A locked node
         // holding one is a seizure holding one.
         self.reach.clear();
+        self.pending_bases.clear();
         // Per-link budgets. Sealed under W_N, which a locked node no longer
         // holds — keeping the in-memory copies would mean a counter that
         // cannot be written back, and a peer list in memory besides.
@@ -8312,6 +8450,20 @@ mod tests {
     /// unreadable to anyone else — while the proposer held a half-signed one
     /// for ever. Neither could supply evidence, which is the entire reason the
     /// document exists, and nothing reported anything wrong.
+    /// Opt in to listing, on both sides, through the real countersign path.
+    fn share_both_ways(x: &mut App, y: &mut App, short_y: &str) {
+        type_command(x, &format!("peer share {short_y} on"));
+        let handover = x.home.join(format!("{short_y}.credential"));
+        let to_y = y.home.join("sh.credential");
+        std::fs::copy(&handover, &to_y).unwrap();
+        y.peer_countersign(Some(to_y.to_str().unwrap()));
+        let short_x = short_id(&x.identity.as_ref().unwrap().node_id());
+        let back = y.home.join(format!("{short_x}.credential"));
+        let to_x = x.home.join("sh.credential");
+        std::fs::copy(&back, &to_x).unwrap();
+        x.peer_countersign(Some(to_x.to_str().unwrap()));
+    }
+
     /// **RFC 3 §8.3's default is false, and nothing is listed until both
     /// parties sign the flag.**
     ///
@@ -8347,7 +8499,7 @@ mod tests {
 
         // Now the fragment lists it, and goes out sealed per peer.
         type_command(&mut x, "peer fragment");
-        assert!(x.output.contains("1 link(s) listed"), "{}", x.output);
+        assert!(x.output.contains("1 link(s)"), "{}", x.output);
         assert!(x.output.contains(&short_y), "{}", x.output);
 
         // And Y, who never opted in to listing X, still lists nothing.
@@ -8356,6 +8508,111 @@ mod tests {
             y.output.contains("nothing to list"),
             "Y published a link it never agreed to publish: {}",
             y.output
+        );
+    }
+
+    /// **RFC 3 §8.2's cadence: a full fragment, then deltas.**
+    ///
+    /// Re-sending an unchanged nodelist costs one copy per peer for no news,
+    /// and §8.2's table puts a one-link delta at 8× to 34× cheaper.
+    #[test]
+    fn a_second_nodelist_is_a_delta_and_an_unchanged_one_is_nothing() {
+        let mut x = ready_node("nd-x");
+        let mut y = ready_node("nd-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+        share_both_ways(&mut x, &mut y, &short_y);
+
+        type_command(&mut x, "peer fragment");
+        assert!(x.output.contains("full nodelist"), "{}", x.output);
+        assert!(
+            x.read_nodelist_base().is_some(),
+            "no base was recorded, so nothing can reference one"
+        );
+
+        // Nothing changed, and nothing is due.
+        type_command(&mut x, "peer fragment");
+        assert!(x.output.contains("nothing has changed"), "{}", x.output);
+
+        // A second peering, and the news is a delta rather than the lot.
+        let mut z = ready_node("nd-z");
+        let (_, short_z) = link_up(&mut x, &mut z);
+        share_both_ways(&mut x, &mut z, &short_z);
+        type_command(&mut x, "peer fragment");
+        assert!(x.output.contains("NODEDIFF"), "{}", x.output);
+        assert!(
+            x.output.contains("1 link(s)"),
+            "a delta carried everything: {}",
+            x.output
+        );
+    }
+
+    /// **A delta applies against the base the reader holds, and only that.**
+    /// §8.2: "a peer that has missed a delta requests the full fragment."
+    #[test]
+    fn a_reader_applies_a_delta_to_the_base_it_stored() {
+        let mut x = ready_node("app-x");
+        let mut y = ready_node("app-y");
+        let (short_x, short_y) = link_up(&mut x, &mut y);
+        share_both_ways(&mut x, &mut y, &short_y);
+
+        // X publishes a full nodelist; Y reads it and records the base.
+        type_command(&mut x, "peer fragment");
+        y.store = x.store.clone();
+        y.refresh_inbox();
+        assert!(
+            y.read_peer_base(&short_x).is_some(),
+            "Y did not record X's base, so X's next delta is unapplicable"
+        );
+        assert_eq!(
+            y.reach
+                .iter()
+                .find(|(w, _)| *w == short_x)
+                .map(|(_, r)| r.len()),
+            Some(1)
+        );
+
+        // X gains a peering and sends a delta; Y applies it against the base.
+        let mut z = ready_node("app-z");
+        let (_, short_z) = link_up(&mut x, &mut z);
+        share_both_ways(&mut x, &mut z, &short_z);
+        type_command(&mut x, "peer fragment");
+        assert!(x.output.contains("NODEDIFF"), "{}", x.output);
+
+        y.store = x.store.clone();
+        y.refresh_inbox();
+        assert_eq!(
+            y.reach
+                .iter()
+                .find(|(w, _)| *w == short_x)
+                .map(|(_, r)| r.len()),
+            Some(2),
+            "the delta was not applied to the stored base"
+        );
+    }
+
+    /// A delta with no base is dropped, not guessed at — otherwise a reader
+    /// builds a nodelist neither party signed.
+    #[test]
+    fn a_delta_without_its_base_is_dropped() {
+        let mut x = ready_node("nob2-x");
+        let mut y = ready_node("nob2-y");
+        let (short_x, short_y) = link_up(&mut x, &mut y);
+        share_both_ways(&mut x, &mut y, &short_y);
+        type_command(&mut x, "peer fragment");
+
+        let mut z = ready_node("nob2-z");
+        let (_, short_z) = link_up(&mut x, &mut z);
+        share_both_ways(&mut x, &mut z, &short_z);
+        type_command(&mut x, "peer fragment");
+
+        // Y never saw the full fragment — only the delta.
+        y.store = x.store.clone();
+        std::fs::remove_file(y.peer_path(&short_x, artifact::PeerFile::Nodelist)).ok();
+        y.refresh_inbox();
+        assert!(
+            y.reach.iter().all(|(w, _)| *w != short_x)
+                || y.reach.iter().any(|(w, r)| *w == short_x && r.len() == 1),
+            "a delta was applied without its base"
         );
     }
 
@@ -9681,6 +9938,7 @@ mod tests {
             body: "something private".into(),
             picture: None,
             post_quantum: true,
+            nodelist: None,
         });
         a.list = vec!["alice  something private".into()];
         a.show_selected();
@@ -12458,6 +12716,7 @@ mod tests {
             body: "hello".into(),
             picture: None,
             post_quantum: false,
+            nodelist: None,
         });
         a.selected = 0;
         a.ui.cycle_focus();
@@ -13531,6 +13790,7 @@ mod tests {
             body: "[picture]".into(),
             picture: Some(png.clone()),
             post_quantum: false,
+            nodelist: None,
         });
         b.selected = 0;
 
@@ -13605,6 +13865,7 @@ mod tests {
             body: "[picture]".into(),
             picture: Some(a_png(16, 16)),
             post_quantum: false,
+            nodelist: None,
         });
         b.selected = 0;
         b.showing = Some(picture::cells(&a_png(16, 16), 20, 8).expect("renders"));
@@ -13656,6 +13917,7 @@ mod tests {
             body: "[picture]".into(),
             picture: Some(a_png(8, 8)),
             post_quantum: false,
+            nodelist: None,
         });
         b.selected = 0;
 
