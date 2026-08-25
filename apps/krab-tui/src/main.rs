@@ -1051,6 +1051,8 @@ impl App {
         // every exchange used to send; see `filter`.
         let scope = self.scope_for(peer);
         let budget = self.budget_for(peer);
+        // Real now, for RFC 3 §7's retention horizon — see `ExchangeView`.
+        let retention_now = now_epoch().0 * 1440;
         let session = self.links.take_session(peer)?;
         let view_store = self.store.clone();
         let carriage = self.roster.carriage;
@@ -1059,7 +1061,8 @@ impl App {
         self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
         std::thread::spawn(move || {
             let mut session = session;
-            let mut view = shared::ExchangeView::new(view_store, window.0, carriage, scope);
+            let mut view =
+                shared::ExchangeView::new(view_store, window.0, carriage, scope, retention_now);
             // Cloned, so the totals can be folded back after the drivers
             // return: the view sees only objects it accepted, and RFC 3 §12's
             // novelty ratio needs the ones it declined as duplicates too.
@@ -1122,6 +1125,7 @@ impl App {
             .unwrap_or(krab_proto::recon::Mode::Manifest);
         let scope = self.scope_for(peer);
         let budget = self.budget_for(peer);
+        let retention_now = now_epoch().0 * 1440;
         let Some(session) = self.links.take_session(peer) else {
             return Some(activity_log::Event::Failed {
                 peer: peer.to_string(),
@@ -1159,7 +1163,8 @@ impl App {
         self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
         std::thread::spawn(move || {
             let mut session = session;
-            let mut view = shared::ExchangeView::new(view_store, window.0, carriage, scope);
+            let mut view =
+                shared::ExchangeView::new(view_store, window.0, carriage, scope, retention_now);
             // Cloned, so the totals can be folded back after the drivers
             // return: the view sees only objects it accepted, and RFC 3 §12's
             // novelty ratio needs the ones it declined as duplicates too.
@@ -2988,7 +2993,12 @@ impl App {
     fn read_peer_base(&self, peer: &str) -> Option<fragment::Fragment> {
         let w = self.epoch_key?;
         let sealed = std::fs::read(self.peer_path(peer, artifact::PeerFile::Nodelist)).ok()?;
-        let raw = krab_crypto::kek::open_under(&w, b"krab/nodelist", &sealed).ok()?;
+        // A **distinct** domain from this node's own base. Two artifacts under
+        // one sealing context means a ciphertext from either opens as the
+        // other, which is the one thing a domain is for — and the checks that
+        // would catch the swap (`base_hash`, the author comparison) are
+        // downstream of a decryption that should never have succeeded.
+        let raw = krab_crypto::kek::open_under(&w, b"krab/nodelist/peer", &sealed).ok()?;
         fragment::Fragment::decode(&raw)
     }
 
@@ -3001,7 +3011,8 @@ impl App {
         let dir = self.home.join("peers").join(peer);
         std::fs::create_dir_all(&dir).ok()?;
         let sealed =
-            krab_crypto::kek::seal_under(&w, b"krab/nodelist", &frag.encode(), &mut OsRng).ok()?;
+            krab_crypto::kek::seal_under(&w, b"krab/nodelist/peer", &frag.encode(), &mut OsRng)
+                .ok()?;
         atomic::write(&dir.join(artifact::PeerFile::Nodelist.name()), &sealed).ok()
     }
 
@@ -8828,6 +8839,7 @@ mod tests {
             now_epoch().0 * 1440,
             krab_crypto::CarriagePolicy::default(),
             filter::Filter::unscoped(),
+            now_epoch().0 * 1440,
         )
         .with_budget(tight);
 

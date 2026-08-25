@@ -768,3 +768,96 @@ change is.
 No structural fix suggests itself for that one. What the pass can do is keep
 finding them, which is the argument for running it after every feature rather
 than before every release.
+
+---
+
+## Pass 9 — the credential's five dependants
+
+Run against everything built on RFC 3 §3's credential: the filter (§7.3), quota
+(§6, §6.2), the negotiation chain (§5.2), nodelist fragments (§8), and
+`NODEDIFF` (§8.2). About 2 500 lines, all written in the days before the pass.
+
+**Two findings, and the first is the worst thing shipped in this series.**
+
+### 1. Every credentialled link silently refused every object
+
+`ExchangeView` was given `window.0` as its `now_min` — the exchange's *lower*
+bound, `now` minus the 45-day window. That is correct for `ingest`, which is
+what the field was added for: passing the window's start makes the whole window
+admissible.
+
+RFC 3 §7's retention horizon was then computed from the same field:
+
+```text
+horizon = now_min + retention_days × 1440
+```
+
+With `now_min` 45 days stale and the default 45-day retention, the horizon
+landed exactly on **now** — and every object, whose expiry is by definition in
+the future, failed `header.expiry_min > horizon`.
+
+So a link with a completed credential accepted nothing. Not an error: the
+exchange completed, reported success, and moved zero objects. RFC 0 §6 makes
+delivery failure silent by design, so the symptom would have been "that peer
+stopped receiving anything" with both nodes reporting healthy reconciliations —
+and it would have appeared exactly when an operator did the thing the last five
+commits were written to encourage.
+
+The shape is new to this series: **one field holding two meanings of "now"**,
+one of which was wrong. Neither meaning is unreasonable, and nothing in the
+name distinguished them. `retention_now_min` is now separate, and a test in
+`shared.rs` puts an ordinary object through a scoped view.
+
+Found by reading the call sites of a value rather than the logic that used it.
+The logic is right; it was fed the wrong number.
+
+### 2. Two artifacts under one sealing domain
+
+`Artifact::Nodelist` (this node's published base) and `PeerFile::Nodelist` (a
+peer's, per peer) were both sealed under `krab/nodelist`. A ciphertext from
+either therefore opens as the other.
+
+The exploit is weak — an attacker who can write the home directory but not read
+it could swap them, and `Delta::apply`'s base-hash and author checks refuse the
+result — but those checks are downstream of a decryption that should never have
+succeeded, and "a later check catches it" is not what a domain is for. Split to
+`krab/nodelist` and `krab/nodelist/peer`.
+
+### Found while wiring, not while auditing
+
+Two more were caught in the same session by writing the NODEDIFF wiring, and
+belong to the same pass:
+
+- **The fragment read path could never have worked.** `Message.body` is
+  `String::from_utf8_lossy`, and a fragment is 32-byte keys and 64-byte
+  signatures, so `Fragment::decode(body.as_bytes())` decoded a string of
+  U+FFFD. The picture path had solved this exact problem, in the same function,
+  and the new code did not reuse it.
+- **Two rows for one peer.** An older full fragment stays in the corpus after
+  its delta arrives, so both opened on one scan and each pushed a reach entry.
+  A reader taking the first got whichever the scan reached.
+
+### What did not fail
+
+- `Account::roll` judges the closing window before resetting it, so a
+  settlement never reads counters it has already cleared.
+- `Standing::effective` saturates: a peer countering with `u64::MAX` quota
+  moves nothing, and in any case states only its own ceiling.
+- The negotiation chain refuses a stranger, a party answering itself, a counter
+  moved onto another negotiation, and a declared count that disagrees with what
+  arrived.
+- `listable` resolves the share direction from the author for both fragments
+  and deltas, so a delta cannot smuggle a link a fragment would refuse.
+- `lock` clears all five new in-memory fields, and `panic_wipe` still routes
+  through `lock`.
+
+### The pattern
+
+Findings 1 and the two wiring defects are all **a value or a solved problem
+that existed nearby and was not reused**: the window bound was reused where it
+should not have been, and the picture path was not reused where it should have
+been. Passes 7 and 8 found rules enforced over stale field lists; this one
+found the opposite failure, which no enumeration would have caught.
+
+What did catch it was asking, of a value used in a new place, *which of its
+meanings applies here* — and the answer being "neither, exactly".

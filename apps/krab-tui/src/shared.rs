@@ -122,6 +122,18 @@ pub struct ExchangeView {
     /// Shared with the interface thread, which persists it once the exchange
     /// reports. A budget the process forgets on restart is not a budget.
     budget: Option<Budget>,
+    /// Now, in minutes, for the retention window only.
+    ///
+    /// **Not `now_min`.** That field is the exchange's lower bound — `now`
+    /// minus the 45-day window — and it is what `ingest` is given so the whole
+    /// window is admissible. Using it for RFC 3 §7's retention horizon put the
+    /// horizon 45 days in the past, so with the default 45-day retention it
+    /// landed exactly on *now* and every object, whose expiry is in the
+    /// future, was refused. A credentialled link moved nothing, silently.
+    ///
+    /// Two meanings of "now" in one field, and one of them wrong. They are
+    /// separate now.
+    retention_now_min: u32,
     /// The agreed scope of this exchange — RFC 3 §7.3.
     ///
     /// **Enforced here, for the reason above.** The filter digest makes the
@@ -153,12 +165,14 @@ impl ExchangeView {
         now_min: u32,
         carriage: krab_crypto::CarriagePolicy,
         filter: crate::filter::Filter,
+        retention_now_min: u32,
     ) -> ExchangeView {
         ExchangeView {
             store,
             now_min,
             carriage,
             filter,
+            retention_now_min,
             budget: None,
         }
     }
@@ -176,7 +190,13 @@ impl ExchangeView {
         now_min: u32,
         carriage: krab_crypto::CarriagePolicy,
     ) -> ExchangeView {
-        ExchangeView::new(store, now_min, carriage, crate::filter::Filter::unscoped())
+        ExchangeView::new(
+            store,
+            now_min,
+            carriage,
+            crate::filter::Filter::unscoped(),
+            now_min,
+        )
     }
 
     /// Whether this node will carry `bytes`.
@@ -244,7 +264,7 @@ impl Corpus for ExchangeView {
         // rows beyond it is exceeding what it agreed to; accepting them would
         // make the signature decorative.
         if let Ok(header) = RoutingHeader::parse(&bytes) {
-            if !self.filter.admits(&header, self.now_min) {
+            if !self.filter.admits(&header, self.retention_now_min) {
                 return;
             }
         }
@@ -298,6 +318,40 @@ mod tests {
         }
     }
 
+    /// **A credentialled link admits ordinary mail.**
+    ///
+    /// The retention horizon was computed from `now_min`, which is the
+    /// exchange's *lower bound* — `now` minus 45 days. With the default
+    /// 45-day retention that put the horizon exactly on now, so every object,
+    /// whose expiry is in the future, was refused: a credentialled link moved
+    /// nothing and reported success.
+    #[test]
+    fn a_scoped_view_admits_ordinary_mail() {
+        let store = SharedStore::new(Store::new());
+        let real_now = NOW;
+        let window_lo = real_now - 45 * 1_440;
+        let scope = crate::filter::Filter {
+            shard_bits: 0,
+            max_bucket: 5,
+            class_mask: 0xFF,
+            retention_days: 45,
+        };
+        let mut view = ExchangeView::new(
+            store.clone(),
+            window_lo,
+            carry_all(),
+            scope,
+            // The real now, not the window's lower bound.
+            real_now,
+        );
+        view.put(object(1));
+        assert_eq!(
+            store.len(),
+            1,
+            "a scoped link refused an object inside its own retention window"
+        );
+    }
+
     fn object(salt: u32) -> Vec<u8> {
         let h = RoutingHeader {
             version: 1,
@@ -322,6 +376,7 @@ mod tests {
             NOW,
             carry_all(),
             crate::filter::Filter::unscoped(),
+            NOW,
         );
 
         let reader = shared.clone();
@@ -353,8 +408,13 @@ mod tests {
             .map(|_| {
                 let s = shared.clone();
                 std::thread::spawn(move || {
-                    let mut v =
-                        ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped());
+                    let mut v = ExchangeView::new(
+                        s,
+                        NOW,
+                        carry_all(),
+                        crate::filter::Filter::unscoped(),
+                        NOW,
+                    );
                     for salt in 0..40 {
                         v.put(object(salt));
                     }
@@ -377,8 +437,13 @@ mod tests {
             .map(|i| {
                 let s = shared.clone();
                 std::thread::spawn(move || {
-                    let mut v =
-                        ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped());
+                    let mut v = ExchangeView::new(
+                        s,
+                        NOW,
+                        carry_all(),
+                        crate::filter::Filter::unscoped(),
+                        NOW,
+                    );
                     v.put(vec![0xFFu8; 256]); // not a valid object
                     v.put(object(i));
                 })
@@ -406,6 +471,7 @@ mod tests {
             NOW,
             carry_all(),
             crate::filter::Filter::unscoped(),
+            NOW,
         );
         view.put(object(1));
 
@@ -422,6 +488,7 @@ mod tests {
             NOW,
             carry_all(),
             crate::filter::Filter::unscoped(),
+            NOW,
         );
         v2.put(object(2));
         assert_eq!(shared.len(), 2);
@@ -441,7 +508,7 @@ mod tests {
             let s = shared.clone();
             std::thread::spawn(move || {
                 let mut v =
-                    ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped());
+                    ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped(), NOW);
                 for salt in 0..300 {
                     v.put(object(salt));
                 }
@@ -473,7 +540,7 @@ mod tests {
             let s = shared.clone();
             std::thread::spawn(move || {
                 let mut v =
-                    ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped());
+                    ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped(), NOW);
                 for salt in 0..300 {
                     v.put(object(salt));
                 }
@@ -488,6 +555,7 @@ mod tests {
                         NOW,
                         carry_all(),
                         crate::filter::Filter::unscoped(),
+                        NOW,
                     );
                     // Each call is internally consistent: entries never
                     // contains a duplicate or a torn row, whatever is landing.
@@ -525,6 +593,7 @@ mod tests {
             0,
             krab_crypto::CarriagePolicy::default(),
             crate::filter::Filter::unscoped(),
+            NOW,
         );
         assert!(!view.carriage.enabled, "carriage must default to off");
         view.put(bytes.clone());
@@ -559,6 +628,7 @@ mod tests {
             0,
             krab_crypto::CarriagePolicy::default(),
             crate::filter::Filter::unscoped(),
+            NOW,
         );
         view.put(object(1));
         assert_eq!(store.len(), 1, "a sealed object was refused");
@@ -584,6 +654,7 @@ mod tests {
                 0,
                 krab_crypto::CarriagePolicy::default(),
                 crate::filter::Filter::unscoped(),
+                0,
             );
             view.put(bytes);
             assert_eq!(store.len(), 1, "{kind:?} was refused with carriage off");
