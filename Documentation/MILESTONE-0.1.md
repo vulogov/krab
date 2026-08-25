@@ -309,8 +309,23 @@ than deleted, because the way it went wrong is the more useful record.
 
 What is actually absent from 0.1:
 
-Nothing from §5's list. RFC 3's own remaining piece is **§8's nodelist
-fragments**, whose share flags already sit in the credential unread.
+Nothing from §5's list, and nothing from RFC 3.
+
+One piece is **built and not wired**, stated here because a thing built with no
+caller is this codebase's most common defect and the two previous instances
+(`exchange::respond_to`, `receive::scan_requests`) were each found by accident
+months later:
+
+| item | state |
+|---|---|
+| `fragment::Delta` — RFC 3 §8.2's `NODEDIFF` | encoded, signed, verified and tested; nothing constructs one. `peer fragment` sends a full fragment every time |
+
+What it needs is bookkeeping rather than protocol: the last full fragment
+remembered per peer on both sides, and §8.2's weekly cadence decided in the
+scheduler rather than in a command. The cost of not having it is bandwidth
+only — §8.2's table puts a one-link delta at 8× to 34× cheaper than a full
+fragment — and **no security property depends on it**, because a full fragment
+carries exactly what a delta would and is checked identically.
 
 Rollcall cost nothing that was not already there: `Class::Bulletin` carried
 channels and prekey batches, so RFC 3 §9's whole public tier came to one

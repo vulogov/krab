@@ -233,6 +233,14 @@ impl Command {
             "finish the peering once both cards are exchanged",
         ),
         (
+            "peer share <peer> on|off",
+            "opt in to listing them in your nodelist — off by default (RFC 3 §8.3)",
+        ),
+        (
+            "peer fragment",
+            "send your nodelist to each peer, individually (RFC 3 §8)",
+        ),
+        (
             "peer counter <n> <MB/day> <objects> <days>",
             "answer a request with your own terms (RFC 3 §5.2)",
         ),
@@ -461,6 +469,14 @@ pub enum Peering {
     /// Ingest the peer's contribution and sign the peer-link, recording how it
     /// arrived and therefore what the reservoir is actually worth.
     Seal,
+    /// Opt in to listing a peer in nodelist fragments — RFC 3 §8.3.
+    ///
+    /// "Default MUST be false — opt in to being listed, not out." Setting it
+    /// re-signs the credential, because the flag is inside both signatures so
+    /// that "neither party can unilaterally expose the other".
+    Share,
+    /// Publish a nodelist fragment to every peer — RFC 3 §8.
+    Fragment,
     /// Counter a peer-request or a counter — RFC 3 §5.2.
     ///
     /// "The counter-offer is the step that matters. Without it, peering is
@@ -495,6 +511,8 @@ impl Peering {
             "reseal" => Peering::Reseal,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,
+            "share" => Peering::Share,
+            "fragment" => Peering::Fragment,
             "counter" => Peering::Counter,
             "countersign" => Peering::Countersign,
             "status" => Peering::Status,

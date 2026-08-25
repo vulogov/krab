@@ -38,6 +38,7 @@ mod credential;
 mod entropy;
 mod fanout;
 mod filter;
+mod fragment;
 mod groups;
 mod identity;
 mod introduction;
@@ -351,6 +352,14 @@ struct App {
     home: PathBuf,
     /// Channels owned and followed — RFC 6 §3.
     roster: channels::Roster,
+    /// Two-hop reachability, from nodelist fragments peers have sent —
+    /// RFC 3 §8.
+    ///
+    /// Held in memory only, and cleared on lock: §15 calls fragments "the
+    /// graph", and a graph on disk is what a seizure is for. It is rebuilt
+    /// from the corpus each time the inbox is read, so nothing is lost by not
+    /// storing it.
+    reach: Vec<(String, Vec<[u8; 32]>)>,
     /// Per-link budgets for the current day — RFC 3 §6.
     ///
     /// Shared with the exchange threads so a running reconciliation is held
@@ -521,6 +530,7 @@ impl Default for App {
             rollcall: rollcall::Listing::default(),
             introductions: Vec::new(),
             spends: std::collections::HashMap::new(),
+            reach: Vec::new(),
             groups: Vec::new(),
             pending: Vec::new(),
             observed_arrivals: 0,
@@ -1297,6 +1307,24 @@ impl App {
             .store
             .with(|st| receive::Inbox::scan(st, table, &peers, &opening_keys, (0, u32::MAX)));
 
+        // **Nodelists arriving from peers** — RFC 3 §8. A fragment is sealed
+        // pairwise like any other message, so it opens here; it is separated
+        // from mail because it is not mail, and rendering one in the message
+        // list would put a nodelist where an operator expects a sentence.
+        //
+        // Verified before it is believed: a signature makes the contents
+        // attributable, not true. `Fragment::verify` refuses a link the author
+        // is not party to, and one whose counterparty never agreed to be
+        // listed.
+        self.reach.clear();
+        for m in &scan.messages {
+            let Some(frag) = fragment::Fragment::decode(m.body.as_bytes()) else {
+                continue;
+            };
+            if frag.verify(self.now_s()).is_ok() {
+                self.reach.push((m.from.clone(), frag.reaches()));
+            }
+        }
         self.list = if scan.messages.is_empty() {
             vec![format!(
                 "(no messages — {} objects examined)",
@@ -2692,6 +2720,154 @@ impl App {
         )
     }
 
+    /// `peer share <peer> on|off` — RFC 3 §8.3.
+    ///
+    /// > "Per direction, both signed, so neither party can unilaterally expose
+    /// > the other. **Default MUST be false** — opt in to being listed, not
+    /// > out."
+    ///
+    /// Both signed, so changing it is a **new credential**: this node sets the
+    /// flag for its own direction, signs, and hands it over to be
+    /// countersigned. There is no way to make it a local setting, and that is
+    /// the property — a local setting is exactly the unilateral exposure §8.3
+    /// is written against.
+    fn peer_share(&mut self, peer: Option<&str>, on: Option<&str>) -> String {
+        let (Some(peer), Some(on)) = (peer, on) else {
+            return "usage: peer share <peer> on|off\n\n\
+                    Whether you will list them in the nodelist fragments you \
+                    hand out. Off by default, and RFC 3 §8.3 says MUST: a node \
+                    may have ten casual peers and one sensitive one, and \
+                    without this the sensitive link is exposed to the other \
+                    ten.\n\n\
+                    It bounds graph-walking too — without it an adversary who \
+                    acquires one peer requests fragments, acquires more, and \
+                    maps the network one hop at a time (§8.3, §15)."
+                .into();
+        };
+        let want = match on {
+            "on" | "yes" | "true" => true,
+            "off" | "no" | "false" => false,
+            _ => return "say `on` or `off`".into(),
+        };
+        let Some(id) = self.identity.as_ref() else {
+            return "no identity — run `init` first".into();
+        };
+        if self.epoch_key.is_none() {
+            return "locked — unlock to change a peering's terms".into();
+        }
+        let Some(card) = self.peer_card(peer) else {
+            return format!("no peer-link for {peer}");
+        };
+        let me = id.node_id();
+
+        // Start from the existing credential where there is one, so the other
+        // party's flag is carried rather than reset — it is theirs to set.
+        let existing = self.credential_with(peer);
+        let mut cred = match credential::Credential::decode(&self.propose_credential(&card)) {
+            Some(c) => c,
+            None => return "could not build a credential".into(),
+        };
+        let mut flags = existing.map(|c| c.flags).unwrap_or_default();
+        if cred.a.node_id() == me {
+            flags.a_shares_b = want;
+        } else {
+            flags.b_shares_a = want;
+        }
+        cred.flags = flags;
+        cred.sig_a = None;
+        cred.sig_b = None;
+        cred.sign(id.signing_key());
+
+        let out = self.home.join(format!("{peer}.credential"));
+        if let Err(e) = atomic::write(&out, &cred.encode()) {
+            return format!("could not write it: {e}");
+        }
+        format!(
+            "you will {} list {peer}.\n\n\
+             Give {} to them and have them run `peer countersign` — the flag \
+             is inside both signatures, so a peering neither of you re-signs \
+             keeps the old one. That is what stops either of you exposing the \
+             other unilaterally (RFC 3 §8.3).",
+            if want { "now" } else { "no longer" },
+            out.display()
+        )
+    }
+
+    /// `peer fragment` — RFC 3 §8.
+    ///
+    /// > "A node's fragment is the set of its currently valid `peer-link`
+    /// > credentials, signed, and **encrypted individually to each of its own
+    /// > peers**. Not published, not flooded, not readable by anyone at three
+    /// > hops."
+    ///
+    /// Individually is the expensive part and the point: §8.1 prices it at
+    /// `O(P²)`, which is the term bounding peer count in §13's table. A
+    /// flooded fragment would be cheaper and would be a directory.
+    fn peer_fragment(&mut self) -> String {
+        let (Some(id), Some(_)) = (&self.identity, self.epoch_key) else {
+            return "locked — unlock to publish a nodelist".into();
+        };
+        let peers = self.peer_ids();
+        if peers.is_empty() {
+            return "no peerings — nothing to list".into();
+        }
+        let now_s = self.now_s();
+        let creds: Vec<credential::Credential> = peers
+            .iter()
+            .filter_map(|p| self.credential_with(p))
+            .collect();
+        let signing = id.signing_key();
+        let frag = fragment::Fragment::create(signing, now_s, &creds, now_s);
+
+        if frag.links.is_empty() {
+            return format!(
+                "nothing to list.\n\n\
+                 {} peering(s), and none opted in to being listed. That is \
+                 RFC 3 §8.3's default and it is a MUST — `peer share <peer> \
+                 on` changes it, with their countersignature.\n\n\
+                 An operator who sets it everywhere has published their social \
+                 graph to their peers, one hop at a time (§15).",
+                peers.len()
+            );
+        }
+
+        let body = frag.encode();
+        let mut sent = 0;
+        for p in &peers {
+            // Individually, pairwise, by the same path a private message
+            // takes — a second sealing path would be a second place to get
+            // the mode or the prekey selection wrong.
+            let Some((oid, bytes)) = self.seal_one(p, &body) else {
+                continue;
+            };
+            if self
+                .store
+                .with(|s| s.ingest(oid, bytes, now_epoch().0 * 1440, u32::MAX))
+                .is_ok()
+            {
+                sent += 1;
+            }
+        }
+        self.save_corpus();
+        format!(
+            "nodelist sent to {sent} of {} peer(s), {} link(s) listed.\n\n\
+             Each copy is sealed to one peer — not published, not flooded, and \
+             not readable by anyone at three hops (RFC 3 §8). That costs \
+             O(P²) bytes, which is the term bounding how many peers a node \
+             should have (§8.1, §13).\n\n\
+             Listed: {}.\n\n\
+             Everyone else you peer with is absent, because they have not \
+             opted in.",
+            peers.len(),
+            frag.links.len(),
+            frag.reaches()
+                .iter()
+                .map(short_id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
     /// The negotiation chain with `peer`, if one was stored — RFC 3 §5.3.
     ///
     /// Sealed under `W_N` and never published: §5.3 calls it "local evidence"
@@ -3683,6 +3859,10 @@ impl App {
                         self.peer_reseal(&tail)
                     }
                     Some(Peering::Counter) => self.peer_counter(rest),
+                    Some(Peering::Share) => {
+                        self.peer_share(arg(rest, 1).as_deref(), arg(rest, 2).as_deref())
+                    }
+                    Some(Peering::Fragment) => self.peer_fragment(),
                     Some(Peering::Countersign) => self.peer_countersign(arg(rest, 1).as_deref()),
                     Some(Peering::Status) => self.peer_status(),
                     Some(Peering::Rekey) => self.peer_rekey(arg(rest, 1).as_deref()),
@@ -6108,8 +6288,20 @@ impl App {
                          this link. `peer countersign` completes one"
                     .into(),
             };
+            // RFC 3 §8's two-hop visibility, where a peer has shared any.
+            let onward = self
+                .reach
+                .iter()
+                .find(|(who, _)| who == id)
+                .map(|(_, r)| r.len())
+                .unwrap_or(0);
+            let nodelist = if onward > 0 {
+                format!("\n    lists {onward} peer(s) onward — two hops, no more (RFC 3 §8)")
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "{id}  peered  ·  {link}  ·  {policy}\n    {how}{budget}\n"
+                "{id}  peered  ·  {link}  ·  {policy}\n    {how}{budget}{nodelist}\n"
             ));
         }
         // Links to nodes we have no peering with cannot exist — `establish`
@@ -7002,6 +7194,9 @@ impl App {
         // flooded stands until it expires, because there is no recall
         // (RFC 3 §6.1) and pretending otherwise would be worse than saying so.
         self.rollcall = rollcall::Listing::default();
+        // The graph, which is what RFC 3 §15 calls a fragment. A locked node
+        // holding one is a seizure holding one.
+        self.reach.clear();
         // Per-link budgets. Sealed under W_N, which a locked node no longer
         // holds — keeping the in-memory copies would mean a counter that
         // cannot be written back, and a peer list in memory besides.
@@ -8117,6 +8312,96 @@ mod tests {
     /// unreadable to anyone else — while the proposer held a half-signed one
     /// for ever. Neither could supply evidence, which is the entire reason the
     /// document exists, and nothing reported anything wrong.
+    /// **RFC 3 §8.3's default is false, and nothing is listed until both
+    /// parties sign the flag.**
+    ///
+    /// §15: "Fragments are the graph. §8.3's default-false share flag is the
+    /// control. An operator who sets it true everywhere has published their
+    /// social graph to their peers, one hop at a time."
+    #[test]
+    fn a_fragment_lists_nothing_until_both_parties_opt_in() {
+        let mut x = ready_node("frag-x");
+        let mut y = ready_node("frag-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+
+        // A credential exists, and lists nothing.
+        assert!(x.credential_with(&short_y).is_some());
+        type_command(&mut x, "peer fragment");
+        assert!(x.output.contains("nothing to list"), "{}", x.output);
+        assert!(x.output.contains("§8.3"), "{}", x.output);
+
+        // X opts in, and hands the re-signed credential to Y.
+        type_command(&mut x, &format!("peer share {short_y} on"));
+        assert!(x.output.contains("will now list"), "{}", x.output);
+        let handover = x.home.join(format!("{short_y}.credential"));
+        let to_y = y.home.join("share.credential");
+        std::fs::copy(&handover, &to_y).unwrap();
+        y.peer_countersign(Some(to_y.to_str().unwrap()));
+
+        // Y hands it back; X stores the countersigned version.
+        let short_x = short_id(&x.identity.as_ref().unwrap().node_id());
+        let back = y.home.join(format!("{short_x}.credential"));
+        let to_x = x.home.join("share.credential");
+        std::fs::copy(&back, &to_x).unwrap();
+        x.peer_countersign(Some(to_x.to_str().unwrap()));
+
+        // Now the fragment lists it, and goes out sealed per peer.
+        type_command(&mut x, "peer fragment");
+        assert!(x.output.contains("1 link(s) listed"), "{}", x.output);
+        assert!(x.output.contains(&short_y), "{}", x.output);
+
+        // And Y, who never opted in to listing X, still lists nothing.
+        type_command(&mut y, "peer fragment");
+        assert!(
+            y.output.contains("nothing to list"),
+            "Y published a link it never agreed to publish: {}",
+            y.output
+        );
+    }
+
+    /// A fragment is sealed to each peer, never flooded — RFC 3 §8. So it is
+    /// not a bulletin, and nothing about it is public.
+    #[test]
+    fn a_fragment_is_not_a_bulletin() {
+        let mut x = ready_node("fragb-x");
+        let mut y = ready_node("fragb-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+        type_command(&mut x, &format!("peer share {short_y} on"));
+        let handover = x.home.join(format!("{short_y}.credential"));
+        let to_y = y.home.join("s.credential");
+        std::fs::copy(&handover, &to_y).unwrap();
+        y.peer_countersign(Some(to_y.to_str().unwrap()));
+        let short_x = short_id(&x.identity.as_ref().unwrap().node_id());
+        let back = y.home.join(format!("{short_x}.credential"));
+        let to_x = x.home.join("s.credential");
+        std::fs::copy(&back, &to_x).unwrap();
+        x.peer_countersign(Some(to_x.to_str().unwrap()));
+
+        let before = x.store.len();
+        type_command(&mut x, "peer fragment");
+        assert!(x.store.len() > before, "nothing was emitted");
+
+        // Nothing new is readable as a bulletin: a fragment is sealed, and
+        // §8 says it is not published, not flooded, and not readable at three
+        // hops.
+        x.store.with(|s| {
+            for (_, oid) in s.entries_in_range(0, u32::MAX) {
+                if let Some(bytes) = s.get(&oid) {
+                    assert!(
+                        bulletin::from_object(bytes)
+                            .map(|b| b.kind != bulletin::Kind::Rollcall)
+                            .unwrap_or(true),
+                        "a fragment was published as a bulletin"
+                    );
+                    assert!(
+                        fragment::Fragment::decode(bytes).is_none(),
+                        "a fragment is readable straight out of the corpus"
+                    );
+                }
+            }
+        });
+    }
+
     /// **RFC 3 §6's example, through the interface.**
     ///
     /// > X requests: 10 MB/day … B counters: 1 MB/day … X accepts.
