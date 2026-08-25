@@ -37,7 +37,7 @@
 
 use crate::credential;
 use crate::introduction;
-use crate::peering::{Card, Policy};
+use crate::peering::Card;
 use krab_core::cbor::{Error as CborError, Item, Reader, Writer};
 use krab_crypto::sign::{Sig, SigningKey, VerifyingKey};
 
@@ -113,8 +113,13 @@ pub struct PeerRequest {
     /// it travels inside a sealed object addressed to the single node
     /// evaluating it, and only because the requester chose to send it.
     pub evidence: Option<credential::Credential>,
-    /// Key 5 — proposed terms.
-    pub terms: Policy,
+    /// Key 5 — proposed terms: what this node will accept from the recipient.
+    ///
+    /// `LinkTerms`, not `Policy`. RFC 3 §6's own example proposes "10 MB/day,
+    /// 30 d retention, all shards, all classes" — three of those four have
+    /// nowhere to live in a card's advertisement, so a request carrying one
+    /// could not open a negotiation about anything §6 cares about.
+    pub terms: credential::LinkTerms,
     /// Key 6 — an introduction token (RFC 3 §10), when there is one.
     ///
     /// **Private by construction.** It is only ever here, inside a sealed
@@ -146,7 +151,7 @@ impl PeerRequest {
         to: &[u8; 32],
         via: Option<&[u8; 32]>,
         evidence: Option<&credential::Credential>,
-        terms: &Policy,
+        terms: &credential::LinkTerms,
         token: Option<&introduction::Token>,
         note: &str,
     ) -> Vec<u8> {
@@ -192,7 +197,7 @@ impl PeerRequest {
         signing: &SigningKey,
         from: Card,
         to: [u8; 32],
-        terms: Policy,
+        terms: credential::LinkTerms,
         note: &str,
         token: Option<introduction::Token>,
         evidence: Option<credential::Credential>,
@@ -374,7 +379,7 @@ impl PeerRequest {
                     evidence = Some(credential::Credential::decode(b).ok_or(CborError::Malformed)?);
                 }
                 (5, Item::Bstr(b)) => {
-                    terms = Some(Policy::decode(b).ok_or(CborError::Malformed)?);
+                    terms = Some(credential::LinkTerms::decode(b).ok_or(CborError::Malformed)?);
                     seen |= 8;
                 }
                 (6, Item::Bstr(b)) => {
@@ -417,13 +422,26 @@ mod tests {
     }
 
     fn card_for(k: &SigningKey, seed: u8) -> Card {
-        Card::create(k, [seed; 32], [seed.wrapping_add(1); 32], Policy::default())
+        Card::create(
+            k,
+            [seed; 32],
+            [seed.wrapping_add(1); 32],
+            crate::peering::Policy::default(),
+        )
     }
 
     fn request(seed: u64, to: [u8; 32], note: &str) -> PeerRequest {
         let k = signer(seed);
         let c = card_for(&k, seed as u8);
-        PeerRequest::create_introduced(&k, c, to, Policy::default(), note, None, None)
+        PeerRequest::create_introduced(
+            &k,
+            c,
+            to,
+            credential::LinkTerms::default(),
+            note,
+            None,
+            None,
+        )
     }
 
     #[test]
@@ -443,9 +461,9 @@ mod tests {
         for mutate in [
             |r: &mut PeerRequest| r.to[0] ^= 1,
             |r: &mut PeerRequest| r.note.push('!'),
-            |r: &mut PeerRequest| r.terms.max_bucket = 1,
-            |r: &mut PeerRequest| r.terms.relay = !r.terms.relay,
-            |r: &mut PeerRequest| r.terms.retention_bytes += 1,
+            |r: &mut PeerRequest| r.terms.policy.max_bucket = 1,
+            |r: &mut PeerRequest| r.terms.policy.relay = !r.terms.policy.relay,
+            |r: &mut PeerRequest| r.terms.bytes_per_day += 1,
             |r: &mut PeerRequest| r.sig[0] ^= 1,
         ] {
             let mut bad = r.clone();

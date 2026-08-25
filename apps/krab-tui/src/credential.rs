@@ -312,7 +312,13 @@ impl Credential {
     }
 
     /// Propose a credential between two cards, signed by whichever of them is
-    /// `signer`.
+    /// `signer`, taking the terms the cards advertise.
+    ///
+    /// The no-negotiation case. RFC 3 §5.2's counter-offer is what produces
+    /// terms either party actually chose; this is what a peering formed
+    /// without one is worth, and [`propose_terms`](Credential::propose_terms)
+    /// is what the ceremony calls.
+    #[cfg(test)]
     ///
     /// The parties are ordered canonically here, so a caller cannot get it
     /// wrong: whichever card is passed first, the same document comes out.
@@ -324,19 +330,48 @@ impl Credential {
         term_days: u64,
         nonce: [u8; 16],
     ) -> Credential {
+        Credential::propose_terms(
+            signer,
+            mine,
+            theirs,
+            terms_for(mine),
+            terms_for(theirs),
+            now_s,
+            term_days,
+            nonce,
+        )
+    }
+
+    /// Propose with terms each party actually stated — RFC 3 §5.2, §5.3.
+    ///
+    /// §5.3: "X countersigns the terms in the final counter, producing the
+    /// `peer-link`." So a credential's terms are the negotiation's outcome,
+    /// not a default either party would have taken anyway. [`propose`] is the
+    /// no-negotiation case and takes what the cards advertise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_terms(
+        signer: &SigningKey,
+        mine: &Card,
+        theirs: &Card,
+        my_terms: LinkTerms,
+        their_terms: LinkTerms,
+        now_s: u64,
+        term_days: u64,
+        nonce: [u8; 16],
+    ) -> Credential {
         let (p1, p2) = (Party::from_card(mine), Party::from_card(theirs));
         let (a, b) = if p1.sig_pk <= p2.sig_pk {
             (p1, p2)
         } else {
             (p2, p1)
         };
-        // Terms are per-direction. Each side proposes what it will accept
-        // *from* the other, which is what `Policy` already means, so A→B is
-        // A's policy and B→A is B's.
+        // Terms are per-direction: each side states what it will accept *from*
+        // the other, so A→B is A's statement and B→A is B's. Which of the two
+        // is A follows the canonical ordering, not who assembled this.
         let (terms_ab, terms_ba) = if p1.sig_pk <= p2.sig_pk {
-            (terms_for(mine), terms_for(theirs))
+            (my_terms, their_terms)
         } else {
-            (terms_for(theirs), terms_for(mine))
+            (their_terms, my_terms)
         };
         let mut cred = Credential {
             a,
@@ -564,8 +599,10 @@ impl Credential {
 /// The contract terms implied by a card's advertisement.
 ///
 /// A card carries only what it can: quota and retention have no field there,
-/// so a first credential takes the defaults. RFC 3 §5.2's counter-offer is
-/// where they become negotiated rather than assumed, and it is not built.
+/// so a credential formed without a negotiation takes the defaults. RFC 3
+/// §5.2's counter-offer is where they become chosen rather than assumed, and
+/// `Credential::propose_terms` is what the ceremony calls once one exists.
+#[cfg(test)]
 fn terms_for(card: &Card) -> LinkTerms {
     LinkTerms {
         policy: card.policy,

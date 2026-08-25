@@ -45,6 +45,7 @@ mod keys;
 mod layout;
 mod line;
 mod links;
+mod negotiate;
 mod peering;
 mod peers;
 mod persist;
@@ -1331,13 +1332,15 @@ impl App {
             receive::scan_requests(st, id.correspondence(), &id.node_id(), epoch, (0, u32::MAX))
         });
         for inc in &requests {
-            let note = inc.request.note.chars().take(40).collect::<String>();
+            let receive::Incoming::Request { request: r, .. } = inc else {
+                continue;
+            };
+            let note = r.note.chars().take(40).collect::<String>();
             self.list.insert(
                 0,
                 format!(
                     "REQUEST from {}  {note}",
-                    inc.request
-                        .from
+                    r.from
                         .fingerprint()
                         .split_whitespace()
                         .take(2)
@@ -1959,25 +1962,54 @@ impl App {
             let Some(n) = (which as usize).checked_sub(1) else {
                 return "usage: requests accept <n>".into();
             };
-            let Some(inc) = incoming.get(n) else {
+            let Some(receive::Incoming::Request { request, .. }) = incoming.get(n) else {
                 return format!("there is no request {which}");
             };
-            return self.accept_request(&inc.request);
+            let request = request.clone();
+            return self.accept_request(&request);
         }
 
         let now_s = self.now_s();
         let spent = self.spent_tokens();
-        let mut out = format!("{} request(s):\n\n", incoming.len());
+        let mut out = format!("{} document(s) waiting:\n\n", incoming.len());
         for (i, inc) in incoming.iter().enumerate() {
-            let who = short_id(&inc.request.from.node_id());
-            out.push_str(&format!("\x20 {}. {who}\n", i + 1));
-            if !inc.request.note.is_empty() {
-                out.push_str(&format!("\x20    \"{}\"\n", inc.request.note));
+            match inc {
+                receive::Incoming::Request { request: r, .. } => {
+                    let who = short_id(&r.from.node_id());
+                    out.push_str(&format!("\x20 {}. request from {who}\n", i + 1));
+                    if !r.note.is_empty() {
+                        out.push_str(&format!("\x20    \"{}\"\n", r.note));
+                    }
+                    out.push_str(&format!(
+                        "\x20    they will accept {} MB/day, {} objects/day, \
+                         {} days retained\n",
+                        r.terms.bytes_per_day >> 20,
+                        r.terms.objects_per_day,
+                        r.terms.retention_days,
+                    ));
+                    out.push_str(&format!(
+                        "\x20    {}\n",
+                        self.introduction_line(r, &me, now_s, &spent)
+                    ));
+                }
+                // RFC 3 §5.2. A counter is only meaningful against the chain
+                // it answers, so it is reported and left for `peer counter`
+                // to place.
+                receive::Incoming::Counter { counter: c, .. } => {
+                    out.push_str(&format!(
+                        "\x20 {}. counter from {}\n\x20    they will accept {} MB/day, \
+                         {} objects/day, {} days retained\n",
+                        i + 1,
+                        short_id(&c.node_id()),
+                        c.terms.bytes_per_day >> 20,
+                        c.terms.objects_per_day,
+                        c.terms.retention_days,
+                    ));
+                    if !c.note.is_empty() {
+                        out.push_str(&format!("\x20    \"{}\"\n", c.note));
+                    }
+                }
             }
-            out.push_str(&format!(
-                "\x20    {}\n",
-                self.introduction_line(&inc.request, &me, now_s, &spent)
-            ));
         }
         out.push_str(
             "\n`requests accept <n>` records the introduction as used and \
@@ -2118,10 +2150,33 @@ impl App {
         };
         let mut nonce = [0u8; 16];
         OsRng.fill(&mut nonce);
-        credential::Credential::propose(
+        // **The negotiation's outcome, where there was one** — RFC 3 §5.3:
+        // "X countersigns the terms in the final counter." A credential built
+        // from defaults instead would make §5.2's whole chain decorative, and
+        // peering accept-or-reject again.
+        let short = short_id(&theirs.node_id());
+        let (mine, theirs_terms) = match self.chain_with(&short) {
+            Some(chain) => {
+                let (requester, recipient) = chain.settled();
+                // Which side of the negotiation this node was on. The chain's
+                // requester is whoever wrote the opening document.
+                if chain.request.from.node_id() == id.node_id() {
+                    (requester, recipient.unwrap_or_default())
+                } else {
+                    (recipient.unwrap_or_default(), requester)
+                }
+            }
+            None => (
+                credential::LinkTerms::default(),
+                credential::LinkTerms::default(),
+            ),
+        };
+        credential::Credential::propose_terms(
             id.signing_key(),
             &id.card(peering::Policy::default()),
             theirs,
+            mine,
+            theirs_terms,
             self.now_s(),
             credential::DEFAULT_TERM_DAYS,
             nonce,
@@ -2483,6 +2538,182 @@ impl App {
         self.credential_with(peer)
             .map(|c| filter::Filter::from_credential(&c))
             .unwrap_or_else(filter::Filter::unscoped)
+    }
+
+    /// `peer counter <n> <MB/day> <objects> <days>` — RFC 3 §5.2.
+    ///
+    /// > "The counter-offer is the step that matters. Without it, peering is
+    /// > accept-or-reject and therefore binary: friend or stranger. With it,
+    /// > peering is negotiated, which is what makes §6 possible."
+    ///
+    /// The terms stated are **what this node will accept from them**, which is
+    /// what `LinkTerms` means everywhere else. §6: "you allocate a sliver of
+    /// capacity and observe" — that is a decision one party makes about its
+    /// own resources, not an edit to the other's proposal.
+    fn peer_counter(&mut self, rest: &str) -> String {
+        let Ok(words) = words::split(rest) else {
+            return "unbalanced quotes".into();
+        };
+        let nums: Vec<i64> = words.iter().skip(1).filter_map(|w| w.int()).collect();
+        if nums.len() < 4 {
+            return "usage: peer counter <n> <MB/day> <objects/day> <days>\n\n\
+                    Answers document <n> from `requests` with the terms you \
+                    will accept from them. RFC 3 §6: you can peer with a \
+                    stranger at 1% trust — allocate a sliver of capacity and \
+                    observe.\n\n\
+                    Countering is not rejecting. It is what makes a peering \
+                    negotiated rather than accept-or-reject."
+                .into();
+        }
+        let (Some(id), Some(_)) = (&self.identity, self.epoch_key) else {
+            return "locked — unlock to negotiate".into();
+        };
+        let me = id.node_id();
+        let epoch = now_epoch();
+        let window = (0u32, u32::MAX);
+        let incoming = self
+            .store
+            .with(|s| receive::scan_requests(s, id.correspondence(), &me, epoch, window));
+        let Some(doc) = (nums[0] as usize)
+            .checked_sub(1)
+            .and_then(|n| incoming.get(n))
+        else {
+            return format!("there is no document {}", nums[0]);
+        };
+
+        let terms = credential::LinkTerms {
+            policy: peering::Policy::default(),
+            retention_days: (nums[3].max(0) as u32).min(krab_core::tag::MAX_TTL_DAYS),
+            bytes_per_day: (nums[1].max(0) as u64) << 20,
+            objects_per_day: nums[2].max(0) as u64,
+        };
+
+        // Place the document in a chain, opening one if this is a request.
+        let (mut chain, theirs) = match doc {
+            receive::Incoming::Request { request, .. } => {
+                let short = short_id(&request.from.node_id());
+                (
+                    self.chain_with(&short)
+                        .unwrap_or_else(|| negotiate::Chain::new(request.clone())),
+                    request.from.clone(),
+                )
+            }
+            receive::Incoming::Counter { counter, .. } => {
+                let short = short_id(&counter.node_id());
+                let Some(mut chain) = self.chain_with(&short) else {
+                    return format!(
+                        "no negotiation with {short} on this node.\n\n\
+                         A counter answers a document; without the chain it \
+                         answers, there is nothing to place it against \
+                         (RFC 3 §5.2)."
+                    );
+                };
+                // Their counter first, then ours on top of it.
+                if let Err(why) = chain.push(counter.clone()) {
+                    return format!("that counter does not belong to the negotiation: {why:?}");
+                }
+                let card = chain.request.from.clone();
+                (chain, card)
+            }
+        };
+
+        let head = chain.head();
+        let note = words::rest(&words, 5);
+        let counter = negotiate::Counter::create(id.signing_key(), head, terms, note.trim());
+        if let Err(why) = chain.push(counter.clone()) {
+            return match why {
+                negotiate::Broken::OutOfTurn => {
+                    "it is not your turn — you wrote the last word in this \
+                     negotiation. Wait for their answer (RFC 3 §5.2)."
+                        .into()
+                }
+                negotiate::Broken::TooLong => {
+                    "this negotiation has run long enough. Peer on the terms \
+                     already offered, or stop."
+                        .into()
+                }
+                other => format!("the counter does not fit the chain: {other:?}"),
+            };
+        }
+
+        // To their inbox tag, the way the request came — the two are still
+        // strangers and there is no other address either can use.
+        let their_pk = krab_crypto::dh::PublicKey(theirs.correspondence_pk);
+        let tag = krab_crypto::inbox_tag(&their_pk, epoch);
+        let composed = match compose::seal_to(
+            id.correspondence(),
+            &compose::Recipient::FirstContact {
+                correspondence: &their_pk,
+                tag,
+            },
+            epoch,
+            0,
+            expiry_for(epoch),
+            &counter.encode(),
+            &mut OsRng,
+        ) {
+            Ok(c) => c,
+            Err(e) => return format!("could not seal the counter: {e:?}"),
+        };
+        if let Err(e) = self
+            .store
+            .with(|s| s.ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX))
+        {
+            return format!("the store refused it: {e:?}");
+        }
+        self.save_corpus();
+
+        let short = short_id(&theirs.node_id());
+        self.save_chain(&short, &chain);
+        let (mine, _) = chain.settled();
+        let _ = mine;
+        format!(
+            "countered {short}: you will accept {} MB/day, {} objects/day, \
+             {} days retained.\n\n\
+             It travels to their inbox tag, like the request did — you are \
+             still strangers and there is no other address either of you has \
+             (RFC 3 §5.1).\n\n\
+             The negotiation is now {} document(s) long and is stored sealed. \
+             Both of you keep it: RFC 3 §5.2 makes the chain what stops either \
+             party later misrepresenting what was offered, and §5.3 forbids \
+             publishing it — it is graph information.\n\n\
+             It is {} turn next.\n\n\
+             When you both stop countering, `peer seal` builds the credential \
+             from the last terms each of you stated.",
+            if chain.awaiting() == me {
+                "your".to_string()
+            } else {
+                format!("{short}'s")
+            },
+            counter.terms.bytes_per_day >> 20,
+            counter.terms.objects_per_day,
+            counter.terms.retention_days,
+            chain.counters.len() + 1,
+        )
+    }
+
+    /// The negotiation chain with `peer`, if one was stored — RFC 3 §5.3.
+    ///
+    /// Sealed under `W_N` and never published: §5.3 calls it "local evidence"
+    /// and says it MUST NOT be published, because it names an introducer and
+    /// is therefore graph information.
+    fn chain_with(&self, peer: &str) -> Option<negotiate::Chain> {
+        let w = self.epoch_key?;
+        let sealed = std::fs::read(self.peer_path(peer, artifact::PeerFile::Chain)).ok()?;
+        let raw = krab_crypto::kek::open_under(&w, b"krab/chain", &sealed).ok()?;
+        let chain = negotiate::Chain::decode(&raw)?;
+        // Verified on the way out, so no caller can act on a chain that does
+        // not hold together — the same rule `bulletin::from_object` follows.
+        chain.verify().ok().map(|()| chain)
+    }
+
+    /// Store a negotiation chain, sealed.
+    fn save_chain(&mut self, peer: &str, chain: &negotiate::Chain) -> Option<()> {
+        let w = self.epoch_key?;
+        self.ensure_peer_dir(peer).ok()?;
+        let sealed =
+            krab_crypto::kek::seal_under(&w, b"krab/chain", &chain.encode(), &mut OsRng).ok()?;
+        atomic::write(&self.peer_path(peer, artifact::PeerFile::Chain), &sealed).ok()
     }
 
     /// This node's completed credential with `peer`, if there is one.
@@ -3451,6 +3682,7 @@ impl App {
                         let tail = rest.trim().strip_prefix("reseal").unwrap_or("").to_string();
                         self.peer_reseal(&tail)
                     }
+                    Some(Peering::Counter) => self.peer_counter(rest),
                     Some(Peering::Countersign) => self.peer_countersign(arg(rest, 1).as_deref()),
                     Some(Peering::Status) => self.peer_status(),
                     Some(Peering::Rekey) => self.peer_rekey(arg(rest, 1).as_deref()),
@@ -5425,7 +5657,10 @@ impl App {
             id.signing_key(),
             id.card(Policy::default()),
             card.node_id(),
-            Policy::default(),
+            // What this node will accept from them, to open the negotiation —
+            // RFC 3 §5.1 key 5. Defaults until `peer counter` revises them;
+            // §5.2's counter is where either party states something else.
+            credential::LinkTerms::default(),
             note,
             token,
             evidence,
@@ -7708,7 +7943,7 @@ mod tests {
             c.identity.as_ref().unwrap().signing_key(),
             c.identity.as_ref().unwrap().card(Policy::default()),
             me,
-            Policy::default(),
+            credential::LinkTerms::default(),
             "let me in",
             Some(token),
             None,
@@ -7753,7 +7988,7 @@ mod tests {
             c.identity.as_ref().unwrap().signing_key(),
             c.identity.as_ref().unwrap().card(Policy::default()),
             me,
-            Policy::default(),
+            credential::LinkTerms::default(),
             "we have a friend in common",
             Some(token),
             Some(cred),
@@ -7795,7 +8030,7 @@ mod tests {
             c.identity.as_ref().unwrap().signing_key(),
             c.identity.as_ref().unwrap().card(Policy::default()),
             me,
-            Policy::default(),
+            credential::LinkTerms::default(),
             "",
             Some(token),
             Some(unrelated),
@@ -7828,7 +8063,7 @@ mod tests {
             c.identity.as_ref().unwrap().signing_key(),
             c.identity.as_ref().unwrap().card(Policy::default()),
             me,
-            Policy::default(),
+            credential::LinkTerms::default(),
             "",
             Some(token),
             None,
@@ -7864,7 +8099,7 @@ mod tests {
             c.identity.as_ref().unwrap().signing_key(),
             c.identity.as_ref().unwrap().card(Policy::default()),
             me,
-            Policy::default(),
+            credential::LinkTerms::default(),
             "",
             Some(token),
             Some(stale),
@@ -7882,6 +8117,116 @@ mod tests {
     /// unreadable to anyone else — while the proposer held a half-signed one
     /// for ever. Neither could supply evidence, which is the entire reason the
     /// document exists, and nothing reported anything wrong.
+    /// **RFC 3 §6's example, through the interface.**
+    ///
+    /// > X requests: 10 MB/day … B counters: 1 MB/day … X accepts.
+    /// > "You can peer with a stranger at 1% trust."
+    ///
+    /// Before §5.2 existed, a credential's terms came from
+    /// `LinkTerms::default()` whatever either party wanted — peering was
+    /// accept-or-reject, the binary §5 says removes §6's whole point.
+    #[test]
+    fn a_counter_sets_the_terms_the_credential_is_built_from() {
+        let mut x = ready_node("neg-x");
+        let mut b = ready_node("neg-b");
+
+        // X requests. The card goes by hand, as first contact does.
+        let card = x.home.join("theirs.card");
+        std::fs::write(
+            &card,
+            b.identity
+                .as_ref()
+                .unwrap()
+                .card(Policy::default())
+                .encode(),
+        )
+        .unwrap();
+        type_command(&mut x, &format!("request {} let me in", card.display()));
+
+        // B sees it, and counters with a sliver.
+        b.store = x.store.clone();
+        type_command(&mut b, "requests");
+        assert!(b.output.contains("request from"), "{}", b.output);
+        type_command(&mut b, "peer counter 1 1 500 3");
+        assert!(b.output.contains("countered"), "{}", b.output);
+
+        let short_x = short_id(&x.identity.as_ref().unwrap().node_id());
+        let chain = b.chain_with(&short_x).expect("B stored the negotiation");
+        assert_eq!(chain.verify(), Ok(()));
+        assert_eq!(chain.counters.len(), 1);
+
+        // The credential B would now propose carries B's stated terms, not a
+        // default — which is the whole of §5.2.
+        let proposal = b.propose_credential(&x.identity.as_ref().unwrap().card(Policy::default()));
+        let cred = credential::Credential::decode(&proposal).expect("a credential");
+        let b_id = b.identity.as_ref().unwrap().node_id();
+        let mine = if cred.a.node_id() == b_id {
+            cred.terms_ab
+        } else {
+            cred.terms_ba
+        };
+        assert_eq!(mine.bytes_per_day, 1 << 20, "B's sliver was not carried");
+        assert_eq!(mine.objects_per_day, 500);
+        assert_eq!(mine.retention_days, 3);
+        assert_ne!(
+            mine.bytes_per_day,
+            credential::LinkTerms::default().bytes_per_day,
+            "the credential fell back to defaults"
+        );
+    }
+
+    /// A counter reaches the other party the way the request did — the inbox
+    /// tag, because at this point they are still strangers.
+    #[test]
+    fn a_counter_travels_to_the_other_party() {
+        let mut x = ready_node("trav-x");
+        let mut b = ready_node("trav-b");
+        let card = x.home.join("theirs.card");
+        std::fs::write(
+            &card,
+            b.identity
+                .as_ref()
+                .unwrap()
+                .card(Policy::default())
+                .encode(),
+        )
+        .unwrap();
+        type_command(&mut x, &format!("request {} hi", card.display()));
+        b.store = x.store.clone();
+        type_command(&mut b, "peer counter 1 2 900 7");
+
+        // X, reading the same corpus, sees the counter on its own inbox tag.
+        x.store = b.store.clone();
+        type_command(&mut x, "requests");
+        assert!(x.output.contains("counter from"), "{}", x.output);
+        assert!(x.output.contains("2 MB/day"), "{}", x.output);
+    }
+
+    /// **It is not your turn.** A party that answered its own last word would
+    /// make the chain evidence of a conversation it never had — §5.2's stated
+    /// purpose is that neither party can misrepresent what was offered.
+    #[test]
+    fn a_party_cannot_counter_its_own_last_word_through_the_interface() {
+        let mut x = ready_node("turn-x");
+        let mut b = ready_node("turn-b");
+        let card = x.home.join("theirs.card");
+        std::fs::write(
+            &card,
+            b.identity
+                .as_ref()
+                .unwrap()
+                .card(Policy::default())
+                .encode(),
+        )
+        .unwrap();
+        type_command(&mut x, &format!("request {} hi", card.display()));
+        b.store = x.store.clone();
+        type_command(&mut b, "peer counter 1 1 500 3");
+        // B answers again without X having spoken.
+        type_command(&mut b, "peer counter 1 1 400 3");
+        assert!(b.output.contains("not your turn"), "{}", b.output);
+    }
+
     /// **The filter digest is no longer a constant.**
     ///
     /// Every exchange used to pass `[0u8; 32]`. The digest was checked on both
@@ -8390,7 +8735,7 @@ mod tests {
             c.identity.as_ref().unwrap().signing_key(),
             c.identity.as_ref().unwrap().card(Policy::default()),
             me,
-            Policy::default(),
+            credential::LinkTerms::default(),
             "",
             Some(token.clone()),
             None,
@@ -9592,7 +9937,9 @@ mod tests {
             "{:?}",
             b.list
         );
-        let req = &incoming[0].request;
+        let receive::Incoming::Request { request: req, .. } = &incoming[0] else {
+            panic!("a request, not a counter");
+        };
         assert_eq!(req.note, "we met at the thing");
         assert!(req.verify(), "the inner signature stands");
         assert!(req.is_for(&b.identity.as_ref().unwrap().node_id()));

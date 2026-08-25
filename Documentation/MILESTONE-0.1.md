@@ -309,7 +309,8 @@ than deleted, because the way it went wrong is the more useful record.
 
 What is actually absent from 0.1:
 
-Nothing. The list is empty, which it has not been before.
+Nothing from §5's list. RFC 3's own remaining piece is **§8's nodelist
+fragments**, whose share flags already sit in the credential unread.
 
 Rollcall cost nothing that was not already there: `Class::Bulletin` carried
 channels and prekey batches, so RFC 3 §9's whole public tier came to one

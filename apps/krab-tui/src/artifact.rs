@@ -134,6 +134,12 @@ pub enum PeerFile {
     Policy,
     /// How the peering was formed, and what it is worth.
     Terms,
+    /// The negotiation that produced this peering — RFC 3 §5.3.
+    ///
+    /// "Both parties store the full chain: `request → counter(s) → link`. The
+    /// chain is local evidence and **MUST NOT be published** — it names an
+    /// introducer and is therefore graph information."
+    Chain,
     /// This link's byte and object budget for the current day — RFC 3 §6.
     ///
     /// Two counters and a day number. §12 forbids per-object provenance, so
@@ -150,13 +156,14 @@ pub enum PeerFile {
 
 impl PeerFile {
     /// Every per-peer file.
-    pub const ALL: [PeerFile; 6] = [
+    pub const ALL: [PeerFile; 7] = [
         PeerFile::Link,
         PeerFile::Reservoir,
         PeerFile::Policy,
         PeerFile::Terms,
         PeerFile::Credential,
         PeerFile::Quota,
+        PeerFile::Chain,
     ];
 
     /// The name on disk.
@@ -168,6 +175,7 @@ impl PeerFile {
             PeerFile::Terms => "terms",
             PeerFile::Credential => "credential",
             PeerFile::Quota => "quota",
+            PeerFile::Chain => "chain",
         }
     }
 }

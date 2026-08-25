@@ -162,16 +162,30 @@ pub struct Scan {
     pub examined: usize,
 }
 
-/// A first-contact request this node could open.
-pub struct Incoming {
-    /// The request, already verified and addressed here.
-    pub request: crate::request::PeerRequest,
-    /// The epoch its inbox tag derives from.
-    ///
-    /// Held so a caller can say how old a request is without the node
-    /// recording arrival times, which RFC 3 §12 forbids.
-    #[allow(dead_code)]
-    pub epoch: Epoch,
+/// A first-contact document this node could open — RFC 3 §5.
+#[allow(clippy::large_enum_variant)]
+pub enum Incoming {
+    /// A request, already verified and addressed here.
+    Request {
+        /// The document.
+        request: crate::request::PeerRequest,
+        /// The epoch its inbox tag derives from.
+        ///
+        /// Held so a caller can say how old a request is without the node
+        /// recording arrival times, which RFC 3 §12 forbids.
+        #[allow(dead_code)]
+        epoch: Epoch,
+    },
+    /// A counter answering one — §5.2. Verified, but whether it belongs to a
+    /// negotiation this node is part of is a question only the chain can
+    /// answer.
+    Counter {
+        /// The document.
+        counter: crate::negotiate::Counter,
+        /// The epoch its inbox tag derives from.
+        #[allow(dead_code)]
+        epoch: Epoch,
+    },
 }
 
 /// Scan for first-contact requests on this node's own inbox tag.
@@ -232,13 +246,30 @@ pub fn scan_requests(
         let Ok(pt) = ctx.open(env.ciphertext, &aad) else {
             continue;
         };
-        let Ok(request) = crate::request::PeerRequest::decode(&pt) else {
-            continue;
-        };
-
-        // Both checks, and neither implies the other.
-        if request.verify() && request.is_for(our_node_id) {
-            out.push(Incoming { request, epoch });
+        // A request, or a counter answering one — RFC 3 §5.2. Both travel to
+        // the inbox tag, because at this point the two nodes are still
+        // strangers and there is no other address either can use.
+        //
+        // Tried in order rather than discriminated by a tag byte: §5.1 fixes
+        // the request's encoding and there is no spare field in it. The two
+        // shapes do not collide — a counter's key 1 is a 32-byte hash where a
+        // request's is a card — and **both are verified before use**, so a
+        // misread is a refusal rather than a confusion.
+        if let Ok(request) = crate::request::PeerRequest::decode(&pt) {
+            // Both checks, and neither implies the other.
+            if request.verify() && request.is_for(our_node_id) {
+                out.push(Incoming::Request { request, epoch });
+                continue;
+            }
+        }
+        if let Some(counter) = crate::negotiate::Counter::decode(&pt) {
+            // Addressing is not checked here: a counter names no recipient,
+            // and the chain it belongs to is what says whether it is ours.
+            // `Chain::push` refuses one that answers a document we do not
+            // hold, which is the same question asked where it can be answered.
+            if counter.verify() {
+                out.push(Incoming::Counter { counter, epoch });
+            }
         }
     }
     out

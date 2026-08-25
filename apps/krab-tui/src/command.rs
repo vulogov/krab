@@ -233,6 +233,10 @@ impl Command {
             "finish the peering once both cards are exchanged",
         ),
         (
+            "peer counter <n> <MB/day> <objects> <days>",
+            "answer a request with your own terms (RFC 3 §5.2)",
+        ),
+        (
             "peer countersign <file>",
             "sign their half of the peer-link credential — RFC 3 §3 needs both",
         ),
@@ -457,6 +461,11 @@ pub enum Peering {
     /// Ingest the peer's contribution and sign the peer-link, recording how it
     /// arrived and therefore what the reservoir is actually worth.
     Seal,
+    /// Counter a peer-request or a counter — RFC 3 §5.2.
+    ///
+    /// "The counter-offer is the step that matters. Without it, peering is
+    /// accept-or-reject and therefore binary: friend or stranger."
+    Counter,
     /// Countersign the peer's `peer-link` credential — RFC 3 §3, §5.3.
     ///
     /// The second signature. Until it exists the document is a proposal: §3 is
@@ -486,6 +495,7 @@ impl Peering {
             "reseal" => Peering::Reseal,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,
+            "counter" => Peering::Counter,
             "countersign" => Peering::Countersign,
             "status" => Peering::Status,
             "rekey" => Peering::Rekey,
