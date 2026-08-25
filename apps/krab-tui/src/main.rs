@@ -1049,6 +1049,16 @@ impl App {
         // credential. A peering with no completed credential has no agreed
         // scope, and says so with a digest of its own rather than the zero one
         // every exchange used to send; see `filter`.
+        // **RFC 3 §4's MUST.** An expired credential leaves the link
+        // unscoped, and an unscoped node does not reconcile with a scoped
+        // one — correct behaviour that is indistinguishable from a dead
+        // link. §4: surface it "rather than as a silent sync failure".
+        if let Standing::Live(credential::Life::Expired, _) = self.credential_standing(peer) {
+            self.log.push(activity_log::Event::Failed {
+                peer: peer.to_string(),
+                why: "credential expired — `peer renew`",
+            });
+        }
         let scope = self.scope_for(peer);
         let budget = self.budget_for(peer);
         // Real now, for RFC 3 §7's retention horizon — see `ExchangeView`.
@@ -2801,6 +2811,109 @@ impl App {
     /// countersigned. There is no way to make it a local setting, and that is
     /// the property — a local setting is exactly the unilateral exposure §8.3
     /// is written against.
+    /// `peer renew <peer>` — RFC 3 §4.
+    ///
+    /// > "Renewal is a fresh `peer-link` with a new nonce, superseding by
+    /// > `established` time."
+    ///
+    /// The same act as `peer share`, minus the flag change: both are a fresh
+    /// credential handed over to be countersigned. One path, because two ways
+    /// to re-sign a peering is two places for the flags or the terms to be
+    /// dropped.
+    fn peer_renew(&mut self, peer: Option<&str>) -> String {
+        let Some(peer) = peer else {
+            return "usage: peer renew <peer>\n\n\
+                    A credential has a term and there is no revocation list — \
+                    RFC 3 §4 makes revocation non-renewal, so a peering that \
+                    is not renewed simply stops. Renew before the term ends, \
+                    while there is still time to reach them."
+                .into();
+        };
+        let was = self.credential_standing(peer);
+        match self.resign_credential(peer, None) {
+            Ok(path) => format!(
+                "renewed: a fresh credential for {peer} is at {}.\n\n\
+                 {}\n\n\
+                 Give it to them and have them run `peer countersign`. It \
+                 carries a new nonce and supersedes the old one by \
+                 `established` time (RFC 3 §4); the flags and terms you had \
+                 agreed are carried across, so renewing changes nothing you \
+                 both signed except the dates.",
+                path.display(),
+                match was {
+                    Standing::Live(credential::Life::Expired, _) =>
+                        "The old one had already expired, so this link has not \
+                         been reconciling. It will once they countersign.",
+                    Standing::Live(credential::Life::DueForRenewal, _) =>
+                        "In good time — the old one had not lapsed yet.",
+                    _ => "There was no usable credential before this.",
+                }
+            ),
+            Err(e) => e,
+        }
+    }
+
+    /// Build a fresh credential for `peer`, optionally changing this node's
+    /// share flag, sign it, and write it out for countersignature.
+    ///
+    /// The one re-signing path. RFC 3 §4's renewal and §8.3's share change are
+    /// the same act — a new credential, both signatures — and giving them
+    /// separate implementations is how one of them comes to drop the terms or
+    /// the other party's flag.
+    fn resign_credential(
+        &mut self,
+        peer: &str,
+        set_share: Option<bool>,
+    ) -> Result<PathBuf, String> {
+        let Some(id) = self.identity.as_ref() else {
+            return Err("no identity — run `init` first".into());
+        };
+        if self.epoch_key.is_none() {
+            return Err("locked — unlock to change a peering's terms".into());
+        }
+        let Some(card) = self.peer_card(peer) else {
+            return Err(format!("no peer-link for {peer}"));
+        };
+        let me = id.node_id();
+
+        // Read the existing document directly rather than through
+        // `credential_with`, which refuses an expired one — and an expired
+        // credential is exactly what renewal is for. Its flags and terms are
+        // what both parties agreed and are carried across.
+        let existing = self.epoch_key.and_then(|w| {
+            std::fs::read(self.peer_path(peer, artifact::PeerFile::Credential))
+                .ok()
+                .and_then(|s| krab_crypto::kek::open_under(&w, b"krab/credential", &s).ok())
+                .and_then(|raw| credential::Credential::decode(&raw))
+        });
+
+        let Some(mut cred) = credential::Credential::decode(&self.propose_credential(&card)) else {
+            return Err("could not build a credential".into());
+        };
+        if let Some(old) = &existing {
+            cred.flags = old.flags;
+            cred.terms_ab = old.terms_ab;
+            cred.terms_ba = old.terms_ba;
+        }
+        if let Some(want) = set_share {
+            if cred.a.node_id() == me {
+                cred.flags.a_shares_b = want;
+            } else {
+                cred.flags.b_shares_a = want;
+            }
+        }
+        cred.sig_a = None;
+        cred.sig_b = None;
+        let Some(id) = self.identity.as_ref() else {
+            return Err("no identity".into());
+        };
+        cred.sign(id.signing_key());
+
+        let out = self.home.join(format!("{peer}.credential"));
+        atomic::write(&out, &cred.encode()).map_err(|e| format!("could not write it: {e}"))?;
+        Ok(out)
+    }
+
     fn peer_share(&mut self, peer: Option<&str>, on: Option<&str>) -> String {
         let (Some(peer), Some(on)) = (peer, on) else {
             return "usage: peer share <peer> on|off\n\n\
@@ -2819,48 +2932,18 @@ impl App {
             "off" | "no" | "false" => false,
             _ => return "say `on` or `off`".into(),
         };
-        let Some(id) = self.identity.as_ref() else {
-            return "no identity — run `init` first".into();
-        };
-        if self.epoch_key.is_none() {
-            return "locked — unlock to change a peering's terms".into();
+        match self.resign_credential(peer, Some(want)) {
+            Ok(path) => format!(
+                "you will {} list {peer}.\n\n\
+                 Give {} to them and have them run `peer countersign` — the \
+                 flag is inside both signatures, so a peering neither of you \
+                 re-signs keeps the old one. That is what stops either of you \
+                 exposing the other unilaterally (RFC 3 §8.3).",
+                if want { "now" } else { "no longer" },
+                path.display()
+            ),
+            Err(e) => e,
         }
-        let Some(card) = self.peer_card(peer) else {
-            return format!("no peer-link for {peer}");
-        };
-        let me = id.node_id();
-
-        // Start from the existing credential where there is one, so the other
-        // party's flag is carried rather than reset — it is theirs to set.
-        let existing = self.credential_with(peer);
-        let mut cred = match credential::Credential::decode(&self.propose_credential(&card)) {
-            Some(c) => c,
-            None => return "could not build a credential".into(),
-        };
-        let mut flags = existing.map(|c| c.flags).unwrap_or_default();
-        if cred.a.node_id() == me {
-            flags.a_shares_b = want;
-        } else {
-            flags.b_shares_a = want;
-        }
-        cred.flags = flags;
-        cred.sig_a = None;
-        cred.sig_b = None;
-        cred.sign(id.signing_key());
-
-        let out = self.home.join(format!("{peer}.credential"));
-        if let Err(e) = atomic::write(&out, &cred.encode()) {
-            return format!("could not write it: {e}");
-        }
-        format!(
-            "you will {} list {peer}.\n\n\
-             Give {} to them and have them run `peer countersign` — the flag \
-             is inside both signatures, so a peering neither of you re-signs \
-             keeps the old one. That is what stops either of you exposing the \
-             other unilaterally (RFC 3 §8.3).",
-            if want { "now" } else { "no longer" },
-            out.display()
-        )
     }
 
     /// `peer fragment` — RFC 3 §8.
@@ -3039,7 +3122,92 @@ impl App {
             krab_crypto::kek::seal_under(&w, b"krab/chain", &chain.encode(), &mut OsRng).ok()?;
         atomic::write(&self.peer_path(peer, artifact::PeerFile::Chain), &sealed).ok()
     }
+}
 
+/// What a peering's credential is, as far as the operator needs to know —
+/// RFC 3 §4.
+///
+/// **The reason `credential_with` was not enough.** It returns `Option`, so
+/// "never countersigned" and "lapsed last Tuesday" arrive as the same `None`,
+/// and every caller downstream treats them the same way: an unscoped filter, a
+/// link that will not reconcile, and nothing said. §4 names that outcome
+/// exactly — "the two look identical from the outside and confusing them will
+/// waste a great deal of operator time" — and makes distinguishing them a MUST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// No credential has been countersigned. The ordinary state of a peering
+    /// formed before `peer countersign` existed, and of one half-finished.
+    None,
+    /// A credential exists and does not verify. Not an expiry — a defect.
+    Unusable(credential::Invalid),
+    /// A credential exists and is where `life` says in its term.
+    Live(credential::Life, u64),
+}
+
+impl Standing {
+    /// One line for the operator, naming the command where there is one.
+    fn line(&self, peer: &str, now_s: u64) -> String {
+        match self {
+            Standing::None => "no credential — nothing is scoped or enforced on \
+                 this link. `peer countersign` completes one"
+                .into(),
+            Standing::Unusable(why) => format!(
+                "credential does not verify ({why:?}) — this is a defect, not \
+                 an expiry. Re-run the ceremony with {peer}"
+            ),
+            Standing::Live(credential::Life::Expired, at) => format!(
+                "**EXPIRED** {} day(s) ago — this link will not reconcile until \
+                 it is renewed. Revocation is non-renewal (RFC 3 §4), so \
+                 nothing is wrong with {peer}: the term simply ended. \
+                 `peer renew {peer}`",
+                now_s.saturating_sub(*at) / 86_400
+            ),
+            Standing::Live(credential::Life::DueForRenewal, at) => format!(
+                "expires in {} day(s) — `peer renew {peer}` now, while there is \
+                 time to reach them",
+                at.saturating_sub(now_s) / 86_400
+            ),
+            Standing::Live(credential::Life::Current, at) => {
+                format!(
+                    "credential valid for {} more day(s)",
+                    at.saturating_sub(now_s) / 86_400
+                )
+            }
+        }
+    }
+}
+
+impl App {
+    /// Where this peering's credential stands — RFC 3 §4.
+    ///
+    /// The one place that reads the file and decides; `credential_with` is
+    /// built on it, so enforcement and reporting cannot disagree about what a
+    /// credential is.
+    fn credential_standing(&self, peer: &str) -> Standing {
+        let Some(w) = self.epoch_key else {
+            return Standing::None;
+        };
+        let Some(cred) = std::fs::read(self.peer_path(peer, artifact::PeerFile::Credential))
+            .ok()
+            .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/credential", &sealed).ok())
+            .and_then(|raw| credential::Credential::decode(&raw))
+        else {
+            return Standing::None;
+        };
+        let now_s = self.now_s();
+        match cred.verify(now_s) {
+            Ok(()) => Standing::Live(cred.life(now_s), cred.expires_s),
+            // Expiry is reported as what it is. `verify` refuses it, which is
+            // correct enforcement; reporting it as a defect is what §4 forbids.
+            Err(credential::Invalid::Expired) => {
+                Standing::Live(credential::Life::Expired, cred.expires_s)
+            }
+            Err(why) => Standing::Unusable(why),
+        }
+    }
+}
+
+impl App {
     /// This node's completed credential with `peer`, if there is one.
     ///
     /// Sealed at rest under `W_N` — RFC 3 §15 makes that a MUST, so a locked
@@ -4007,6 +4175,7 @@ impl App {
                         self.peer_reseal(&tail)
                     }
                     Some(Peering::Counter) => self.peer_counter(rest),
+                    Some(Peering::Renew) => self.peer_renew(arg(rest, 1).as_deref()),
                     Some(Peering::Share) => {
                         self.peer_share(arg(rest, 1).as_deref(), arg(rest, 2).as_deref())
                     }
@@ -6411,10 +6580,14 @@ impl App {
                         Some(n) => format!("{:.0}% novel", n * 100.0),
                         None => "nothing offered".into(),
                     };
+                    let term = match self.credential_standing(id) {
+                        Standing::Live(credential::Life::Current, _) => String::new(),
+                        other => format!("\n    {}", other.line(id, self.now_s())),
+                    };
                     format!(
                         "\n    quota {}% of {} MB/day, {} objects/day \
                          (standing {}/{} of {} MB, {} objects agreed)\n    \
-                         today: {novelty}{}",
+                         today: {novelty}{}{term}",
                         acct.spend.used_percent(eff_b, eff_o),
                         eff_b >> 20,
                         eff_o,
@@ -6429,12 +6602,15 @@ impl App {
                         },
                     )
                 }
-                // Not a detail: a peering with no credential is one where
-                // nothing is enforced, and §6 makes quota the central
-                // mechanism. Saying so is the point.
-                None => "\n    no credential — no agreed quota is enforced on \
-                         this link. `peer countersign` completes one"
-                    .into(),
+                // Not a detail: a peering with no *usable* credential is one
+                // where nothing is scoped or enforced, and RFC 3 §4 makes
+                // saying which of the reasons applies a MUST — an expiry and
+                // a peering that was never countersigned look identical from
+                // here and are not the same thing at all.
+                None => format!(
+                    "\n    {}",
+                    self.credential_standing(id).line(id, self.now_s())
+                ),
             };
             // RFC 3 §8's two-hop visibility, where a peer has shared any.
             let onward = self
@@ -8473,6 +8649,146 @@ mod tests {
         let to_x = x.home.join("sh.credential");
         std::fs::copy(&back, &to_x).unwrap();
         x.peer_countersign(Some(to_x.to_str().unwrap()));
+    }
+
+    /// **RFC 3 §4's MUST: an expired peering is an explicit state, not a
+    /// silent sync failure.**
+    ///
+    /// > "The two look identical from the outside and confusing them will
+    /// > waste a great deal of operator time."
+    ///
+    /// They were identical from the inside too: `credential_with` returns
+    /// `Option`, so "never countersigned" and "lapsed last Tuesday" arrived as
+    /// the same `None`, and every caller downstream fell back to an unscoped
+    /// filter and said nothing.
+    #[test]
+    fn an_expired_credential_is_named_and_not_confused_with_an_absent_one() {
+        let mut x = ready_node("exp-x");
+        let mut y = ready_node("exp-y");
+        let short_y = peer_up(&mut x, &mut y);
+
+        // No credential at all.
+        assert_eq!(x.credential_standing(&short_y), Standing::None);
+        let absent = x.credential_standing(&short_y).line(&short_y, x.now_s());
+        assert!(absent.contains("no credential"), "{absent}");
+
+        link_up(&mut x, &mut y);
+        match x.credential_standing(&short_y) {
+            Standing::Live(credential::Life::Current, _) => {}
+            other => panic!("a fresh credential is not current: {other:?}"),
+        }
+
+        // Age it past its term, the way a calendar does.
+        let cred = {
+            let w = x.epoch_key.unwrap();
+            let sealed =
+                std::fs::read(x.peer_path(&short_y, artifact::PeerFile::Credential)).unwrap();
+            let raw = krab_crypto::kek::open_under(&w, b"krab/credential", &sealed).unwrap();
+            credential::Credential::decode(&raw).unwrap()
+        };
+        assert_eq!(cred.life(cred.expires_s), credential::Life::Expired);
+
+        // The two states produce different sentences, and the expired one
+        // names the command that fixes it.
+        let expired = Standing::Live(credential::Life::Expired, cred.expires_s)
+            .line(&short_y, cred.expires_s + 86_400);
+        assert!(expired.contains("EXPIRED"), "{expired}");
+        assert!(expired.contains("peer renew"), "{expired}");
+        assert!(
+            !expired.contains("no credential"),
+            "an expiry read as an absent credential: {expired}"
+        );
+
+        // And a due-for-renewal one prompts before it lapses — §4's 75%.
+        let due = Standing::Live(credential::Life::DueForRenewal, cred.expires_s)
+            .line(&short_y, cred.expires_s - 10 * 86_400);
+        assert!(due.contains("expires in 10 day(s)"), "{due}");
+        assert!(due.contains("peer renew"), "{due}");
+    }
+
+    /// **Renewal carries what was agreed.** §4: "a fresh `peer-link` with a
+    /// new nonce, superseding by `established` time" — the dates change and
+    /// nothing else, or renewing would silently drop a share flag or a
+    /// negotiated quota.
+    #[test]
+    fn renewal_carries_the_flags_and_terms_across() {
+        let mut x = ready_node("ren-x");
+        let mut y = ready_node("ren-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+        share_both_ways(&mut x, &mut y, &short_y);
+
+        let before = x.credential_with(&short_y).expect("a credential");
+        assert!(fragment::listable(
+            &before,
+            &x.identity.as_ref().unwrap().node_id()
+        ));
+
+        type_command(&mut x, &format!("peer renew {short_y}"));
+        assert!(x.output.contains("renewed"), "{}", x.output);
+
+        let proposal = credential::Credential::decode(
+            &std::fs::read(x.home.join(format!("{short_y}.credential"))).unwrap(),
+        )
+        .expect("a fresh credential");
+        assert_eq!(proposal.flags, before.flags, "the share flags were dropped");
+        assert_eq!(proposal.terms_ab, before.terms_ab, "terms were dropped");
+        assert_eq!(proposal.terms_ba, before.terms_ba);
+        assert_ne!(proposal.nonce, before.nonce, "§4 requires a new nonce");
+        assert!(
+            proposal.established_s >= before.established_s,
+            "a renewal must supersede by established time"
+        );
+    }
+
+    /// `peer renew` works on an already-expired peering — which is the case it
+    /// exists for. `credential_with` refuses one, so the re-sign path reads
+    /// the document directly.
+    #[test]
+    fn renewal_works_on_a_peering_that_has_already_lapsed() {
+        let mut x = ready_node("lap-x");
+        let mut y = ready_node("lap-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+
+        // A credential whose term has genuinely run out — **properly signed**,
+        // because editing the dates of a signed document makes it a forgery
+        // and `verify` reports that first, which is right: expiry is a state
+        // of a valid document and nothing else.
+        let w = x.epoch_key.unwrap();
+        let (xi, yi) = (x.identity.as_ref().unwrap(), y.identity.as_ref().unwrap());
+        let mut cred = credential::Credential::propose(
+            xi.signing_key(),
+            &xi.card(Policy::default()),
+            &yi.card(Policy::default()),
+            1,
+            1,
+            [4u8; 16],
+        );
+        assert!(cred.sign(yi.signing_key()));
+        let sealed =
+            krab_crypto::kek::seal_under(&w, b"krab/credential", &cred.encode(), &mut OsRng)
+                .unwrap();
+        std::fs::write(
+            x.peer_path(&short_y, artifact::PeerFile::Credential),
+            sealed,
+        )
+        .unwrap();
+
+        assert!(
+            x.credential_with(&short_y).is_none(),
+            "it should be refused"
+        );
+        match x.credential_standing(&short_y) {
+            Standing::Live(credential::Life::Expired, _) => {}
+            other => panic!("a lapsed credential reported as {other:?}"),
+        }
+
+        type_command(&mut x, &format!("peer renew {short_y}"));
+        assert!(x.output.contains("renewed"), "{}", x.output);
+        assert!(
+            x.output.contains("already expired"),
+            "the operator was not told why the link was quiet: {}",
+            x.output
+        );
     }
 
     /// **RFC 3 §8.3's default is false, and nothing is listed until both

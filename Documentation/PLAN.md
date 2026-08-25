@@ -14,7 +14,7 @@ module built and never called.
 
 | # | requirement | state | why it is where it is |
 |---|---|---|---|
-| 1 | RFC 3 §4 — expiry must be an explicit state | **unmet** | there is a 90-day clock already running |
+| 1 | RFC 3 §4 — expiry must be an explicit state | **done** | there was a 90-day clock already running |
 | 2 | RFC 3 §8.4 — termination must purge attributable artifacts | **unmet** | five new attributable artifacts were added last week, and nothing removes any of them |
 | 3 | RFC 3 §13 — implementations MUST warn below the peer-count floor | **built, never called** | `krab_node::warnings` has zero callers in the interface |
 | 4 | RFC 3 §12 — the accountability panel | **partial** | most metrics exist; the panel shows some of them |
@@ -98,7 +98,7 @@ than correctness.
 Three phases and a decision. Each phase is independently shippable and ends
 with a pass over what it touched.
 
-### Phase 1 — expiry becomes visible (§4)
+### Phase 1 — expiry becomes visible (§4) · **done 2026-08-25**
 
 1. **An explicit state.** A peering whose credential has expired reports as
    *expired*, in `peers` and wherever a send or a reconciliation declines
@@ -110,7 +110,17 @@ with a pass over what it touched.
 3. **A test that fails on the day it would matter**: a credential aged past its
    term must produce a named state, not a silent unscoped filter.
 
-Small. The mechanism exists; what is missing is that anyone is told.
+Done. `credential::Life` names the three stages of a term, `Standing`
+distinguishes "never countersigned" from "lapsed last Tuesday" — they arrived
+as the same `None` before — and `peer renew` is the fresh credential §4 asks
+for, carrying the flags and terms across so a renewal changes the dates and
+nothing else. A scheduled reconciliation that declines on an expired credential
+logs why.
+
+One thing the work taught: editing a signed document's dates makes it a
+forgery, and `verify` reports that first. Expiry is a state of a *valid*
+document, which is why `Life` is separate from `Invalid` — a test that faked an
+expiry by editing dates got `BadSignature`, correctly.
 
 ### Phase 2 — unpeering (§8.4)
 

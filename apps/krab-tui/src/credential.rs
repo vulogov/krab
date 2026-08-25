@@ -268,6 +268,35 @@ pub struct Credential {
     pub sig_b: Option<[u8; 64]>,
 }
 
+/// RFC 3 §4 — prompt for renewal at this fraction of the term.
+///
+/// > "Implementations SHOULD prompt for renewal at 75% of the term."
+///
+/// At the 90-day default that is a fortnight's notice, which is the point: a
+/// courier deployment may not reach its counterparty in a week.
+pub const RENEW_AT: u64 = 3;
+const RENEW_OF: u64 = 4;
+
+/// Where a credential is in its term — RFC 3 §4.
+///
+/// **Separate from [`Invalid`] because expiry is not a defect.** §4 makes
+/// revocation non-renewal, so a lapsed credential is the ordinary end of a
+/// term rather than something wrong — and telling the two apart is the whole
+/// requirement:
+///
+/// > "Implementations … **MUST surface an expired peering as an explicit state
+/// > rather than as a silent sync failure** — the two look identical from the
+/// > outside and confusing them will waste a great deal of operator time."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Life {
+    /// Valid, and not yet worth mentioning.
+    Current,
+    /// Past [`RENEW_AT`] of its term. §4's prompt.
+    DueForRenewal,
+    /// Past `expires`. The link still exists socially; the document does not.
+    Expired,
+}
+
 /// Why a credential was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invalid {
@@ -465,6 +494,36 @@ impl Credential {
             return Err(Invalid::Expired);
         }
         Ok(())
+    }
+
+    /// Where this credential is in its term — RFC 3 §4.
+    ///
+    /// Says nothing about whether the document is *valid*; a forgery has a
+    /// term like anything else. [`verify`](Credential::verify) is the question
+    /// about validity and this is the question about time, and an interface
+    /// that ran them together would report a bad signature as an expiry.
+    pub fn life(&self, now_s: u64) -> Life {
+        if now_s >= self.expires_s {
+            return Life::Expired;
+        }
+        let term = self.expires_s.saturating_sub(self.established_s);
+        let elapsed = now_s.saturating_sub(self.established_s);
+        if elapsed.saturating_mul(RENEW_OF) >= term.saturating_mul(RENEW_AT) {
+            Life::DueForRenewal
+        } else {
+            Life::Current
+        }
+    }
+
+    /// Seconds until it expires, or zero once it has.
+    ///
+    /// The interface renders days from `expires_s` directly, so this is used
+    /// by the test that pins §4's fortnight of notice. Kept because a caller
+    /// asking "how long left" should not have to know that expiry is absolute
+    /// rather than relative.
+    #[cfg(test)]
+    pub fn remaining(&self, now_s: u64) -> u64 {
+        self.expires_s.saturating_sub(now_s)
     }
 
     /// Whether this credential is between exactly these two nodes.
@@ -938,6 +997,44 @@ mod tests {
         assert_eq!(DEFAULT_TERM_DAYS, 90, "§15 argues for the upper end");
         let c = linked(&node(1), &node(2));
         assert_eq!(c.expires_s - c.established_s, DEFAULT_TERM_DAYS * DAY);
+    }
+
+    /// **RFC 3 §4's renewal prompt fires at three quarters of the term**, and
+    /// expiry is a state of its own rather than an error.
+    ///
+    /// §4's `MUST` is that an expired peering is surfaced explicitly, "rather
+    /// than as a silent sync failure — the two look identical from the outside
+    /// and confusing them will waste a great deal of operator time." A
+    /// `Life` that collapsed into `Invalid` would be that confusion.
+    #[test]
+    fn a_term_has_three_named_stages() {
+        let c = linked(&node(1), &node(2));
+        let term = c.expires_s - c.established_s;
+        assert_eq!(c.life(c.established_s), Life::Current);
+        assert_eq!(c.life(c.established_s + term / 2), Life::Current);
+        assert_eq!(
+            c.life(c.established_s + term * 3 / 4),
+            Life::DueForRenewal,
+            "§4 prompts at 75% of the term"
+        );
+        assert_eq!(c.life(c.expires_s - 1), Life::DueForRenewal);
+        assert_eq!(c.life(c.expires_s), Life::Expired);
+
+        // At the 90-day default the prompt is a fortnight's notice, which a
+        // courier deployment needs.
+        assert!(c.remaining(c.established_s + term * 3 / 4) >= 14 * 86_400);
+        assert_eq!(c.remaining(c.expires_s + 1), 0);
+    }
+
+    /// **A forgery has a term like anything else.** Time and validity are
+    /// separate questions, and an interface that ran them together would
+    /// report a bad signature as an expiry.
+    #[test]
+    fn life_says_nothing_about_validity() {
+        let mut c = linked(&node(1), &node(2));
+        c.sig_b = Some([9u8; 64]);
+        assert_eq!(c.verify(NOW + 60), Err(Invalid::BadSignature));
+        assert_eq!(c.life(NOW + 60), Life::Current, "a forgery is not expired");
     }
 
     /// Revocation is non-renewal — RFC 3 §4. An expired credential is refused,

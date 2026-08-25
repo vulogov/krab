@@ -233,6 +233,10 @@ impl Command {
             "finish the peering once both cards are exchanged",
         ),
         (
+            "peer renew <peer>",
+            "fresh credential before the term ends — there is no revocation list",
+        ),
+        (
             "peer share <peer> on|off",
             "opt in to listing them in your nodelist — off by default (RFC 3 §8.3)",
         ),
@@ -469,6 +473,12 @@ pub enum Peering {
     /// Ingest the peer's contribution and sign the peer-link, recording how it
     /// arrived and therefore what the reservoir is actually worth.
     Seal,
+    /// Renew a peering's credential — RFC 3 §4.
+    ///
+    /// "Renewal is a fresh `peer-link` with a new nonce, superseding by
+    /// `established` time." Revocation is non-renewal, so this is the only
+    /// thing that keeps a peering alive past its term.
+    Renew,
     /// Opt in to listing a peer in nodelist fragments — RFC 3 §8.3.
     ///
     /// "Default MUST be false — opt in to being listed, not out." Setting it
@@ -511,6 +521,7 @@ impl Peering {
             "reseal" => Peering::Reseal,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,
+            "renew" => Peering::Renew,
             "share" => Peering::Share,
             "fragment" => Peering::Fragment,
             "counter" => Peering::Counter,
