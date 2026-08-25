@@ -16,8 +16,8 @@ module built and never called.
 |---|---|---|---|
 | 1 | RFC 3 §4 — expiry must be an explicit state | **done** | there was a 90-day clock already running |
 | 2 | RFC 3 §8.4 — termination must purge attributable artifacts | **done** | five new attributable artifacts were added last week, and nothing removed any of them |
-| 3 | RFC 3 §13 — implementations MUST warn below the peer-count floor | **built, never called** | `krab_node::warnings` has zero callers in the interface |
-| 4 | RFC 3 §12 — the accountability panel | **partial** | most metrics exist; the panel shows some of them |
+| 3 | RFC 3 §13 — implementations MUST warn below the peer-count floor | **done** | `krab_node::warnings` had zero callers in the interface |
+| 4 | RFC 3 §12 — the accountability panel | **done** | one signal unfed: coverage has no production constructor |
 
 ### 1.1 Why §4 is first, and why it is urgent rather than merely unmet
 
@@ -157,7 +157,7 @@ starts from default terms, since the agreed ones went with the credential.
 "a node offline longer than a credential term returns unable to peer with
 anyone".
 
-### Phase 3 — the operator can act (§13, §12)
+### Phase 3 — the operator can act (§13, §12) · **done 2026-08-25**
 
 1. Call `krab_node::warnings` from the interface and render it, with the
    transport mix the node actually has.
@@ -165,7 +165,27 @@ anyone".
 3. Make the disconnect decision one keystroke from the evidence, which is the
    sentence the whole section is written around.
 
-Small, and mostly wiring.
+Done, and it was not only wiring. `krab_node::warnings` computed five warnings
+and **rendered none**, so wiring it into an interface would have meant writing
+the prose there — which is where the reasoning stops travelling with the
+threshold it came from. `Warning::line` now carries both, and the transport mix
+is read from the links the node has rather than configured: a floor the
+operator sets is a floor the operator can set wrong.
+
+`Debug` leaked into operator text on the first attempt — "the floor for a
+IpConnected deployment" — which is the shape of every enum that reaches an
+interface without being asked how it should read. `TransportMix::describe`
+fixes it and a test refuses any line containing `{` or a double space.
+
+§12's rows come from the two counters the budget already keeps: objects this
+peer was first to deliver, and what they offered that this node already had.
+That is unique-source contribution and duplicate arrivals measured at the only
+moment they *can* be measured without storing which object came from whom —
+which §12 forbids outright.
+
+One signal is still unfed and is marked so in the code: `metrics::Coverage` has
+no production constructor, so the ramp warning cannot fire. It is the last of
+§13's four.
 
 ### Phase 4 onward — the rest of the series
 

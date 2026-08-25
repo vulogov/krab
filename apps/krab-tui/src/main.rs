@@ -358,6 +358,11 @@ struct App {
     /// makes next week's delta unapplicable, which presents as a peer who
     /// stopped sharing (RFC 3 §8.2).
     pending_bases: Vec<(String, fragment::Fragment)>,
+    /// Objects whose tag matched and which did not open — RFC 1 §6.4.
+    ///
+    /// Node-wide, not per peer: a tag is derived from a pair, and an 8-byte
+    /// collision is by definition not attributable to whoever sent it.
+    last_scan_fail: usize,
     /// Two-hop reachability, from nodelist fragments peers have sent —
     /// RFC 3 §8.
     ///
@@ -537,6 +542,7 @@ impl Default for App {
             introductions: Vec::new(),
             spends: std::collections::HashMap::new(),
             reach: Vec::new(),
+            last_scan_fail: 0,
             pending_bases: Vec::new(),
             groups: Vec::new(),
             pending: Vec::new(),
@@ -1397,6 +1403,7 @@ impl App {
             }
         }
         self.reach = reach.into_iter().map(|(w, _, r)| (w, r)).collect();
+        self.last_scan_fail = scan.tag_match_decrypt_fail;
         self.pending_bases = bases;
         self.list = if scan.messages.is_empty() {
             vec![format!(
@@ -2812,6 +2819,50 @@ impl App {
     /// countersigned. There is no way to make it a local setting, and that is
     /// the property — a local setting is exactly the unilateral exposure §8.3
     /// is written against.
+    /// RFC 3 §13's warnings, for this node's actual transport mix.
+    ///
+    /// > "Operators choose peers by hand and will not know any of this.
+    /// > Implementations **MUST warn** below the lower bound for the node's
+    /// > actual transport mix, and SHOULD warn above 25 on constrained links."
+    ///
+    /// `krab_node::warnings` computed these and **nothing called it** — the
+    /// same defect as `respond_to`, `scan_requests` and `Delta`, and the
+    /// fourth instance in this codebase. The thresholds it holds are SIM-0's
+    /// and SIM-1's, which is exactly the knowledge §13 says an operator will
+    /// not have.
+    ///
+    /// The mix is read from the links this node actually has rather than
+    /// configured, because §13's floor depends on it and a floor the operator
+    /// sets is a floor the operator can set wrong.
+    fn peer_warnings(&self) -> Vec<krab_node::warnings::Warning> {
+        use krab_node::warnings::TransportMix;
+        let peers = self.peer_ids().len();
+        // A link is constrained if its profile cannot flood — RFC 4 §5.4's
+        // question, asked of the profile rather than of its name.
+        let profiles: Vec<_> = self.links.iter().map(|l| l.profile.clone()).collect();
+        let constrained = profiles
+            .iter()
+            .any(|p| !p.can_flood(peering::Policy::default().retention_bytes as f64 / 30.0));
+        let mix = match (profiles.is_empty(), constrained) {
+            // No links at all is a courier deployment until told otherwise:
+            // the highest floor, which is the safe direction for a warning.
+            (true, _) => TransportMix::Austere,
+            (false, true) => TransportMix::Mixed,
+            (false, false) => TransportMix::IpConnected,
+        };
+        krab_node::warnings::evaluate(
+            peers,
+            mix,
+            krab_core::tag::MAX_TTL_DAYS,
+            // Coverage is not measured yet — `metrics::Coverage` has no
+            // production constructor — so the default profile is passed and
+            // the ramp warning cannot fire. Stated rather than hidden: this
+            // is the one §13 signal that is still unfed.
+            krab_node::metrics::Coverage::default(),
+            constrained,
+        )
+    }
+
     /// `peer forget <peer>` — RFC 3 §8.4.
     ///
     /// > "Objects are content-addressed and unattributed, so the corpus is
@@ -6713,10 +6764,29 @@ impl App {
                         Standing::Live(credential::Life::Current, _) => String::new(),
                         other => format!("\n    {}", other.line(id, self.now_s())),
                     };
+                    // **RFC 3 §12's aggregates, and only aggregates.** §12
+                    // forbids per-object provenance outright — "a forensic
+                    // reconstruction of the graph and its timing gradients,
+                    // sitting on disk, waiting for seizure" — so the table's
+                    // rows are derived from the two counters the budget
+                    // already keeps rather than from a record of which object
+                    // came from whom.
+                    //
+                    // `duplicates` is what they offered and this node already
+                    // had; `first` is what they were first to deliver, which
+                    // is §12's unique-source contribution measured at the only
+                    // moment it can be measured without storing provenance.
+                    let duplicates = acct.spend.offered.saturating_sub(acct.spend.objects);
+                    let evidence = format!(
+                        "\n    today: {} new, {duplicates} duplicate(s), {} KB — \
+                         cutting them loses what only they bring (§12)",
+                        acct.spend.objects,
+                        acct.spend.bytes / 1024,
+                    );
                     format!(
                         "\n    quota {}% of {} MB/day, {} objects/day \
-                         (standing {}/{} of {} MB, {} objects agreed)\n    \
-                         today: {novelty}{}{term}",
+                         (standing {}/{} of {} MB, {} objects agreed){evidence}\n    \
+                         {novelty}{}{term}",
                         acct.spend.used_percent(eff_b, eff_o),
                         eff_b >> 20,
                         eff_o,
@@ -6766,7 +6836,36 @@ impl App {
                 out.push('\n');
             }
         }
-        out.push_str("\nno accountability metrics yet — nothing has reconciled.");
+        // **RFC 3 §13's warnings, at the top of the evidence.** §12's closing
+        // sentence is the requirement the whole panel is written around: "a
+        // disconnect decision should be one keystroke from the evidence
+        // justifying it. If it is not, operators will not make it, and the
+        // accountability model degrades to nothing."
+        //
+        // A warning about the peer set as a whole belongs beside the per-peer
+        // rows for the same reason — the decision to cut one peer is a
+        // decision about the set.
+        let warnings = self.peer_warnings();
+        if !warnings.is_empty() {
+            out.push_str(&format!("\n{} warning(s):\n", warnings.len()));
+            for w in &warnings {
+                out.push_str(&format!("\x20 ! {}\n", w.line()));
+            }
+        }
+        // RFC 1 §6.4 — decapsulation cost. Node-wide rather than per peer,
+        // because a tag is computed from a pair and a *collision* is by
+        // definition not attributable to whoever sent it.
+        if self.last_scan_fail > 0 {
+            out.push_str(&format!(
+                "\n{} object(s) matched a tag and did not open. A high rate \
+                 means mail is arriving outside the acceptance window, which is \
+                 otherwise invisible (RFC 1 §6.4).\n",
+                self.last_scan_fail
+            ));
+        }
+        if self.log.len() == 0 && warnings.is_empty() {
+            out.push_str("\nno accountability metrics yet — nothing has reconciled.");
+        }
         if !recent.is_empty() {
             out.push_str(&format!(
                 "\n\nrecent activity ({} of at most {}, cleared on lock):\n",
@@ -7651,6 +7750,7 @@ impl App {
         // holding one is a seizure holding one.
         self.reach.clear();
         self.pending_bases.clear();
+        self.last_scan_fail = 0;
         // Per-link budgets. Sealed under W_N, which a locked node no longer
         // holds — keeping the in-memory copies would mean a counter that
         // cannot be written back, and a peer list in memory besides.
@@ -8455,9 +8555,15 @@ mod tests {
         type_command(&mut a, "connect q3m9 tcp");
         type_command(&mut a, "peers");
         assert!(a.output.contains("q3m9"), "{}", a.output);
+        // **RFC 3 §13's MUST, now that `warnings` has a caller.** A node with
+        // no peerings is below every floor in §13's table, and §13 says an
+        // implementation MUST say so — "operators choose peers by hand and
+        // will not know any of this".
+        assert!(a.output.contains("warning(s)"), "{}", a.output);
+        assert!(a.output.contains("is the floor for"), "{}", a.output);
         assert!(
-            a.output.contains("no accountability metrics yet"),
-            "{}",
+            !a.output.contains("IpConnected"),
+            "a Debug enum reached operator text: {}",
             a.output
         );
         // Still no per-object anything (RFC 3 §12).
@@ -8778,6 +8884,66 @@ mod tests {
         let to_x = x.home.join("sh.credential");
         std::fs::copy(&back, &to_x).unwrap();
         x.peer_countersign(Some(to_x.to_str().unwrap()));
+    }
+
+    /// **RFC 3 §13's MUST, and the transport mix it depends on.**
+    ///
+    /// > "Implementations MUST warn below the lower bound for the node's
+    /// > actual transport mix, and SHOULD warn above 25 on constrained links."
+    ///
+    /// The mix is read from the links the node has rather than configured: a
+    /// floor the operator sets is a floor the operator can set wrong, and §13
+    /// exists because "operators choose peers by hand and will not know any of
+    /// this".
+    #[test]
+    fn the_peer_count_warning_uses_the_mix_the_node_actually_has() {
+        let mut a = ready_node("warn-a");
+        // No links at all: treated as the austere case, which has the highest
+        // floor — the safe direction for a warning.
+        let austere = a.peer_warnings();
+        assert!(!austere.is_empty());
+        assert!(
+            austere[0].line().contains("courier"),
+            "a node with no links got the easiest floor: {}",
+            austere[0].line()
+        );
+
+        // A TCP link moves it to the IP-connected floor.
+        type_command(&mut a, "connect q3m9 tcp");
+        let ip = a.peer_warnings();
+        assert!(ip[0].line().contains("IP-connected"), "{}", ip[0].line());
+        assert!(ip[0].line().contains("8 is the floor"), "{}", ip[0].line());
+
+        // Every warning reads as a sentence, not as a Debug dump.
+        for w in a.peer_warnings() {
+            let l = w.line();
+            assert!(!l.contains("{"), "unrendered placeholder: {l}");
+            assert!(!l.contains("  "), "the text is mangled: {l}");
+        }
+    }
+
+    /// **RFC 3 §12's aggregates, and only aggregates.** §12 forbids per-object
+    /// provenance — "a forensic reconstruction of the graph and its timing
+    /// gradients, sitting on disk, waiting for seizure" — so the panel's rows
+    /// come from the two counters the budget already keeps.
+    #[test]
+    fn the_panel_shows_evidence_without_per_object_provenance() {
+        let mut x = ready_node("ev12-x");
+        let mut y = ready_node("ev12-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+        {
+            let b = x.budget_for(&short_y).unwrap();
+            let mut a = b.spend.lock().unwrap();
+            a.spend.objects = 7;
+            a.spend.offered = 10;
+            a.spend.bytes = 4_096;
+        }
+        type_command(&mut x, "peers");
+        assert!(x.output.contains("7 new"), "{}", x.output);
+        assert!(x.output.contains("3 duplicate(s)"), "{}", x.output);
+        assert!(x.output.contains("4 KB"), "{}", x.output);
+        // §12: "Implementations MUST NOT retain per-object provenance."
+        assert!(!x.output.contains("id="), "{}", x.output);
     }
 
     /// **RFC 3 §8.4, both halves.** "On termination or expiry a node MUST

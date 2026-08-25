@@ -113,6 +113,51 @@ pub enum Warning {
     },
 }
 
+impl TransportMix {
+    /// How to name this mix to an operator.
+    ///
+    /// `Debug` leaked into operator text once — "the floor for a IpConnected
+    /// deployment" — which is the shape of every enum that reaches an
+    /// interface without being asked how it should read.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            TransportMix::IpConnected => "an IP-connected",
+            TransportMix::Mixed => "a mixed",
+            TransportMix::Austere => "a courier- or radio-dominated",
+        }
+    }
+}
+
+impl Warning {
+    /// One line for an operator, saying what to do about it.
+    ///
+    /// **The reason this module had no callers.** It computed five warnings
+    /// and rendered none, so wiring it into an interface meant writing the
+    /// prose there — which is where the reasoning stops travelling with
+    /// the threshold it came from. RFC 3 §13: "operators choose peers by
+    /// hand and will not know any of this."
+    pub fn line(&self) -> String {
+        match self {
+            Warning::PeerCountLow { have, want, mix } => format!(
+                "only {have} peer(s); {want} is the floor for {} deployment. A privacy warning before an availability one — SIM-1 §3 measures holdings-based identification getting sharply worse below it.",
+                mix.describe()
+            ),
+            Warning::PeerCountHighForConstrainedLink { have } => format!(
+                "{have} peers on a constrained link. RFC 3 §8.1 makes nodelist cost O(P²) — at fifty peers one publication is about 58 LoRa reconciliations."
+            ),
+            Warning::TtlLow { have, want } => format!(
+                "objects get {have} day(s) to arrive and this deployment needs {want}. Mail will expire in transit, silently, because RFC 0 §6 makes delivery failure silent by design."
+            ),
+            Warning::CoverageRamped { youngest, mean } => format!(
+                "coverage is a ramp, not a level: {:.0}% of the youngest objects against {:.0}% overall. Propagation is not completing within TTL, so holding a young object identifies you — SIM-1 §2's 37% headline concealed exactly this.",
+                youngest * 100.0,
+                mean * 100.0
+            ),
+            Warning::LinkEffectivelyInert { .. } => "a link cannot carry what its filter admits — it is configured to move nothing. Widen the filter, or accept that this peer is unreachable.".into(),
+        }
+    }
+}
+
 /// Evaluate the operator warnings for a node.
 pub fn evaluate(
     peers: usize,
