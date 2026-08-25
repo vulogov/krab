@@ -47,6 +47,16 @@ pub struct Moved {
     pub received: usize,
     /// Objects sent to the peer.
     pub sent: usize,
+    /// Objects the peer **delivered**, accepted or not.
+    ///
+    /// RFC 3 §12's novelty ratio is `received / offered`, and §12 calls it
+    /// "the key metric: high volume at low novelty is misconfiguration or
+    /// attack". Without this, `received` alone cannot distinguish a peer with
+    /// nothing new to give from one re-sending the corpus.
+    ///
+    /// An aggregate and nothing more. §12 forbids per-object provenance
+    /// outright, so there is no record of *which* objects were duplicates.
+    pub offered: usize,
 }
 
 /// Cap on messages handled in one exchange.
@@ -192,7 +202,10 @@ pub fn initiate<C: Corpus + ?Sized>(
                 };
                 session.send(&Control::Want(want))?;
             }
-            Some(Control::Obj(bytes)) => moved.received += take(corpus, bytes),
+            Some(Control::Obj(bytes)) => {
+                moved.offered += 1;
+                moved.received += take(corpus, bytes)
+            }
             Some(Control::Done) => {
                 session.send(&Control::Done)?;
                 break;
@@ -264,7 +277,10 @@ pub fn respond_to<C: Corpus + ?Sized>(
                 moved.sent += serve_wants(session, corpus, &ids)?;
                 served = true;
             }
-            Some(Control::Obj(bytes)) => moved.received += take(corpus, bytes),
+            Some(Control::Obj(bytes)) => {
+                moved.offered += 1;
+                moved.received += take(corpus, bytes)
+            }
             Some(Control::Done) | None => break,
             Some(_) => continue,
         }
@@ -275,7 +291,10 @@ pub fn respond_to<C: Corpus + ?Sized>(
             // reason as the outer loop.
             for _ in 0..MAX_MESSAGES {
                 match session.recv()? {
-                    Some(Control::Obj(bytes)) => moved.received += take(corpus, bytes),
+                    Some(Control::Obj(bytes)) => {
+                        moved.offered += 1;
+                        moved.received += take(corpus, bytes)
+                    }
                     Some(Control::Done) | None => break,
                     Some(_) => continue,
                 }
@@ -471,7 +490,10 @@ fn descend<C: Corpus + ?Sized>(
                 }
             }
             Some(Control::Want(ids)) => moved.sent += serve_wants(session, corpus, &ids)?,
-            Some(Control::Obj(bytes)) => moved.received += take(corpus, bytes),
+            Some(Control::Obj(bytes)) => {
+                moved.offered += 1;
+                moved.received += take(corpus, bytes)
+            }
             Some(Control::RangeDone) | Some(Control::Done) => {
                 if !said_done {
                     session.send(&Control::RangeDone)?;
@@ -487,7 +509,10 @@ fn descend<C: Corpus + ?Sized>(
                     Half::Initiator => {
                         for _ in 0..MAX_MESSAGES {
                             match session.recv()? {
-                                Some(Control::Obj(bytes)) => moved.received += take(corpus, bytes),
+                                Some(Control::Obj(bytes)) => {
+                                    moved.offered += 1;
+                                    moved.received += take(corpus, bytes)
+                                }
                                 Some(Control::Want(ids)) => {
                                     moved.sent += serve_wants(session, corpus, &ids)?
                                 }

@@ -354,7 +354,7 @@ struct App {
     ///
     /// Shared with the exchange threads so a running reconciliation is held
     /// to the ceiling, and persisted when it reports. Keyed by short id.
-    spends: std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<quota::Spend>>>,
+    spends: std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<quota::Account>>>,
     /// Introduction tokens this node holds, to present when it requests —
     /// RFC 3 §10.
     ///
@@ -1042,6 +1042,10 @@ impl App {
         std::thread::spawn(move || {
             let mut session = session;
             let mut view = shared::ExchangeView::new(view_store, window.0, carriage, scope);
+            // Cloned, so the totals can be folded back after the drivers
+            // return: the view sees only objects it accepted, and RFC 3 §12's
+            // novelty ratio needs the ones it declined as duplicates too.
+            let account = budget.clone();
             if let Some(b) = budget {
                 view = view.with_budget(b);
             }
@@ -1057,6 +1061,10 @@ impl App {
                     window.1,
                 ),
             };
+            if let (Some(b), Ok(m)) = (&account, &outcome) {
+                let mut a = b.spend.lock().unwrap_or_else(|e| e.into_inner());
+                a.spend.offered = a.spend.offered.saturating_add(m.offered as u64);
+            }
             let event = match outcome {
                 Ok(moved) => activity_log::Event::Reconciled {
                     peer: name,
@@ -1134,6 +1142,10 @@ impl App {
         std::thread::spawn(move || {
             let mut session = session;
             let mut view = shared::ExchangeView::new(view_store, window.0, carriage, scope);
+            // Cloned, so the totals can be folded back after the drivers
+            // return: the view sees only objects it accepted, and RFC 3 §12's
+            // novelty ratio needs the ones it declined as duplicates too.
+            let account = budget.clone();
             if let Some(b) = budget {
                 view = view.with_budget(b);
             }
@@ -1154,6 +1166,10 @@ impl App {
                     salt,
                 ),
             };
+            if let (Some(b), Ok(m)) = (&account, &outcome) {
+                let mut a = b.spend.lock().unwrap_or_else(|e| e.into_inner());
+                a.spend.offered = a.spend.offered.saturating_add(m.offered as u64);
+            }
             let event = match outcome {
                 Ok(moved) => activity_log::Event::Reconciled {
                     peer: name,
@@ -2377,17 +2393,30 @@ impl App {
         let day = quota::day_of(self.now_s());
         let cell = self.spends.entry(peer.to_string()).or_insert_with(|| {
             std::sync::Arc::new(std::sync::Mutex::new(
-                Self::read_spend(&self.home, peer, self.epoch_key).unwrap_or(quota::Spend {
-                    day,
-                    ..quota::Spend::default()
+                Self::read_spend(&self.home, peer, self.epoch_key).unwrap_or(quota::Account {
+                    spend: quota::Spend {
+                        day,
+                        ..quota::Spend::default()
+                    },
+                    standing: quota::Standing::default(),
                 }),
             ))
         });
-        cell.lock().unwrap_or_else(|e| e.into_inner()).roll(day);
+        // Settles the window that just closed — RFC 3 §6.2's adjustment, which
+        // is why this is not merely a counter reset.
+        let standing = {
+            let mut a = cell.lock().unwrap_or_else(|e| e.into_inner());
+            a.roll(day);
+            a.standing
+        };
+        // **The dial, not the ceiling.** §6.2: "adjustment within the
+        // credential's negotiated ceiling requires no re-signing; raising the
+        // ceiling does." So a fresh peering admits an eighth of what was
+        // signed, and earns the rest (RFC 0 §5.3).
         Some(shared::Budget {
             spend: cell.clone(),
-            bytes_per_day: terms.bytes_per_day,
-            objects_per_day: terms.objects_per_day,
+            bytes_per_day: standing.effective(terms.bytes_per_day),
+            objects_per_day: standing.effective(terms.objects_per_day),
         })
     }
 
@@ -2411,11 +2440,11 @@ impl App {
         home: &std::path::Path,
         peer: &str,
         epoch_key: Option<[u8; 32]>,
-    ) -> Option<quota::Spend> {
+    ) -> Option<quota::Account> {
         let w = epoch_key?;
         let sealed = std::fs::read(home.join("peers").join(peer).join("quota")).ok()?;
         let raw = krab_crypto::kek::open_under(&w, b"krab/quota", &sealed).ok()?;
-        quota::Spend::decode(&raw)
+        quota::Account::decode(&raw)
     }
 
     /// Write every budget that a running exchange may have moved.
@@ -2426,7 +2455,7 @@ impl App {
     /// disclosure RFC 3 §8.4 says to purge.
     fn save_spends(&mut self) {
         let Some(w) = self.epoch_key else { return };
-        let entries: Vec<(String, quota::Spend)> = self
+        let entries: Vec<(String, quota::Account)> = self
             .spends
             .iter()
             .map(|(k, v)| (k.clone(), *v.lock().unwrap_or_else(|e| e.into_inner())))
@@ -5804,16 +5833,37 @@ impl App {
             // make it, and the accountability model degrades to nothing."
             let budget = match self.inbound_terms(id) {
                 Some(t) => {
-                    let spent = self
+                    let acct = self
                         .spends
                         .get(id)
                         .map(|c| *c.lock().unwrap_or_else(|e| e.into_inner()))
                         .unwrap_or_default();
+                    // The **effective** ceiling and the signed one, both.
+                    // RFC 3 §6.2 dials within the credential, and an operator
+                    // who sees only one of the two numbers cannot tell a
+                    // throttled peer from a peer with a small agreement.
+                    let eff_b = acct.standing.effective(t.bytes_per_day);
+                    let eff_o = acct.standing.effective(t.objects_per_day);
+                    let novelty = match acct.spend.novelty() {
+                        Some(n) => format!("{:.0}% novel", n * 100.0),
+                        None => "nothing offered".into(),
+                    };
                     format!(
-                        "\n    quota {}% of {} MB/day, {} objects/day today",
-                        spent.used_percent(t.bytes_per_day, t.objects_per_day),
+                        "\n    quota {}% of {} MB/day, {} objects/day \
+                         (standing {}/{} of {} MB, {} objects agreed)\n    \
+                         today: {novelty}{}",
+                        acct.spend.used_percent(eff_b, eff_o),
+                        eff_b >> 20,
+                        eff_o,
+                        acct.standing.age,
+                        quota::MATURE_WINDOWS,
                         t.bytes_per_day >> 20,
                         t.objects_per_day,
+                        if acct.spend.refused > 0 {
+                            format!(", {} refused over budget", acct.spend.refused)
+                        } else {
+                            String::new()
+                        },
                     )
                 }
                 // Not a detail: a peering with no credential is one where
@@ -7901,6 +7951,105 @@ mod tests {
         assert_eq!(store.len(), 2, "the budget did not hold the link to two");
     }
 
+    /// **RFC 3 §6.2 — the dial moves within the credential and never past
+    /// it**, and a fresh peering starts at an eighth of what was signed.
+    ///
+    /// RFC 0 §5.3: "graduated quota is what makes early vantage points
+    /// low-bandwidth and slow to become useful." An adversary who obtains a
+    /// peering does not obtain a vantage point on the corpus — they obtain an
+    /// eighth of one, and have to behave for a week for the rest.
+    #[test]
+    fn a_fresh_peering_is_dialled_down_and_earns_its_way_up() {
+        let mut x = ready_node("dial-x");
+        let mut y = ready_node("dial-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+
+        let signed = x
+            .inbound_terms(&short_y)
+            .expect("a credential")
+            .objects_per_day;
+        let fresh = x.budget_for(&short_y).unwrap();
+        assert_eq!(
+            fresh.objects_per_day,
+            signed / quota::MATURE_WINDOWS as u64,
+            "a fresh peering was granted the full ceiling"
+        );
+
+        // Eight good windows, driven through the account the way a day roll
+        // does, and the dial reaches the signed ceiling and stops.
+        {
+            let cell = x.spends.get(&short_y).unwrap();
+            let mut a = cell.lock().unwrap();
+            for day in 1..=20u32 {
+                a.spend.day = day;
+                a.spend.offered = 100;
+                a.spend.objects = 100;
+                a.spend.refused = 0;
+                a.roll(day + 1);
+            }
+        }
+        let mature = x.budget_for(&short_y).unwrap();
+        assert_eq!(mature.objects_per_day, signed, "the dial never matured");
+        assert!(
+            mature.objects_per_day <= signed,
+            "the dial exceeded the signed ceiling"
+        );
+    }
+
+    /// **A violation drops it sharply** — §6.2's "flood → quota reduction",
+    /// and RFC 3 §12's key metric: high volume at low novelty.
+    #[test]
+    fn high_volume_at_low_novelty_drops_the_dial() {
+        let mut x = ready_node("drop-x");
+        let mut y = ready_node("drop-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+        x.budget_for(&short_y);
+
+        let cell = x.spends.get(&short_y).unwrap().clone();
+        {
+            let mut a = cell.lock().unwrap();
+            a.standing.age = quota::MATURE_WINDOWS;
+            // A window of pure duplication.
+            a.spend.day = 1;
+            a.spend.offered = 5_000;
+            a.spend.objects = 1;
+            a.roll(2);
+        }
+        let after = cell.lock().unwrap().standing.age;
+        assert_eq!(
+            after,
+            quota::MATURE_WINDOWS / 2,
+            "a flood did not reduce the quota"
+        );
+
+        // And the link is still up: §6.2 makes disconnection the limit case,
+        // not the mechanism.
+        assert!(x.budget_for(&short_y).unwrap().objects_per_day > 0);
+    }
+
+    /// The novelty ratio counts objects the view never saw. `put` is reached
+    /// only for objects this node lacks, so without the driver's `offered` a
+    /// peer re-sending the whole corpus would look like a peer with nothing to
+    /// send.
+    #[test]
+    fn the_novelty_ratio_counts_duplicates() {
+        let mut m = krab_node::exchange::Moved::default();
+        m.offered = 10;
+        m.received = 1;
+        let mut a = quota::Account::default();
+        a.spend.offered = m.offered as u64;
+        a.spend.objects = m.received as u64;
+        assert_eq!(a.spend.novelty(), Some(0.1));
+        assert_eq!(
+            quota::Standing::judge(&quota::Spend {
+                offered: 1_000,
+                objects: 1,
+                ..a.spend
+            }),
+            quota::Conduct::Unproductive
+        );
+    }
+
     /// A link with no credential has agreed no ceiling, so none is enforced —
     /// a budget nobody signed is the unilateral judgement §6 is written
     /// against.
@@ -7921,15 +8070,15 @@ mod tests {
         let (_, short_y) = link_up(&mut x, &mut y);
 
         let b = x.budget_for(&short_y).unwrap();
-        b.spend.lock().unwrap().charge(4_096);
+        b.spend.lock().unwrap().spend.charge(4_096);
         x.save_spends();
 
         // A fresh view of the same home, as a restart gives.
         x.spends.clear();
         let again = x.budget_for(&short_y).unwrap();
         let spend = *again.spend.lock().unwrap();
-        assert_eq!(spend.objects, 1, "the budget reset on restart");
-        assert_eq!(spend.bytes, 4_096);
+        assert_eq!(spend.spend.objects, 1, "the budget reset on restart");
+        assert_eq!(spend.spend.bytes, 4_096);
     }
 
     /// The counters are cleared on lock: they are sealed under `W_N`, which a

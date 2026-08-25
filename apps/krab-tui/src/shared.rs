@@ -136,8 +136,11 @@ pub struct ExchangeView {
 #[derive(Clone)]
 pub struct Budget {
     /// What has crossed today.
-    pub spend: std::sync::Arc<Mutex<crate::quota::Spend>>,
+    pub spend: std::sync::Arc<Mutex<crate::quota::Account>>,
     /// Bytes per day this node accepts from the peer — RFC 3 §6.
+    ///
+    /// The **effective** ceiling, not the credential's: §6.2 dials this
+    /// within what was signed, and `Standing::effective` is what produces it.
     pub bytes_per_day: u64,
     /// Objects per day.
     pub objects_per_day: u64,
@@ -251,15 +254,22 @@ impl Corpus for ExchangeView {
         // disconnection "the limit case, not the mechanism", and RFC 0 I-4
         // makes a quiet link normal.
         if let Some(b) = &self.budget {
-            let mut spend = b.spend.lock().unwrap_or_else(|e| e.into_inner());
-            if !spend.admits(bytes.len(), b.bytes_per_day, b.objects_per_day) {
+            let mut acct = b.spend.lock().unwrap_or_else(|e| e.into_inner());
+            if !acct
+                .spend
+                .admits(bytes.len(), b.bytes_per_day, b.objects_per_day)
+            {
+                // Counted, because it is the violation signal RFC 3 §6.2
+                // adjusts on: a peer that keeps sending past what it agreed to
+                // is the case §6.1 calls "throttled, then reduced, then cut".
+                acct.spend.refused = acct.spend.refused.saturating_add(1);
                 return;
             }
             // Charged before `ingest`, which may refuse the object under RFC 1
             // §11. That is deliberate: the bytes crossed the link either way,
             // and a peer that could spend nothing by sending rejects would
             // have found the way around the budget.
-            spend.charge(bytes.len());
+            acct.spend.charge(bytes.len());
         }
         // RFC 1 §11's I1–I6 apply here exactly as they do on the main thread:
         // `ingest` is the only path that admits data and it checks regardless
