@@ -147,6 +147,11 @@ Medium, and it depends on Phase 1 for the expiry trigger.
 
 Small, and mostly wiring.
 
+### Phase 4 onward — the rest of the series
+
+Everything above is RFC 3. A survey of the other eight documents follows in
+§2.1; the phases it produces run after Phase 3.
+
 ### Then: a decision, not a phase
 
 With those closed, every normative requirement in RFC 3 that this
@@ -160,6 +165,89 @@ changelog, `REPRODUCIBLE-BUILDS.md` verified end to end, and a README that
 tells someone how to run it.
 
 ---
+
+## 2.1 The other RFCs — survey, and Phases 4–6
+
+**Scope of this survey, stated honestly.** RFC 8 §7 and §10 were read in full
+and checked against the tree; the items marked *verified* below were confirmed
+by looking for the mechanism, not by looking for the word. The rest were found
+by extracting normative lines and spot-checking, and are marked *to verify* —
+they are candidates, not findings. Finishing that audit is itself the first
+task of Phase 4, and it should take an afternoon.
+
+RFC 8 carries the most normative weight in the series (60 `MUST`/`SHOULD`
+lines against RFC 1's 43) and has had the least of it checked, because the
+implementation work has been protocol-first throughout.
+
+### Phase 4 — RFC 8 §7: names are attacker-controlled *(verified)*
+
+```
+A key fingerprint MUST appear alongside every display name in list views,
+  not only in a detail pane.
+The client MUST run Unicode confusable detection against names the user
+  already follows, and MUST mark matches.
+```
+
+Neither is implemented. There is no confusable check anywhere, and no
+fingerprint beside a name in any list.
+
+It is not vacuous: `groups::Group` carries an operator-chosen `name`, and a
+roster arrives **signed by another member** — so the name is chosen by someone
+else and rendered by this node. §7's own sentence is the threat: "a Cyrillic
+homoglyph defeats the strongest cryptographic guarantee in the system with a
+font."
+
+§7 also anticipates the half-fix: "Fingerprints in the detail pane only would
+satisfy the letter and miss the point: the confusion happens while scanning a
+list."
+
+Work: fingerprints in list rows; Unicode TR39 confusable skeletons compared
+against names already followed; matches marked. The mechanism is standard and
+the table is data.
+
+### Phase 5 — RFC 8 §10: retention is a foreground property *(verified)*
+
+```
+The client MUST make the consequence of the retention window visible
+  BEFORE the window elapses.
+A pin action MUST be available, re-encrypting a selected conversation
+  under a long-lived key.
+```
+
+**Entirely absent.** The word "pin" occurs once in the tree, in a comment about
+test vectors.
+
+§10's reasoning is the strongest argument in RFC 8 for doing it:
+
+> "Epoch erasure makes a node's own archive of that epoch permanently
+> unreadable. That is the point — it is the only genuine form of message expiry
+> — but a user who discovers it afterwards has lost something irrecoverably,
+> and no support channel can help."
+
+This one is not an interface nicety. `shred_expired_epochs` already runs on the
+schedule and destroys epoch keys, so the loss is real, automatic and running
+today. Pinning is the only thing that can precede it, which makes this the
+highest-consequence item outside RFC 3.
+
+Work: a pin verb re-encrypting a conversation under a long-lived key (RFC 7
+§8.1 is the derivation), and a foreground warning before an epoch's keys are
+shredded rather than after.
+
+### Phase 6 — the remainder *(to verify)*
+
+Candidates, in the order they should be checked:
+
+| document | line | requirement | note |
+|---|---|---|---|
+| RFC 6 §216 | "MUST surface burn rate and MUST warn when joining a group would make the batch insufficient" | `groups::prekey_warning` exists; whether `keys` surfaces the rate is unchecked |
+| RFC 6 §281 | "Nodes MUST support excluding class 1 (bulletin) entirely via `class_mask`" | the filter enforces `class_mask`; **nothing sets it** — `Flags::class_mask` is `0xFF` and no verb changes it |
+| RFC 7 §509 | "Implementations MUST store ciphertext and derive on display" | no marker found in the tree; needs reading rather than grepping |
+| RFC 7 §410 | "MUST surface this wherever the link is displayed" (non-post-quantum reservoir) | `peers` does say it; other views unchecked |
+| RFC 6 §158 | "Divergence MUST be surfaced, not silently resolved" | `groups::divergence` exists; whether every caller surfaces it is unchecked |
+
+§281 is the one that looks most like a real gap: the enforcement is built and
+the control is not, which is the same shape as the share flag before `peer
+share` existed.
 
 ## 3. What is deliberately not on this list
 
