@@ -170,6 +170,41 @@ pub enum PeerFile {
 }
 
 impl PeerFile {
+    /// Whether RFC 3 §8.4 purges this when a credential **expires**, as
+    /// distinct from when the operator ends the relationship.
+    ///
+    /// > "Fragments, beacons, credentials, and negotiation chains are
+    /// > attributable — they are records of a relationship. On termination or
+    /// > expiry a node MUST purge those and MUST retain the corpus."
+    ///
+    /// §8.4 names four things, and the list is doing work: a **credential**, a
+    /// **chain** and a **fragment** are records that two parties agreed
+    /// something. A card and a reservoir are not records of an agreement —
+    /// they are the material that makes sealing possible, and destroying them
+    /// on a lapsed term would end a relationship the operator may be about to
+    /// renew.
+    ///
+    /// So expiry purges the record and keeps the material; **termination**
+    /// ([`App::peer_forget`](crate::App::peer_forget)) purges both, because
+    /// there the operator has said the relationship is over.
+    ///
+    /// The consequence, stated because it is a real cost: renewing a peering
+    /// that has already lapsed starts from default terms, since the terms that
+    /// were agreed went with the credential. RFC 3 §4 prompts at 75% of the
+    /// term precisely so that does not happen, and §15 accepts the case
+    /// directly — "a node offline longer than a credential term returns unable
+    /// to peer with anyone".
+    pub fn purged_on_expiry(&self) -> bool {
+        match self {
+            // Records of an agreement.
+            PeerFile::Credential | PeerFile::Chain | PeerFile::Nodelist => true,
+            // Material, and a local counter. The peering may be renewed.
+            PeerFile::Link | PeerFile::Reservoir | PeerFile::Policy | PeerFile::Terms => false,
+            // Spent budget against terms that no longer exist.
+            PeerFile::Quota => true,
+        }
+    }
+
     /// Every per-peer file.
     pub const ALL: [PeerFile; 8] = [
         PeerFile::Link,
@@ -388,6 +423,33 @@ mod tests {
              check whether they need purging from history too:\n  {}",
             found.join("\n  ")
         );
+    }
+
+    /// **RFC 3 §8.4 names what expiry purges, and the split is deliberate.**
+    ///
+    /// A record of an agreement goes; the material that makes sealing possible
+    /// stays, so a lapsed peering can be renewed rather than having to be
+    /// formed again. Written as a method so a new per-peer file has to answer
+    /// the question rather than default into one of the two answers.
+    #[test]
+    fn expiry_purges_records_and_keeps_material() {
+        assert!(PeerFile::Credential.purged_on_expiry());
+        assert!(PeerFile::Chain.purged_on_expiry());
+        assert!(PeerFile::Nodelist.purged_on_expiry());
+
+        assert!(
+            !PeerFile::Link.purged_on_expiry(),
+            "the card is not a record"
+        );
+        assert!(
+            !PeerFile::Reservoir.purged_on_expiry(),
+            "destroying the reservoir would end a renewable peering"
+        );
+
+        // And termination takes everything: `wiped` covers every variant.
+        for p in PeerFile::ALL {
+            assert!(wiped(p.name()), "{} survives a termination", p.name());
+        }
     }
 
     /// A file this node never writes is not destroyed — a wipe that removed

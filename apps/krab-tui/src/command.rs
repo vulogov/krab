@@ -233,6 +233,10 @@ impl Command {
             "finish the peering once both cards are exchanged",
         ),
         (
+            "peer forget <peer>",
+            "end a peering and destroy its record — the corpus is kept (RFC 3 §8.4)",
+        ),
+        (
             "peer renew <peer>",
             "fresh credential before the term ends — there is no revocation list",
         ),
@@ -473,6 +477,13 @@ pub enum Peering {
     /// Ingest the peer's contribution and sign the peer-link, recording how it
     /// arrived and therefore what the reservoir is actually worth.
     Seal,
+    /// End a peering and purge its record — RFC 3 §8.4.
+    ///
+    /// "Unpeering should remove the relationship record, not merely stop the
+    /// conversation." The corpus is retained, which §8.4 makes an equal MUST:
+    /// objects are content-addressed and unattributed, so they are unaffected
+    /// by who this node peers with.
+    Forget,
     /// Renew a peering's credential — RFC 3 §4.
     ///
     /// "Renewal is a fresh `peer-link` with a new nonce, superseding by
@@ -521,6 +532,7 @@ impl Peering {
             "reseal" => Peering::Reseal,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,
+            "forget" => Peering::Forget,
             "renew" => Peering::Renew,
             "share" => Peering::Share,
             "fragment" => Peering::Fragment,

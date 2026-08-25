@@ -15,7 +15,7 @@ module built and never called.
 | # | requirement | state | why it is where it is |
 |---|---|---|---|
 | 1 | RFC 3 §4 — expiry must be an explicit state | **done** | there was a 90-day clock already running |
-| 2 | RFC 3 §8.4 — termination must purge attributable artifacts | **unmet** | five new attributable artifacts were added last week, and nothing removes any of them |
+| 2 | RFC 3 §8.4 — termination must purge attributable artifacts | **done** | five new attributable artifacts were added last week, and nothing removed any of them |
 | 3 | RFC 3 §13 — implementations MUST warn below the peer-count floor | **built, never called** | `krab_node::warnings` has zero callers in the interface |
 | 4 | RFC 3 §12 — the accountability panel | **partial** | most metrics exist; the panel shows some of them |
 
@@ -122,7 +122,7 @@ forgery, and `verify` reports that first. Expiry is a state of a *valid*
 document, which is why `Life` is separate from `Invalid` — a test that faked an
 expiry by editing dates got `BadSignature`, correctly.
 
-### Phase 2 — unpeering (§8.4)
+### Phase 2 — unpeering (§8.4) · **done 2026-08-25**
 
 1. `peer forget <peer>` — purge the credential, chain, quota, nodelist, terms,
    reservoir and card for one peer, shredded per `SECURE-DELETE.md`, and
@@ -135,7 +135,27 @@ expiry by editing dates got `BadSignature`, correctly.
 4. A test that walks `PeerFile::ALL` and asserts nothing for that peer
    survives — the structural form, so a new per-peer artifact fails it.
 
-Medium, and it depends on Phase 1 for the expiry trigger.
+Done. `peer forget <peer>` shreds every per-peer file, removes the directory,
+and drops the peer from the scheduler, the link table, the allowed set, the
+quota counters and the nodelist — stopping the conversation and removing the
+record in the same breath, because a node still dialling someone whose card it
+has just destroyed fails in a way nothing explains.
+
+**The split §8.4 forced.** Expiry and termination are not the same purge.
+§8.4 names four things — fragments, beacons, credentials and negotiation
+chains — and the list is doing work: those are records that two parties agreed
+something. A card and a reservoir are not. Destroying them on a lapsed term
+would end a relationship the operator may be about to renew, and §4 makes
+renewal the ordinary path.
+
+So `PeerFile::purged_on_expiry` splits them, as a method rather than a list, so
+a new per-peer file has to answer the question. Termination takes everything.
+
+The cost, stated because it is real: renewing a peering that has already lapsed
+starts from default terms, since the agreed ones went with the credential.
+§4 prompts at 75% precisely so that does not happen, and §15 accepts the case —
+"a node offline longer than a credential term returns unable to peer with
+anyone".
 
 ### Phase 3 — the operator can act (§13, §12)
 

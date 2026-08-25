@@ -906,6 +906,7 @@ impl App {
         self.release_pending();
         self.republish_prekeys_if_due();
         self.republish_rollcall_if_due();
+        self.purge_expired_peerings();
         self.shred_expired_epochs();
         self.enforce_retention();
         let now_s = std::time::SystemTime::now()
@@ -2811,6 +2812,133 @@ impl App {
     /// countersigned. There is no way to make it a local setting, and that is
     /// the property — a local setting is exactly the unilateral exposure §8.3
     /// is written against.
+    /// `peer forget <peer>` — RFC 3 §8.4.
+    ///
+    /// > "Objects are content-addressed and unattributed, so the corpus is
+    /// > unaffected by unpeering. Fragments, beacons, credentials, and
+    /// > negotiation chains are attributable — they are records of a
+    /// > relationship. On termination or expiry a node **MUST purge those**
+    /// > and **MUST retain the corpus**. Unpeering should remove the
+    /// > relationship record, not merely stop the conversation."
+    ///
+    /// Both halves are requirements and they pull opposite ways, so both are
+    /// tested. Destroying the corpus would lose everyone else's mail to end
+    /// one relationship; keeping the record would leave, per RFC 3 §15, "the
+    /// peer list **with cryptographic proof** — worse than an address book".
+    ///
+    /// # Stopping the conversation is not enough, and neither is the reverse
+    ///
+    /// Purging the files while the peer stays in the scheduler, the allowed
+    /// set and the link table would leave a node still dialling someone it has
+    /// no record of — and still accepting them. So the relationship stops
+    /// being *acted on* in the same breath as it stops being stored.
+    fn peer_forget(&mut self, peer: Option<&str>) -> String {
+        let Some(peer) = peer else {
+            return "usage: peer forget <peer>\n\n\
+                    Ends a peering and destroys its record — the credential, \
+                    the negotiation, the reservoir, their card, and this \
+                    node's counters. Shredded, not unlinked.\n\n\
+                    **Your messages are kept.** RFC 3 §8.4 makes retaining the \
+                    corpus an equal MUST: objects are content-addressed and \
+                    unattributed, so they are unaffected by who you peer with.\n\n\
+                    It cannot be undone and they are not told. Peering again \
+                    means the ceremony again."
+                .into();
+        };
+        if self.epoch_key.is_none() {
+            return "locked — unlock to end a peering".into();
+        }
+        let dir = self.home.join("peers").join(peer);
+        if !dir.exists() && self.peer_card(peer).is_none() {
+            return format!("no peering with {peer}");
+        }
+        let before = self.store.len();
+
+        // Stop acting on it first. A purge that left the peer in the
+        // scheduler would have this node dialling someone whose card it has
+        // just destroyed, which fails in a way nothing explains.
+        self.links.disconnect(peer);
+        self.spends.remove(peer);
+        self.reach.retain(|(who, _)| who != peer);
+        if let Some(card) = self.peer_card(peer) {
+            self.scheduler
+                .remove(&sync::peer_id_from_node(&card.node_id()));
+        }
+
+        // Then destroy it. Shredded rather than unlinked — `SECURE-DELETE.md`:
+        // destruction protects against an adversary who obtains the key
+        // *later*, and a credential is non-repudiable for as long as it lasts.
+        let mut gone = 0;
+        for f in artifact::PeerFile::ALL {
+            let path = dir.join(f.name());
+            if path.exists() && shred::remove(&path, &mut OsRng) {
+                gone += 1;
+            }
+        }
+        // Anything else the directory holds, including a layout this version
+        // does not know about — the same reasoning as `wipe`'s predicate.
+        gone += shred::remove_matching(&dir, |_| true, &mut OsRng);
+        let _ = std::fs::remove_dir(&dir);
+
+        // The allowed set is rebuilt from what is on disk, so it drops them.
+        self.refresh_allowed();
+
+        format!(
+            "peering with {peer} ended. {gone} file(s) shredded.\n\n\
+             They are no longer scheduled, no longer accepted on the \
+             listener, and no longer in your nodelist.\n\n\
+             **Your {} objects are untouched** — RFC 3 §8.4 keeps the corpus, \
+             because objects are content-addressed and unattributed and are \
+             not a record of anyone.\n\n\
+             Mail you already exchanged stays readable while its epoch keys \
+             live. What is gone is the record that the two of you agreed \
+             anything, which is what a seized disk would otherwise prove.",
+            before
+        )
+    }
+
+    /// Purge the records of peerings whose credentials have lapsed —
+    /// RFC 3 §8.4's "on termination **or expiry**".
+    ///
+    /// Runs on the schedule, because an expiry has no keystroke behind it.
+    ///
+    /// Purges only what §8.4 names — see [`artifact::PeerFile::purged_on_expiry`].
+    /// The card and the reservoir stay, so `peer renew` can still form a fresh
+    /// credential; what goes is the agreement, which nobody is party to any
+    /// more.
+    fn purge_expired_peerings(&mut self) {
+        if self.epoch_key.is_none() {
+            return;
+        }
+        for peer in self.peer_ids() {
+            if !matches!(
+                self.credential_standing(&peer),
+                Standing::Live(credential::Life::Expired, _)
+            ) {
+                continue;
+            }
+            let dir = self.home.join("peers").join(&peer);
+            let mut gone = 0;
+            for f in artifact::PeerFile::ALL {
+                if !f.purged_on_expiry() {
+                    continue;
+                }
+                let path = dir.join(f.name());
+                if path.exists() && shred::remove(&path, &mut OsRng) {
+                    gone += 1;
+                }
+            }
+            if gone > 0 {
+                self.spends.remove(&peer);
+                self.reach.retain(|(who, _)| who != &peer);
+                self.log.push(activity_log::Event::Failed {
+                    peer: peer.clone(),
+                    why: "credential expired — record purged (§8.4), `peer renew`",
+                });
+            }
+        }
+    }
+
     /// `peer renew <peer>` — RFC 3 §4.
     ///
     /// > "Renewal is a fresh `peer-link` with a new nonce, superseding by
@@ -4175,6 +4303,7 @@ impl App {
                         self.peer_reseal(&tail)
                     }
                     Some(Peering::Counter) => self.peer_counter(rest),
+                    Some(Peering::Forget) => self.peer_forget(arg(rest, 1).as_deref()),
                     Some(Peering::Renew) => self.peer_renew(arg(rest, 1).as_deref()),
                     Some(Peering::Share) => {
                         self.peer_share(arg(rest, 1).as_deref(), arg(rest, 2).as_deref())
@@ -8649,6 +8778,144 @@ mod tests {
         let to_x = x.home.join("sh.credential");
         std::fs::copy(&back, &to_x).unwrap();
         x.peer_countersign(Some(to_x.to_str().unwrap()));
+    }
+
+    /// **RFC 3 §8.4, both halves.** "On termination or expiry a node MUST
+    /// purge those and **MUST retain the corpus**."
+    ///
+    /// The two requirements pull opposite ways, so both are asserted:
+    /// destroying the corpus would lose everyone else's mail to end one
+    /// relationship, and keeping the record would leave what §15 calls "the
+    /// peer list with cryptographic proof — worse than an address book".
+    ///
+    /// The file check walks `PeerFile::ALL` rather than a list, so a new
+    /// per-peer artifact fails this until `forget` reaches it — the same
+    /// structural form as `wipe`'s, and for the same reason.
+    #[test]
+    fn forgetting_a_peer_purges_the_record_and_keeps_the_corpus() {
+        let mut x = ready_node("fgt-x");
+        let mut y = ready_node("fgt-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+        share_both_ways(&mut x, &mut y, &short_y);
+
+        // Something in the corpus, and a peering with every artifact on disk.
+        x.store.with(|s| {
+            let b = test_object(7);
+            let _ = s.ingest(
+                krab_crypto::object_id(&b),
+                b,
+                now_epoch().0 * 1440,
+                u32::MAX,
+            );
+        });
+        let objects = x.store.len();
+        assert!(objects > 0);
+        assert!(x.credential_with(&short_y).is_some());
+        x.budget_for(&short_y);
+
+        type_command(&mut x, &format!("peer forget {short_y}"));
+        assert!(x.output.contains("ended"), "{}", x.output);
+
+        // Every per-peer file is gone, whatever it is called.
+        for f in artifact::PeerFile::ALL {
+            assert!(
+                !x.peer_path(&short_y, f).exists(),
+                "{} survived a termination",
+                f.name()
+            );
+        }
+        assert!(
+            !x.home.join("peers").join(&short_y).exists(),
+            "the directory remains"
+        );
+
+        // And the corpus is untouched — §8.4's other MUST.
+        assert_eq!(x.store.len(), objects, "unpeering destroyed the corpus");
+
+        // No longer acted on, either.
+        assert!(!x.spends.contains_key(&short_y));
+        assert!(x.credential_with(&short_y).is_none());
+        assert!(x.reach.iter().all(|(w, _)| w != &short_y));
+    }
+
+    /// **§8.4 says "termination *or* expiry"**, and an expiry has no
+    /// keystroke behind it — so the purge runs on the schedule.
+    ///
+    /// What it takes is what §8.4 names: the record of an agreement. The card
+    /// and the reservoir stay, so `peer renew` can still form a fresh
+    /// credential rather than the whole ceremony having to run again.
+    #[test]
+    fn an_expired_peering_has_its_record_purged_but_not_its_material() {
+        let mut x = ready_node("pex-x");
+        let mut y = ready_node("pex-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+
+        // A credential whose term has genuinely run out, properly signed.
+        let w = x.epoch_key.unwrap();
+        let (xi, yi) = (x.identity.as_ref().unwrap(), y.identity.as_ref().unwrap());
+        let mut cred = credential::Credential::propose(
+            xi.signing_key(),
+            &xi.card(Policy::default()),
+            &yi.card(Policy::default()),
+            1,
+            1,
+            [8u8; 16],
+        );
+        assert!(cred.sign(yi.signing_key()));
+        let sealed =
+            krab_crypto::kek::seal_under(&w, b"krab/credential", &cred.encode(), &mut OsRng)
+                .unwrap();
+        std::fs::write(
+            x.peer_path(&short_y, artifact::PeerFile::Credential),
+            sealed,
+        )
+        .unwrap();
+        let objects = x.store.len();
+        // What is actually on disk, so the assertion is about files that
+        // exist rather than files a fixture happens to write.
+        let before: Vec<artifact::PeerFile> = artifact::PeerFile::ALL
+            .into_iter()
+            .filter(|f| x.peer_path(&short_y, *f).exists())
+            .collect();
+        assert!(before.contains(&artifact::PeerFile::Credential));
+
+        x.purge_expired_peerings();
+
+        for f in before {
+            let exists = x.peer_path(&short_y, f).exists();
+            if f.purged_on_expiry() {
+                assert!(!exists, "{} outlived the agreement it records", f.name());
+            } else {
+                assert!(
+                    exists,
+                    "{} was destroyed by an expiry — a lapsed peering is \
+                     renewable, not gone",
+                    f.name()
+                );
+            }
+        }
+        // Their card in particular, or renewal is impossible.
+        assert!(x.peer_path(&short_y, artifact::PeerFile::Link).exists());
+        assert_eq!(x.store.len(), objects, "an expiry destroyed the corpus");
+
+        // And the operator is told, rather than the link merely going quiet.
+        assert!(
+            x.log.recent(16).iter().any(|l| l.contains("purged")),
+            "an automatic purge happened silently"
+        );
+
+        // Renewal still works, from the material that was kept.
+        type_command(&mut x, &format!("peer renew {short_y}"));
+        assert!(x.output.contains("renewed"), "{}", x.output);
+    }
+
+    /// Forgetting someone this node never peered with says so rather than
+    /// reporting a successful destruction of nothing.
+    #[test]
+    fn forgetting_a_stranger_is_refused() {
+        let mut x = ready_node("fgs-x");
+        type_command(&mut x, "peer forget ffffffff");
+        assert!(x.output.contains("no peering"), "{}", x.output);
     }
 
     /// **RFC 3 §4's MUST: an expired peering is an explicit state, not a
