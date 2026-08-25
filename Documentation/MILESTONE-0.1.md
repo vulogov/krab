@@ -311,6 +311,11 @@ What is actually absent from 0.1:
 
 Nothing from §5's list, and nothing from RFC 3.
 
+What remains is in `PLAN.md`: four normative requirements inside sections that
+are otherwise implemented — RFC 3 §4's expiry state, §8.4's purge on
+termination, §13's peer-count warning, and §12's panel. Three are `MUST`s and
+the first has a ninety-day clock already running.
+
 Nothing is built-and-unwired. §8.2's `NODEDIFF` was, for one commit, and is
 recorded here because that state is worth naming rather than discovering:
 `peer fragment` now sends a full fragment weekly and a delta between, and a
