@@ -117,6 +117,30 @@ pub struct ExchangeView {
     /// a setting that does not bind is worse than an absent one — it is a
     /// false claim about legal exposure.
     carriage: krab_crypto::CarriagePolicy,
+    /// This link's budget for the day — RFC 3 §6.
+    ///
+    /// Shared with the interface thread, which persists it once the exchange
+    /// reports. A budget the process forgets on restart is not a budget.
+    budget: Option<Budget>,
+    /// The agreed scope of this exchange — RFC 3 §7.3.
+    ///
+    /// **Enforced here, for the reason above.** The filter digest makes the
+    /// two sides *agree* on the scope; nothing about a matching digest stops a
+    /// peer offering rows outside it afterwards. RFC 3 §6.1's model is that a
+    /// peer is held to what it signed rather than trusted to honour it, so the
+    /// agreement and the enforcement are separate and both are here.
+    filter: crate::filter::Filter,
+}
+
+/// A link's budget, shared between the exchange thread and the interface.
+#[derive(Clone)]
+pub struct Budget {
+    /// What has crossed today.
+    pub spend: std::sync::Arc<Mutex<crate::quota::Spend>>,
+    /// Bytes per day this node accepts from the peer — RFC 3 §6.
+    pub bytes_per_day: u64,
+    /// Objects per day.
+    pub objects_per_day: u64,
 }
 
 impl ExchangeView {
@@ -125,12 +149,31 @@ impl ExchangeView {
         store: SharedStore,
         now_min: u32,
         carriage: krab_crypto::CarriagePolicy,
+        filter: crate::filter::Filter,
     ) -> ExchangeView {
         ExchangeView {
             store,
             now_min,
             carriage,
+            filter,
+            budget: None,
         }
+    }
+
+    /// Hold this exchange to RFC 3 §6's budget.
+    pub fn with_budget(mut self, budget: Budget) -> ExchangeView {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// A view with no agreed scope, for tests and for a link that has none.
+    #[cfg(test)]
+    pub fn new_unscoped(
+        store: SharedStore,
+        now_min: u32,
+        carriage: krab_crypto::CarriagePolicy,
+    ) -> ExchangeView {
+        ExchangeView::new(store, now_min, carriage, crate::filter::Filter::unscoped())
     }
 
     /// Whether this node will carry `bytes`.
@@ -193,6 +236,31 @@ impl Corpus for ExchangeView {
         if !self.will_carry(&bytes) {
             return;
         }
+        // RFC 3 §7.3 — and outside the agreed scope is not a smaller answer
+        // but a different one. A peer that signed a filter and then offers
+        // rows beyond it is exceeding what it agreed to; accepting them would
+        // make the signature decorative.
+        if let Ok(header) = RoutingHeader::parse(&bytes) {
+            if !self.filter.admits(&header, self.now_min) {
+                return;
+            }
+        }
+        // RFC 3 §6 — the byte and object budget on the link, checked before
+        // the object lands and charged only if it does. Exceeding it stops
+        // acceptance for the rest of the window and nothing else: §6.2 makes
+        // disconnection "the limit case, not the mechanism", and RFC 0 I-4
+        // makes a quiet link normal.
+        if let Some(b) = &self.budget {
+            let mut spend = b.spend.lock().unwrap_or_else(|e| e.into_inner());
+            if !spend.admits(bytes.len(), b.bytes_per_day, b.objects_per_day) {
+                return;
+            }
+            // Charged before `ingest`, which may refuse the object under RFC 1
+            // §11. That is deliberate: the bytes crossed the link either way,
+            // and a peer that could spend nothing by sending rejects would
+            // have found the way around the budget.
+            spend.charge(bytes.len());
+        }
         // RFC 1 §11's I1–I6 apply here exactly as they do on the main thread:
         // `ingest` is the only path that admits data and it checks regardless
         // of which thread calls it.
@@ -239,7 +307,12 @@ mod tests {
     #[test]
     fn the_lock_is_released_between_operations() {
         let shared = SharedStore::new(Store::new());
-        let mut view = ExchangeView::new(shared.clone(), NOW, carry_all());
+        let mut view = ExchangeView::new(
+            shared.clone(),
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+        );
 
         let reader = shared.clone();
         let handle = std::thread::spawn(move || {
@@ -270,7 +343,8 @@ mod tests {
             .map(|_| {
                 let s = shared.clone();
                 std::thread::spawn(move || {
-                    let mut v = ExchangeView::new(s, NOW, carry_all());
+                    let mut v =
+                        ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped());
                     for salt in 0..40 {
                         v.put(object(salt));
                     }
@@ -293,7 +367,8 @@ mod tests {
             .map(|i| {
                 let s = shared.clone();
                 std::thread::spawn(move || {
-                    let mut v = ExchangeView::new(s, NOW, carry_all());
+                    let mut v =
+                        ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped());
                     v.put(vec![0xFFu8; 256]); // not a valid object
                     v.put(object(i));
                 })
@@ -316,7 +391,12 @@ mod tests {
     #[test]
     fn a_poisoned_lock_is_recovered_from() {
         let shared = SharedStore::new(Store::new());
-        let mut view = ExchangeView::new(shared.clone(), NOW, carry_all());
+        let mut view = ExchangeView::new(
+            shared.clone(),
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+        );
         view.put(object(1));
 
         let poisoner = shared.clone();
@@ -327,7 +407,12 @@ mod tests {
 
         // Still usable, and still consistent.
         assert_eq!(shared.len(), 1);
-        let mut v2 = ExchangeView::new(shared.clone(), NOW, carry_all());
+        let mut v2 = ExchangeView::new(
+            shared.clone(),
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+        );
         v2.put(object(2));
         assert_eq!(shared.len(), 2);
     }
@@ -345,7 +430,8 @@ mod tests {
         let writer = {
             let s = shared.clone();
             std::thread::spawn(move || {
-                let mut v = ExchangeView::new(s, NOW, carry_all());
+                let mut v =
+                    ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped());
                 for salt in 0..300 {
                     v.put(object(salt));
                 }
@@ -376,7 +462,8 @@ mod tests {
         let writer = {
             let s = shared.clone();
             std::thread::spawn(move || {
-                let mut v = ExchangeView::new(s, NOW, carry_all());
+                let mut v =
+                    ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped());
                 for salt in 0..300 {
                     v.put(object(salt));
                 }
@@ -386,7 +473,12 @@ mod tests {
             let s = shared.clone();
             std::thread::spawn(move || {
                 for _ in 0..300 {
-                    let v = ExchangeView::new(s.clone(), NOW, carry_all());
+                    let v = ExchangeView::new(
+                        s.clone(),
+                        NOW,
+                        carry_all(),
+                        crate::filter::Filter::unscoped(),
+                    );
                     // Each call is internally consistent: entries never
                     // contains a duplicate or a torn row, whatever is landing.
                     let e = v.entries(0, u32::MAX);
@@ -418,7 +510,12 @@ mod tests {
         let (_, bytes) = crate::channels::into_object(&post, 0, 100).expect("wraps");
 
         let off = SharedStore::new(Store::new());
-        let mut view = ExchangeView::new(off.clone(), 0, krab_crypto::CarriagePolicy::default());
+        let mut view = ExchangeView::new(
+            off.clone(),
+            0,
+            krab_crypto::CarriagePolicy::default(),
+            crate::filter::Filter::unscoped(),
+        );
         assert!(!view.carriage.enabled, "carriage must default to off");
         view.put(bytes.clone());
         assert!(
@@ -428,7 +525,7 @@ mod tests {
 
         // And with it on, the same object is carried.
         let on = SharedStore::new(Store::new());
-        let mut view = ExchangeView::new(
+        let mut view = ExchangeView::new_unscoped(
             on.clone(),
             0,
             krab_crypto::CarriagePolicy {
@@ -447,7 +544,12 @@ mod tests {
     #[test]
     fn carriage_off_still_relays_sealed_mail() {
         let store = SharedStore::new(Store::new());
-        let mut view = ExchangeView::new(store.clone(), 0, krab_crypto::CarriagePolicy::default());
+        let mut view = ExchangeView::new(
+            store.clone(),
+            0,
+            krab_crypto::CarriagePolicy::default(),
+            crate::filter::Filter::unscoped(),
+        );
         view.put(object(1));
         assert_eq!(store.len(), 1, "a sealed object was refused");
     }
@@ -467,8 +569,12 @@ mod tests {
             let b = crate::bulletin::Bulletin::create(kind, &k, 1, b"payload".to_vec());
             let (_, bytes) = crate::bulletin::into_object(&b, 0, 100).expect("wraps");
             let store = SharedStore::new(Store::new());
-            let mut view =
-                ExchangeView::new(store.clone(), 0, krab_crypto::CarriagePolicy::default());
+            let mut view = ExchangeView::new(
+                store.clone(),
+                0,
+                krab_crypto::CarriagePolicy::default(),
+                crate::filter::Filter::unscoped(),
+            );
             view.put(bytes);
             assert_eq!(store.len(), 1, "{kind:?} was refused with carriage off");
         }
@@ -496,7 +602,7 @@ mod tests {
             let post = c.post(1, "text/plain", b"x");
             let (_, bytes) = crate::channels::into_object(&post, 0, 100).expect("wraps");
             let store = SharedStore::new(Store::new());
-            let mut view = ExchangeView::new(store.clone(), 0, policy);
+            let mut view = ExchangeView::new_unscoped(store.clone(), 0, policy);
             view.put(bytes);
             if store.is_empty() {
                 refused += 1;

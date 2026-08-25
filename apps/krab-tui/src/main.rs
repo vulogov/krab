@@ -37,6 +37,7 @@ mod courier;
 mod credential;
 mod entropy;
 mod fanout;
+mod filter;
 mod groups;
 mod identity;
 mod introduction;
@@ -49,6 +50,7 @@ mod peers;
 mod persist;
 mod picture;
 mod prekeys;
+mod quota;
 mod reach;
 mod receive;
 mod rekey;
@@ -348,6 +350,11 @@ struct App {
     home: PathBuf,
     /// Channels owned and followed — RFC 6 §3.
     roster: channels::Roster,
+    /// Per-link budgets for the current day — RFC 3 §6.
+    ///
+    /// Shared with the exchange threads so a running reconciliation is held
+    /// to the ceiling, and persisted when it reports. Keyed by short id.
+    spends: std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<quota::Spend>>>,
     /// Introduction tokens this node holds, to present when it requests —
     /// RFC 3 §10.
     ///
@@ -512,6 +519,7 @@ impl Default for App {
             roster: channels::Roster::default(),
             rollcall: rollcall::Listing::default(),
             introductions: Vec::new(),
+            spends: std::collections::HashMap::new(),
             groups: Vec::new(),
             pending: Vec::new(),
             observed_arrivals: 0,
@@ -1019,6 +1027,12 @@ impl App {
         // code happened to implement would be the divergence RFC 0's editorial
         // rule exists to prevent. Read before `take_session`, which removes it.
         let mode = self.links.get(peer)?.profile.sync_mode();
+        // **The agreed scope** — RFC 3 §7.3, derived from the signed
+        // credential. A peering with no completed credential has no agreed
+        // scope, and says so with a digest of its own rather than the zero one
+        // every exchange used to send; see `filter`.
+        let scope = self.scope_for(peer);
+        let budget = self.budget_for(peer);
         let session = self.links.take_session(peer)?;
         let view_store = self.store.clone();
         let carriage = self.roster.carriage;
@@ -1027,15 +1041,18 @@ impl App {
         self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
         std::thread::spawn(move || {
             let mut session = session;
-            let mut view = shared::ExchangeView::new(view_store, window.0, carriage);
+            let mut view = shared::ExchangeView::new(view_store, window.0, carriage, scope);
+            if let Some(b) = budget {
+                view = view.with_budget(b);
+            }
             let outcome = match mode {
                 krab_proto::recon::Mode::Rbsr => {
-                    krab_node::exchange::respond_rbsr(&mut *session, &mut view, [0u8; 32])
+                    krab_node::exchange::respond_rbsr(&mut *session, &mut view, scope.digest())
                 }
                 krab_proto::recon::Mode::Manifest => krab_node::exchange::respond_to(
                     &mut *session,
                     &mut view,
-                    [0u8; 32],
+                    scope.digest(),
                     window.0,
                     window.1,
                 ),
@@ -1077,6 +1094,8 @@ impl App {
             .get(peer)
             .map(|l| l.profile.sync_mode())
             .unwrap_or(krab_proto::recon::Mode::Manifest);
+        let scope = self.scope_for(peer);
+        let budget = self.budget_for(peer);
         let Some(session) = self.links.take_session(peer) else {
             return Some(activity_log::Event::Failed {
                 peer: peer.to_string(),
@@ -1114,19 +1133,22 @@ impl App {
         self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
         std::thread::spawn(move || {
             let mut session = session;
-            let mut view = shared::ExchangeView::new(view_store, window.0, carriage);
+            let mut view = shared::ExchangeView::new(view_store, window.0, carriage, scope);
+            if let Some(b) = budget {
+                view = view.with_budget(b);
+            }
             let outcome = match mode {
                 krab_proto::recon::Mode::Rbsr => krab_node::exchange::initiate_rbsr(
                     &mut *session,
                     &mut view,
-                    [0u8; 32],
+                    scope.digest(),
                     window.0,
                     window.1,
                 ),
                 krab_proto::recon::Mode::Manifest => krab_node::exchange::initiate(
                     &mut *session,
                     &mut view,
-                    [0u8; 32],
+                    scope.digest(),
                     window.0,
                     window.1,
                     salt,
@@ -1163,6 +1185,8 @@ impl App {
             }
             self.log.push(event);
         }
+        // RFC 3 §6's counters, which an exchange may have just moved.
+        self.save_spends();
         // Mail may have arrived while the interface was doing nothing.
         if self.identity.is_some() && self.epoch_key.is_some() {
             self.refresh_inbox();
@@ -2305,25 +2329,25 @@ impl App {
         } else {
             (cred.terms_ba, cred.terms_ab)
         };
+        let describe = |t: &credential::LinkTerms| {
+            format!(
+                "buckets to {} B, {}, {} MB/day, {} objects/day, {} days retained{}",
+                krab_core::object::BUCKETS[t.policy.max_bucket.min(5) as usize],
+                if t.policy.relay { "relaying" } else { "leaf" },
+                t.bytes_per_day >> 20,
+                t.objects_per_day,
+                t.retention_days,
+                if t.policy.shard_bits > 0 {
+                    format!(", 1/{} shard", 1u32 << t.policy.shard_bits)
+                } else {
+                    String::new()
+                },
+            )
+        };
         let terms = format!(
-            "\n\nyou accept from them: buckets to {} B, {}, {} B retained{}\n\
-             they accept from you: buckets to {} B, {}, {} B retained{}",
-            krab_core::object::BUCKETS[to_them.max_bucket.min(5) as usize],
-            if to_them.relay { "relaying" } else { "leaf" },
-            to_them.retention_bytes,
-            if to_them.shard_bits > 0 {
-                format!(", 1/{} shard", 1u32 << to_them.shard_bits)
-            } else {
-                String::new()
-            },
-            krab_core::object::BUCKETS[from_them.max_bucket.min(5) as usize],
-            if from_them.relay { "relaying" } else { "leaf" },
-            from_them.retention_bytes,
-            if from_them.shard_bits > 0 {
-                format!(", 1/{} shard", 1u32 << from_them.shard_bits)
-            } else {
-                String::new()
-            },
+            "\n\nyou accept from them: {}\nthey accept from you: {}",
+            describe(&to_them),
+            describe(&from_them),
         );
         format!(
             "peer-link with {short} is complete{}.{terms}\n\n\
@@ -2335,6 +2359,101 @@ impl App {
              ceremony before then.{handover}",
             if added { "" } else { " (it already was)" }
         )
+    }
+
+    /// This link's budget for today — RFC 3 §6.
+    ///
+    /// The ceilings come from the credential, which is where §6 says they
+    /// live: "the peering agreement and the rate limit are one document, so
+    /// 'you exceeded quota' is a checkable statement against a signed artifact
+    /// rather than a unilateral judgement."
+    ///
+    /// A link with no credential has agreed no ceiling, so none is enforced.
+    /// That is the honest reading — a budget nobody signed is a unilateral
+    /// judgement, which is exactly what §6 is written against — and it is
+    /// visible rather than silent, because `peers` reports it.
+    fn budget_for(&mut self, peer: &str) -> Option<shared::Budget> {
+        let terms = self.inbound_terms(peer)?;
+        let day = quota::day_of(self.now_s());
+        let cell = self.spends.entry(peer.to_string()).or_insert_with(|| {
+            std::sync::Arc::new(std::sync::Mutex::new(
+                Self::read_spend(&self.home, peer, self.epoch_key).unwrap_or(quota::Spend {
+                    day,
+                    ..quota::Spend::default()
+                }),
+            ))
+        });
+        cell.lock().unwrap_or_else(|e| e.into_inner()).roll(day);
+        Some(shared::Budget {
+            spend: cell.clone(),
+            bytes_per_day: terms.bytes_per_day,
+            objects_per_day: terms.objects_per_day,
+        })
+    }
+
+    /// The terms governing what this node accepts **from** `peer`.
+    ///
+    /// Per-direction, so which half of the credential applies depends on
+    /// which party this node is — and that is fixed by the canonical ordering
+    /// rather than by who assembled the document.
+    fn inbound_terms(&self, peer: &str) -> Option<credential::LinkTerms> {
+        let me = self.identity.as_ref()?.node_id();
+        let c = self.credential_with(peer)?;
+        Some(if c.a.node_id() == me {
+            c.terms_ab
+        } else {
+            c.terms_ba
+        })
+    }
+
+    /// Read a stored budget, sealed under `W_N`.
+    fn read_spend(
+        home: &std::path::Path,
+        peer: &str,
+        epoch_key: Option<[u8; 32]>,
+    ) -> Option<quota::Spend> {
+        let w = epoch_key?;
+        let sealed = std::fs::read(home.join("peers").join(peer).join("quota")).ok()?;
+        let raw = krab_crypto::kek::open_under(&w, b"krab/quota", &sealed).ok()?;
+        quota::Spend::decode(&raw)
+    }
+
+    /// Write every budget that a running exchange may have moved.
+    ///
+    /// Called when an exchange reports, which is the only moment one can have
+    /// changed. Sealed under `W_N` and shredded by `wipe`: the counters say
+    /// nothing about what crossed, but the file naming a peer is the
+    /// disclosure RFC 3 §8.4 says to purge.
+    fn save_spends(&mut self) {
+        let Some(w) = self.epoch_key else { return };
+        let entries: Vec<(String, quota::Spend)> = self
+            .spends
+            .iter()
+            .map(|(k, v)| (k.clone(), *v.lock().unwrap_or_else(|e| e.into_inner())))
+            .collect();
+        for (peer, spend) in entries {
+            if self.ensure_peer_dir(&peer).is_err() {
+                continue;
+            }
+            if let Ok(sealed) =
+                krab_crypto::kek::seal_under(&w, b"krab/quota", &spend.encode(), &mut OsRng)
+            {
+                let _ = atomic::write(&self.peer_path(&peer, artifact::PeerFile::Quota), &sealed);
+            }
+        }
+    }
+
+    /// The agreed scope of an exchange with `peer` — RFC 3 §7.3.
+    ///
+    /// Derived from the signed credential, so both ends compute the same
+    /// digest without exchanging anything. A peering with no completed
+    /// credential gets [`filter::Filter::unscoped`], whose digest differs from
+    /// every real filter's — so it will not reconcile with a peering that has
+    /// one, which is what "provably agree on the scope" has to mean.
+    fn scope_for(&self, peer: &str) -> filter::Filter {
+        self.credential_with(peer)
+            .map(|c| filter::Filter::from_credential(&c))
+            .unwrap_or_else(filter::Filter::unscoped)
     }
 
     /// This node's completed credential with `peer`, if there is one.
@@ -5679,8 +5798,33 @@ impl App {
                 }
                 None => "how it was formed: unrecorded".into(),
             };
+            // RFC 3 §6 and §12: the quota position, next to the peering it
+            // governs. "A disconnect decision should be one keystroke from
+            // the evidence justifying it. If it is not, operators will not
+            // make it, and the accountability model degrades to nothing."
+            let budget = match self.inbound_terms(id) {
+                Some(t) => {
+                    let spent = self
+                        .spends
+                        .get(id)
+                        .map(|c| *c.lock().unwrap_or_else(|e| e.into_inner()))
+                        .unwrap_or_default();
+                    format!(
+                        "\n    quota {}% of {} MB/day, {} objects/day today",
+                        spent.used_percent(t.bytes_per_day, t.objects_per_day),
+                        t.bytes_per_day >> 20,
+                        t.objects_per_day,
+                    )
+                }
+                // Not a detail: a peering with no credential is one where
+                // nothing is enforced, and §6 makes quota the central
+                // mechanism. Saying so is the point.
+                None => "\n    no credential — no agreed quota is enforced on \
+                         this link. `peer countersign` completes one"
+                    .into(),
+            };
             out.push_str(&format!(
-                "{id}  peered  ·  {link}  ·  {policy}\n    {how}\n"
+                "{id}  peered  ·  {link}  ·  {policy}\n    {how}{budget}\n"
             ));
         }
         // Links to nodes we have no peering with cannot exist — `establish`
@@ -6573,6 +6717,10 @@ impl App {
         // flooded stands until it expires, because there is no recall
         // (RFC 3 §6.1) and pretending otherwise would be worse than saying so.
         self.rollcall = rollcall::Listing::default();
+        // Per-link budgets. Sealed under W_N, which a locked node no longer
+        // holds — keeping the in-memory copies would mean a counter that
+        // cannot be written back, and a peer list in memory besides.
+        self.spends.clear();
         // Held tokens are private vouches other people made. A locked node has
         // no business holding one, and they are single-use in any case.
         self.introductions.clear();
@@ -7684,6 +7832,157 @@ mod tests {
     /// unreadable to anyone else — while the proposer held a half-signed one
     /// for ever. Neither could supply evidence, which is the entire reason the
     /// document exists, and nothing reported anything wrong.
+    /// **The filter digest is no longer a constant.**
+    ///
+    /// Every exchange used to pass `[0u8; 32]`. The digest was checked on both
+    /// sides and compared two zeros, so two nodes with entirely different
+    /// ideas of what an exchange covered agreed every time — RFC 3 §7.3's
+    /// "both sides provably agree on the scope", proving nothing.
+    /// A well-formed corpus object, for budget tests.
+    fn test_object(salt: u32) -> Vec<u8> {
+        let h = krab_core::object::RoutingHeader {
+            version: 1,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: now_epoch().0 * 1440 + 10_000,
+            tag: krab_core::object::Tag((salt as u64).to_le_bytes()),
+        };
+        krab_core::object::canonical_bytes(&h, &[salt as u8; 40]).unwrap()
+    }
+
+    /// Complete a credential between two ready nodes, both ends.
+    fn link_up(x: &mut App, y: &mut App) -> (String, String) {
+        let short_y = peer_up(x, y);
+        let short_x = peer_up(y, x);
+        let proposal = x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default()));
+        let to_y = y.home.join("lk.credential");
+        std::fs::write(&to_y, &proposal).unwrap();
+        y.peer_countersign(Some(to_y.to_str().unwrap()));
+        let back = y.home.join(format!("{short_x}.credential"));
+        let to_x = x.home.join("lk.credential");
+        std::fs::copy(&back, &to_x).unwrap();
+        x.peer_countersign(Some(to_x.to_str().unwrap()));
+        (short_x, short_y)
+    }
+
+    /// **RFC 3 §6 — the budget stops objects, and it comes from the signed
+    /// credential.** "You exceeded quota" is a checkable statement against a
+    /// signed artifact rather than a unilateral judgement, which is only true
+    /// if the ceiling is read from the document both parties signed.
+    #[test]
+    fn a_link_budget_stops_objects_once_it_is_spent() {
+        let mut x = ready_node("bud-x");
+        let mut y = ready_node("bud-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+
+        let budget = x.budget_for(&short_y).expect("a credential sets a ceiling");
+        assert!(budget.bytes_per_day > 0);
+        assert!(budget.objects_per_day > 0);
+
+        // A view held to a ceiling of two objects.
+        let tight = shared::Budget {
+            objects_per_day: 2,
+            ..budget
+        };
+        let store = shared::SharedStore::new(krab_store::index::Store::new());
+        let mut view = shared::ExchangeView::new(
+            store.clone(),
+            now_epoch().0 * 1440,
+            krab_crypto::CarriagePolicy::default(),
+            filter::Filter::unscoped(),
+        )
+        .with_budget(tight);
+
+        use krab_proto::recon::Corpus;
+        for salt in 0u32..5 {
+            view.put(test_object(salt));
+        }
+        assert_eq!(store.len(), 2, "the budget did not hold the link to two");
+    }
+
+    /// A link with no credential has agreed no ceiling, so none is enforced —
+    /// a budget nobody signed is the unilateral judgement §6 is written
+    /// against.
+    #[test]
+    fn a_link_with_no_credential_has_no_budget() {
+        let mut x = ready_node("nob-x");
+        let mut y = ready_node("nob-y");
+        let short_y = peer_up(&mut x, &mut y);
+        assert!(x.budget_for(&short_y).is_none());
+    }
+
+    /// **The budget survives a restart**, or it is not a budget: a peer that
+    /// spent its day could restart the other end and start again.
+    #[test]
+    fn a_spent_budget_survives_a_restart() {
+        let mut x = ready_node("per-x");
+        let mut y = ready_node("per-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+
+        let b = x.budget_for(&short_y).unwrap();
+        b.spend.lock().unwrap().charge(4_096);
+        x.save_spends();
+
+        // A fresh view of the same home, as a restart gives.
+        x.spends.clear();
+        let again = x.budget_for(&short_y).unwrap();
+        let spend = *again.spend.lock().unwrap();
+        assert_eq!(spend.objects, 1, "the budget reset on restart");
+        assert_eq!(spend.bytes, 4_096);
+    }
+
+    /// The counters are cleared on lock: they are sealed under `W_N`, which a
+    /// locked node no longer holds.
+    #[test]
+    fn locking_drops_the_in_memory_budgets() {
+        let mut x = ready_node("lockb-x");
+        let mut y = ready_node("lockb-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+        assert!(x.budget_for(&short_y).is_some());
+        assert!(!x.spends.is_empty());
+        x.lock();
+        assert!(x.spends.is_empty(), "a locked node kept per-link counters");
+    }
+
+    #[test]
+    fn the_exchange_scope_comes_from_the_credential() {
+        let mut x = ready_node("scope-x");
+        let mut y = ready_node("scope-y");
+        let short_y = peer_up(&mut x, &mut y);
+        let short_x = peer_up(&mut y, &mut x);
+
+        // No credential yet: unscoped, and *not* the old zero.
+        let before = x.scope_for(&short_y);
+        assert!(before.is_unscoped());
+        assert_ne!(before.digest(), [0u8; 32], "the vacuous digest is back");
+
+        // Complete a credential on both ends.
+        let proposal = x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default()));
+        let to_y = y.home.join("in.credential");
+        std::fs::write(&to_y, &proposal).unwrap();
+        y.peer_countersign(Some(to_y.to_str().unwrap()));
+        let back = y.home.join(format!("{short_x}.credential"));
+        let to_x = x.home.join("in.credential");
+        std::fs::copy(&back, &to_x).unwrap();
+        x.peer_countersign(Some(to_x.to_str().unwrap()));
+
+        // Both ends now derive a real scope, and the same one.
+        let sx = x.scope_for(&short_y);
+        let sy = y.scope_for(&short_x);
+        assert!(!sx.is_unscoped(), "a credential scoped nothing");
+        assert_eq!(
+            sx.digest(),
+            sy.digest(),
+            "the two ends disagree about the scope of their own link"
+        );
+        assert_ne!(
+            sx.digest(),
+            before.digest(),
+            "a credentialled link is indistinguishable from an uncredentialled one"
+        );
+    }
+
     #[test]
     fn both_ends_end_up_holding_the_completed_credential() {
         let mut x = ready_node("both-x");

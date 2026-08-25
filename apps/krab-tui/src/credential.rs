@@ -125,6 +125,119 @@ impl Default for Flags {
     }
 }
 
+/// RFC 3 §3 keys 6 and 7 — "terms A→B: quota, retention, filters (§6, §7)".
+///
+/// # Why this is not a `Policy`
+///
+/// A [`Card`]'s `Policy` is an **advertisement**: the largest object I accept,
+/// whether I relay, how much I store, how I shard. It is what a stranger reads
+/// before proposing anything, and its four fields are inside the card's
+/// signature — which is why they cannot grow. Every card ever signed would
+/// stop verifying.
+///
+/// A credential's terms are the **contract**, and RFC 3 §3 says so in the
+/// table: quota, retention, filters. §6's own example has a request proposing
+/// "10 MB/day, 30 d retention, all shards, all classes" — three of those four
+/// have nowhere to live in a `Policy`.
+///
+/// So the advertisement stays frozen and the contract carries the rest. That
+/// division is RFC 3's, not a workaround: §6 is explicit that "the peering
+/// agreement and the rate limit are one document".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkTerms {
+    /// What was advertised, and agreed.
+    pub policy: Policy,
+    /// RFC 3 §7's floor commitment: "I will keep at least N days of history
+    /// available to you."
+    ///
+    /// Distinct from an object's expiry, which is absolute and identical on
+    /// every node. This is local, negotiable and per-direction — and
+    /// **detectable in breach**, which is what makes it enforceable without
+    /// any new machinery: "if B promised 30 days and reconciliation shows B
+    /// missing objects from day 10 that A gave B, A knows."
+    pub retention_days: u32,
+    /// RFC 3 §6 — bytes per day accepted from the other party.
+    ///
+    /// "Quota is a ceiling you are held to; retention is a floor."
+    pub bytes_per_day: u64,
+    /// Objects per day accepted from the other party.
+    pub objects_per_day: u64,
+}
+
+impl Default for LinkTerms {
+    /// Full participation, and RFC 3 §7's ceiling on retention.
+    ///
+    /// The quota defaults are generous rather than minimal. §6.1 warns that
+    /// "a flood is indistinguishable from a well-connected peer relaying a
+    /// busy region", and advises negotiating generously and renegotiating —
+    /// a tight default would throttle honest peers and teach operators to
+    /// ignore the mechanism.
+    fn default() -> LinkTerms {
+        LinkTerms {
+            policy: Policy::default(),
+            retention_days: krab_core::tag::MAX_TTL_DAYS,
+            bytes_per_day: 100 << 20,
+            objects_per_day: 20_000,
+        }
+    }
+}
+
+impl LinkTerms {
+    /// Deterministic CBOR — RFC 1 §4.3.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.map(4)
+            .uint(1)
+            .bstr(&self.policy.encode())
+            .uint(2)
+            .uint(self.retention_days as u64)
+            .uint(3)
+            .uint(self.bytes_per_day)
+            .uint(4)
+            .uint(self.objects_per_day);
+        w.finish()
+    }
+
+    /// Decode. **Pre-authentication input** — terms arrive inside a credential
+    /// offered by a stranger, and inside evidence from one.
+    ///
+    /// A retention window beyond `MAX_TTL_DAYS` is refused rather than
+    /// clamped: RFC 3 §7 writes `retention ≤ MAX_TTL`, and a peer promising to
+    /// keep objects for longer than objects exist has read §7 differently.
+    pub fn decode(bytes: &[u8]) -> Option<LinkTerms> {
+        let mut r = Reader::new(bytes);
+        let mut m = r.map().ok()?;
+        if m.left() != 4 {
+            return None;
+        }
+        let policy = match (m.key().ok()??, m.value().ok()?) {
+            (1, Item::Bstr(b)) => Policy::decode(b)?,
+            _ => return None,
+        };
+        let retention_days = match (m.key().ok()??, m.value().ok()?) {
+            (2, Item::Uint(v)) => u32::try_from(v).ok()?,
+            _ => return None,
+        };
+        let bytes_per_day = match (m.key().ok()??, m.value().ok()?) {
+            (3, Item::Uint(v)) => v,
+            _ => return None,
+        };
+        let objects_per_day = match (m.key().ok()??, m.value().ok()?) {
+            (4, Item::Uint(v)) => v,
+            _ => return None,
+        };
+        if retention_days > krab_core::tag::MAX_TTL_DAYS {
+            return None;
+        }
+        Some(LinkTerms {
+            policy,
+            retention_days,
+            bytes_per_day,
+            objects_per_day,
+        })
+    }
+}
+
 /// A mutually signed peering credential — RFC 3 §3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credential {
@@ -139,9 +252,9 @@ pub struct Credential {
     /// Key 5 — 16 bytes, so a superseded link cannot be replayed.
     pub nonce: [u8; 16],
     /// Key 6 — terms A→B.
-    pub terms_ab: Policy,
+    pub terms_ab: LinkTerms,
     /// Key 7 — terms B→A.
-    pub terms_ba: Policy,
+    pub terms_ba: LinkTerms,
     /// Key 8.
     pub flags: Flags,
     /// Key 9 — endpoints, and **empty is the normal case**. RFC 3 §9.2 keeps
@@ -221,9 +334,9 @@ impl Credential {
         // *from* the other, which is what `Policy` already means, so A→B is
         // A's policy and B→A is B's.
         let (terms_ab, terms_ba) = if p1.sig_pk <= p2.sig_pk {
-            (mine.policy, theirs.policy)
+            (terms_for(mine), terms_for(theirs))
         } else {
-            (theirs.policy, mine.policy)
+            (terms_for(theirs), terms_for(mine))
         };
         let mut cred = Credential {
             a,
@@ -409,11 +522,11 @@ impl Credential {
                     seen |= 32;
                 }
                 (6, Item::Bstr(x)) => {
-                    terms_ab = Policy::decode(x);
+                    terms_ab = LinkTerms::decode(x);
                     seen |= 64;
                 }
                 (7, Item::Bstr(x)) => {
-                    terms_ba = Policy::decode(x);
+                    terms_ba = LinkTerms::decode(x);
                     seen |= 128;
                 }
                 (8, Item::Bstr(x)) => {
@@ -445,6 +558,18 @@ impl Credential {
             sig_a,
             sig_b,
         })
+    }
+}
+
+/// The contract terms implied by a card's advertisement.
+///
+/// A card carries only what it can: quota and retention have no field there,
+/// so a first credential takes the defaults. RFC 3 §5.2's counter-offer is
+/// where they become negotiated rather than assumed, and it is not built.
+fn terms_for(card: &Card) -> LinkTerms {
+    LinkTerms {
+        policy: card.policy,
+        ..LinkTerms::default()
     }
 }
 
@@ -679,7 +804,7 @@ mod tests {
             },
         ];
         let mut terms = base.clone();
-        terms.terms_ab.retention_bytes += 1;
+        terms.terms_ab.policy.retention_bytes += 1;
         edits.push(terms);
 
         for e in edits {

@@ -134,6 +134,12 @@ pub enum PeerFile {
     Policy,
     /// How the peering was formed, and what it is worth.
     Terms,
+    /// This link's byte and object budget for the current day — RFC 3 §6.
+    ///
+    /// Two counters and a day number. §12 forbids per-object provenance, so
+    /// there is nothing here about *what* crossed or *when* — but the file
+    /// naming a peer is itself the disclosure §8.4 says to purge.
+    Quota,
     /// The mutually signed `peer-link` credential — RFC 3 §3.
     ///
     /// The most sensitive per-peer file: RFC 3 §15 calls credentials at rest
@@ -144,12 +150,13 @@ pub enum PeerFile {
 
 impl PeerFile {
     /// Every per-peer file.
-    pub const ALL: [PeerFile; 5] = [
+    pub const ALL: [PeerFile; 6] = [
         PeerFile::Link,
         PeerFile::Reservoir,
         PeerFile::Policy,
         PeerFile::Terms,
         PeerFile::Credential,
+        PeerFile::Quota,
     ];
 
     /// The name on disk.
@@ -160,6 +167,7 @@ impl PeerFile {
             PeerFile::Policy => "policy",
             PeerFile::Terms => "terms",
             PeerFile::Credential => "credential",
+            PeerFile::Quota => "quota",
         }
     }
 }

@@ -67,7 +67,14 @@ pub fn channel_tag(channel_id: &[u8; 32]) -> Tag {
 }
 
 /// BLAKE3-256 over `domain ‖ input`.
-fn domain_hash(domain: &[u8], input: &[u8]) -> [u8; 32] {
+///
+/// The series' one hashing construction. Public so that a domain defined
+/// outside this crate — a reconciliation filter, say — is hashed the same way
+/// as an object identifier rather than by a second construction that differs
+/// in some detail nobody notices. **The domain is not optional**: RFC 3 §2.1's
+/// rule is that every hashed or signed input is prefixed with a string unique
+/// to its type, so two inputs whose encodings coincide cannot collide.
+pub fn domain_hash(domain: &[u8], input: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(domain);
     h.update(input);
