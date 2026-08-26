@@ -3130,23 +3130,34 @@ impl App {
         // RFC 6 §2.7's stagger, given up deliberately for this send.
         let released = self.release_all_pending();
 
-        let mut moved = (0usize, 0usize);
+        // **`None` is the success path.** `reconcile_with` hands the exchange
+        // to a thread and returns `None`; it returns `Some(Failed)` when there
+        // was no session to take. Reading `None` as failure made a forced send
+        // that had *already started* report "nothing to force: no session",
+        // while the message it was sent to move arrived a moment later.
         let mut done = Vec::new();
+        let mut refused = Vec::new();
         for p in &peers {
-            if let Some(event) = self.reconcile_with(p) {
-                if let activity_log::Event::Reconciled { received, sent, .. } = &event {
-                    moved.0 += received;
-                    moved.1 += sent;
+            match self.reconcile_with(p) {
+                None => done.push(p.clone()),
+                Some(event) => {
+                    // A synchronous event from here is a failure to start —
+                    // no session on the link. Record it and say so.
+                    refused.push(p.clone());
+                    self.log.push(event);
                 }
-                done.push(p.clone());
-                self.log.push(event);
             }
         }
-        // The exchange runs on a thread, so what it moved arrives later — the
-        // counts above are what returned synchronously, and saying "0" as
-        // though it were a result would be a lie about a thing still running.
+        // The exchange runs on a thread, so what it moved arrives later. That
+        // is why nothing here reports counts: saying "0" as though it were a
+        // result would be a lie about a thing still running.
         if done.is_empty() {
-            return format!("nothing to force: no session with {}.", peers.join(", "));
+            return format!(
+                "nothing to force: no session with {}. `connect <peer> tcp \
+                 <addr>` first — a forced exchange still needs one, and this \
+                 verb will not dial it for you.",
+                refused.join(", ")
+            );
         }
         format!(
             "forced an exchange with {}.{}\n\n\
@@ -9794,12 +9805,69 @@ mod tests {
         type_command(&mut a, "force-send");
         assert!(a.output.contains("no link is up"), "{}", a.output);
 
+        // A named link with no session refuses, and names the way out. This
+        // used to be asserted as "either the cost notice or the refusal",
+        // which is an assertion that passes whichever one appears — and it is
+        // how the bug below reached a release.
         type_command(&mut a, "connect q3m9 tcp");
         type_command(&mut a, "force-send");
+        assert!(a.output.contains("nothing to force"), "{}", a.output);
+        assert!(a.output.contains("connect"), "no way out named: {}", a.output);
+    }
+
+    /// **A forced exchange that started must not report that it did not.**
+    ///
+    /// `reconcile_with` hands the exchange to a thread and returns `None`;
+    /// it returns `Some` only when there was no session to take. `force_send`
+    /// had the test inverted, so a forced send over a live link answered
+    /// "nothing to force: no session" — and then delivered the message a
+    /// moment later. Found by forcing a send between two real nodes over TCP
+    /// and watching it arrive after the verb said it had not been sent.
+    #[test]
+    fn forcing_over_a_live_session_reports_that_it_started() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("fs-live");
+        type_command(&mut a, &format!("send {b_id} forced across"));
+        assert!(a.output.contains("composed"), "{}", a.output);
+
+        let (sa, sb) = session_pair();
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+        a.links.established(&b_id, Some(Box::new(sa)));
+        b.links.connect(&a_id, profile_named("tcp").unwrap());
+        b.links.established(&a_id, Some(Box::new(sb)));
+
+        let a_peer = a_id.clone();
+        let responder = std::thread::spawn(move || {
+            b.answer_reconciliation(&a_peer);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                b.drain_exchanges();
+                if !b.messages.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            b
+        });
+
+        type_command(&mut a, &format!("force-send {b_id}"));
+        let said = a.output.clone();
+        let b = responder.join().expect("B's thread");
+
         assert!(
-            a.output.contains("RFC 5 §6.1") || a.output.contains("nothing to force"),
-            "{}",
-            a.output
+            !said.contains("nothing to force"),
+            "a forced send over a live session claimed there was none: {said}"
+        );
+        assert!(
+            said.contains("forced an exchange"),
+            "the verb did not say what it did: {said}"
+        );
+        // And it still states its cost, every time — the point of the verb.
+        assert!(said.contains("RFC 5 §6.1"), "the cost went unstated: {said}");
+
+        assert!(
+            b.messages.iter().any(|m| m.body.contains("forced across")),
+            "the forced send moved nothing: {:?}",
+            b.messages.iter().map(|m| &m.body).collect::<Vec<_>>()
         );
     }
 
