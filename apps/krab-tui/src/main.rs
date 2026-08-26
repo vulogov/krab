@@ -1108,7 +1108,18 @@ impl App {
             peer: "local".into(),
             why: "mail becomes unreadable soon — `pin <peer>` keeps it",
         });
-        self.output = format!(
+        // **Into the list, not over the output pane.**
+        //
+        // This replaced `self.output` from a timer, so a background tick threw
+        // away whatever the operator had just asked for — including, on a bad
+        // day, the error they were reading. §10 wants the consequence in the
+        // foreground; the message list *is* the foreground, and it persists,
+        // which the output pane does not.
+        self.list.insert(
+            0,
+            format!("!! {count} message(s) unreadable in {days} day(s) — `pin <peer>` keeps them"),
+        );
+        let warning = format!(
             "{count} message(s) become **permanently unreadable in {days} day(s)**.\n\n\
              Their epoch key is shredded then, and nothing recovers it: not this \
              node, not the sender, not a backup of the corpus. The objects remain \
@@ -1120,6 +1131,14 @@ impl App {
              a user who discovers it afterwards has lost something \
              irrecoverably."
         );
+        // Appended, so a command's answer survives a tick that lands on top
+        // of it.
+        if self.output.is_empty() {
+            self.output = warning;
+        } else {
+            self.output.push_str("\n\n");
+            self.output.push_str(&warning);
+        }
     }
 
     /// Answer a reconciliation a peer opened.
@@ -1511,13 +1530,12 @@ impl App {
                     format!(
                         "{}  {}{}",
                         m.from,
-                        m.body
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .chars()
-                            .take(48)
-                            .collect::<String>(),
+                        // **A body is foreign text like any other.** Phase 4
+                        // routed the request notes through `display::safe`
+                        // and left this — the path an operator reads most —
+                        // rendering U+202E, escape sequences and zero-width
+                        // characters verbatim.
+                        display::safe(m.body.lines().next().unwrap_or("")).text,
                         if m.post_quantum {
                             ""
                         } else {
@@ -4476,7 +4494,16 @@ impl App {
         }
         match self.messages.get(self.selected) {
             Some(m) => {
-                self.body = format!("from {}\n\n{}", m.from, m.body);
+                // The pane keeps the whole body rather than a first line, so
+                // it is sanitised line by line — a control character in the
+                // fortieth line is as good as one in the first.
+                let safe: String = m
+                    .body
+                    .lines()
+                    .map(|l| display::safe(l).text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.body = format!("from {}\n\n{}", m.from, safe);
             }
             None => self.body.push_str("no message selected"),
         }
@@ -9300,6 +9327,79 @@ mod tests {
         );
         // And the material is still there, so it can be peered with again.
         assert!(a.peer_path(&sb, artifact::PeerFile::Link).exists());
+    }
+
+    /// **A message body is foreign text too.**
+    ///
+    /// Phase 4 built `display::safe` for RFC 8 §7 and routed the *notes*
+    /// through it. The body — the path an operator reads most, and the one
+    /// that arrives from an established peer rather than a stranger — kept
+    /// rendering U+202E, escape sequences and zero-width characters verbatim.
+    #[test]
+    fn a_message_body_cannot_carry_formatting_into_a_pane() {
+        let mut a = ready_node("body-safe");
+        a.messages.push(receive::Message {
+            id: krab_core::object::ObjectId([3u8; 32]),
+            from: "beefcafe".into(),
+            epoch: now_epoch(),
+            nodelist: None,
+            picture: None,
+            body: "safe\u{202e}reversed\u{1b}[31m\u{200b}\nsecond\u{202e}line".into(),
+            post_quantum: true,
+        });
+
+        // The list row.
+        let row = display::safe(a.messages[0].body.lines().next().unwrap_or("")).text;
+        for bad in ['\u{202e}', '\u{1b}', '\u{200b}'] {
+            assert!(!row.contains(bad), "{bad:?} reached the list");
+        }
+
+        // And the pane, every line of it — a control character in the fortieth
+        // line is as good as one in the first.
+        a.selected = 0;
+        a.show_selected();
+        for bad in ['\u{202e}', '\u{1b}', '\u{200b}'] {
+            assert!(!a.body.contains(bad), "{bad:?} reached the message pane");
+        }
+        assert!(a.body.contains("second"), "the body was lost: {}", a.body);
+    }
+
+    /// **A background tick must not throw away what the operator asked for.**
+    ///
+    /// The shred warning replaced `self.output` from a timer, so a tick landing
+    /// mid-read discarded a command's answer — including, on a bad day, an
+    /// error the operator was reading.
+    #[test]
+    fn the_shred_warning_does_not_discard_the_operators_output() {
+        let mut a = ready_node("warn-pane");
+        let now = now_epoch().0;
+        a.messages.push(receive::Message {
+            id: krab_core::object::ObjectId([4u8; 32]),
+            from: "beefcafe".into(),
+            epoch: krab_core::tag::Epoch(now + 2 - krab_core::tag::EPOCH_WINDOW),
+            nodelist: None,
+            picture: None,
+            body: "keep me".into(),
+            post_quantum: true,
+        });
+        a.output = "the operator asked for this".into();
+
+        a.warn_before_shredding();
+        assert!(
+            a.output.contains("the operator asked for this"),
+            "a tick discarded the pane: {}",
+            a.output
+        );
+        assert!(a.output.contains("permanently unreadable"), "{}", a.output);
+        // And it reaches the list, which persists where the output pane does
+        // not — §10 wants the consequence in the foreground.
+        assert!(
+            a.list
+                .first()
+                .is_some_and(|l| l.contains("unreadable in 2 day(s)")),
+            "{:?}",
+            a.list.first()
+        );
     }
 
     /// **RFC 7 §8.1's "before".** The warning has to arrive while there is

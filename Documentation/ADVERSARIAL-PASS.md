@@ -966,3 +966,75 @@ front of anyone writing Phase 2.
 The practical consequence is that a pass over a phase is not enough. A pass has
 to be over the phase **and everything the phase now touches**, which is the
 larger and less comfortable question.
+
+---
+
+## Pass 11 — Phases 4 and 5, and the path a feature did not reach
+
+Run against `display` (RFC 8 §7) and `pin` (RFC 8 §10, RFC 7 §8.1), under
+Pass 10's rule: the phase **and everything the phase now touches**.
+
+**Two findings, both of them the shape Pass 10 named.**
+
+### 1. The sanitiser was applied to the notes and not to the mail
+
+Phase 4 built `display::safe` because attacker-chosen text reached a pane
+verbatim, and applied it to the operator note on a `peer-request` and a
+`peer-counter`.
+
+It did not apply it to `Message::body`.
+
+That is the path an operator reads most, and the one that carries text from an
+**established peer** rather than a stranger — so the list row and the message
+pane both rendered U+202E, ANSI escape sequences and zero-width characters
+exactly as they arrived. The list used `.lines().next()`, which happens to
+handle a newline and nothing else, and that partial defence is probably why it
+looked done.
+
+Both paths now go through `display::safe`, the pane line by line — a control
+character in the fortieth line is as good as one in the first.
+
+The uncomfortable part: Phase 4 was *about* this. It found the notes by asking
+where attacker-controlled text reaches a list, and answered with two of the
+three places. A feature written to close a class of hole left the largest
+instance of that class open.
+
+### 2. A background tick threw away what the operator asked for
+
+`warn_before_shredding` set `self.output`, and it is called from
+`shred_expired_epochs`, which is called from `tick_schedule` — a timer.
+
+So a tick landing mid-read replaced the answer to whatever command had just
+been run, including an error the operator was in the middle of reading. RFC 8
+§10 wants the consequence in the foreground, and taking the foreground away
+from the operator is not the same thing.
+
+The warning now goes into the message list, which persists where the output
+pane does not, and is **appended** to any output already there rather than
+replacing it.
+
+### What did not fail
+
+- The pin key is a subkey of the KEK, and a test confirms the archive does not
+  open under `W_N` — which is the one thing that would make a pin worthless.
+- `pin_key` is derived at both unlock sites and cleared on lock, along with
+  `warned_shred_at`.
+- The archive refuses a declared count that disagrees with what is present, and
+  a truncated file reads as nothing rather than as a shorter archive.
+- `confusable_with_known` still refuses to flag an exact quotation, so the mark
+  does not fire on ordinary text.
+- Pinning is idempotent and bounded.
+
+### The pattern, holding
+
+Pass 10 found two correct phases wrong together and concluded that a pass has
+to cover everything a phase touches. Both findings here are that, one layer
+in: a **new mechanism not reaching a path an older feature owns**.
+
+`display::safe` is a rule about foreign text; `Message::body` is foreign text
+that predates it. `self.output` is the interface's, and Phase 5 wrote to it
+from a timer without asking what else writes there.
+
+Neither is found by reading the new code, because the new code is correct. They
+are found by asking, of every new rule, **what else is already in its scope** —
+and of every new writer, **who else owns what it writes to**.
