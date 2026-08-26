@@ -73,9 +73,74 @@ apps/
 
     cargo build --release
 
-    ./target/release/krab                        # TUI (scaffold)
+    ./target/release/krab                        # the node
     ./target/release/krab-sim --diag --sweep mix # SIM-0
     ./target/release/krab-sizes --check          # verify RFC 1's byte counts
+
+The toolchain is pinned and the build is reproducible — two builds of this
+source produce the same bytes. Check it yourself:
+
+    ./build-reproducible.sh --verify
+
+## Running a node
+
+Everything is typed into the command pane. There is **no configuration file**:
+a file can be lost, spoofed or read, so every decision is a command the
+operator gives.
+
+    init                    create the identity — writes down a backup, once
+    listen 127.0.0.1:40000  accept inbound links (optional)
+    help                    every verb, with what it is for
+
+### Peering with someone
+
+Peering is deliberate and mutual. There is no discovery and no bootstrap
+server: **you cannot join Krab without knowing a participant**, which is the
+property that makes proof-of-work unnecessary.
+
+Both ends run the same steps; neither is the initiator.
+
+    peer offer                      write your card
+    peer pad theirs.pad             your half of the reservoir
+    ...exchange both files...
+    peer accept their.card          read theirs, and read the words aloud
+    peer verified <peer>            record that the fingerprints matched
+    peer seal their.pad in-person   finish, and say how it travelled
+    peer countersign <file>         both signatures on the credential
+
+Step two of RFC 3 §11 — comparing the fingerprint word lists **aloud** — is the
+security step. Everything else is bookkeeping around it.
+
+For two people who cannot meet, `peer meet <addr>` does first contact over a
+link, and `peer wrap` carries the reservoir under a key read over a phone call.
+Both record what they cost: a peering formed over a network is not
+post-quantum until `peer reseal`.
+
+### Sending
+
+    message <peer> [peer…]   compose; Ctrl-D seals and queues
+    send <peer> <text>       one line, from the command line
+    peers                    who you peer with, and the evidence
+
+### When someone is at the door
+
+    Ctrl-L                   lock, from any mode, including mid-composition
+    wipe                     RFC 7 §10's panic destruction
+
+Lock is one keystroke and asks nothing. `wipe` destroys every key this node
+holds, overwriting before unlinking, and cannot be undone.
+
+## What this release is, and is not
+
+0.1.0 ships with **RFC 1 §12's vector gate recorded unmet** — it requires two
+independent implementations to agree, and there is one. RFC 1 does not reach
+Final on this release. [`CHANGELOG.md`](CHANGELOG.md) says what stands in its
+place and what that is worth.
+
+The cryptographic review is self-review. Twelve adversarial passes are recorded
+in [`Documentation/ADVERSARIAL-PASS.md`](Documentation/ADVERSARIAL-PASS.md),
+including what each found after the code had shipped — which is the honest
+measure of how much the earlier ones missed.
 
 ## Documentation
 

@@ -17,8 +17,17 @@ on different machines, in different directories, by different people. As of
 section makes, external review being unavailable, which raises rather than
 lowers its importance.
 
-**Verified reproducible** on `aarch64-apple-darwin`, 2026-08-10, rustc 1.94.1:
-two builds from two directories, byte-identical.
+**Verified reproducible** on `aarch64-apple-darwin`, rustc 1.94.1: two builds
+from two directories, byte-identical.
+
+| date | tree | hash |
+|---|---|---|
+| 2026-08-10 | pre-0.1 | — |
+| 2026-08-26 | **0.1.0** | `ef82f172c6c72cec4fc467278db0b944b2e596dbfc700832fc945c6d01c0aa7c` |
+
+Re-run for the release rather than carried forward: three weeks of work sat
+between the two dates, and a reproducibility claim that is not re-checked is a
+claim about a tree nobody is shipping.
 
 ## What makes it work
 

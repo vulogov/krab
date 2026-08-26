@@ -1,10 +1,11 @@
 # Milestone 0.1 — Implementation Plan
 
     Branch:   0.1
-    Status:   A–E done. F: two of three gates met; RFC 1 §12's needs a second
-              implementation that will not exist, and **0.1 ships with it
-              unmet** — the decision and its cost are in §2.2.2.
-              Last checked against the tree 2026-08-24.
+    Status:   **SHIPPED 2026-08-26 as 0.1.0.** A–E done. F: two of three gates
+              met; RFC 1 §12's needs a second implementation that will not
+              exist, and 0.1 ships with it unmet — the decision and its cost
+              are in §2.2.2, and on the release itself in CHANGELOG.md rather
+              than only here.
     Scope:    a message from A to B, over sim, TCP and courier, with lock
               — plus what §5 records as having grown past that
 

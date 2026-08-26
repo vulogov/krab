@@ -20,7 +20,14 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# Matches `rust-toolchain.toml`, and deliberately.
+#
+# An MSRV below the pinned toolchain is a claim nobody checks: this workspace
+# is built with 1.94.1 for reproducibility (RFC 0 §9), nothing is ever compiled
+# with 1.75, and a reader taking that number at face value gets a failure that
+# names a missing feature rather than a wrong toolchain. Declaring the version
+# actually used is the only honest figure available.
+rust-version = "1.94.1"
 license = "MIT"
 repository = "https://github.com/vulogov/krab"
 authors = ["Vladimir Ulogov"]
