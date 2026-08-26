@@ -35,6 +35,7 @@ mod command;
 mod compose;
 mod courier;
 mod credential;
+mod display;
 mod entropy;
 mod fanout;
 mod filter;
@@ -1463,7 +1464,7 @@ impl App {
             let receive::Incoming::Request { request: r, .. } = inc else {
                 continue;
             };
-            let note = r.note.chars().take(40).collect::<String>();
+            let note = self.foreign(&r.note);
             self.list.insert(
                 0,
                 format!(
@@ -2106,7 +2107,7 @@ impl App {
                     let who = short_id(&r.from.node_id());
                     out.push_str(&format!("\x20 {}. request from {who}\n", i + 1));
                     if !r.note.is_empty() {
-                        out.push_str(&format!("\x20    \"{}\"\n", r.note));
+                        out.push_str(&format!("\x20    {}\n", self.foreign(&r.note)));
                     }
                     out.push_str(&format!(
                         "\x20    they will accept {} MB/day, {} objects/day, \
@@ -2134,7 +2135,7 @@ impl App {
                         c.terms.retention_days,
                     ));
                     if !c.note.is_empty() {
-                        out.push_str(&format!("\x20    \"{}\"\n", c.note));
+                        out.push_str(&format!("\x20    {}\n", self.foreign(&c.note)));
                     }
                 }
             }
@@ -2831,6 +2832,30 @@ impl App {
     /// countersigned. There is no way to make it a local setting, and that is
     /// the property — a local setting is exactly the unilateral exposure §8.3
     /// is written against.
+    /// Render text this node did not write — RFC 8 §7.
+    ///
+    /// **Every path that shows a stranger's words goes through here.** The
+    /// notes on a `peer-request` and a `peer-counter` are the only free text
+    /// that reaches a pane from outside, and both went to it verbatim: a
+    /// newline broke the layout, U+202E reversed the rest of the line, and a
+    /// note reading `0797с2с1` in Cyrillic was indistinguishable from the
+    /// short id it imitates.
+    ///
+    /// §7's second requirement is the confusable mark, and the set it is run
+    /// against is this node's own peerings — which is what "names the user
+    /// already follows" means in a client whose every identifier is a key.
+    fn foreign(&self, text: &str) -> String {
+        let r = display::safe(text);
+        let mut out = r.line();
+        if let Some(imitated) = display::confusable_with_known(&r.text, &self.peer_ids()) {
+            out.push_str(&format!(
+                "  ** this reads like {imitated}, and is not — a homoglyph, \
+                 not that peer **"
+            ));
+        }
+        out
+    }
+
     /// RFC 3 §13's warnings, for this node's actual transport mix.
     ///
     /// > "Operators choose peers by hand and will not know any of this.
@@ -9059,6 +9084,94 @@ mod tests {
         );
         // And the material is still there, so it can be peered with again.
         assert!(a.peer_path(&sb, artifact::PeerFile::Link).exists());
+    }
+
+    /// **RFC 8 §7, where the attack actually lands.**
+    ///
+    /// §7 is written for a client with petnames and this one has none — every
+    /// identifier an operator sees is a short id derived from a key, and
+    /// `groups::Group::name` is local and never crosses the wire. So §7's
+    /// first MUST holds by construction.
+    ///
+    /// What does arrive from a stranger is the free-text note on a
+    /// `peer-request` (RFC 3 §5.1 key 7), and it reached the pane verbatim.
+    /// Because every identifier here is hex, the impersonation §7 describes
+    /// has a precise form: Cyrillic letters that render as hex digits.
+    #[test]
+    fn a_note_that_imitates_a_short_id_is_marked_in_the_list() {
+        let b = ready_node("hg-b");
+        let other = ready_node("hg-other");
+
+        // A peering whose short id is chosen rather than drawn, so the
+        // homoglyph in the fixture is guaranteed to be one. `peer_ids` reads
+        // the directory names, which is what `foreign` compares against.
+        let known = "acedface".to_string();
+        let dir = b.home.join("peers").join(&known);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(artifact::PeerFile::Link.name()),
+            other
+                .identity
+                .as_ref()
+                .unwrap()
+                .card(Policy::default())
+                .encode(),
+        )
+        .unwrap();
+        assert!(b.peer_ids().contains(&known));
+
+        // Cyrillic а, с and е for the Latin ones — renders identically.
+        let spoofed = "асеdfасе";
+        assert_ne!(spoofed, known, "the fixture has no homoglyph in it");
+
+        let line = b.foreign(&format!("from {spoofed}, vouching"));
+        assert!(
+            line.contains("reads like"),
+            "a homoglyph of a known peer went unmarked: {line}"
+        );
+        assert!(
+            line.contains(&known),
+            "the mark does not name what it imitates: {line}"
+        );
+
+        // And quoting the real one is not marked — otherwise the mark is
+        // trained out of an operator within a week.
+        let plain = b.foreign(&format!("from {known}, vouching"));
+        assert!(!plain.contains("reads like"), "{plain}");
+    }
+
+    /// **A stranger's note cannot reach a pane with its control characters.**
+    /// A newline breaks a list built from lines; U+202E reverses the rest of
+    /// the row without being visible itself.
+    #[test]
+    fn a_note_cannot_break_the_pane_it_is_rendered_in() {
+        let mut x = ready_node("nt-x");
+        let mut y = ready_node("nt-y");
+        let card = x.home.join("theirs.card");
+        std::fs::write(
+            &card,
+            y.identity
+                .as_ref()
+                .unwrap()
+                .card(Policy::default())
+                .encode(),
+        )
+        .unwrap();
+        type_command(
+            &mut x,
+            &format!("request {} first\u{202e}second", card.display()),
+        );
+        y.store = x.store.clone();
+        type_command(&mut y, "requests");
+
+        // Whatever arrived, the pane is still lines and holds no formatting.
+        for bad in ['\n', '\r', '\u{202e}', '\u{200b}'] {
+            let rows: Vec<&str> = y.output.lines().collect();
+            assert!(
+                rows.iter().all(|r| !r.contains(bad)),
+                "{bad:?} reached the pane"
+            );
+        }
     }
 
     /// **RFC 3 §13's MUST, and the transport mix it depends on.**

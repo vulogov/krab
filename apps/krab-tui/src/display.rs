@@ -1,0 +1,375 @@
+//! Rendering text this node did not write — RFC 8 §7.
+//!
+//! > "Channel and node identifiers are keys and cannot be spoofed. **Display
+//! > names are attacker-controlled**, and a Cyrillic homoglyph defeats the
+//! > strongest cryptographic guarantee in the system with a font."
+//!
+//! ```text
+//! A key fingerprint MUST appear alongside every display name in list views,
+//!   not only in a detail pane.
+//! The client MUST run Unicode confusable detection against names the user
+//!   already follows, and MUST mark matches.
+//! ```
+//!
+//! # What §7 protects, and what this implementation actually has
+//!
+//! §7 is written for a client with petnames. This one has none: every
+//! identifier an operator sees is a **short id**, four bytes of a node
+//! identifier in hex, derived from a key. `groups::Group::name` looks like a
+//! display name and is not — it is "local only … not in any signature", so it
+//! never crosses the wire and no one but the operator can choose it.
+//!
+//! So §7's first `MUST` is satisfied by construction, and the second has no
+//! set of "names the user already follows" to run against. That is a stronger
+//! position than §7 asks for and it would be easy, and wrong, to stop there.
+//!
+//! # Where the attack actually lands
+//!
+//! Two fields of attacker-chosen **free text** reach list views: the operator
+//! note on a `peer-request` (RFC 3 §5.1 key 7) and on a `peer-counter`
+//! (§5.2). Both are written by someone this node has never met, and both were
+//! rendered verbatim.
+//!
+//! Because every identifier here *is* a short hex id, the impersonation §7
+//! describes has a precise form: a note reading `0797c2c1` where the digits
+//! are Cyrillic `о`, `с` and so on. It renders identically, it is a different
+//! string, and an operator scanning a list has no way to tell. §7's own
+//! sentence is the requirement — "the confusion happens while scanning a
+//! list".
+//!
+//! So [`skeleton`] folds the homoglyphs and [`confusable_with_known`] marks a
+//! note that renders like an identifier this node already holds.
+//!
+//! # And the simpler thing that was also wrong
+//!
+//! A note went to the pane with its control characters intact. A newline
+//! breaks the list's layout; U+202E reverses everything after it; a zero-width
+//! joiner hides a difference the skeleton would otherwise catch. [`safe`]
+//! removes them and says how many it removed, because silently swallowing an
+//! attacker's bytes is its own kind of lie.
+//!
+//! # What this is not
+//!
+//! Not a full Unicode TR39 implementation. The confusables table below is the
+//! Cyrillic, Greek and fullwidth folds onto ASCII — the ones that matter for
+//! text that impersonates a hex identifier — and it is a **subset**, stated
+//! rather than implied. A name built from confusables outside it renders
+//! unmarked, and the fingerprint beside it is what the operator has left.
+//!
+//! That is why §7 asks for both and why doing only one would, in its words,
+//! "satisfy the letter and miss the point".
+
+/// The most characters of foreign text this node will render in one line.
+///
+/// A list row is a line; text longer than one is not a name.
+pub const MAX_RENDERED: usize = 64;
+
+/// Characters removed before anything is rendered.
+///
+/// Control characters break the layout of a pane built from lines. The
+/// bidirectional and zero-width formatting characters are worse: they change
+/// what the *rest* of the line looks like without being visible themselves,
+/// which is the whole mechanism of a display-spoofing attack.
+fn is_dangerous(c: char) -> bool {
+    c.is_control()
+        // Bidi overrides and embeddings — U+202A..U+202E, U+2066..U+2069.
+        || ('\u{202a}'..='\u{202e}').contains(&c)
+        || ('\u{2066}'..='\u{2069}').contains(&c)
+        // Zero-width space, non-joiner, joiner, and the marks.
+        || ('\u{200b}'..='\u{200f}').contains(&c)
+        // Byte-order mark, used as a zero-width no-break space.
+        || c == '\u{feff}'
+        // Invisible mathematical operators, which render as nothing.
+        || ('\u{2061}'..='\u{2064}').contains(&c)
+}
+
+/// What rendering someone else's text produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    /// Safe to put in a pane.
+    pub text: String,
+    /// Characters removed because they would have changed the line around
+    /// them. **Reported, not swallowed**: an operator whose peer sent
+    /// invisible formatting should know that rather than see a tidy string.
+    pub removed: usize,
+    /// Whether it was cut at [`MAX_RENDERED`].
+    pub truncated: bool,
+}
+
+impl Rendered {
+    /// The line to show, with the marks §7 requires.
+    pub fn line(&self) -> String {
+        let mut out = format!("\"{}\"", self.text);
+        if self.truncated {
+            out.push('…');
+        }
+        if self.removed > 0 {
+            out.push_str(&format!(
+                "  [{} hidden character(s) removed — formatting that would \
+                 have changed how this line reads]",
+                self.removed
+            ));
+        }
+        out
+    }
+}
+
+/// Prepare text this node did not write for a pane.
+pub fn safe(text: &str) -> Rendered {
+    let mut out = String::new();
+    let mut removed = 0;
+    let mut truncated = false;
+    for c in text.chars() {
+        if is_dangerous(c) {
+            removed += 1;
+            continue;
+        }
+        if out.chars().count() >= MAX_RENDERED {
+            truncated = true;
+            break;
+        }
+        out.push(c);
+    }
+    Rendered {
+        text: out,
+        removed,
+        truncated,
+    }
+}
+
+/// Fold a string onto its confusable skeleton — Unicode TR39's idea.
+///
+/// Case is folded and the confusables below are mapped onto ASCII, so two
+/// strings that render alike produce the same skeleton. A **subset**: see the
+/// module header on what that costs.
+pub fn skeleton(text: &str) -> String {
+    text.chars()
+        .filter(|c| !is_dangerous(*c))
+        .map(fold)
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Confusables that matter for text impersonating a hex identifier.
+///
+/// Cyrillic and Greek letters that render as Latin ones, plus the fullwidth
+/// forms. Hex digits are `0`–`9` and `a`–`f`, so the folds that matter most
+/// are the ones producing those.
+fn fold(c: char) -> char {
+    match c {
+        // Cyrillic → Latin.
+        'а' | 'А' => 'a',
+        'е' | 'Е' | 'ё' | 'Ё' => 'e',
+        'о' | 'О' => 'o',
+        'с' | 'С' => 'c',
+        'р' | 'Р' => 'p',
+        'х' | 'Х' => 'x',
+        'у' | 'У' => 'y',
+        'ѕ' | 'Ѕ' => 's',
+        'і' | 'І' | 'ї' | 'Ї' => 'i',
+        'ј' | 'Ј' => 'j',
+        'һ' | 'Һ' => 'h',
+        'ԁ' => 'd',
+        'В' => 'b',
+        'М' => 'm',
+        'Н' => 'h',
+        'Т' => 't',
+        'К' => 'k',
+        'Ѵ' => 'v',
+        // Greek → Latin.
+        'ο' | 'Ο' => 'o',
+        'α' | 'Α' => 'a',
+        'ε' | 'Ε' => 'e',
+        'ρ' | 'Ρ' => 'p',
+        'χ' | 'Χ' => 'x',
+        'υ' => 'u',
+        'ν' => 'v',
+        'Β' => 'b',
+        'Ϲ' | 'ϲ' => 'c',
+        'Ι' => 'i',
+        'Κ' => 'k',
+        'Μ' => 'm',
+        'Ν' => 'n',
+        'Τ' => 't',
+        'Υ' => 'y',
+        'Ζ' => 'z',
+        'Η' => 'h',
+        // Letters that render as digits. `l` and `I` are the classic pair;
+        // in a hex identifier a `1` is what they imitate.
+        'l' => '1',
+        'I' => '1',
+        'Ⅰ' => '1',
+        // Fullwidth forms.
+        '\u{ff10}'..='\u{ff19}' => char::from_u32(c as u32 - 0xff10 + 0x30).unwrap_or(c),
+        '\u{ff21}'..='\u{ff3a}' => char::from_u32(c as u32 - 0xff21 + 0x61).unwrap_or(c),
+        '\u{ff41}'..='\u{ff5a}' => char::from_u32(c as u32 - 0xff41 + 0x61).unwrap_or(c),
+        _ => c,
+    }
+}
+
+/// Whether `text` renders like one of `known` without being it — §7's
+/// "confusable detection against names the user already follows".
+///
+/// Returns the identifier it imitates. Exact matches are **not** flagged: a
+/// note that simply says a peer's short id is quoting it, which is ordinary,
+/// and marking that would train an operator to ignore the mark.
+pub fn confusable_with_known(text: &str, known: &[String]) -> Option<String> {
+    // A short id appears inside a sentence, so the comparison is per word
+    // rather than over the whole string — and **punctuation is trimmed**,
+    // because the first version compared `"асеdfасе,"` against `"acedface"`
+    // and found nothing. An attacker writing a full stop would have walked
+    // past the check.
+    let words: Vec<String> = text.split_whitespace().map(trim_punctuation).collect();
+    known.iter().find_map(|k| {
+        let target = skeleton(k);
+        let imitates = words.iter().any(|w| skeleton(w) == target);
+        // An exact quotation is not an impersonation.
+        let quotes = words.iter().any(|w| w == k);
+        (imitates && !quotes).then(|| k.clone())
+    })
+}
+
+/// Strip leading and trailing punctuation from a word.
+fn trim_punctuation(w: &str) -> String {
+    w.trim_matches(|c: char| !c.is_alphanumeric()).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A note claiming to be an identifier.** Every identifier this node
+    /// shows is four bytes of hex, so the impersonation §7 describes has a
+    /// precise form here: Cyrillic letters that render as hex digits.
+    #[test]
+    fn a_cyrillic_homoglyph_of_a_short_id_is_marked() {
+        let real = "0797c2c1".to_string();
+        // Cyrillic с (U+0441) for the Latin c, twice.
+        let spoof = "from 0797с2с1 — trust me";
+        assert!(!spoof.contains(&real), "the fixture is not a spoof");
+        assert_eq!(
+            confusable_with_known(spoof, std::slice::from_ref(&real)),
+            Some(real),
+            "a homoglyph of a known identifier went unmarked"
+        );
+    }
+
+    /// **Quoting an identifier is not impersonating one.** Marking it would
+    /// train an operator to ignore the mark.
+    #[test]
+    fn quoting_a_real_identifier_is_not_flagged() {
+        let real = "0797c2c1".to_string();
+        assert_eq!(confusable_with_known("this is 0797c2c1", &[real]), None);
+    }
+
+    /// **Punctuation must not carry a homoglyph past the check.** The first
+    /// version compared `"асеdfасе,"` against `"acedface"` and found nothing,
+    /// so an attacker writing a full stop walked past it.
+    #[test]
+    fn punctuation_does_not_hide_a_homoglyph() {
+        let real = "acedface".to_string();
+        for note in [
+            "from асеdfасе, vouching",
+            "асеdfасе.",
+            "(асеdfасе)",
+            "\"асеdfасе\"",
+            "асеdfасе!",
+        ] {
+            assert_eq!(
+                confusable_with_known(note, std::slice::from_ref(&real)),
+                Some(real.clone()),
+                "punctuation hid a homoglyph in {note:?}"
+            );
+        }
+        // And the exact one, punctuated, is still a quotation.
+        assert_eq!(confusable_with_known("acedface.", &[real]), None);
+    }
+
+    /// Nothing to imitate, nothing marked.
+    #[test]
+    fn ordinary_text_is_not_flagged() {
+        let known = vec!["0797c2c1".to_string(), "deadbeef".to_string()];
+        assert_eq!(confusable_with_known("we met at the thing", &known), None);
+        assert_eq!(confusable_with_known("", &known), None);
+    }
+
+    /// **Bidi overrides change the line around them without being visible.**
+    /// That is the whole mechanism, so they go before anything is rendered.
+    #[test]
+    fn formatting_characters_are_removed_and_reported() {
+        let nasty = "alice\u{202e}txt.exe";
+        let r = safe(nasty);
+        assert!(!r.text.contains('\u{202e}'));
+        assert_eq!(r.removed, 1);
+        assert!(
+            r.line().contains("hidden character(s) removed"),
+            "removal was silent: {}",
+            r.line()
+        );
+    }
+
+    /// A newline breaks a pane built from lines; a control character can do
+    /// worse on a terminal.
+    #[test]
+    fn control_characters_cannot_reach_a_pane() {
+        let r = safe("first\nsecond\r\u{7}\u{1b}[31mred");
+        assert!(!r.text.contains('\n'));
+        assert!(!r.text.contains('\r'));
+        assert!(!r.text.contains('\u{1b}'), "an escape sequence survived");
+        assert_eq!(r.removed, 4);
+    }
+
+    /// Zero-width characters hide a difference the skeleton would catch.
+    #[test]
+    fn zero_width_characters_are_removed() {
+        for c in ['\u{200b}', '\u{200d}', '\u{feff}', '\u{2062}'] {
+            let s = format!("a{c}b");
+            assert_eq!(safe(&s).text, "ab", "{c:?} survived");
+            assert_eq!(skeleton(&s), "ab", "{c:?} survived folding");
+        }
+    }
+
+    /// Long text is a paragraph, not a name, and a list row is a line.
+    #[test]
+    fn long_text_is_cut_and_says_so() {
+        let r = safe(&"x".repeat(MAX_RENDERED * 2));
+        assert_eq!(r.text.chars().count(), MAX_RENDERED);
+        assert!(r.truncated);
+        assert!(r.line().ends_with('…'));
+    }
+
+    /// The fold covers Greek and fullwidth as well as Cyrillic, because a
+    /// table that stopped at one script would be a table an attacker reads.
+    #[test]
+    fn the_fold_covers_the_scripts_it_claims_to() {
+        assert_eq!(skeleton("ο"), "o", "Greek omicron");
+        assert_eq!(skeleton("аеос"), "aeoc", "Cyrillic");
+        assert_eq!(skeleton("\u{ff10}\u{ff41}"), "0a", "fullwidth");
+        assert_eq!(skeleton("ABC"), "abc", "case is folded");
+    }
+
+    /// A skeleton is not a decoder ring: text that is genuinely different
+    /// stays different.
+    #[test]
+    fn distinct_text_keeps_distinct_skeletons() {
+        assert_ne!(skeleton("0797c2c1"), skeleton("0797c2c2"));
+        assert_ne!(skeleton("alice"), skeleton("bob"));
+    }
+
+    /// Nothing here may panic on whatever arrived from a stranger.
+    #[test]
+    fn arbitrary_input_does_not_panic() {
+        for s in [
+            "",
+            "\u{0}",
+            "🙂🙂🙂",
+            "\u{202e}\u{202d}\u{feff}",
+            &"é".repeat(500),
+        ] {
+            let r = safe(s);
+            let _ = r.line();
+            let _ = skeleton(s);
+            let _ = confusable_with_known(s, &["0797c2c1".into()]);
+        }
+    }
+}

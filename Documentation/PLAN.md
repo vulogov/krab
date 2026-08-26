@@ -219,7 +219,7 @@ RFC 8 carries the most normative weight in the series (60 `MUST`/`SHOULD`
 lines against RFC 1's 43) and has had the least of it checked, because the
 implementation work has been protocol-first throughout.
 
-### Phase 4 — RFC 8 §7: names are attacker-controlled *(verified)*
+### Phase 4 — RFC 8 §7: names are attacker-controlled · **done 2026-08-25**
 
 ```
 A key fingerprint MUST appear alongside every display name in list views,
@@ -241,9 +241,35 @@ font."
 satisfy the letter and miss the point: the confusion happens while scanning a
 list."
 
-Work: fingerprints in list rows; Unicode TR39 confusable skeletons compared
-against names already followed; matches marked. The mechanism is standard and
-the table is data.
+Done, and the audit changed the answer. **§7's first MUST holds by
+construction**: this client has no petnames. Every identifier an operator sees
+is a short id derived from a key, and `groups::Group::name` — which looks like
+a display name — is "local only … not in any signature", so it never crosses
+the wire and no one but the operator can choose it.
+
+Stopping there would have been wrong. The audit found what *does* arrive from a
+stranger and reach a list: the free-text note on a `peer-request` (RFC 3 §5.1
+key 7) and on a `peer-counter`. Both were rendered **verbatim**, and there was
+no sanitisation anywhere in the codebase.
+
+Because every identifier here is hex, §7's attack has a precise form: a note
+reading `acedface` where the letters are Cyrillic. `display::skeleton` folds
+Cyrillic, Greek and fullwidth onto ASCII; `confusable_with_known` marks a note
+that renders like a peering this node holds; and quoting a real identifier is
+deliberately *not* marked, because a mark that fires on ordinary text is
+trained out of an operator within a week.
+
+`display::safe` removes control characters, bidi overrides and zero-width
+formatting before anything reaches a pane — a newline broke the list's layout
+and U+202E reversed the rest of the row — and **reports how many it removed**,
+because silently swallowing an attacker's bytes is its own kind of lie.
+
+Two things the work taught. The confusables table is a subset and says so; a
+name built outside it renders unmarked, and the fingerprint beside it is what
+the operator has left — which is why §7 asks for both. And the first version of
+the check compared `"асеdfасе,"` against `"acedface"` and found nothing: an
+attacker writing a full stop would have walked past it. Punctuation is trimmed
+now, and a test pins five kinds of it.
 
 ### Phase 5 — RFC 8 §10: retention is a foreground property *(verified)*
 
