@@ -861,3 +861,108 @@ found the opposite failure, which no enumeration would have caught.
 
 What did catch it was asking, of a value used in a new place, *which of its
 meanings applies here* — and the answer being "neither, exactly".
+
+---
+
+## Pass 10 — the three phases, and a phase undoing another
+
+Run against Phases 1–3: RFC 3 §4's expiry state, §8.4's purge, §13's warnings
+and §12's panel. **Three findings**, and the middle one is a shape no previous
+pass produced.
+
+### 1. `peer forget` left the file it exists to destroy
+
+`peer seal`, `peer renew`, `peer share` and `peer countersign` all write
+`<peer>.credential` into the home directory, **in the clear**, for the operator
+to hand over. `forget` cleared `peers/<id>/` and stopped.
+
+So the one command whose whole purpose is RFC 3 §8.4's "remove the relationship
+record" left behind the single most incriminating file in the layout: a
+mutually signed and, per §15, non-repudiable statement that these two agreed to
+peer — sitting unencrypted in the working directory, after the operator had
+been told the peering was ended and the files shredded.
+
+`forget` now shreds anything in the home directory named for that peer which
+`artifact::wiped` recognises.
+
+### 2. Phase 2 undid Phase 1, one tick later
+
+Phase 1 existed for §4's `MUST`: an expired peering must be an explicit state,
+"rather than as a silent sync failure — the two look identical from the outside
+and confusing them will waste a great deal of operator time."
+
+Phase 2 purged the credential the moment its term lapsed. `credential_standing`
+then found nothing, so the operator was told:
+
+```
+no credential — nothing is scoped or enforced on this link.
+`peer countersign` completes one
+```
+
+instead of:
+
+```
+**EXPIRED** 3 day(s) ago — this link will not reconcile until it is
+renewed. `peer renew <peer>`
+```
+
+The reason was destroyed along with the record, and the remaining advice was
+**wrong** as well as uninformative: `peer countersign` does nothing for a
+peering with no proposal outstanding.
+
+Two `MUST`s from the same document, in sections that never mention each other,
+where satisfying the second cancels the first. §4 resolves it and neither
+section says so: "revocation is non-renewal" — a peering ends when it is *not
+renewed*, not the instant its term runs out. So there is a fortnight's grace in
+which the state stays reportable and renewable, and §8.4's purge fires when
+declining has actually become true.
+
+**This is the first finding in ten passes where two pieces of correct work
+combined into an incorrect whole.** Neither phase was wrong on its own, and
+neither review would have caught it: Phase 1's tests pass, Phase 2's tests pass,
+and the defect lives in the sentence between them.
+
+### 3. Forgetting one peer silenced another
+
+`TagTable` maps a tag to a **position** in the correspondent slice. That slice
+is rebuilt from the peer directories on every inbox refresh; the table rebuilds
+only on epoch rollover.
+
+So removing a peering shifted every correspondent after it down one, and a
+still-valid peer's tag resolved to somebody else's keys. Decryption failed, and
+`correspondents.get(idx)` made that a **miss rather than a panic** — so mail
+from an untouched peering simply stopped opening, with nothing reported, until
+midnight.
+
+An operator ending one relationship would have watched a different one go
+quiet, on the same day, and had no reason to connect the two. `forget` now
+invalidates the table.
+
+### What did not fail
+
+- `forget` retains the corpus (§8.4's other `MUST`), asserted alongside the
+  purge because the two pull opposite ways.
+- The expiry purge takes records and leaves material, so a lapsed peering is
+  renewable rather than gone.
+- `PeerFile::purged_on_expiry` is a method, so a new per-peer file has to
+  answer the question rather than defaulting into an answer.
+- §12's aggregates are derived from the budget's two counters and store no
+  per-object provenance.
+- `Warning::line` renders every variant; a test refuses an unrendered
+  placeholder, which is how `Debug` reached operator text in the first place.
+
+### The pattern, and what it changes about the passes
+
+Passes 7 and 8 found rules enforced over stale lists. Pass 9 found a value
+reused where it did not fit. **Pass 10 found an interaction** — two correct
+features that are wrong together — and that is the first one where reviewing
+either change alone was guaranteed not to find it.
+
+Findings 1 and 3 share it in a smaller way: both are a *new* operation failing
+to reach state that a *previous* feature owns. The handover file belongs to
+Phase 1's renewal path; the tag table belongs to the inbox. Neither was in
+front of anyone writing Phase 2.
+
+The practical consequence is that a pass over a phase is not enough. A pass has
+to be over the phase **and everything the phase now touches**, which is the
+larger and less comfortable question.

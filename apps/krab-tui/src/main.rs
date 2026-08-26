@@ -215,6 +215,18 @@ const OUTPUT_SCROLL_LINES: usize = 8;
 ///
 /// Long enough to be seen at a glance, short enough that it stops well before
 /// an operator could mistake it for continuous traffic.
+/// How long a lapsed peering keeps its record before RFC 3 §8.4 purges it.
+///
+/// §4: "revocation is non-renewal." A peering ends when it is *not renewed*,
+/// not the instant its term runs out — so this is the window in which
+/// declining becomes true, and until it closes the peering reports as expired
+/// and can still be renewed.
+///
+/// A fortnight. §4 prompts for renewal at 75% of a 60–90 day term, which is
+/// about three weeks' notice; a fortnight after is the same order and short
+/// against §15's concern that credentials at rest are non-repudiable.
+const GRACE_AFTER_EXPIRY_S: u64 = 14 * 24 * 3600;
+
 const ACTIVITY_GLYPH_TICKS: u8 = 20;
 
 /// Epochs between signed-prekey rotations — RFC 7 §5.1's "weekly to monthly",
@@ -2931,8 +2943,36 @@ impl App {
         gone += shred::remove_matching(&dir, |_| true, &mut OsRng);
         let _ = std::fs::remove_dir(&dir);
 
+        // **And the handover copies in the home directory.**
+        //
+        // `peer seal`, `peer renew`, `peer share` and `peer countersign` all
+        // write `<peer>.credential` there, in the clear, for the operator to
+        // hand over. `forget` cleared `peers/<id>/` and left it — so the one
+        // command whose job is to destroy the record left behind the single
+        // most incriminating file in the layout: a mutually signed, and per
+        // RFC 3 §15 non-repudiable, statement that these two agreed to peer.
+        let prefix = format!("{peer}.");
+        gone += shred::remove_matching(
+            &self.home,
+            |name| name.starts_with(&prefix) && artifact::wiped(name),
+            &mut OsRng,
+        );
+
         // The allowed set is rebuilt from what is on disk, so it drops them.
         self.refresh_allowed();
+
+        // **And the tag table, which holds indices into a list that just
+        // shrank.**
+        //
+        // `TagTable` maps a tag to a position in the correspondent slice, and
+        // the slice is rebuilt from the peer directories on every inbox
+        // refresh — but the table only rebuilds on epoch rollover. Removing a
+        // peering shifts every correspondent after it down one, so a tag
+        // belonging to a peer who is still there resolves to somebody else's
+        // keys, decryption fails, and **their mail silently stops opening**
+        // until midnight. `correspondents.get(idx)` makes that a miss rather
+        // than a panic, which is exactly what makes it invisible.
+        self.tag_table = None;
 
         format!(
             "peering with {peer} ended. {gone} file(s) shredded.\n\n\
@@ -2961,11 +3001,26 @@ impl App {
         if self.epoch_key.is_none() {
             return;
         }
+        let now_s = self.now_s();
         for peer in self.peer_ids() {
-            if !matches!(
-                self.credential_standing(&peer),
-                Standing::Live(credential::Life::Expired, _)
-            ) {
+            let Standing::Live(credential::Life::Expired, at) = self.credential_standing(&peer)
+            else {
+                continue;
+            };
+            // **Not the instant the term lapses.**
+            //
+            // Purging immediately erased the reason along with the record:
+            // `credential_standing` then reported `None`, so an operator whose
+            // peering had lapsed was told "no credential — `peer countersign`"
+            // rather than "expired — `peer renew`". That is RFC 3 §4's MUST
+            // undone by RFC 3 §8.4, one tick later, and the advice was wrong
+            // as well as uninformative.
+            //
+            // §4 resolves it: "revocation is non-renewal". A peering ends when
+            // it is *not renewed*, not the moment its term runs out — so the
+            // grace below is when declining becomes true, and until then the
+            // state stays reportable and renewable.
+            if now_s.saturating_sub(at) < GRACE_AFTER_EXPIRY_S {
                 continue;
             }
             let dir = self.home.join("peers").join(&peer);
@@ -2984,7 +3039,7 @@ impl App {
                 self.reach.retain(|(who, _)| who != &peer);
                 self.log.push(activity_log::Event::Failed {
                     peer: peer.clone(),
-                    why: "credential expired — record purged (§8.4), `peer renew`",
+                    why: "expired and not renewed — record purged (§8.4)",
                 });
             }
         }
@@ -8884,6 +8939,126 @@ mod tests {
         let to_x = x.home.join("sh.credential");
         std::fs::copy(&back, &to_x).unwrap();
         x.peer_countersign(Some(to_x.to_str().unwrap()));
+    }
+
+    /// **Forgetting one peer must not stop another's mail opening.**
+    ///
+    /// `TagTable` maps a tag to a *position* in the correspondent slice, and
+    /// that slice is rebuilt from the peer directories on every inbox refresh
+    /// while the table rebuilds only on epoch rollover. Removing a peering
+    /// shifts everyone after it down one, so a still-valid peer's tag resolved
+    /// to somebody else's keys and their mail silently failed to open until
+    /// midnight — a miss rather than a panic, which is what made it invisible.
+    #[test]
+    fn forgetting_one_peer_does_not_silence_another() {
+        let mut a = ready_node("tt-a");
+        let mut b = ready_node("tt-b");
+        let mut c = ready_node("tt-c");
+        let sb = peer_up(&mut a, &mut b);
+        let sc = peer_up(&mut a, &mut c);
+        assert_ne!(sb, sc);
+
+        // Build the table, then remove a peering under it.
+        a.refresh_inbox();
+        assert!(a.tag_table.is_some(), "no table to invalidate");
+        type_command(&mut a, &format!("peer forget {sb}"));
+        assert!(
+            a.tag_table.is_none(),
+            "the tag table outlived the peer list it indexes"
+        );
+
+        // Rebuilt, and the surviving peer is still recognised.
+        a.refresh_inbox();
+        let table = a.tag_table.as_ref().expect("rebuilt");
+        assert!(!table.is_empty(), "the surviving peering lost its tags");
+    }
+
+    /// **`forget` reaches the handover copies too.**
+    ///
+    /// `peer seal`, `peer renew`, `peer share` and `peer countersign` all
+    /// write `<peer>.credential` into the home directory, in the clear, for
+    /// the operator to hand over. `forget` cleared `peers/<id>/` and left it —
+    /// so the one command whose job is to destroy the record left behind the
+    /// single most incriminating file in the layout.
+    #[test]
+    fn forgetting_a_peer_reaches_the_plaintext_handover_copy() {
+        let mut x = ready_node("hnd-x");
+        let mut y = ready_node("hnd-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+
+        type_command(&mut x, &format!("peer renew {short_y}"));
+        let loose = x.home.join(format!("{short_y}.credential"));
+        assert!(loose.exists(), "the fixture wrote no handover file");
+
+        type_command(&mut x, &format!("peer forget {short_y}"));
+        assert!(
+            !loose.exists(),
+            "a plaintext, non-repudiable credential survived a termination"
+        );
+        // And nothing else named for them is left anywhere in home.
+        for e in std::fs::read_dir(&x.home).unwrap().flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            assert!(
+                !(n.starts_with(&format!("{short_y}.")) && artifact::wiped(&n)),
+                "{n} survived a termination"
+            );
+        }
+    }
+
+    /// **The expiry purge must not erase the reason before the operator can
+    /// act.**
+    ///
+    /// Purging the instant a term lapsed made `credential_standing` report
+    /// `None`, so an operator was told "no credential — `peer countersign`"
+    /// rather than "expired — `peer renew`": RFC 3 §4's MUST undone by §8.4
+    /// one tick later, with the advice wrong as well as uninformative.
+    ///
+    /// §4 resolves it — "revocation is non-renewal" — so a peering ends when
+    /// it is not renewed, and the grace is when that becomes true.
+    #[test]
+    fn a_lapsed_peering_keeps_its_reason_until_the_grace_runs_out() {
+        let mut a = ready_node("grc-a");
+        let mut b = ready_node("grc-b");
+        let (_, sb) = link_up(&mut a, &mut b);
+
+        // Both credentials built up front, so nothing holds a borrow on the
+        // node while it is being mutated.
+        let now = a.now_s();
+        let w = a.epoch_key.unwrap();
+        let seal = |established: u64| {
+            let (ai, bi) = (a.identity.as_ref().unwrap(), b.identity.as_ref().unwrap());
+            let mut c = credential::Credential::propose(
+                ai.signing_key(),
+                &ai.card(Policy::default()),
+                &bi.card(Policy::default()),
+                established,
+                90,
+                [3u8; 16],
+            );
+            assert!(c.sign(bi.signing_key()));
+            krab_crypto::kek::seal_under(&w, b"krab/credential", &c.encode(), &mut OsRng).unwrap()
+        };
+        let lapsed_yesterday = seal(now - 91 * 86_400);
+        let lapsed_a_month_ago = seal(now - 121 * 86_400);
+        let path = a.peer_path(&sb, artifact::PeerFile::Credential);
+
+        // Inside the grace: the reason survives and renewal is still named.
+        std::fs::write(&path, &lapsed_yesterday).unwrap();
+        a.purge_expired_peerings();
+        let line = a.credential_standing(&sb).line(&sb, a.now_s());
+        assert!(line.contains("EXPIRED"), "the reason was erased: {line}");
+        assert!(line.contains("peer renew"), "wrong advice: {line}");
+        assert!(path.exists(), "purged inside the grace");
+
+        // Past it: §8.4 takes the record of an agreement nobody renewed.
+        std::fs::write(&path, &lapsed_a_month_ago).unwrap();
+        a.purge_expired_peerings();
+        assert!(
+            !path.exists(),
+            "a peering that was never renewed kept its record for ever"
+        );
+        // And the material is still there, so it can be peered with again.
+        assert!(a.peer_path(&sb, artifact::PeerFile::Link).exists());
     }
 
     /// **RFC 3 §13's MUST, and the transport mix it depends on.**
