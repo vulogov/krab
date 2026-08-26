@@ -1038,3 +1038,76 @@ from a timer without asking what else writes there.
 Neither is found by reading the new code, because the new code is correct. They
 are found by asking, of every new rule, **what else is already in its scope** —
 and of every new writer, **who else owns what it writes to**.
+
+---
+
+## Pass 12 — Phase 6, and a default word with two directions
+
+Run against Phase 6 — `peer carry`, the burn-rate report — and against what it
+touches: `resign_credential`, which Phases 1 and 4 also own, and `Flags`, which
+Phase 2 purges.
+
+**One finding, and it is Pass 10's shape again with a sharper point.**
+
+### A renewal silently re-enabled what the operator had turned off
+
+`Flags::default()` holds two things that are not alike:
+
+```rust
+a_shares_b: false,      // RFC 3 §8.3 — "opt in to being listed, not out"
+b_shares_a: false,
+class_mask: 0xFF,       // RFC 6 §281 — admits everything
+```
+
+The share bits default to the safe direction and `class_mask` defaults to the
+unsafe one, and nothing anywhere had asked whether those were the same
+question.
+
+They meet in `resign_credential`. It carries the previous credential's flags
+across, so `peer renew` changes the dates and nothing else — but when RFC 3
+§8.4 has purged the credential after a lapse, there is nothing to carry, and
+the fresh one takes the defaults. Sharing correctly comes back **off**.
+Carriage comes back **on**, undoing a decision the operator made and signed,
+with nothing said.
+
+Measured, not reasoned:
+
+```text
+after carry off, mask admits bulletins: false
+after purge+renew,  admits bulletins: true
+after purge+renew,  shares peer:      false
+```
+
+Neither phase is wrong alone. Phase 2 purges the record because §8.4 says
+`MUST`. Phase 6 defaults the mask to `0xFF` because a fresh peering that
+refused prekey batches and rollcall entries could not discover anyone. The
+defect is that "start from defaults" is safe for one field of a word and not
+for another, and the word was treated as one thing.
+
+`resign_credential` now reports whether it started from an agreement or from
+defaults, and a renewal that could not carry anything across says so and names
+what to check. The default is not changed: an initial credential that excluded
+class 1 would break peering discovery for everyone in order to protect a
+decision nobody had made yet.
+
+### What did not fail
+
+- `peer carry` goes through the one re-signing path, so the share flags and the
+  negotiated terms survive a carriage change and vice versa.
+- The mask is not per direction, which is right: a link carrying bulletins one
+  way is still moving them.
+- `Class::Bulletin as u8 & 7` and `filter::admits`'s `1u8 << (class & 7)` agree
+  on which bit is which.
+- The burn-rate report claims only what a recipient can know. A node cannot see
+  which one-time keys a sender chose, and no consumption count is invented.
+
+### The pattern
+
+Passes 10 and 11 found new work not reaching what older work owns. This one is
+narrower and worse: **a single value whose safe direction differs field by
+field**, where reading either phase alone gives the right answer and reading
+them together gives the wrong one.
+
+The question that finds it is not "what does this touch" but "what does this
+*default to*, and is that the safe direction **for each thing it defaults**".
+A struct's `Default` is a set of decisions wearing one name.

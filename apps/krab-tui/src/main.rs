@@ -3316,15 +3316,24 @@ impl App {
         };
         let was = self.credential_standing(peer);
         match self.resign_credential(peer, None, None) {
-            Ok(path) => format!(
+            Ok((path, from_agreement)) => format!(
                 "renewed: a fresh credential for {peer} is at {}.\n\n\
                  {}\n\n\
                  Give it to them and have them run `peer countersign`. It \
                  carries a new nonce and supersedes the old one by \
                  `established` time (RFC 3 §4); the flags and terms you had \
                  agreed are carried across, so renewing changes nothing you \
-                 both signed except the dates.",
+                 both signed except the dates.{}",
                 path.display(),
+                if from_agreement {
+                    ""
+                } else {
+                    "\n\n**Rebuilt from defaults.** There was no credential to \
+                     carry terms across from — it lapsed and RFC 3 §8.4 purged \
+                     the record. Any `peer carry` or `peer share` decision you \
+                     had made is gone, and carriage is back on: check both \
+                     before you hand this over."
+                },
                 match was {
                     Standing::Live(credential::Life::Expired, _) =>
                         "The old one had already expired, so this link has not \
@@ -3350,7 +3359,7 @@ impl App {
         peer: &str,
         set_share: Option<bool>,
         set_bulletin: Option<bool>,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<(PathBuf, bool), String> {
         let Some(id) = self.identity.as_ref() else {
             return Err("no identity — run `init` first".into());
         };
@@ -3409,7 +3418,19 @@ impl App {
 
         let out = self.home.join(format!("{peer}.credential"));
         atomic::write(&out, &cred.encode()).map_err(|e| format!("could not write it: {e}"))?;
-        Ok(out)
+        // **Whether anything was carried across.**
+        //
+        // `Flags::default()` is safe for §8.3's share bits — false, opt in
+        // rather than out — and is *not* safe for `class_mask`, which defaults
+        // to admitting everything. So a peering whose credential was purged on
+        // expiry (RFC 3 §8.4) and is then renewed silently re-enables carriage
+        // the operator had turned off, while correctly leaving sharing off.
+        //
+        // One default word, two directions, and only one of them was thought
+        // about. The safe direction is not the same for every flag, so the
+        // caller is told which case this was rather than the difference being
+        // invisible.
+        Ok((out, existing.is_some()))
     }
 
     fn peer_share(&mut self, peer: Option<&str>, on: Option<&str>) -> String {
@@ -3431,7 +3452,7 @@ impl App {
             _ => return "say `on` or `off`".into(),
         };
         match self.resign_credential(peer, Some(want), None) {
-            Ok(path) => format!(
+            Ok((path, _)) => format!(
                 "you will {} list {peer}.\n\n\
                  Give {} to them and have them run `peer countersign` — the \
                  flag is inside both signatures, so a peering neither of you \
@@ -3476,7 +3497,7 @@ impl App {
             _ => return "say `on` or `off`".into(),
         };
         match self.resign_credential(peer, None, Some(want)) {
-            Ok(path) => format!(
+            Ok((path, _)) => format!(
                 "this link will {} carry public content.\n\n\
                  Give {} to {peer} and have them run `peer countersign` — the \
                  mask is inside both signatures, so it binds only once you \
@@ -9447,6 +9468,60 @@ mod tests {
         );
         // And the material is still there, so it can be peered with again.
         assert!(a.peer_path(&sb, artifact::PeerFile::Link).exists());
+    }
+
+    /// **One default word, two directions, and only one was thought about.**
+    ///
+    /// `Flags::default()` is safe for RFC 3 §8.3's share bits — false, "opt in
+    /// to being listed, not out" — and is *not* safe for RFC 6 §281's
+    /// `class_mask`, which defaults to admitting everything.
+    ///
+    /// So a peering whose credential lapsed and was purged by §8.4, then
+    /// renewed, correctly came back with sharing off and **silently re-enabled
+    /// the carriage the operator had turned off**. Neither Phase 2 nor Phase 6
+    /// was wrong alone; the safe direction is simply not the same for every
+    /// flag in the word.
+    #[test]
+    fn a_renewal_from_defaults_says_that_it_is_one() {
+        let mut x = ready_node("dflt-x");
+        let mut y = ready_node("dflt-y");
+        let (_, sy) = link_up(&mut x, &mut y);
+        let bit = 1u8 << (krab_core::object::Class::Bulletin as u8 & 7);
+
+        // Turn carriage off, and complete it on both sides.
+        type_command(&mut x, &format!("peer carry {sy} off"));
+        let to_y = y.home.join("c.credential");
+        std::fs::copy(x.home.join(format!("{sy}.credential")), &to_y).unwrap();
+        y.peer_countersign(to_y.to_str());
+        let sx = short_id(&x.identity.as_ref().unwrap().node_id());
+        let to_x = x.home.join("c.credential");
+        std::fs::copy(y.home.join(format!("{sx}.credential")), &to_x).unwrap();
+        x.peer_countersign(to_x.to_str());
+        assert_eq!(
+            x.credential_with(&sy).unwrap().flags.class_mask & bit,
+            0,
+            "the operator's decision did not take"
+        );
+
+        // Renewing while the agreement stands carries it across silently.
+        type_command(&mut x, &format!("peer renew {sy}"));
+        assert!(!x.output.contains("Rebuilt from defaults"), "{}", x.output);
+        let kept = credential::Credential::decode(
+            &std::fs::read(x.home.join(format!("{sy}.credential"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kept.flags.class_mask & bit, 0, "carriage came back");
+
+        // After §8.4 has purged the record, it cannot — and says so.
+        std::fs::remove_file(x.peer_path(&sy, artifact::PeerFile::Credential)).unwrap();
+        type_command(&mut x, &format!("peer renew {sy}"));
+        assert!(
+            x.output.contains("Rebuilt from defaults"),
+            "a renewal silently widened what the link carries: {}",
+            x.output
+        );
+        assert!(x.output.contains("carriage is back on"), "{}", x.output);
+        assert!(x.output.contains("peer carry"), "the way back is not named");
     }
 
     /// **RFC 6 §281: "Nodes MUST support excluding class 1 (bulletin)
