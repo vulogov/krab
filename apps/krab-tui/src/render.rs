@@ -138,9 +138,17 @@ fn frame_for(ui: &Ui, pane: Pane, title: String) -> Block<'static> {
 fn draw_list(f: &mut Frame, area: Rect, view: &View) {
     // RFC 8 §2: the channels list is two-level and the client MUST indicate
     // which level is displayed.
+    //
+    // The node's own short id rides on this frame as well as the output
+    // pane's. This is the pane an operator looks at while reading mail, and
+    // running two nodes on one host — the ordinary way to test anything — the
+    // two windows are otherwise identical. Knowing which node you are typing
+    // into is not a nicety when one of the verbs is `wipe`.
     let title = match (view.ui.tab(), view.ui.level()) {
-        (Tab::Private, _) => " messages ".to_string(),
-        (Tab::Channels, Level::Channels) => " channels ".to_string(),
+        (Tab::Private, _) => format!(" messages · {} ", view.me.unwrap_or("no identity")),
+        (Tab::Channels, Level::Channels) => {
+            format!(" channels · {} ", view.me.unwrap_or("no identity"))
+        }
         (Tab::Channels, Level::Messages) => " channel ▸ posts ".to_string(),
     };
     let rows: Vec<Line> = view.list.iter().map(|s| Line::from(s.as_str())).collect();

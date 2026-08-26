@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+Answering "is it ready, and how do I use it" — the first thing a new node
+could not tell you.
+
+### Added
+
+- **`status`** — identity and short id, lock state, prekeys by tier, the
+  listening address, peers and which of them hold a countersigned credential,
+  and corpus size. It ends with what is *not* done yet, in the order it has to
+  be done, so a fresh node says what its next command is instead of leaving
+  the operator to infer it. `init` and unlock now print the same report.
+- **`force-send <peer>`** — reconciles now rather than at the next Poisson
+  draw, and releases queued fan-out. **This costs unlinkability**: RFC 5 §6.1
+  keeps sync intervals uncorrelated with message events precisely so an
+  observer cannot tell when something was composed, and a sync on your
+  keystroke *is* that correlation. It does not perturb the schedule — the next
+  scheduled sync still falls where it would have — and it says what it cost
+  every time it runs.
+- **`smoke.sh`** — two nodes from nothing to a delivered message. The default
+  mode drives the flow through the same command parser the pane uses;
+  `--manual` creates two homes and prints the walkthrough for two terminals,
+  naming the two things the shortcut gives up.
+- The short id is now on the messages pane frame, not only the output pane.
+
+### Fixed
+
+- The message pane kept "no identity. `init` to create one." after `init`
+  succeeded. Same at unlock.
+- `cargo clippy` is clean across the workspace including `krab-sim`, which had
+  carried three `needless_range_loop` warnings. Two were real; the third scans
+  a column of a row-major array and now says so.
+
 ## 0.1.0 — 2026-08-26
 
 First release. A message from A to B, over sim, TCP, Tor, serial or a

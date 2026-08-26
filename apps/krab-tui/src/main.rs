@@ -3082,6 +3082,202 @@ impl App {
         atomic::write(&self.path(artifact::Artifact::Pinned), &sealed).ok()
     }
 
+    /// `force-send [peer]` — reconcile now, rather than when the schedule says.
+    ///
+    /// **This is the one verb that deliberately breaks an invariant**, so it
+    /// says so every time rather than once in a manual.
+    ///
+    /// RFC 5 §6.1 requires inter-sync intervals be uncorrelated with message
+    /// events, because a sync that follows a composition tells an observer
+    /// watching the link that this node just sent something. Forcing one is
+    /// exactly that correlation.
+    ///
+    /// Two things keep the damage to what was asked for:
+    ///
+    /// - **The schedule is not touched.** `reconcile_with` does not consult or
+    ///   redraw `next_due`, so scheduled syncs remain a Poisson process and
+    ///   §6.1 still holds for every exchange this verb did not cause. What an
+    ///   observer sees is one extra sync, not a schedule that has become
+    ///   readable.
+    /// - **Pending fan-out is released first.** RFC 6 §2.7 staggers group
+    ///   copies over a window precisely so `G−1` objects do not appear at
+    ///   once; flushing them here undoes that for this send. Said plainly,
+    ///   because an operator forcing a group message is giving up more than
+    ///   they are for a private one.
+    fn force_send(&mut self, line: &str) -> String {
+        let Ok(words) = words::split(line) else {
+            return "unbalanced quotes".into();
+        };
+        if self.epoch_key.is_none() {
+            return "locked — unlock first".into();
+        }
+        let named = words.get(1).map(|w| w.text());
+        let peers: Vec<String> = match &named {
+            Some(p) => vec![p.clone()],
+            None => self.links.peer_names(),
+        };
+        if peers.is_empty() {
+            return "no link is up. `connect <peer> tcp <addr>` first — a \
+                    forced exchange still needs a session, and this verb will \
+                    not dial one for you."
+                .into();
+        }
+
+        // RFC 6 §2.7's stagger, given up deliberately for this send.
+        let released = self.release_all_pending();
+
+        let mut moved = (0usize, 0usize);
+        let mut done = Vec::new();
+        for p in &peers {
+            if let Some(event) = self.reconcile_with(p) {
+                if let activity_log::Event::Reconciled { received, sent, .. } = &event {
+                    moved.0 += received;
+                    moved.1 += sent;
+                }
+                done.push(p.clone());
+                self.log.push(event);
+            }
+        }
+        // The exchange runs on a thread, so what it moved arrives later — the
+        // counts above are what returned synchronously, and saying "0" as
+        // though it were a result would be a lie about a thing still running.
+        if done.is_empty() {
+            return format!("nothing to force: no session with {}.", peers.join(", "));
+        }
+        format!(
+            "forced an exchange with {}.{}\n\n\
+             **This is visible.** RFC 5 §6.1 keeps sync intervals uncorrelated \
+             with message events so an observer cannot tell when you composed \
+             something; a forced sync is that correlation. Anyone watching \
+             this link sees a reconciliation that followed your keystroke.\n\n\
+             The schedule is untouched — it stays a Poisson process, so this \
+             is one extra sync rather than a pattern. Results arrive as the \
+             exchange completes; `peers` shows what moved.",
+            done.join(", "),
+            if released > 0 {
+                format!(
+                    "\n\n{released} staggered fan-out cop(ies) released at once. \
+                     RFC 6 §2.7 spreads them over a window so `G−1` objects do \
+                     not appear together — that is given up for this send, and \
+                     the group size is inferable from the burst."
+                )
+            } else {
+                String::new()
+            }
+        )
+    }
+
+    /// Whether this node is ready to operate, and what is missing if not.
+    ///
+    /// **The question `keys`, `peers` and `reach` do not answer.** Each of
+    /// those reports one subsystem well; an operator looking at a fresh screen
+    /// after `init` wants to know whether the thing works yet, and had to
+    /// infer it from three verbs and the absence of an error.
+    ///
+    /// So this ends with what to do next, and says nothing reassuring when
+    /// there is something missing. A status line that reads "ready" on a node
+    /// that cannot receive is worse than no status line.
+    fn status_report(&self) -> String {
+        let Some(id) = self.identity.as_ref() else {
+            return "no identity.\n\n\
+                    `init` creates one. It writes down a backup exactly once, \
+                    during the ceremony — RFC 7 §11, because the moment \
+                    somebody needs a backup is the moment they can no longer \
+                    make one."
+                .into();
+        };
+        let locked = self.epoch_key.is_none();
+        let mut out = format!(
+            "identity   {}\n\
+             {}\n",
+            id.short_id(),
+            if locked {
+                "state      LOCKED — `unlock` to open the store"
+            } else {
+                "state      unlocked"
+            }
+        );
+
+        // Keys.
+        let epochs = id.hierarchy.epochs().count();
+        out.push_str(&format!(
+            "keys       {epochs} epoch key(s), {} prekeys published\n",
+            if self.prekey_age_days().is_some() {
+                prekeys::BATCH_KEYS.to_string()
+            } else {
+                "no".into()
+            }
+        ));
+
+        // Where this node listens, which is the half `keys` never had.
+        out.push_str(&match (&self.listen, self.inbound.is_some()) {
+            (Some(addr), true) => format!("listening  {addr} — accepting any known peer\n"),
+            (Some(addr), false) => {
+                format!("listening  {addr} — CONFIGURED BUT NOT RUNNING, `unlock` first\n")
+            }
+            (None, _) => "listening  no — this node dials out only; a peer \
+                          cannot reach it unprompted\n"
+                .into(),
+        });
+
+        let peers = self.peer_ids();
+        let credentialled = peers
+            .iter()
+            .filter(|p| matches!(self.credential_standing(p), Standing::Live(_, _)))
+            .count();
+        out.push_str(&format!(
+            "peers      {} peered, {credentialled} with a credential\n\
+             corpus     {} object(s), {} byte(s)\n",
+            peers.len(),
+            self.store.len(),
+            self.store.with(|s| s.bytes()),
+        ));
+
+        // **What is missing**, in the order it has to be fixed. Nothing here
+        // says "ready" while something above it is not done.
+        let mut todo: Vec<String> = Vec::new();
+        if locked {
+            todo.push("`unlock` — the store is closed and nothing sends or receives".into());
+        }
+        if peers.is_empty() {
+            todo.push(
+                "`peer offer` — there is nobody to talk to. Peering is \
+                 deliberate and mutual; there is no discovery and no bootstrap \
+                 server, and you cannot join without knowing a participant \
+                 (RFC 3 §11.2)"
+                    .into(),
+            );
+        } else if credentialled < peers.len() {
+            todo.push(format!(
+                "`peer countersign` — {} peering(s) have no credential, so \
+                 nothing is scoped or enforced on them and they will not \
+                 reconcile with a peer that has one",
+                peers.len() - credentialled
+            ));
+        }
+        if self.listen.is_none() && self.links.up_count() == 0 {
+            todo.push(
+                "`listen <addr>` or `connect <peer> tcp <addr>` — this node \
+                 has no way in or out. Mail can still cross by `pack` and \
+                 `import` on a stick"
+                    .into(),
+            );
+        }
+        for w in self.peer_warnings() {
+            todo.push(w.line());
+        }
+
+        if todo.is_empty() {
+            out.push_str("\nready. Mail sends, arrives, and reconciles on the schedule.");
+        } else {
+            out.push_str("\nnot ready yet:\n");
+            for t in &todo {
+                out.push_str(&format!("\x20 - {t}\n"));
+            }
+        }
+        out
+    }
+
     /// RFC 3 §13's warnings, for this node's actual transport mix.
     ///
     /// > "Operators choose peers by hand and will not know any of this.
@@ -4270,6 +4466,27 @@ impl App {
     }
 
     /// Release any fan-out copies whose time has come.
+    /// Release every staggered fan-out copy at once — `force-send` only.
+    ///
+    /// **Gives up RFC 6 §2.7.** The stagger exists so `G−1` objects do not
+    /// appear together in one size bucket, because a burst is visible as
+    /// *"someone just sent to about G people"*. Flushing them undoes that for
+    /// this send, and `force_send` says so rather than doing it quietly.
+    fn release_all_pending(&mut self) -> usize {
+        if self.pending.is_empty() {
+            return 0;
+        }
+        let now_min = now_epoch().0 * 1440;
+        let n = self.pending.len();
+        for p in std::mem::take(&mut self.pending) {
+            let _ = self
+                .store
+                .with(|s| s.ingest(p.id, p.bytes, now_min, u32::MAX));
+        }
+        self.save_corpus();
+        n
+    }
+
     fn release_pending(&mut self) {
         if self.pending.is_empty() {
             return;
@@ -4978,6 +5195,8 @@ impl App {
             Command::Reach => self.output = self.reach_report(line),
             Command::Keys => self.output = self.keys_report(),
             Command::Pin => self.output = self.pin_command(line),
+            Command::Status => self.output = self.status_report(),
+            Command::ForceSend => self.output = self.force_send(line),
             Command::Rollcall => self.output = self.rollcall_command(line),
             Command::Introduce => self.output = self.introduce(line),
             Command::Requests => self.output = self.requests(line),
@@ -8027,6 +8246,12 @@ impl App {
             if let Some(note) = self.start_listener() {
                 self.output.push_str(&format!("\n\n{note}"));
             }
+            // And the same status, for the same reason: a restarted node was
+            // showing "a store is here. `unlock` to open it." in the message
+            // pane *after* it had been opened.
+            let status = self.status_report();
+            self.output.push_str(&format!("\n\n{status}"));
+            self.body = status;
             return;
         }
 
@@ -8067,6 +8292,17 @@ impl App {
                     self.output.push_str(&format!("\n\n{note}"));
                 }
                 self.become_relay_if_asked();
+                // **What state the node is actually in, and what is missing.**
+                //
+                // `init` used to end on "generated 37e35a58" and leave the
+                // message pane holding the text it was given before the
+                // program started — "no identity. `init` to create one." —
+                // so a node that had just been created reported that it had
+                // not been. The operator had no way to tell whether anything
+                // else was needed.
+                let status = self.status_report();
+                self.output.push_str(&format!("\n\n{status}"));
+                self.body = status;
             }
             Some(next) => {
                 if next == InitStep::Generate {
@@ -9522,6 +9758,118 @@ mod tests {
         );
         assert!(x.output.contains("carriage is back on"), "{}", x.output);
         assert!(x.output.contains("peer carry"), "the way back is not named");
+    }
+
+    /// **`force-send` says what it costs, every time.**
+    ///
+    /// RFC 5 §6.1 keeps inter-sync intervals uncorrelated with message events
+    /// so an observer cannot tell when a node composed something. Forcing a
+    /// sync is that correlation, and a verb that breaks an invariant quietly
+    /// is worse than one that does not exist.
+    #[test]
+    fn force_send_states_the_invariant_it_breaks() {
+        let mut a = ready_node("fs-a");
+        // No link: it refuses rather than pretending, and does not dial.
+        type_command(&mut a, "force-send");
+        assert!(a.output.contains("no link is up"), "{}", a.output);
+
+        type_command(&mut a, "connect q3m9 tcp");
+        type_command(&mut a, "force-send");
+        assert!(
+            a.output.contains("RFC 5 §6.1") || a.output.contains("nothing to force"),
+            "{}",
+            a.output
+        );
+    }
+
+    /// **The Poisson schedule is not perturbed.** That is what keeps §6.1
+    /// true for every exchange the operator did not force: what an observer
+    /// sees is one extra sync, not a schedule that has become readable.
+    #[test]
+    fn forcing_an_exchange_does_not_redraw_the_schedule() {
+        let mut a = ready_node("fs-sched");
+        let mut b = ready_node("fs-sched-b");
+        let sb = peer_up(&mut a, &mut b);
+        a.refresh_inbox();
+
+        let id = sync::peer_id_from_node(&a.peer_card(&sb).unwrap().node_id());
+        let before = a.scheduler.next_due(&id);
+        assert!(before.is_some(), "the peering was never scheduled");
+
+        type_command(&mut a, &format!("force-send {sb}"));
+        assert_eq!(
+            a.scheduler.next_due(&id),
+            before,
+            "forcing an exchange moved the next scheduled one, which makes the \
+             schedule a function of when the operator typed"
+        );
+    }
+
+    /// A locked node forces nothing.
+    #[test]
+    fn a_locked_node_cannot_force_an_exchange() {
+        let mut a = ready_node("fs-lock");
+        a.lock();
+        type_command(&mut a, "force-send");
+        assert!(a.output.contains("locked"), "{}", a.output);
+    }
+
+    /// **After `init`, a node says what state it is in.**
+    ///
+    /// It used to end on "generated 37e35a58" and leave the message pane
+    /// holding the text it was given before the program started — "no
+    /// identity. `init` to create one." So a node that had just been created
+    /// reported that it had not been, and an operator had no way to tell
+    /// whether anything else was needed.
+    #[test]
+    fn init_ends_by_saying_whether_the_node_is_ready() {
+        let mut a = ready_node("status-a");
+
+        let s = a.status_report();
+        assert!(s.contains(&a.identity.as_ref().unwrap().short_id()), "{s}");
+        assert!(s.contains("keys"), "{s}");
+        assert!(s.contains("listening"), "{s}");
+        assert!(s.contains("corpus"), "{s}");
+
+        // A fresh node is **not** ready, and says what is missing rather than
+        // anything reassuring — a status line reading "ready" on a node that
+        // cannot receive is worse than none.
+        assert!(s.contains("not ready yet"), "{s}");
+        assert!(s.contains("peer offer"), "the next step is not named: {s}");
+        assert!(
+            !s.contains("\nready."),
+            "a node with no peers claimed ready"
+        );
+
+        // The verb prints the same thing.
+        type_command(&mut a, "status");
+        assert_eq!(a.output, s);
+    }
+
+    /// Where the node listens is in it — the half `keys` never reported, and
+    /// the one the screenshot was missing.
+    #[test]
+    fn the_status_says_where_the_node_listens() {
+        let mut a = ready_node("status-listen");
+        assert!(
+            a.status_report().contains("dials out only"),
+            "{}",
+            a.status_report()
+        );
+
+        a.listen = Some("127.0.0.1:40000".into());
+        let s = a.status_report();
+        assert!(s.contains("127.0.0.1:40000"), "{s}");
+    }
+
+    /// A locked node says so first, because nothing else it reports matters.
+    #[test]
+    fn a_locked_node_reports_locked_before_anything_else() {
+        let mut a = ready_node("status-lock");
+        a.lock();
+        let s = a.status_report();
+        assert!(s.contains("LOCKED"), "{s}");
+        assert!(s.contains("unlock"), "{s}");
     }
 
     /// **RFC 6 §281: "Nodes MUST support excluding class 1 (bulletin)

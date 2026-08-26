@@ -81,6 +81,29 @@ pub enum Command {
     /// not link at all. A bind address is not a dial address and must not be
     /// spelled like one.
     Listen,
+    /// **Not in RFC 8 §5, and against the grain of RFC 5 §6.1.** Reconcile
+    /// with a peer now, rather than when the schedule says.
+    ///
+    /// §6.1 requires inter-sync intervals be uncorrelated with message
+    /// events, and this is that correlation by construction: an observer
+    /// watching the link sees a sync that followed a composition. It exists
+    /// because testing a two-node setup otherwise means waiting on a Poisson
+    /// draw, and because an operator who needs something to go now will
+    /// otherwise restart the process to get it — which leaks the same thing
+    /// and tells them less.
+    ///
+    /// It does **not** perturb the schedule. The forced exchange is extra, so
+    /// scheduled syncs stay uncorrelated and §6.1 still holds for everything
+    /// this verb did not cause.
+    ForceSend,
+    /// **Not in RFC 8 §5.** Whether this node is ready to operate, and what
+    /// is missing if it is not.
+    ///
+    /// §5 has `keys`, `peers` and `reach`, each answering one question well.
+    /// None answers "can I use this yet", which is the question an operator
+    /// has on the screen after `init` and cannot get from a verb that reports
+    /// one subsystem.
+    Status,
     /// **Not in RFC 8 §5.** Every verb, listed. §5 assumes an operator who
     /// has read it; an operator running a node for the first time has an
     /// empty screen and a prompt, and no way to find out what to type.
@@ -159,13 +182,15 @@ impl Command {
     /// to 19 of 26 without anything noticing. `every_variant_is_in_all` closes
     /// that: it matches on `Command` exhaustively, so a new variant does not
     /// compile until it appears here.
-    pub const ALL: [Command; 27] = [
+    pub const ALL: [Command; 29] = [
         Command::Pin,
         Command::Picture,
         Command::Group,
         Command::Channel,
         Command::Quit,
         Command::Listen,
+        Command::ForceSend,
+        Command::Status,
         Command::Help,
         Command::Init,
         Command::Peer,
@@ -218,6 +243,8 @@ impl Command {
             "group" => Command::Group,
             "pin" => Command::Pin,
             "picture" | "pic" => Command::Picture,
+            "force-send" => Command::ForceSend,
+            "status" => Command::Status,
             "help" | "?" => Command::Help,
             _ => return None,
         })
@@ -314,6 +341,14 @@ impl Command {
         (
             "wipe",
             "destroy the key hierarchy — irreversible, asks twice",
+        ),
+        (
+            "status",
+            "whether this node is ready to operate, and what is missing",
+        ),
+        (
+            "force-send [peer]",
+            "reconcile now instead of on the schedule — leaks that you just sent",
         ),
         ("help", "this list"),
         ("quit", "leave — the same as Ctrl-Q"),
@@ -436,6 +471,8 @@ impl fmt::Display for Command {
             Command::Group => "group",
             Command::Pin => "pin",
             Command::Picture => "picture",
+            Command::ForceSend => "force-send",
+            Command::Status => "status",
             Command::Help => "help",
         };
         f.write_str(s)
@@ -667,6 +704,8 @@ mod tests {
                 Command::Channel => {}
                 Command::Quit => {}
                 Command::Listen => {}
+                Command::ForceSend => {}
+                Command::Status => {}
                 Command::Help => {}
                 Command::Init => {}
                 Command::Peer => {}
@@ -690,7 +729,7 @@ mod tests {
                 Command::Verify => {}
             }
         }
-        assert_eq!(Command::ALL.len(), 27);
+        assert_eq!(Command::ALL.len(), 29);
     }
 
     /// **Every verb round-trips.** RFC 8 §5's ten, and the sixteen it omits.

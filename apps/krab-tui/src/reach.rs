@@ -100,7 +100,7 @@ impl Path {
             }
             if link.shard_k > 0 {
                 let width = 1u64 << link.shard_k;
-                if shard % width != 0 {
+                if !shard.is_multiple_of(width) {
                     return Verdict::Block(Block::Shard {
                         k: link.shard_k,
                         shard,

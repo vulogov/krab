@@ -414,7 +414,7 @@ pub fn to_text(t: &Token) -> String {
 /// pasted, which may be anything at all.
 pub fn from_text(s: &str) -> Option<Token> {
     let s = s.trim();
-    if s.len() % 2 != 0 || s.is_empty() {
+    if !s.len().is_multiple_of(2) || s.is_empty() {
         return None;
     }
     let mut bytes = Vec::with_capacity(s.len() / 2);

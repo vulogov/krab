@@ -555,7 +555,7 @@ pub const ODD: [&str; 256] = [
 
 /// The word for `byte` at `position`.
 pub fn word(position: usize, byte: u8) -> &'static str {
-    if position % 2 == 0 {
+    if position.is_multiple_of(2) {
         EVEN[byte as usize]
     } else {
         ODD[byte as usize]

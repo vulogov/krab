@@ -300,8 +300,8 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
         *seq += 1;
         q.push(Sched { t, seq: *seq, ev });
     };
-    for i in 0..m {
-        push(&mut q, &mut seq, objs[i].created, Ev::Inject(i as u32));
+    for (i, o) in objs.iter().enumerate().take(m) {
+        push(&mut q, &mut seq, o.created, Ev::Inject(i as u32));
     }
     for (li, l) in links.iter().enumerate() {
         let first = (rng.f64() * l.kind.sync_mean()) as u64;
@@ -573,12 +573,11 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
     for oi in lo..hi {
         let age = cfg.horizon.saturating_sub(created[oi]);
         let b = (((age as f64 / cfg.ttl as f64) * NB as f64) as usize).min(NB - 1);
-        let mut holders: u64 = 0;
-        for u in 0..cfg.n {
-            if store[u].get(oi) {
-                holders += 1;
-            }
-        }
+        let holders = store
+            .iter()
+            .take(cfg.n)
+            .filter(|s| s.get(oi))
+            .count() as u64;
         age_hold[b] += holders;
         age_tot[b] += cfg.n as u64;
         held_total += holders as u128;
@@ -710,6 +709,9 @@ pub fn run(cfg: &Config, seed: u64) -> Option<RunResult> {
             }
             let mut best = 0usize;
             let mut ll: Vec<f64> = Vec::with_capacity(cfg.n);
+            // `c` indexes the second axis of `dists`, one column across every
+            // row — not a walk over a slice, so there is no iterator to take.
+            #[allow(clippy::needless_range_loop)]
             for c in 0..cfg.n {
                 let mut s = 0.0f64;
                 for (vi, &o) in obs.iter().enumerate() {
