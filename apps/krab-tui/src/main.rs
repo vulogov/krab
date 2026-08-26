@@ -499,6 +499,9 @@ struct App {
     /// Where inbound links arrive, from `--listen`. `None` means this node
     /// only dials.
     listen: Option<String>,
+    /// Why the listener is not running, when `--listen` was given and the
+    /// bind failed. Without this, `status` blames the lock for a busy port.
+    listen_error: Option<String>,
     /// Inbound sessions accepted by the background listener, waiting to be
     /// installed. Drained on each tick.
     inbound: Option<std::sync::mpsc::Receiver<krab_fabric::backend::listener::Accepted>>,
@@ -565,6 +568,7 @@ impl Default for App {
             home: default_home(),
             relay: false,
             listen: None,
+            listen_error: None,
             roster: channels::Roster::default(),
             rollcall: rollcall::Listing::default(),
             introductions: Vec::new(),
@@ -3213,7 +3217,15 @@ impl App {
         out.push_str(&match (&self.listen, self.inbound.is_some()) {
             (Some(addr), true) => format!("listening  {addr} — accepting any known peer\n"),
             (Some(addr), false) => {
-                format!("listening  {addr} — CONFIGURED BUT NOT RUNNING, `unlock` first\n")
+                // Two different failures reach here and they need different
+                // advice. A bind that failed is not a node that needs
+                // unlocking, and telling an unlocked operator to `unlock`
+                // sends them to the one place the problem is not.
+                let why = match &self.listen_error {
+                    Some(e) => e.clone(),
+                    None => "`unlock` first".to_string(),
+                };
+                format!("listening  {addr} — CONFIGURED BUT NOT RUNNING: {why}\n")
             }
             (None, _) => "listening  no — this node dials out only; a peer \
                           cannot reach it unprompted\n"
@@ -7811,7 +7823,15 @@ impl App {
             self.allowed.clone(),
         ) {
             Ok(v) => v,
-            Err(e) => return Some(format!("could not listen on {addr}: {e:?}")),
+            Err(e) => {
+                // Remember it. `status` reads this rather than inferring a
+                // cause from `inbound` being empty, which it got wrong: a
+                // node that is unlocked and failed to bind was told to
+                // `unlock`, which it had already done.
+                let why = format!("could not listen on {addr}: {e:?}");
+                self.listen_error = Some(why.clone());
+                return Some(why);
+            }
         };
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -7831,6 +7851,7 @@ impl App {
             }
         });
         self.inbound = Some(rx);
+        self.listen_error = None;
         Some(format!(
             "listening on {addr} (port {port}) for any peered node.\n\n\
              Nothing else is needed at this end. The other end dials with:\n\
@@ -9860,6 +9881,32 @@ mod tests {
         a.listen = Some("127.0.0.1:40000".into());
         let s = a.status_report();
         assert!(s.contains("127.0.0.1:40000"), "{s}");
+    }
+
+    /// **A listener that failed to bind is not a node that needs unlocking.**
+    ///
+    /// Found by running two nodes for real: the second was told to bind a port
+    /// the first already held, and its status said "CONFIGURED BUT NOT
+    /// RUNNING, `unlock` first" while sitting one line under "state
+    /// unlocked". The operator is sent to the one place the problem is not.
+    #[test]
+    fn a_listener_that_could_not_bind_says_why_not_unlock() {
+        let mut a = ready_node("status-bind");
+        a.listen = Some("127.0.0.1:40000".into());
+        a.listen_error = Some("could not listen on 127.0.0.1:40000: AddrInUse".into());
+
+        let s = a.status_report();
+        assert!(s.contains("CONFIGURED BUT NOT RUNNING"), "{s}");
+        assert!(s.contains("AddrInUse"), "the real cause is missing: {s}");
+        assert!(
+            !s.contains("NOT RUNNING: `unlock` first"),
+            "an unlocked node was told to unlock: {s}"
+        );
+
+        // And with no recorded failure it still gives the ordinary advice,
+        // which is right for the case it was written for.
+        a.listen_error = None;
+        assert!(a.status_report().contains("`unlock` first"));
     }
 
     /// A locked node says so first, because nothing else it reports matters.

@@ -43,23 +43,37 @@ In each, once:
   init                            identity, and the backup shown exactly once
   status                          says what is still missing
 
-Peer them. Both ends run the same steps — there is no initiator:
+Peer them. Both ends run the same steps — there is no initiator. The order
+below is the order the app itself prints, and it is not interchangeable:
 
   peer offer                      writes peer.card into that home
-  peer pad $EX/<yours>.pad
 
-Copy both files across; on one host $EX is your courier. Then in each:
+Copy each home's peer.card across as <name>.card; on one host $EX is your
+courier. Then in each:
 
-  peer accept $EX/<theirs>.card
-  peer verified <their-short-id>  you compared the fingerprint words
+  peer accept $EX/<theirs>.card   prints both fingerprints to compare aloud
+  peer pad $EX/<yours>.pad        your SECRET half — carry it, don't leave it
   peer seal $EX/<theirs>.pad in-person
-  peer countersign <file>         both signatures on the credential
 
-Then:
+\`peer seal\` is what records the terms, and only then does the link exist to
+say anything about. So verification comes after it, not before:
+
+  peer verified <their-short-id>  you compared the fingerprint words
+
+\`peer seal\` wrote <their-short-id>.credential into your home, carrying only
+your signature. Swap those two files and countersign what you receive:
+
+  peer countersign $EX/<theirs>.credential
+
+Then, and \`connect\` must come first — force-send uses an existing session
+and will not dial one for you:
 
   connect <their-short-id> tcp 127.0.0.1:4000{0,1}
-  message <their-short-id>        type, Ctrl-D to seal and queue
+  send <their-short-id>           type, Ctrl-D to seal and queue
   force-send <their-short-id>     do not wait for the Poisson draw
+
+\`send\` addresses the composition to that peer. \`message\` also opens a
+composer, but an unaddressed one — it will not reach anybody.
 
 Two things this shortcut costs, and they are real:
 
