@@ -213,6 +213,17 @@ const MEET_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// same keystroke moves a different distance depending on state.
 const OUTPUT_SCROLL_LINES: usize = 8;
 
+/// Marks an inbox row whose message carries an attachment.
+///
+/// One cell wide, so the column it sits in is the same width on every row
+/// whether or not there is an attachment. Deliberately not an emoji: those
+/// are two cells in most terminals and one in some, which is a column that
+/// moves depending on who is looking at it.
+///
+/// RFC 8 §6 permits pictures and no other attachment type, so this means
+/// exactly one thing and needs no second glyph.
+const ATTACHMENT_GLYPH: &str = "▣";
+
 /// How many ticks an activity glyph keeps turning after bytes move.
 ///
 /// Long enough to be seen at a glance, short enough that it stops well before
@@ -533,6 +544,9 @@ struct App {
     /// Dropped on lock: it is derived from static-static shared secrets, so it
     /// is content-key material and a relay must not hold it.
     tag_table: Option<receive::TagTable>,
+    /// The correspondent names `tag_table` was built from. A table is stale
+    /// when this no longer matches, not only when the epoch has rolled.
+    tag_table_peers: Vec<String>,
     /// Set by the confirmation prompt, consumed by the next command.
     confirmed: bool,
     /// Where the first-run ceremony has got to, if it is running.
@@ -604,6 +618,7 @@ impl Default for App {
             selected: 0,
             log: activity_log::ActivityLog::new(),
             tag_table: None,
+            tag_table_peers: Vec::new(),
             confirmed: false,
             init_step: None,
             unlocking: false,
@@ -1381,6 +1396,33 @@ impl App {
         }
     }
 
+/// One inbox row: who it is from, whether it carries an attachment, and the
+/// first line of the body.
+///
+/// Separate from `refresh_inbox` so the format can be asserted directly. The
+/// pane renders exactly this, so a change to it has to break those tests.
+fn inbox_row(m: &receive::Message) -> String {
+    format!(
+        "{}  {} {}{}",
+        m.from,
+        // **An attachment is visible in the list, not only once opened.**
+        // One cell, always present so the body column does not shift between
+        // rows — a ragged column is harder to scan than no marker at all.
+        // RFC 8 §6 permits pictures and nothing else, so it means one thing.
+        if m.picture.is_some() {
+            ATTACHMENT_GLYPH
+        } else {
+            " "
+        },
+        // **A body is foreign text like any other.** Phase 4 routed the
+        // request notes through `display::safe` and left this — the path an
+        // operator reads most — rendering U+202E, escape sequences and
+        // zero-width characters verbatim.
+        display::safe(m.body.lines().next().unwrap_or("")).text,
+        if m.post_quantum { "" } else { "  (no reservoir)" }
+    )
+}
+
     /// Rebuild the tag table and open what this node can read.
     ///
     /// Called after anything that changes the corpus or the correspondent set.
@@ -1453,10 +1495,28 @@ impl App {
         }
 
         let epoch = now_epoch();
-        // Rebuild only on rollover. A stale table loses the newest epoch,
-        // which would present as "mail from today is undecryptable".
-        if !self.tag_table.as_ref().is_some_and(|t| t.is_current(epoch)) {
+        // **Rebuild on rollover *or* on a change to the correspondent set.**
+        //
+        // Epoch alone was the condition, and it was not enough: a node that
+        // completed its first peering while running kept the table it built
+        // at startup, when it had no peers. Nothing from that peer carried a
+        // tag it knew, so every message matched nothing and the pane read
+        // "(no messages — N objects examined)" while the corpus grew. It
+        // worked after a restart, which is what made it look like a refresh
+        // delay rather than a stale cache.
+        //
+        // The set is compared by name, which is what `Correspondent` is keyed
+        // on — so peering, unpeering and a renewal that replaces a link all
+        // invalidate it, not only the clock.
+        let built_from: Vec<String> = peers.iter().map(|p| p.name.clone()).collect();
+        let current = self
+            .tag_table
+            .as_ref()
+            .is_some_and(|t| t.is_current(epoch))
+            && self.tag_table_peers == built_from;
+        if !current {
             self.tag_table = Some(receive::TagTable::build(&peers, epoch));
+            self.tag_table_peers = built_from;
         }
         let table = self.tag_table.as_ref().expect("just built");
         // **Every private key this node holds**, in a fixed order: the
@@ -1543,26 +1603,7 @@ impl App {
                 scan.examined
             )]
         } else {
-            scan.messages
-                .iter()
-                .map(|m| {
-                    format!(
-                        "{}  {}{}",
-                        m.from,
-                        // **A body is foreign text like any other.** Phase 4
-                        // routed the request notes through `display::safe`
-                        // and left this — the path an operator reads most —
-                        // rendering U+202E, escape sequences and zero-width
-                        // characters verbatim.
-                        display::safe(m.body.lines().next().unwrap_or("")).text,
-                        if m.post_quantum {
-                            ""
-                        } else {
-                            "  (no reservoir)"
-                        }
-                    )
-                })
-                .collect()
+            scan.messages.iter().map(Self::inbox_row).collect()
         };
         // Bases recorded now that the scan's borrow has ended. Deferred rather
         // than skipped: without them, a delta arriving next week has nothing
@@ -9830,6 +9871,70 @@ mod tests {
         assert!(a.output.contains("connect"), "no way out named: {}", a.output);
     }
 
+    /// **A node that peers while running must be able to read the mail.**
+    ///
+    /// The tag table was rebuilt on epoch rollover and on nothing else. A
+    /// node that completed its first peering without restarting kept the
+    /// table it built at startup, when it had no correspondents — so nothing
+    /// from that peer carried a tag it knew. The pane read
+    /// "(no messages — N objects examined)" while the corpus grew, and a
+    /// restart fixed it, which made a stale cache look like a refresh delay.
+    ///
+    /// Found by delivering to a freshly peered node and watching twelve polls
+    /// go by with the objects on disk and nothing in the list.
+    #[test]
+    fn a_peering_made_while_running_is_visible_without_a_restart() {
+        // Prime the table the way a running node does: scan once, with no
+        // correspondents at all. This is the state the bug depended on.
+        let mut b = ready_node("stale-tags-b");
+        b.refresh_inbox();
+        assert!(b.tag_table.is_some(), "the empty table was not built");
+        assert!(b.tag_table_peers.is_empty(), "there should be no peers yet");
+
+        // Now peer, in this process, without restarting.
+        let mut a = ready_node("stale-tags-a");
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+        let carry = |from: &App, to: &App, name: artifact::Artifact, as_name: &str| {
+            let bytes = std::fs::read(from.path(name)).expect("artifact exists");
+            let dest = to.at(as_name);
+            std::fs::write(&dest, bytes).expect("delivered");
+            dest.to_string_lossy().into_owned()
+        };
+        let a_card = carry(&a, &b, artifact::Artifact::PeerCard, "from-a.card");
+        let b_card = carry(&b, &a, artifact::Artifact::PeerCard, "from-b.card");
+        type_command(&mut a, &format!("peer accept {b_card}"));
+        type_command(&mut b, &format!("peer accept {a_card}"));
+        let a_pad = pad_onto(&mut a, &b.at("from-a.pad"));
+        let b_pad = pad_onto(&mut b, &a.at("from-b.pad"));
+        type_command(&mut a, &format!("peer seal {b_pad} media"));
+        type_command(&mut b, &format!("peer seal {a_pad} media"));
+
+        let b_id = short_id(&b.identity.as_ref().unwrap().node_id());
+        type_command(&mut a, &format!("send {b_id} peered while running"));
+        assert!(a.output.contains("composed"), "{}", a.output);
+
+        // Carry every object across, as a reconciliation would.
+        let now_min = now_epoch().0 * 1440;
+        let carried: Vec<(krab_core::object::ObjectId, Vec<u8>)> = a.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|x| (i, x.to_vec())))
+                .collect()
+        });
+        for (i, bytes) in carried {
+            let _ = b.store.with(|s| s.ingest(i, bytes, now_min, u32::MAX));
+        }
+
+        b.refresh_inbox();
+        assert!(
+            b.messages.iter().any(|m| m.body.contains("peered while running")),
+            "a peering made while running cannot read its mail — the tag \
+             table was not rebuilt. list: {:?}",
+            b.list
+        );
+    }
+
     /// **Mail that arrived must be on the disk, not only in the pane.**
     ///
     /// The exchange thread puts received objects into the store, which is
@@ -16041,6 +16146,58 @@ mod tests {
         );
         // The list shows it as a picture rather than as mangled text.
         assert!(m.body.contains("[picture"), "{}", m.body);
+
+        // **And the row is marked, so an attachment is visible without
+        // opening anything.** Asserted on `list`, which is what the pane
+        // renders, rather than on the `Message` — the glyph is a property of
+        // the row and a change to the row format has to break this.
+        let row = b
+            .list
+            .iter()
+            .find(|r| r.contains("[picture"))
+            .expect("the picture is not in the list");
+        assert!(
+            row.contains(ATTACHMENT_GLYPH),
+            "an attachment is not marked in the list: {row}"
+        );
+    }
+
+    /// **The marker column is the same width on every row.**
+    ///
+    /// A glyph that only appears on some rows moves the body column between
+    /// them, which is harder to scan than no marker. The blank is deliberate.
+    #[test]
+    fn the_attachment_column_holds_its_width_without_an_attachment() {
+        // `Message` is deliberately not `Clone` — it holds plaintext that
+        // `lock` destroys — so both rows are built outright.
+        let mk = |body: &str, picture: Option<Vec<u8>>| receive::Message {
+            id: krab_crypto::hash::object_id(b"x"),
+            from: "deadbeef".into(),
+            epoch: now_epoch(),
+            body: body.into(),
+            picture,
+            post_quantum: true,
+            nodelist: None,
+        };
+        let with = App::inbox_row(&mk("[picture]", Some(a_png(2, 2))));
+        let without = App::inbox_row(&mk("plain", None));
+
+        assert!(with.contains(ATTACHMENT_GLYPH), "{with}");
+        assert!(!without.contains(ATTACHMENT_GLYPH), "{without}");
+        // Columns are cells, not bytes: the glyph is three bytes of UTF-8
+        // and one cell, so comparing byte offsets would fail on a row that
+        // lines up perfectly on screen.
+        let col = |row: &str, needle: &str| {
+            row[..row.find(needle).expect("body not in row")]
+                .chars()
+                .count()
+        };
+        assert_eq!(
+            col(&with, "[picture]"),
+            col(&without, "plain"),
+            "the body column moved between a row with an attachment and one \
+             without:\n  {with}\n  {without}"
+        );
     }
 
     /// `picture save` writes bytes and does not open anything — RFC 8 §6
