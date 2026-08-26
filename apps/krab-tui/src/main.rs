@@ -1346,6 +1346,7 @@ impl App {
 
     /// Drain finished exchanges. Never blocks.
     fn drain_exchanges(&mut self) {
+        let mut arrived = 0usize;
         while let Ok(event) = self.exchanges.1.try_recv() {
             if matches!(event, activity_log::Event::Failed { .. }) {
                 self.links.failed(event.peer());
@@ -1355,8 +1356,22 @@ impl App {
             // in, because that is the traffic a fan-out would be hiding among.
             if let activity_log::Event::Reconciled { received, .. } = &event {
                 self.observed_arrivals += *received as u64;
+                arrived += *received;
             }
             self.log.push(event);
+        }
+        // **Received mail has to reach the disk here.**
+        //
+        // The exchange thread puts objects into the store, which is memory.
+        // Nothing on the receive path wrote them out, so a node that took
+        // delivery and then exited had lost it — and the loss was invisible,
+        // because the sender still holds the objects and hands them over
+        // again at the next reconciliation. It stops being invisible exactly
+        // when the sender no longer has them: after its retention horizon
+        // (RFC 3 §7), or after a wipe. Found by watching `corpus.krab` stay
+        // at its old size while three messages sat in the pane above it.
+        if arrived > 0 {
+            self.save_corpus();
         }
         // RFC 3 §6's counters, which an exchange may have just moved.
         self.save_spends();
@@ -9813,6 +9828,73 @@ mod tests {
         type_command(&mut a, "force-send");
         assert!(a.output.contains("nothing to force"), "{}", a.output);
         assert!(a.output.contains("connect"), "no way out named: {}", a.output);
+    }
+
+    /// **Mail that arrived must be on the disk, not only in the pane.**
+    ///
+    /// The exchange thread puts received objects into the store, which is
+    /// memory. Nothing on the receive path wrote them out, so a node that
+    /// took delivery and exited lost it. The loss was invisible because the
+    /// sender re-delivers from its own copy at the next reconciliation — it
+    /// would have surfaced only once the sender no longer had it.
+    ///
+    /// Found by running two nodes and watching `corpus.krab` sit at 4111
+    /// bytes while three delivered messages, one of them a picture, were
+    /// listed in the pane above it.
+    #[test]
+    fn received_mail_reaches_the_disk_not_only_the_pane() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("persist-recv");
+        type_command(&mut a, &format!("send {b_id} this must outlive the process"));
+
+        let corpus = b.path(artifact::Artifact::Corpus);
+        let before = std::fs::metadata(&corpus).map(|m| m.len()).unwrap_or(0);
+
+        let (sa, sb) = session_pair();
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+        a.links.established(&b_id, Some(Box::new(sa)));
+        b.links.connect(&a_id, profile_named("tcp").unwrap());
+        b.links.established(&a_id, Some(Box::new(sb)));
+
+        let a_peer = a_id.clone();
+        let responder = std::thread::spawn(move || {
+            b.answer_reconciliation(&a_peer);
+            // The store is shared with the exchange thread, so plaintext can
+            // appear in the pane a moment before the completion event drains.
+            // Keep draining past that point: the write happens on the event.
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut seen_after = 0;
+            while std::time::Instant::now() < deadline {
+                b.drain_exchanges();
+                if !b.messages.is_empty() {
+                    seen_after += 1;
+                    if seen_after > 25 {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            b
+        });
+        a.reconcile_with(&b_id);
+        let b = responder.join().expect("B's thread");
+
+        assert!(
+            b.messages.iter().any(|m| m.body.contains("outlive")),
+            "nothing arrived, so this proves nothing"
+        );
+
+        // The pane has it. The question is whether the disk does.
+        let after = std::fs::metadata(&corpus).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            after > before,
+            "the corpus on disk did not grow: {before} -> {after}. \
+             Received mail is lost when the process exits."
+        );
+
+        // And read it back the way a restart would, with no help from memory.
+        let mut fresh = krab_store::index::Store::default();
+        let n = persist::read_corpus(&corpus, &mut fresh, 0).expect("corpus reads back");
+        assert!(n > 0, "the persisted corpus is empty");
     }
 
     /// **A forced exchange that started must not report that it did not.**
