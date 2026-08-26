@@ -310,21 +310,30 @@ from the erasure everything else gets**, and that erasure is what stops a
 seized disk being a transcript. Every pin is a hole in it, `pin` says how many
 holes there are, and `pin release` closes one.
 
-### Phase 6 — the remainder *(to verify)*
+### Phase 6 — the remainder · **done 2026-08-25**
 
-Candidates, in the order they should be checked:
+Audited. Of the five candidates, **one was a real gap and one was half-built**;
+the other three were already met, and one of my own findings was wrong.
 
-| document | line | requirement | note |
-|---|---|---|---|
-| RFC 6 §216 | "MUST surface burn rate and MUST warn when joining a group would make the batch insufficient" | `groups::prekey_warning` exists; whether `keys` surfaces the rate is unchecked |
-| RFC 6 §281 | "Nodes MUST support excluding class 1 (bulletin) entirely via `class_mask`" | the filter enforces `class_mask`; **nothing sets it** — `Flags::class_mask` is `0xFF` and no verb changes it |
-| RFC 7 §509 | "Implementations MUST store ciphertext and derive on display" | no marker found in the tree; needs reading rather than grepping |
-| RFC 7 §410 | "MUST surface this wherever the link is displayed" (non-post-quantum reservoir) | `peers` does say it; other views unchecked |
-| RFC 6 §158 | "Divergence MUST be surfaced, not silently resolved" | `groups::divergence` exists; whether every caller surfaces it is unchecked |
+| candidate | verdict |
+|---|---|
+| RFC 6 §281 — exclude class 1 via `class_mask` | **real gap, now built.** The filter enforced the mask and nothing ever set it: `Flags::class_mask` was `0xFF` and no verb changed it, so a node could not decline public content however much it wanted to. `peer carry <peer> on\|off` re-signs the credential; the same shape the share flag had before `peer share` |
+| RFC 6 §216 — surface burn rate | **half-built.** The join-time warning was already wired; the `keys` report said nothing about prekeys at all, and §216's point is that "exhaustion degrades forward secrecy **silently**" |
+| RFC 6 §216 — warn at join | already met — `prekey_warning` is called from `group_member` |
+| RFC 7 §410 — surface a non-post-quantum reservoir | already met, in seven places |
+| RFC 6 §158 — divergence surfaced, not resolved | already met — `roster_divergences` renders in the group list |
 
-§281 is the one that looks most like a real gap: the enforcement is built and
-the control is not, which is the same shape as the share flag before `peer
-share` existed.
+**A correction worth recording.** The audit's first pass reported that
+`prekey_warning` had no production caller, and it does — `main.rs:1757`. The
+grep that produced the finding ended in `head -4` and the four lines it kept
+were all from `groups.rs`; the caller was on the fifth. A truncated search
+reported as an absence.
+
+That is the same failure the passes keep finding, turned on the audit itself: a
+rule — here "this function is never called" — asserted over a set that was not
+the whole set. It is recorded because the fix is not "be careful with `head`",
+it is to make a claim of absence prove itself, and this one did not.
+
 
 ## 3. What is deliberately not on this list
 

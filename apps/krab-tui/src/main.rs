@@ -3315,7 +3315,7 @@ impl App {
                 .into();
         };
         let was = self.credential_standing(peer);
-        match self.resign_credential(peer, None) {
+        match self.resign_credential(peer, None, None) {
             Ok(path) => format!(
                 "renewed: a fresh credential for {peer} is at {}.\n\n\
                  {}\n\n\
@@ -3349,6 +3349,7 @@ impl App {
         &mut self,
         peer: &str,
         set_share: Option<bool>,
+        set_bulletin: Option<bool>,
     ) -> Result<PathBuf, String> {
         let Some(id) = self.identity.as_ref() else {
             return Err("no identity — run `init` first".into());
@@ -3387,6 +3388,18 @@ impl App {
                 cred.flags.b_shares_a = want;
             }
         }
+        // RFC 6 §281 — "Nodes MUST support excluding class 1 (bulletin)
+        // entirely via `class_mask`." Not per direction: the mask is one
+        // field of the credential and both parties sign it, so a link either
+        // carries public content or does not.
+        if let Some(want) = set_bulletin {
+            let bit = 1u8 << (krab_core::object::Class::Bulletin as u8 & 7);
+            if want {
+                cred.flags.class_mask |= bit;
+            } else {
+                cred.flags.class_mask &= !bit;
+            }
+        }
         cred.sig_a = None;
         cred.sig_b = None;
         let Some(id) = self.identity.as_ref() else {
@@ -3417,7 +3430,7 @@ impl App {
             "off" | "no" | "false" => false,
             _ => return "say `on` or `off`".into(),
         };
-        match self.resign_credential(peer, Some(want)) {
+        match self.resign_credential(peer, Some(want), None) {
             Ok(path) => format!(
                 "you will {} list {peer}.\n\n\
                  Give {} to them and have them run `peer countersign` — the \
@@ -3426,6 +3439,61 @@ impl App {
                  exposing the other unilaterally (RFC 3 §8.3).",
                 if want { "now" } else { "no longer" },
                 path.display()
+            ),
+            Err(e) => e,
+        }
+    }
+
+    /// `peer carry <peer> on|off` — RFC 6 §281.
+    ///
+    /// > "Nodes MUST support excluding class 1 (bulletin) entirely via
+    /// > `class_mask`."
+    ///
+    /// The filter has enforced `class_mask` since it existed and **nothing
+    /// ever set it**: `Flags::class_mask` was `0xFF` and no verb changed it,
+    /// so a node could not decline public content however much it wanted to.
+    /// The same shape the share flag had before `peer share`.
+    ///
+    /// Not per direction. The mask is one field of the credential and both
+    /// parties sign it, so a link either carries bulletins or it does not —
+    /// which is right, because a link that carried them one way would still
+    /// be moving them.
+    fn peer_carry(&mut self, peer: Option<&str>, on: Option<&str>) -> String {
+        let (Some(peer), Some(on)) = (peer, on) else {
+            return "usage: peer carry <peer> on|off\n\n\
+                    Whether this link carries public content — channel posts, \
+                    prekey batches, rollcall entries (RFC 1 §5.2's bulletins).\n\n\
+                    Turning it off narrows what crosses to sealed mail only. \
+                    RFC 6 §281 requires a node be able to decline class 1 \
+                    entirely; RFC 6 §3.6 makes carrying public content an \
+                    explicit decision, because what a node hosts has \
+                    consequences that depend on the operator's jurisdiction."
+                .into();
+        };
+        let want = match on {
+            "on" | "yes" | "true" => true,
+            "off" | "no" | "false" => false,
+            _ => return "say `on` or `off`".into(),
+        };
+        match self.resign_credential(peer, None, Some(want)) {
+            Ok(path) => format!(
+                "this link will {} carry public content.\n\n\
+                 Give {} to {peer} and have them run `peer countersign` — the \
+                 mask is inside both signatures, so it binds only once you \
+                 both agree to it.\n\n\
+                 {}",
+                if want { "now" } else { "no longer" },
+                path.display(),
+                if want {
+                    "Bulletins are public and attributable to whoever wrote \
+                     them, not to you — but a node that carries them is \
+                     hosting them (RFC 6 §3.6)."
+                } else {
+                    "Sealed mail is unaffected. What stops crossing is \
+                     channel posts, prekey batches and rollcall entries — \
+                     which means peers on the other side of this link may \
+                     become harder to reach."
+                }
             ),
             Err(e) => e,
         }
@@ -4673,6 +4741,9 @@ impl App {
                     Some(Peering::Renew) => self.peer_renew(arg(rest, 1).as_deref()),
                     Some(Peering::Share) => {
                         self.peer_share(arg(rest, 1).as_deref(), arg(rest, 2).as_deref())
+                    }
+                    Some(Peering::Carry) => {
+                        self.peer_carry(arg(rest, 1).as_deref(), arg(rest, 2).as_deref())
                     }
                     Some(Peering::Fragment) => self.peer_fragment(),
                     Some(Peering::Countersign) => self.peer_countersign(arg(rest, 1).as_deref()),
@@ -7244,11 +7315,44 @@ impl App {
             Some(t) if !t.is_empty() => format!("{} entries", t.len()),
             _ => "not built — no correspondents, or locked".into(),
         };
+        // **RFC 6 §216's burn rate.** "Exhaustion degrades forward secrecy
+        // silently, so clients MUST surface burn rate." Silently is the word
+        // that matters: a node whose batch has run out falls back to the
+        // signed prekey and nothing says so.
+        //
+        // What is honestly knowable here is the batch size, how long it has
+        // been published, and — the actionable part — whether the cadence
+        // holds for the largest group this node is in. A recipient cannot see
+        // which one-time keys a sender chose, so a literal consumption count
+        // is not available to it.
+        let largest = self
+            .groups
+            .iter()
+            .map(|g| g.members.len())
+            .max()
+            .unwrap_or(0);
+        let age_days = self.prekey_age_days().unwrap_or(0);
+        let burn = match groups::Group::prekey_warning(
+            largest,
+            prekeys::BATCH_KEYS,
+            REPUBLISH_EPOCHS.max(age_days),
+        ) {
+            Some(w) => format!(
+                "{} published, {age_days} day(s) ago — ! {w}",
+                prekeys::BATCH_KEYS
+            ),
+            None => format!(
+                "{} published, {age_days} day(s) ago; republished every {} day(s)",
+                prekeys::BATCH_KEYS,
+                REPUBLISH_EPOCHS
+            ),
+        };
         format!(
             "identity   {}  (this node's address — public, not a secret)\n\
              epochs     {epochs} wrapper{} ({} bytes)\n\
              corpus     {} objects, {} bytes (cap {})\n\
              tags       {table}\n\
+             prekeys    {burn}\n\
              activity   {} line{} held, cleared on lock (RFC 3 §12)\n\
              backup     shown once at init and never again (RFC 7 §11)\n\
              \n\
@@ -7263,6 +7367,22 @@ impl App {
             self.log.len(),
             if self.log.len() == 1 { "" } else { "s" },
         )
+    }
+
+    /// Days since this node last published a prekey batch — RFC 6 §216.
+    fn prekey_age_days(&self) -> Option<u32> {
+        let me = self.identity.as_ref()?.node_id();
+        let mut newest = 0u32;
+        self.store.with(|s| {
+            for (_, oid) in s.entries_in_range(0, u32::MAX) {
+                if let Some(b) = s.get(&oid).and_then(bulletin::from_object) {
+                    if b.kind == bulletin::Kind::Prekeys && b.node_id() == me {
+                        newest = newest.max(b.epoch);
+                    }
+                }
+            }
+        });
+        (newest > 0).then(|| now_epoch().0.saturating_sub(newest))
     }
 
     /// Report where a ceremony has reached.
@@ -9327,6 +9447,76 @@ mod tests {
         );
         // And the material is still there, so it can be peered with again.
         assert!(a.peer_path(&sb, artifact::PeerFile::Link).exists());
+    }
+
+    /// **RFC 6 §281: "Nodes MUST support excluding class 1 (bulletin)
+    /// entirely via `class_mask`."**
+    ///
+    /// The filter has enforced `class_mask` since it existed and nothing ever
+    /// set it — `Flags::class_mask` was `0xFF` and no verb changed it, so a
+    /// node could not decline public content however much it wanted to. The
+    /// same shape the share flag had before `peer share`.
+    #[test]
+    fn a_link_can_be_made_to_decline_public_content() {
+        let mut x = ready_node("carry-x");
+        let mut y = ready_node("carry-y");
+        let (_, short_y) = link_up(&mut x, &mut y);
+
+        // By default the link carries everything, and the filter says so.
+        let before = filter::Filter::from_credential(&x.credential_with(&short_y).unwrap());
+        let bulletin_bit = 1u8 << (krab_core::object::Class::Bulletin as u8 & 7);
+        assert!(before.class_mask & bulletin_bit != 0);
+
+        type_command(&mut x, &format!("peer carry {short_y} off"));
+        assert!(x.output.contains("no longer carry"), "{}", x.output);
+
+        // The re-signed credential excludes class 1, and the filter enforces it.
+        let proposal = credential::Credential::decode(
+            &std::fs::read(x.home.join(format!("{short_y}.credential"))).unwrap(),
+        )
+        .expect("a fresh credential");
+        assert_eq!(
+            proposal.flags.class_mask & bulletin_bit,
+            0,
+            "class 1 still admitted"
+        );
+
+        let scoped = filter::Filter::between(
+            &proposal.terms_ab,
+            &proposal.terms_ba,
+            proposal.flags.class_mask,
+        );
+        let now = now_epoch().0 * 1440;
+        let bulletin = krab_core::object::RoutingHeader {
+            version: 1,
+            class: krab_core::object::Class::Bulletin as u8,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: now + 1_000,
+            tag: krab_core::object::Tag([0; 8]),
+        };
+        assert!(!scoped.admits(&bulletin, now), "a bulletin still crossed");
+        let sealed = krab_core::object::RoutingHeader {
+            class: krab_core::object::Class::Sealed as u8,
+            ..bulletin
+        };
+        assert!(scoped.admits(&sealed, now), "sealed mail was refused too");
+    }
+
+    /// **RFC 6 §216: "clients MUST surface burn rate."** Exhaustion degrades
+    /// forward secrecy *silently* — a node whose batch has run out falls back
+    /// to the signed prekey and nothing says so.
+    #[test]
+    fn the_prekey_burn_rate_is_surfaced() {
+        let mut a = ready_node("burn-a");
+        type_command(&mut a, "keys");
+        assert!(a.output.contains("prekeys"), "{}", a.output);
+        assert!(
+            a.output.contains(&prekeys::BATCH_KEYS.to_string()),
+            "the batch size is not reported: {}",
+            a.output
+        );
+        assert!(a.output.contains("republished every"), "{}", a.output);
     }
 
     /// **A message body is foreign text too.**

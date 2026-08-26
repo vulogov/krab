@@ -252,6 +252,10 @@ impl Command {
             "opt in to listing them in your nodelist — off by default (RFC 3 §8.3)",
         ),
         (
+            "peer carry <peer> on|off",
+            "whether this link carries public content at all (RFC 6 §281)",
+        ),
+        (
             "peer fragment",
             "send your nodelist to each peer, individually (RFC 3 §8)",
         ),
@@ -508,6 +512,8 @@ pub enum Peering {
     /// re-signs the credential, because the flag is inside both signatures so
     /// that "neither party can unilaterally expose the other".
     Share,
+    /// Whether a link carries public content — RFC 6 §281.
+    Carry,
     /// Publish a nodelist fragment to every peer — RFC 3 §8.
     Fragment,
     /// Counter a peer-request or a counter — RFC 3 §5.2.
@@ -547,6 +553,7 @@ impl Peering {
             "forget" => Peering::Forget,
             "renew" => Peering::Renew,
             "share" => Peering::Share,
+            "carry" => Peering::Carry,
             "fragment" => Peering::Fragment,
             "counter" => Peering::Counter,
             "countersign" => Peering::Countersign,
