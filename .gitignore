@@ -58,6 +58,7 @@ reseal.cbor
 duress.wrapped
 introductions.spent
 nodelist.sent
+pinned.archive
 
 # Every PeerFile variant. They live in `peers/<node-id>/`, and that whole
 # directory is node state — the list of who this node has peered with is a
@@ -80,4 +81,5 @@ peers/
 *.krab
 *.credential
 *.sent
+*.archive
 kek.*

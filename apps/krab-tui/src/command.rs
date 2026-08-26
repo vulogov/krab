@@ -48,6 +48,11 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
+    /// **Not in RFC 8 §5.** Keep a conversation past the retention window —
+    /// RFC 8 §10, RFC 7 §8.1.
+    ///
+    /// "Pinning is a conscious act; the default is forgetting."
+    Pin,
     /// **Not in RFC 8 §5.** Write a received picture to a file — RFC 8 §6.
     ///
     /// Writes bytes and stops. RFC 8 §6 forbids passing received bytes to a
@@ -154,7 +159,8 @@ impl Command {
     /// to 19 of 26 without anything noticing. `every_variant_is_in_all` closes
     /// that: it matches on `Command` exhaustively, so a new variant does not
     /// compile until it appears here.
-    pub const ALL: [Command; 26] = [
+    pub const ALL: [Command; 27] = [
+        Command::Pin,
         Command::Picture,
         Command::Group,
         Command::Channel,
@@ -210,6 +216,7 @@ impl Command {
             "quit" | "exit" => Command::Quit,
             "channel" | "chan" => Command::Channel,
             "group" => Command::Group,
+            "pin" => Command::Pin,
             "picture" | "pic" => Command::Picture,
             "help" | "?" => Command::Help,
             _ => return None,
@@ -285,6 +292,10 @@ impl Command {
             "vouch for someone, once, privately (RFC 3 §10)",
         ),
         ("requests", "first-contact requests waiting for you"),
+        (
+            "pin <peer> | pin release <peer> | pin",
+            "keep a conversation past the retention window — the default is forgetting",
+        ),
         (
             "message <peer> [peer…]",
             "compose to one or more people; Ctrl-D seals and queues",
@@ -419,6 +430,7 @@ impl fmt::Display for Command {
             Command::Quit => "quit",
             Command::Channel => "channel",
             Command::Group => "group",
+            Command::Pin => "pin",
             Command::Picture => "picture",
             Command::Help => "help",
         };
@@ -642,6 +654,7 @@ mod tests {
     fn every_variant_is_in_all() {
         for c in Command::ALL {
             match c {
+                Command::Pin => {}
                 Command::Picture => {}
                 Command::Group => {}
                 Command::Channel => {}
@@ -670,7 +683,7 @@ mod tests {
                 Command::Verify => {}
             }
         }
-        assert_eq!(Command::ALL.len(), 26);
+        assert_eq!(Command::ALL.len(), 27);
     }
 
     /// **Every verb round-trips.** RFC 8 §5's ten, and the sixteen it omits.

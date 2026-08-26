@@ -113,6 +113,24 @@ impl fmt::Debug for Kek {
 }
 
 impl Kek {
+    /// A domain-separated subkey of this KEK.
+    ///
+    /// For key material that must outlive an epoch. `W_N` is a function of the
+    /// epoch and is shredded with it (RFC 7 §8), so anything that has to
+    /// survive that — RFC 7 §8.1's pinned archive is the case this exists for
+    /// — cannot be sealed under it.
+    ///
+    /// **The derivation lives here rather than in the caller** because the KEK
+    /// bytes do not leave this crate. A caller that could read them in order
+    /// to hash them would be a caller that could write them somewhere, and
+    /// RFC 7 §4 is that the KEK is memory-only.
+    ///
+    /// Domain-separated, so two subkeys of one KEK are unrelated and neither
+    /// is the KEK.
+    pub fn subkey(&self, domain: &[u8]) -> [u8; 32] {
+        crate::hash::domain_hash(domain, self.0.expose())
+    }
+
     /// Derive from a passphrase, RFC 7 §4.1.
     ///
     /// Costs `m_kib` of memory and roughly 500 ms at the specified parameters.

@@ -56,6 +56,12 @@ pub enum Artifact {
     Reseal,
     /// The duress store — RFC 7 §10.
     DuressWrapped,
+    /// Conversations pinned under the long-lived key — RFC 8 §10, RFC 7 §8.1.
+    ///
+    /// **Plaintext mail, sealed under a key that outlives every epoch.** That
+    /// is the request and the risk together: RFC 7 §8's erasure is what stops
+    /// a seized disk being a transcript, and this file is exempt from it.
+    Pinned,
     /// The last full nodelist fragment this node published — RFC 3 §8.2.
     ///
     /// The base a `NODEDIFF` references. One record for every peer, because a
@@ -72,7 +78,7 @@ pub enum Artifact {
 
 impl Artifact {
     /// Every artifact. Used by the test that keeps this file honest.
-    pub const ALL: [Artifact; 13] = [
+    pub const ALL: [Artifact; 14] = [
         Artifact::IdentityWrapped,
         Artifact::KekParams,
         Artifact::Corpus,
@@ -86,6 +92,7 @@ impl Artifact {
         Artifact::DuressWrapped,
         Artifact::IntroductionsSpent,
         Artifact::Nodelist,
+        Artifact::Pinned,
     ];
 
     /// The name on disk.
@@ -104,6 +111,7 @@ impl Artifact {
             Artifact::DuressWrapped => "duress.wrapped",
             Artifact::IntroductionsSpent => "introductions.spent",
             Artifact::Nodelist => "nodelist.sent",
+            Artifact::Pinned => "pinned.archive",
         }
     }
 
@@ -127,7 +135,8 @@ impl Artifact {
             | Artifact::Reseal
             | Artifact::DuressWrapped
             | Artifact::IntroductionsSpent
-            | Artifact::Nodelist => true,
+            | Artifact::Nodelist
+            | Artifact::Pinned => true,
         }
     }
 }

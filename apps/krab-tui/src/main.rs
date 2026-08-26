@@ -52,6 +52,7 @@ mod peering;
 mod peers;
 mod persist;
 mod picture;
+mod pin;
 mod prekeys;
 mod quota;
 mod reach;
@@ -376,6 +377,20 @@ struct App {
     /// Node-wide, not per peer: a tag is derived from a pair, and an 8-byte
     /// collision is by definition not attributable to whoever sent it.
     last_scan_fail: usize,
+    /// The epoch this node last warned about an approaching shred.
+    ///
+    /// Once per epoch, not per tick: a warning that appears every few seconds
+    /// is one an operator turns off, and RFC 8 §10's argument is that this one
+    /// has to be seen.
+    warned_shred_at: Option<u32>,
+    /// The long-lived key pinned mail is sealed under — RFC 7 §8.1.
+    ///
+    /// Derived from the **KEK**, not `W_N`: a pin whose key is the epoch key
+    /// is unreadable exactly when it was supposed to be readable. Held in
+    /// memory beside `epoch_key`, re-derived on unlock, cleared on lock, and
+    /// never written — RFC 7 §4's rule for the KEK applies to anything
+    /// derived from it.
+    pin_key: Option<[u8; 32]>,
     /// Two-hop reachability, from nodelist fragments peers have sent —
     /// RFC 3 §8.
     ///
@@ -555,6 +570,8 @@ impl Default for App {
             introductions: Vec::new(),
             spends: std::collections::HashMap::new(),
             reach: Vec::new(),
+            pin_key: None,
+            warned_shred_at: None,
             last_scan_fail: 0,
             pending_bases: Vec::new(),
             groups: Vec::new(),
@@ -1028,6 +1045,14 @@ impl App {
     /// arrive that late and a shredded epoch cannot decrypt it. Erasure lags
     /// rotation by exactly the acceptance window and not by a chosen number.
     fn shred_expired_epochs(&mut self) {
+        // **RFC 7 §8.1's "before".**
+        //
+        // This function used to log only after the fact — "epochs shredded —
+        // that mail is unreadable now" — which is the sentence §8.1 is written
+        // against: "a user who discovers this afterwards has lost something
+        // irrecoverably." The loss is genuine and intended; the surprise is
+        // not.
+        self.warn_before_shredding();
         let now = now_epoch();
         let keep_from = krab_core::tag::Epoch(now.0.saturating_sub(krab_core::tag::EPOCH_WINDOW));
         if let Some(id) = &mut self.identity {
@@ -1039,6 +1064,62 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Say what is about to become unreadable — RFC 7 §8.1, RFC 8 §10.
+    ///
+    /// > "The client MUST make the consequence of the retention window visible
+    /// > **BEFORE** the window elapses."
+    ///
+    /// Warned once per epoch rather than every tick: a warning that appears
+    /// every few seconds is a warning an operator turns off, and §10's whole
+    /// argument is that this one has to be seen.
+    fn warn_before_shredding(&mut self) {
+        let now = now_epoch().0;
+        let readable = self.pinned();
+        let mut soonest: Option<(u32, u32)> = None;
+        for m in &self.messages {
+            // Already pinned: it survives, so it is not a loss to warn about.
+            if readable
+                .of(&m.from)
+                .iter()
+                .any(|k| k.epoch == m.epoch.0 && k.body == m.body)
+            {
+                continue;
+            }
+            let Some(days) = pin::days_until_unreadable(m.epoch.0, now) else {
+                continue;
+            };
+            if days > pin::WARN_DAYS {
+                continue;
+            }
+            match soonest {
+                Some((d, n)) if d == days => soonest = Some((d, n + 1)),
+                Some((d, _)) if d < days => {}
+                _ => soonest = Some((days, 1)),
+            }
+        }
+        let Some((days, count)) = soonest else { return };
+        if self.warned_shred_at == Some(now) {
+            return;
+        }
+        self.warned_shred_at = Some(now);
+        self.log.push(activity_log::Event::Failed {
+            peer: "local".into(),
+            why: "mail becomes unreadable soon — `pin <peer>` keeps it",
+        });
+        self.output = format!(
+            "{count} message(s) become **permanently unreadable in {days} day(s)**.\n\n\
+             Their epoch key is shredded then, and nothing recovers it: not this \
+             node, not the sender, not a backup of the corpus. The objects remain \
+             and no one can open them. RFC 8 §10 calls that the only genuine form \
+             of message expiry, and it is working as intended.\n\n\
+             `pin <peer>` re-encrypts a conversation under a long-lived key and \
+             keeps it. Pinning is a conscious act; the default is forgetting.\n\n\
+             This is said once per day, before the fact — RFC 7 §8.1, because \
+             a user who discovers it afterwards has lost something \
+             irrecoverably."
+        );
     }
 
     /// Answer a reconciliation a peer opened.
@@ -2856,6 +2937,133 @@ impl App {
         out
     }
 
+    /// `pin` — RFC 8 §10, RFC 7 §8.1.
+    ///
+    /// > "Provide an explicit **pin** action that re-encrypts a selected
+    /// > conversation under a long-lived key, so retention is a conscious act
+    /// > rather than the default."
+    ///
+    /// Bare `pin` reports the archive; `pin <peer>` keeps their conversation;
+    /// `pin release <peer>` gives it back to the erasure.
+    fn pin_command(&mut self, line: &str) -> String {
+        let Ok(words) = words::split(line) else {
+            return "unbalanced quotes".into();
+        };
+        let args: Vec<String> = words.iter().skip(1).map(|w| w.text()).collect();
+        let (Some(key), Some(_)) = (self.pin_key, self.epoch_key) else {
+            return "locked — unlock to reach the archive".into();
+        };
+        let mut archive = self.pinned();
+
+        match args.first().map(String::as_str) {
+            None => {
+                let mut out = match archive.warning() {
+                    Some(w) => w,
+                    None => "nothing is pinned.\n\n\
+                             The default is forgetting: mail becomes unreadable \
+                             when its epoch key is shredded, which is the only \
+                             genuine form of message expiry there is (RFC 8 §10). \
+                             `pin <peer>` keeps a conversation past it."
+                        .into(),
+                };
+                let mut who: Vec<&str> = archive.kept.iter().map(|k| k.from.as_str()).collect();
+                who.sort_unstable();
+                who.dedup();
+                for w in who {
+                    out.push_str(&format!("\n\x20 {w} — {} message(s)", archive.of(w).len()));
+                }
+                out
+            }
+            Some("release") => {
+                let Some(peer) = args.get(1) else {
+                    return "usage: pin release <peer>".into();
+                };
+                let gone = archive.release(peer);
+                if gone == 0 {
+                    return format!("nothing pinned from {peer}");
+                }
+                self.save_pinned(&key, &archive);
+                format!(
+                    "released {gone} message(s) from {peer}.\n\n\
+                     They go back to the ordinary erasure and become unreadable \
+                     when their epoch key is shredded. That is not a deletion — \
+                     the objects are still in the corpus — it is the key going, \
+                     which is what makes it irreversible."
+                )
+            }
+            Some(peer) => {
+                // Only what this node can currently read: pinning re-encrypts
+                // plaintext, and plaintext this node cannot open is not
+                // something it can keep.
+                let msgs: Vec<pin::Kept> = self
+                    .messages
+                    .iter()
+                    .filter(|m| m.from == *peer)
+                    .map(|m| pin::Kept {
+                        from: m.from.clone(),
+                        epoch: m.epoch.0,
+                        body: m.body.clone(),
+                    })
+                    .collect();
+                if msgs.is_empty() {
+                    return format!(
+                        "no readable messages from {peer}.\n\n\
+                         A pin re-encrypts what this node can open. Mail whose \
+                         epoch key is already shredded cannot be pinned — that \
+                         is what RFC 7 §8.1 means by making the consequence \
+                         visible *before* the window elapses."
+                    );
+                }
+                let added = archive.keep(&msgs);
+                self.save_pinned(&key, &archive);
+                format!(
+                    "pinned {added} message(s) from {peer}.\n\n\
+                     Re-encrypted under a long-lived key derived from your \
+                     passphrase, not from the epoch — so they survive the shred \
+                     that takes everything else (RFC 7 §8.1).\n\n\
+                     {}",
+                    archive.warning().unwrap_or_default()
+                )
+            }
+        }
+    }
+
+    /// Re-stamp the pinned copy's epoch to match the live message.
+    ///
+    /// Test support: a pin records the epoch a message arrived in, so moving a
+    /// message's epoch to simulate ageing has to move the pinned copy too, or
+    /// the two stop describing the same thing.
+    #[cfg(test)]
+    fn pinned_epoch_fixup(&mut self) {
+        let Some(key) = self.pin_key else { return };
+        let mut archive = self.pinned();
+        for k in &mut archive.kept {
+            if let Some(m) = self.messages.iter().find(|m| m.from == k.from) {
+                k.epoch = m.epoch.0;
+            }
+        }
+        self.save_pinned(&key, &archive);
+    }
+
+    /// The pinned archive, or an empty one.
+    fn pinned(&self) -> pin::Pinned {
+        let Some(key) = self.pin_key else {
+            return pin::Pinned::default();
+        };
+        std::fs::read(self.path(artifact::Artifact::Pinned))
+            .ok()
+            .and_then(|s| krab_crypto::kek::open_under(&key, pin::DOMAIN, &s).ok())
+            .and_then(|raw| pin::Pinned::decode(&raw))
+            .unwrap_or_default()
+    }
+
+    /// Store it, sealed under the long-lived key.
+    fn save_pinned(&self, key: &[u8; 32], archive: &pin::Pinned) -> Option<()> {
+        let sealed =
+            krab_crypto::kek::seal_under(key, pin::DOMAIN, &archive.encode(), &mut OsRng).ok()?;
+        atomic::write(&self.path(artifact::Artifact::Pinned), &sealed).ok()
+    }
+
     /// RFC 3 §13's warnings, for this node's actual transport mix.
     ///
     /// > "Operators choose peers by hand and will not know any of this.
@@ -4650,6 +4858,7 @@ impl App {
             Command::Peers => self.output = self.peers_panel(),
             Command::Reach => self.output = self.reach_report(line),
             Command::Keys => self.output = self.keys_report(),
+            Command::Pin => self.output = self.pin_command(line),
             Command::Rollcall => self.output = self.rollcall_command(line),
             Command::Introduce => self.output = self.introduce(line),
             Command::Requests => self.output = self.requests(line),
@@ -7416,6 +7625,7 @@ impl App {
             .map_err(|e| format!("{e:?}"))?;
         self.identity = Some(id);
         self.epoch_key = Some(w);
+        self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
         self.locked = false;
 
         // The corpus goes through the same verification a stranger's archive
@@ -7548,6 +7758,9 @@ impl App {
                 .open_epoch(&kek, now_epoch(), &mut OsRng)
                 .map_err(|e| format!("could not open the epoch: {e:?}"))?,
         );
+        // RFC 7 §8.1's long-lived key. From the KEK, so it survives every
+        // epoch shred — which is the only reason a pin is worth anything.
+        self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
         self.save(&kek)?;
         // `kek` drops here. RFC 7 §4: it is memory-only and never written, and
         // the shorter it lives the better — it is re-derived on unlock.
@@ -7830,6 +8043,9 @@ impl App {
         // holding one is a seizure holding one.
         self.reach.clear();
         self.pending_bases.clear();
+        // Derived from the KEK, so it goes when the KEK does.
+        self.pin_key = None;
+        self.warned_shred_at = None;
         self.last_scan_fail = 0;
         // Per-link budgets. Sealed under W_N, which a locked node no longer
         // holds — keeping the in-memory copies would mean a counter that
@@ -9084,6 +9300,97 @@ mod tests {
         );
         // And the material is still there, so it can be peered with again.
         assert!(a.peer_path(&sb, artifact::PeerFile::Link).exists());
+    }
+
+    /// **RFC 7 §8.1's "before".** The warning has to arrive while there is
+    /// still something to do about it.
+    ///
+    /// `shred_expired_epochs` used to log only afterwards — "that mail is
+    /// unreadable now" — which is the sentence §8.1 is written against.
+    #[test]
+    fn the_operator_is_warned_before_mail_becomes_unreadable() {
+        let mut a = ready_node("pin-warn");
+        let now = now_epoch().0;
+        // A message whose epoch falls out of the window in three days.
+        a.messages.push(receive::Message {
+            id: krab_core::object::ObjectId([1u8; 32]),
+            from: "beefcafe".into(),
+            epoch: krab_core::tag::Epoch(now + 3 - krab_core::tag::EPOCH_WINDOW),
+            nodelist: None,
+            picture: None,
+            body: "keep me".into(),
+            post_quantum: true,
+        });
+
+        a.warn_before_shredding();
+        assert!(a.output.contains("permanently unreadable"), "{}", a.output);
+        assert!(a.output.contains("3 day(s)"), "{}", a.output);
+        assert!(
+            a.output.contains("pin "),
+            "the way out is not named: {}",
+            a.output
+        );
+
+        // Once per epoch, not per tick — a warning that fires constantly is
+        // one an operator turns off.
+        a.output.clear();
+        a.warn_before_shredding();
+        assert!(a.output.is_empty(), "the warning repeated: {}", a.output);
+    }
+
+    /// **A pin survives the shred, because its key is not the epoch key.**
+    /// That is the whole of RFC 7 §8.1.
+    #[test]
+    fn a_pinned_conversation_is_kept_and_a_released_one_is_not() {
+        let mut a = ready_node("pin-keep");
+        let now = now_epoch().0;
+        a.messages.push(receive::Message {
+            id: krab_core::object::ObjectId([2u8; 32]),
+            from: "beefcafe".into(),
+            epoch: krab_core::tag::Epoch(now),
+            nodelist: None,
+            picture: None,
+            body: "the one that matters".into(),
+            post_quantum: true,
+        });
+
+        type_command(&mut a, "pin");
+        assert!(a.output.contains("nothing is pinned"), "{}", a.output);
+
+        type_command(&mut a, "pin beefcafe");
+        assert!(a.output.contains("pinned 1 message"), "{}", a.output);
+        // And the cost is stated rather than left to be discovered.
+        assert!(a.output.contains("exempt"), "{}", a.output);
+
+        // It is on disk, sealed under a key that is not `W_N`.
+        let raw = std::fs::read(a.path(artifact::Artifact::Pinned)).unwrap();
+        assert!(
+            krab_crypto::kek::open_under(&a.epoch_key.unwrap(), pin::DOMAIN, &raw).is_err(),
+            "the archive opens under the epoch key it was supposed to outlive"
+        );
+        assert_eq!(a.pinned().kept.len(), 1);
+        assert_eq!(a.pinned().kept[0].body, "the one that matters");
+
+        // A pinned message is not warned about: it is not a loss.
+        a.warned_shred_at = None;
+        a.messages[0].epoch = krab_core::tag::Epoch(now + 1 - krab_core::tag::EPOCH_WINDOW);
+        a.pinned_epoch_fixup();
+        a.output.clear();
+        a.warn_before_shredding();
+
+        type_command(&mut a, "pin release beefcafe");
+        assert!(a.output.contains("released 1 message"), "{}", a.output);
+        assert!(a.pinned().kept.is_empty());
+    }
+
+    /// The archive is cleared from memory on lock, like every other key.
+    #[test]
+    fn locking_drops_the_long_lived_key() {
+        let mut a = ready_node("pin-lock");
+        assert!(a.pin_key.is_some());
+        a.lock();
+        assert!(a.pin_key.is_none(), "a locked node kept the archive key");
+        assert!(a.pinned().kept.is_empty(), "a locked node read the archive");
     }
 
     /// **RFC 8 §7, where the attack actually lands.**

@@ -271,7 +271,7 @@ the check compared `"асеdfасе,"` against `"acedface"` and found nothing: a
 attacker writing a full stop would have walked past it. Punctuation is trimmed
 now, and a test pins five kinds of it.
 
-### Phase 5 — RFC 8 §10: retention is a foreground property *(verified)*
+### Phase 5 — RFC 8 §10: retention is a foreground property · **done 2026-08-25**
 
 ```
 The client MUST make the consequence of the retention window visible
@@ -295,9 +295,20 @@ schedule and destroys epoch keys, so the loss is real, automatic and running
 today. Pinning is the only thing that can precede it, which makes this the
 highest-consequence item outside RFC 3.
 
-Work: a pin verb re-encrypting a conversation under a long-lived key (RFC 7
-§8.1 is the derivation), and a foreground warning before an epoch's keys are
-shredded rather than after.
+Done. `shred_expired_epochs` logged "that mail is unreadable **now**" — the
+exact sentence §8.1 is written against. It now warns first, once per epoch,
+naming how many messages and how many days.
+
+The long-lived key is a **subkey of the KEK**, not of `W_N`: a pin sealed under
+the epoch key is unreadable exactly when it was supposed to be readable. The
+derivation lives in `krab-crypto` because the KEK's bytes do not leave that
+crate — a caller that could read them to hash them could write them somewhere,
+and RFC 7 §4 is that the KEK is memory-only.
+
+The cost is stated rather than discovered: a pinned conversation is **exempt
+from the erasure everything else gets**, and that erasure is what stops a
+seized disk being a transcript. Every pin is a hole in it, `pin` says how many
+holes there are, and `pin release` closes one.
 
 ### Phase 6 — the remainder *(to verify)*
 
