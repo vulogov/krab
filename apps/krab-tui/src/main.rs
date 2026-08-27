@@ -213,6 +213,12 @@ const MEET_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// same keystroke moves a different distance depending on state.
 const OUTPUT_SCROLL_LINES: usize = 8;
 
+/// Rows the output pane shows in the default layout.
+///
+/// The threshold for opening it automatically. Two rows of frame plus this;
+/// a reply taller than this is one whose result would be off screen.
+const OUTPUT_PANE_ROWS: usize = 2;
+
 /// Marks an inbox row whose message carries an attachment.
 ///
 /// One cell wide, so the column it sits in is the same width on every row
@@ -483,6 +489,12 @@ struct App {
     history_at: usize,
     /// Lines the output pane is scrolled back by. Zero is the newest line.
     output_scroll: i64,
+    /// Inner width of the output pane, and the rows its content wrapped to,
+    /// as of the last frame. `Cell` because the render pass only has `&self`
+    /// — it measures, it does not decide anything.
+    output_width: std::cell::Cell<u16>,
+    output_rows: std::cell::Cell<usize>,
+    output_height: std::cell::Cell<u16>,
     /// Ticks remaining on the inbound and outbound indicators.
     ///
     /// Set when bytes actually move and counted down, so each glyph stops on
@@ -604,6 +616,9 @@ impl Default for App {
             history: Vec::new(),
             history_at: 0,
             output_scroll: 0,
+            output_width: std::cell::Cell::new(0),
+            output_rows: std::cell::Cell::new(0),
+            output_height: std::cell::Cell::new(0),
             inbound_ticks: 0,
             outbound_ticks: 0,
             inbound: None,
@@ -705,6 +720,10 @@ impl App {
             list: &self.list,
             body: &self.body,
             output: &self.output,
+            output_width: &self.output_width,
+            output_rows: &self.output_rows,
+            output_height: &self.output_height,
+            waiting: self.waiting(),
             showing: self.showing.as_deref(),
             // While the passphrase is being taken the prompt shows its length,
             // not the command line — see `masked`.
@@ -843,8 +862,12 @@ impl App {
             // **Scroll the output pane.** By screens, so a long `help` or
             // `peers` can be read without zooming.
             Binding::Scroll(d) => {
+                // **Rows, not logical lines.** Clamping to `output.lines()`
+                // under-counted every wrapped line, so on output that wrapped
+                // — which is most of it in a four-row pane — PgUp stopped
+                // before the top and the rest could not be reached at all.
                 let step = OUTPUT_SCROLL_LINES as i64;
-                let n = self.output.lines().count() as i64;
+                let n = self.output_rows.get() as i64;
                 self.output_scroll = (self.output_scroll + d as i64 * step).clamp(0, n);
             }
             Binding::Compose if !self.locked => {
@@ -3238,6 +3261,45 @@ fn inbox_row(m: &receive::Message) -> String {
         )
     }
 
+    /// What the interface is waiting for, and what the next keystroke does.
+    ///
+    /// Two different things stop and wait — the first-run ceremony, and a
+    /// verb that has asked for words to be typed — and neither announced
+    /// itself anywhere but in the prose of the output pane. From outside,
+    /// "press Enter to continue" and "this node is busy, wait" looked the
+    /// same, so the operator either waited on a node that was waiting on them
+    /// or pressed keys at one that was working.
+    ///
+    /// Each answer says the key and the consequence, in that order, because
+    /// the consequence is what decides whether to press it.
+    fn waiting(&self) -> Option<&'static str> {
+        if let Some(p) = &self.prompt {
+            return Some(match p {
+                Prompt::TransferWords { .. } => {
+                    "type the 32 words they read aloud, then Enter \u{2014} completes the peering"
+                }
+                Prompt::ResealWords { .. } => {
+                    "type the 32 words they read aloud, then Enter \u{2014} re-seals the link"
+                }
+            });
+        }
+        match self.init_step? {
+            InitStep::Passphrase => Some(
+                "type a passphrase, then Enter \u{2014} it is not echoed, and it is the only root",
+            ),
+            InitStep::Generate => {
+                Some("Enter \u{2014} generates the identity and the first prekeys")
+            }
+            InitStep::ShowBackup => {
+                Some("Enter \u{2014} shows the backup words, the only time they are shown")
+            }
+            InitStep::ConfirmBackup => Some(
+                "Enter \u{2014} confirms you wrote them down; they cannot be shown again",
+            ),
+            InitStep::Done => None,
+        }
+    }
+
     /// Whether this node is ready to operate, and what is missing if not.
     ///
     /// **The question `keys`, `peers` and `reach` do not answer.** Each of
@@ -4943,6 +5005,50 @@ impl App {
 
     /// Run whatever is on the command line.
     fn submit(&mut self) {
+        self.run_command();
+        self.reveal_output();
+    }
+
+    /// Open the output pane when the reply will not fit in it.
+    ///
+    /// The pane is a few rows. A verb whose reply runs long — `help`,
+    /// `peers`, `status`, the backup words — put its most useful part behind
+    /// a `PgUp` the operator had no reason to know was waiting. Rather than
+    /// make every long reply a scrolling exercise, the pane opens itself and
+    /// `Esc` puts the layout back, which is what `Esc` already did.
+    ///
+    /// Only when it does not fit: a reply that fits is not worth a layout
+    /// change, and a pane that opens for everything is a pane the operator
+    /// starts closing reflexively.
+    fn reveal_output(&mut self) {
+        // Never over a composer: the draft and its banner (RFC 8 §2.1) are
+        // what the operator is looking at, and this is not urgent.
+        if self.ui.mode() == Mode::Compose || self.ui.zoomed().is_some() {
+            return;
+        }
+        let width = self.output_width.get() as usize;
+        let rows = render::wrap_rows(&self.output, width).len();
+        // `output_rows` still holds the *previous* reply until the next
+        // frame; measure this one now so the decision is about what was just
+        // printed.
+        self.output_rows.set(rows);
+        if rows > self.output_fits() {
+            self.ui.zoom(layout::Pane::Output);
+        }
+    }
+
+    /// Rows the output pane shows without being opened.
+    ///
+    /// Derived from the last frame rather than assumed, so a node run in a
+    /// short terminal does not decide that nothing ever fits.
+    fn output_fits(&self) -> usize {
+        match self.output_height.get() as usize {
+            0 => OUTPUT_PANE_ROWS,
+            n => n,
+        }
+    }
+
+    fn run_command(&mut self) {
         let line = self.command.take();
         // Tokenise once, up front, so a malformed line is refused with the
         // reason rather than reaching a verb that sees a truncated argument
@@ -5206,13 +5312,23 @@ impl App {
             Command::Help => {
                 // Into the body pane: RFC 8 §3 forbids scrolling output
                 // through the two-line command pane.
+                // **The column is measured, not assumed.** A fixed `:<20`
+                // does not pad anything wider than 20, so the verbs that grew
+                // past it — `peer countersign <file>`, `peer counter <n>
+                // <MB/day> <objects> <days>` — ran straight into their own
+                // descriptions with no gap at all.
+                let column = |rows: &[(&str, &str)]| {
+                    rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0) + 2
+                };
                 let mut out = String::from("verbs\n");
+                let w = column(Command::SYNOPSES);
                 for (verb, what) in Command::SYNOPSES {
-                    out.push_str(&format!("  {verb:<20}{what}\n"));
+                    out.push_str(&format!("  {verb:<w$}{what}\n"));
                 }
                 out.push_str("\nkeys\n");
+                let w = column(Command::CHORDS);
                 for (chord, what) in Command::CHORDS {
-                    out.push_str(&format!("  {chord:<20}{what}\n"));
+                    out.push_str(&format!("  {chord:<w$}{what}\n"));
                 }
                 self.output = out;
             }
@@ -9869,6 +9985,145 @@ mod tests {
         type_command(&mut a, "force-send");
         assert!(a.output.contains("nothing to force"), "{}", a.output);
         assert!(a.output.contains("connect"), "no way out named: {}", a.output);
+    }
+
+    /// **Every help row has a gap between the verb and what it does.**
+    ///
+    /// The column was `:<20`, which pads nothing wider than 20 — so the
+    /// verbs that outgrew it printed as `peer countersign <file>sign their
+    /// half...`. Measured from the table now, so a longer verb widens it
+    /// instead of colliding with it.
+    #[test]
+    fn no_help_row_runs_its_verb_into_its_description() {
+        let mut a = ready_node("help-columns");
+        type_command(&mut a, "help");
+        for (verb, what) in Command::SYNOPSES.iter().chain(Command::CHORDS) {
+            // Split at the column gap and compare the left side exactly —
+            // matching on a prefix makes `request` find the `requests` row.
+            let row = a
+                .output
+                .lines()
+                .find(|l| l.trim_start().split("  ").next() == Some(*verb))
+                .unwrap_or_else(|| panic!("{verb} is not in help"));
+            let rest = &row.trim_start()[verb.len()..];
+            assert!(rest.starts_with("  "), "no gap after {verb:?}: {row:?}");
+            assert_eq!(rest.trim_start(), *what, "{row:?}");
+        }
+    }
+
+    /// **A reply that does not fit opens the pane it does not fit in.**
+    ///
+    /// The output pane is a few rows. `help`, `peers` and `status` all run
+    /// longer than that, and the part an operator wants is usually at the
+    /// end — so the useful half sat behind a `PgUp` there was no reason to
+    /// know was waiting.
+    #[test]
+    fn a_reply_too_long_for_the_pane_opens_it() {
+        let mut a = ready_node("reveal");
+        // A pane as the terminal last reported it: four rows, eighty wide.
+        a.output_height.set(4);
+        a.output_width.set(80);
+
+        type_command(&mut a, "status");
+        assert!(
+            a.output.lines().count() > 4,
+            "this test needs a long reply: {}",
+            a.output
+        );
+        assert_eq!(
+            a.ui.zoomed(),
+            Some(layout::Zoom::One(layout::Pane::Output)),
+            "a reply taller than the pane did not open it"
+        );
+
+        // Esc puts the layout back — the chord that already meant "back".
+        a.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(a.ui.zoomed(), None, "Esc did not restore the layout");
+    }
+
+    /// And a short reply is left alone: a pane that opens for everything is
+    /// one the operator starts closing reflexively.
+    #[test]
+    fn a_reply_that_fits_does_not_disturb_the_layout() {
+        let mut a = ready_node("reveal-short");
+        a.output_height.set(4);
+        a.output_width.set(80);
+        type_command(&mut a, "channel carry");
+        assert!(a.output.lines().count() <= 4, "{}", a.output);
+        assert_eq!(a.ui.zoomed(), None, "a short reply opened the pane");
+    }
+
+    /// **Scrolling counts what is on screen, not what is in the string.**
+    ///
+    /// The clamp used `output.lines()`, which under-counted every line that
+    /// wrapped — so on a narrow pane PgUp stopped before the top and the rest
+    /// could not be reached at all.
+    #[test]
+    fn the_output_scroll_counts_wrapped_rows() {
+        let mut a = ready_node("scroll-rows");
+        // One logical line, many rows once wrapped into a narrow pane.
+        a.output = "x ".repeat(400);
+        a.output_width.set(20);
+        a.output_rows
+            .set(render::wrap_rows(&a.output, 20).len());
+        assert!(a.output_rows.get() > 20, "the fixture does not wrap");
+
+        for _ in 0..12 {
+            a.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+        }
+        assert!(
+            a.output_scroll > 1,
+            "a single logical line could not be scrolled: {}",
+            a.output_scroll
+        );
+    }
+
+    /// A word longer than the pane is cut rather than left running off it.
+    #[test]
+    fn wrapping_breaks_a_word_that_cannot_fit() {
+        let rows = render::wrap_rows(&"z".repeat(50), 10);
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert!(rows.iter().all(|r| r.chars().count() <= 10), "{rows:?}");
+    }
+
+    /// **A node that is waiting says so, and says what the key does.**
+    ///
+    /// "Press Enter to continue" and "this node is busy" looked identical
+    /// from outside: both were prose in the output pane, if they appeared at
+    /// all. The status rule now carries it.
+    #[test]
+    fn every_step_that_waits_says_what_the_next_key_does() {
+        let mut a = App::default();
+        a.home = temp_home("waiting");
+        assert_eq!(a.waiting(), None, "an idle node claims to be waiting");
+
+        type_command(&mut a, "init");
+        let w = a.waiting().expect("the passphrase step does not announce itself");
+        assert!(w.contains("passphrase"), "{w}");
+        assert!(w.contains("Enter"), "the key to press is not named: {w}");
+
+        // Every step of the ceremony, not only the first.
+        let mut seen = 0;
+        while let Some(step) = a.init_step {
+            if step == InitStep::Done {
+                break;
+            }
+            let w = a.waiting().unwrap_or_else(|| panic!("{step:?} announces nothing"));
+            assert!(
+                w.contains("Enter"),
+                "{step:?} does not name the key: {w}"
+            );
+            seen += 1;
+            if step == InitStep::Passphrase {
+                a.passphrase = line::Line::from("a passphrase");
+            }
+            a.advance_init();
+            if seen > 8 {
+                break;
+            }
+        }
+        assert!(seen >= 3, "the ceremony was not walked: {seen} steps");
+        assert_eq!(a.waiting(), None, "a finished ceremony still claims to wait");
     }
 
     /// **A channel post crosses a session and a follower reads it.**

@@ -11,7 +11,7 @@ use crate::layout::{Banner, Level, Mode, Pane, Rect as UiRect, Tab, Ui};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 fn to_rect(r: UiRect) -> Rect {
@@ -46,6 +46,18 @@ pub struct View<'a> {
     /// Whether anything is going out, and whether anything is coming in.
     pub sending: bool,
     pub receiving: bool,
+    /// Inner width of the output pane at the last frame, and how many rows
+    /// its content wrapped to. Written by `draw_output` and read by the
+    /// scroll clamp and the auto-reveal, so all three use the same units.
+    pub output_width: &'a std::cell::Cell<u16>,
+    pub output_rows: &'a std::cell::Cell<usize>,
+    /// Rows the pane showed, so the auto-reveal knows what "does not fit"
+    /// means in the terminal actually in use.
+    pub output_height: &'a std::cell::Cell<u16>,
+    /// What the interface is waiting for the operator to do, if anything.
+    /// Takes the status rule when set, because nothing else on screen is
+    /// more useful than "this is stopped, and here is what unsticks it".
+    pub waiting: Option<&'a str>,
     /// Lines the output pane is scrolled back from the newest.
     pub scroll: usize,
     /// Composer contents, shown when `ui.mode()` is `Compose`.
@@ -202,6 +214,53 @@ fn draw_view(f: &mut Frame, area: Rect, view: &View) {
     );
 }
 
+/// Break `text` into rows no wider than `width`, breaking on whitespace where
+/// possible and mid-word only when a single word does not fit.
+///
+/// Shared with the scroll clamp and the auto-reveal threshold so that all
+/// three agree on how tall a given output actually is.
+pub fn wrap_rows(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return text.lines().map(str::to_string).collect();
+    }
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.chars().count() <= width {
+            out.push(line.to_string());
+            continue;
+        }
+        let mut row = String::new();
+        let mut n = 0usize;
+        for word in line.split_inclusive(char::is_whitespace) {
+            let w = word.chars().count();
+            if n + w > width && n > 0 {
+                out.push(std::mem::take(&mut row));
+                n = 0;
+            }
+            // A single word longer than the pane: cut it, rather than let it
+            // run off the edge where it cannot be read or scrolled to.
+            if w > width {
+                for c in word.chars() {
+                    if n == width {
+                        out.push(std::mem::take(&mut row));
+                        n = 0;
+                    }
+                    row.push(c);
+                    n += 1;
+                }
+            } else {
+                row.push_str(word);
+                n += w;
+            }
+        }
+        out.push(row);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Command output.
 ///
 /// Not subject to RFC 8 §2.2's locked-node blanking: this is what the node
@@ -213,15 +272,30 @@ fn draw_output(f: &mut Frame, area: Rect, view: &View) {
     // operator just asked for. Showing the top would mean a verb whose reply
     // runs long appears to have printed nothing.
     let rows = area.height.saturating_sub(2) as usize;
-    let lines: Vec<&str> = view.output.lines().collect();
-    // The window ends `scroll` lines above the newest, so a fresh command
+    let width = area.width.saturating_sub(2) as usize;
+    // **Window over display rows, not logical lines.**
+    //
+    // This used to slice `output.lines()` and hand the result to a wrapping
+    // Paragraph. A window of `rows` logical lines wraps to more than `rows`
+    // rows on screen, and the overflow is clipped off the bottom — so the
+    // newest line, the one the verb was run for, could be the invisible one.
+    // Scrolling could not reach it either, because PgUp counted the logical
+    // lines. Wrapping here first makes the window, the scroll and the
+    // ↑n/↓n counts all speak the same unit.
+    let lines = wrap_rows(view.output, width);
+    // The window ends `scroll` rows above the newest, so a fresh command
     // lands at the bottom and PgUp walks backwards from there. Anchoring to
     // the top instead would put every reply's first line on screen and hide
     // its result, which is the part the operator asked for.
-    let end = lines.len().saturating_sub(view.scroll);
+    let end = lines.len().saturating_sub(view.scroll.min(lines.len()));
     let from = end.saturating_sub(rows.max(1));
     let shown = lines[from..end].join("\n");
     let below = lines.len() - end;
+    // What the pane is, so the scroll clamp and the auto-reveal threshold can
+    // work in the same units this function just used.
+    view.output_width.set(width as u16);
+    view.output_rows.set(lines.len());
+    view.output_height.set(rows as u16);
     // This node's own short id, on the frame of the pane the operator is
     // always looking at. It is public — it is in every card handed out and is
     // the name a peer types into `connect` — and being asked "what is my id"
@@ -237,9 +311,9 @@ fn draw_output(f: &mut Frame, area: Rect, view: &View) {
         (a, b) => format!(" {me}  {out}\u{2191} {inn}\u{2193}  \u{2191}{a} \u{2193}{b} PgUp/PgDn "),
     };
     f.render_widget(
-        Paragraph::new(shown)
-            .wrap(Wrap { trim: false })
-            .block(frame_for(view.ui, Pane::Output, title)),
+        // Already wrapped above; wrapping again would re-flow rows that were
+        // measured, and the counts in the title would stop being true.
+        Paragraph::new(shown).block(frame_for(view.ui, Pane::Output, title)),
         area,
     );
 }
@@ -307,6 +381,18 @@ fn draw_command(f: &mut Frame, area: Rect, view: &View) {
     } else {
         status
     };
+    // **What the interface is waiting for wins the rule.**
+    //
+    // A step that needs a keypress used to say so only in the output pane, in
+    // prose, next to whatever else the verb printed — so "press Enter" and
+    // "the node is doing something, wait" looked identical from the outside.
+    // A node mid-ceremony is not a quiet node and its chords are not what the
+    // operator needs next.
+    let waiting = view.waiting.is_some();
+    let status = match view.waiting {
+        Some(w) => format!("WAITING \u{2192} {w}"),
+        None => status,
+    };
     let lock = if view.locked { "  \u{1f512}" } else { "" };
     // The status rides on the rule. It has to live somewhere, and the two rows
     // below are spoken for: RFC 8 §3 gives this pane a prompt and one line of
@@ -316,7 +402,11 @@ fn draw_command(f: &mut Frame, area: Rect, view: &View) {
     let block = Block::default()
         .borders(Borders::TOP)
         .title(format!(" {status}{lock} "))
-        .title_style(Style::default().fg(Color::DarkGray))
+        .title_style(Style::default().fg(if waiting {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        }))
         .border_style(Style::default().fg(if focused {
             Color::White
         } else {
