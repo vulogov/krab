@@ -12,6 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use ratatui::Frame;
 
 fn to_rect(r: UiRect) -> Rect {
@@ -223,30 +224,37 @@ pub fn wrap_rows(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return text.lines().map(str::to_string).collect();
     }
+    // **Cells, not characters.** A CJK character is one `char` and two
+    // columns, a combining mark is one `char` and none. Counting `chars()`
+    // let a row that "fit" overflow the pane, and since this function
+    // replaced the widget's own wrapping, the overflow was truncated rather
+    // than re-flowed — text silently gone, not merely misplaced.
+    let cells = |s: &str| UnicodeWidthStr::width(s);
     let mut out = Vec::new();
     for line in text.lines() {
-        if line.chars().count() <= width {
+        if cells(line) <= width {
             out.push(line.to_string());
             continue;
         }
         let mut row = String::new();
         let mut n = 0usize;
         for word in line.split_inclusive(char::is_whitespace) {
-            let w = word.chars().count();
+            let w = cells(word);
             if n + w > width && n > 0 {
                 out.push(std::mem::take(&mut row));
                 n = 0;
             }
-            // A single word longer than the pane: cut it, rather than let it
+            // A single word wider than the pane: cut it, rather than let it
             // run off the edge where it cannot be read or scrolled to.
             if w > width {
                 for c in word.chars() {
-                    if n == width {
+                    let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                    if n + cw > width {
                         out.push(std::mem::take(&mut row));
                         n = 0;
                     }
                     row.push(c);
-                    n += 1;
+                    n += cw;
                 }
             } else {
                 row.push_str(word);

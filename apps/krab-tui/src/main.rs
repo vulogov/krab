@@ -867,8 +867,15 @@ impl App {
                 // — which is most of it in a four-row pane — PgUp stopped
                 // before the top and the rest could not be reached at all.
                 let step = OUTPUT_SCROLL_LINES as i64;
-                let n = self.output_rows.get() as i64;
-                self.output_scroll = (self.output_scroll + d as i64 * step).clamp(0, n);
+                // Stop where the oldest row reaches the top, not where it
+                // reaches the bottom: clamping to the row count let the
+                // window run off the end of the text entirely and the pane
+                // went blank — which reads as "the output is gone".
+                let n = self
+                    .output_rows
+                    .get()
+                    .saturating_sub(self.output_fits()) as i64;
+                self.output_scroll = (self.output_scroll + d as i64 * step).clamp(0, n.max(0));
             }
             Binding::Compose if !self.locked => {
                 self.ui.compose();
@@ -5023,7 +5030,17 @@ impl App {
     fn reveal_output(&mut self) {
         // Never over a composer: the draft and its banner (RFC 8 §2.1) are
         // what the operator is looking at, and this is not urgent.
-        if self.ui.mode() == Mode::Compose || self.ui.zoomed().is_some() {
+        // A composer and its banner (RFC 8 §2.1) are what the operator is
+        // looking at, and this is not urgent enough to take that.
+        if self.ui.mode() == Mode::Compose {
+            return;
+        }
+        // Already showing the output pane: nothing to do. Either shape
+        // counts — the operator may have reached one with Ctrl-O themselves.
+        if matches!(
+            self.ui.zoomed(),
+            Some(layout::Zoom::Console) | Some(layout::Zoom::One(layout::Pane::Output))
+        ) {
             return;
         }
         let width = self.output_width.get() as usize;
@@ -5033,7 +5050,12 @@ impl App {
         // printed.
         self.output_rows.set(rows);
         if rows > self.output_fits() {
-            self.ui.zoom(layout::Pane::Output);
+            // **Console, not a bare full-screen pane.** `Zoom::One` renders
+            // that pane and nothing else — no prompt, and no status rule, so
+            // the WAITING indicator vanished at exactly the ceremony steps
+            // that need it. Ctrl-O doing that is the operator's own choice;
+            // this is not, so it keeps the command line.
+            self.ui.zoom_console();
         }
     }
 
@@ -8421,6 +8443,14 @@ impl App {
     /// confirmation. Nothing here can skip a step; `InitStep::next` is the
     /// only edge available.
     fn advance_init(&mut self) {
+        self.advance_init_step();
+        // **The same reveal a typed verb gets.** `status` opens the pane; the
+        // identical report printed at the end of `init` did not, which is the
+        // one moment a new operator most needs to read it.
+        self.reveal_output();
+    }
+
+    fn advance_init_step(&mut self) {
         let Some(step) = self.init_step else { return };
 
         // An unlock is a single step: derive and open, or refuse.
@@ -10011,6 +10041,155 @@ mod tests {
         }
     }
 
+    /// **Pass 13. The reveal must not hide the prompt it needs.**
+    ///
+    /// `Zoom::One` renders that pane and nothing else — no command line, so
+    /// no prompt and no status rule, and the WAITING indicator went with it.
+    /// The backup-words step is long enough to trigger the reveal, so the two
+    /// features added together cancelled each other at exactly the step where
+    /// the operator has to be told to press Enter.
+    #[test]
+    fn revealing_a_long_reply_keeps_the_command_line() {
+        let mut a = App::default();
+        a.home = temp_home("reveal-keeps-prompt");
+        a.output_height.set(4);
+        a.output_width.set(80);
+
+        type_command(&mut a, "init");
+        a.passphrase = line::Line::from("a passphrase");
+        a.advance_init();
+        while a.init_step.is_some() && a.init_step != Some(InitStep::ShowBackup) {
+            a.advance_init();
+        }
+        a.advance_init();
+
+        assert!(a.waiting().is_some(), "the ceremony is not waiting");
+        assert_eq!(
+            a.ui.zoomed(),
+            Some(layout::Zoom::Console),
+            "an automatic reveal took the whole screen"
+        );
+        // The command pane is in the layout, which is what carries both the
+        // prompt and the rule the WAITING indicator rides on.
+        let panes = a.ui.layout(layout::Rect {
+            x: 0,
+            y: 0,
+            w: 120,
+            h: 40,
+        });
+        assert!(
+            panes.iter().any(|(p, _)| *p == layout::Pane::Command),
+            "the reveal left no command pane: {panes:?}"
+        );
+    }
+
+    /// **Pass 13. Wrapping counts columns, not characters.**
+    ///
+    /// A CJK character is one `char` and two columns. Counting `chars()` let
+    /// a row that "fit" be twice the width of the pane — and because this
+    /// wrapping replaced the widget's own, the overflow was truncated rather
+    /// than re-flowed. Text was silently gone, not merely misplaced. That was
+    /// a regression introduced with the wrapping itself.
+    #[test]
+    fn wrapping_measures_display_columns_not_characters() {
+        let rows = render::wrap_rows(&"\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(10), 10);
+        for r in &rows {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(r.as_str()) <= 10,
+                "a row is wider than the pane: {r:?}"
+            );
+        }
+        // A zero-width combining mark must not consume a column either.
+        let combining = render::wrap_rows("e\u{301}".repeat(20).as_str(), 10);
+        for r in &combining {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(r.as_str()) <= 10,
+                "{r:?}"
+            );
+        }
+    }
+
+    /// **Pass 13. Scrolling to the top must not scroll past it.**
+    ///
+    /// The clamp allowed `scroll == rows`, which put the window entirely off
+    /// the end of the text: `lines[0..0]`, an empty pane. Holding PgUp read
+    /// as "the output is gone".
+    #[test]
+    fn scrolling_to_the_top_leaves_the_output_on_screen() {
+        let mut a = ready_node("scroll-top");
+        a.output = (0..40).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        a.output_rows.set(40);
+        a.output_height.set(4);
+
+        for _ in 0..40 {
+            a.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+        }
+        assert!(
+            a.output_scroll <= (40 - a.output_fits()) as i64,
+            "scrolled past the top: {} of 40",
+            a.output_scroll
+        );
+        // What the pane would render at that position is not empty.
+        let rows = render::wrap_rows(&a.output, 80);
+        let scrolled = a.output_scroll.max(0) as usize;
+        let end = rows.len().saturating_sub(scrolled.min(rows.len()));
+        assert!(end > 0, "the window ran off the end of the text");
+    }
+
+    /// **Pass 13. The end of `init` reveals what a typed verb would.**
+    ///
+    /// `status` opened the pane; the identical report at the end of the
+    /// ceremony did not, because the reveal hung off `submit` alone. That is
+    /// the one moment a new operator most needs to read it.
+    #[test]
+    fn the_report_at_the_end_of_init_opens_the_pane_too() {
+        let mut a = App::default();
+        a.home = temp_home("init-reveal");
+        a.output_height.set(4);
+        a.output_width.set(80);
+
+        type_command(&mut a, "init");
+        a.passphrase = line::Line::from("a passphrase");
+        for _ in 0..5 {
+            if a.init_step.is_none() {
+                break;
+            }
+            a.advance_init();
+        }
+        assert!(a.output.lines().count() > 4, "{}", a.output);
+        assert_eq!(
+            a.ui.zoomed(),
+            Some(layout::Zoom::Console),
+            "the end of init did not show its own report"
+        );
+    }
+
+    /// **Pass 13. A zoom on some other pane does not hide the reply.**
+    ///
+    /// The reveal skipped when anything was zoomed, so an operator who had
+    /// full-screened the list and then ran `status` got no output at all —
+    /// worse than the truncation the reveal exists to prevent.
+    #[test]
+    fn a_long_reply_takes_the_screen_from_another_zoomed_pane() {
+        let mut a = ready_node("zoom-elsewhere");
+        a.output_height.set(4);
+        a.output_width.set(80);
+        // Reached the way an operator reaches it: Tab to the list, Ctrl-O.
+        a.ui.cycle_focus();
+        assert_eq!(a.ui.focus(), layout::Pane::List);
+        a.ui.toggle_full_screen();
+        assert_eq!(a.ui.zoomed(), Some(layout::Zoom::One(layout::Pane::List)));
+
+        type_command(&mut a, "status");
+        assert_eq!(
+            a.ui.zoomed(),
+            Some(layout::Zoom::Console),
+            "the reply was left behind a zoomed list"
+        );
+        a.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(a.ui.zoomed(), None);
+    }
+
     /// **A reply that does not fit opens the pane it does not fit in.**
     ///
     /// The output pane is a few rows. `help`, `peers` and `status` all run
@@ -10032,7 +10211,7 @@ mod tests {
         );
         assert_eq!(
             a.ui.zoomed(),
-            Some(layout::Zoom::One(layout::Pane::Output)),
+            Some(layout::Zoom::Console),
             "a reply taller than the pane did not open it"
         );
 

@@ -15,6 +15,10 @@ name = "krab"
 path = "src/main.rs"
 
 [dependencies]
+# Column width for the output pane. ratatui already wraps by display
+# width; when this crate took over that wrapping it had to as well, or a
+# double-width character overflows a row that "fits" by character count.
+unicode-width = "0.2"
 krab = { workspace = true }
 krab-core = { workspace = true }
 krab-crypto = { workspace = true }

@@ -236,13 +236,12 @@ impl Ui {
         }
     }
 
-    /// Full-screen one pane, whatever has focus.
+    /// The output pane with the command line kept below it.
     ///
-    /// Focus is deliberately not moved: the operator was typing on the
-    /// command line and a reply arriving is not a reason to take that away.
-    /// `Esc` — which already resets zoom — puts the layout back.
-    pub fn zoom(&mut self, p: Pane) {
-        self.zoomed = Some(Zoom::One(p));
+    /// What an automatic reveal uses: taking the prompt away from an
+    /// operator who did not ask for full screen leaves them typing blind.
+    pub fn zoom_console(&mut self) {
+        self.zoomed = Some(Zoom::Console);
     }
 
     /// Toggle full-screen on the focused pane.
