@@ -305,17 +305,126 @@ pub fn scan_requests(
 /// The recognition and decryption path.
 pub struct Inbox;
 
+/// How many trial decapsulations one scan may spend, and which
+/// `(id, expiry)` pairs are known not to open.
+///
+/// **Bounded on purpose.** The keys are attacker-supplied identifiers, so an
+/// unbounded cache is the same denial of service wearing the other hat: the
+/// flood that used to cost CPU would cost memory instead. When it is full it
+/// stops accepting new entries rather than evicting — a full cache still
+/// answers correctly for everything in it, and the per-scan cap below is what
+/// bounds the work for everything else.
+#[derive(Debug, Default)]
+pub struct Attempts {
+    bad: std::collections::HashSet<([u8; 32], u32)>,
+    spent: usize,
+}
+
+/// Entries kept. Each is 36 bytes plus set overhead, so this is tens of KB.
+pub const MAX_REMEMBERED: usize = 4096;
+
+/// Trial decapsulations one scan may spend.
+///
+/// RFC 2 §9 says "per peer per epoch"; this is per scan, which is stricter in
+/// the direction that matters — a scan covers every peer and the whole epoch
+/// window, so a per-scan bound bounds every per-peer figure inside it. It is
+/// generous against honest traffic: a node whose correspondents send more than
+/// this many objects that match a tag and fail to open, in one pass, is under
+/// attack rather than busy.
+pub const MAX_ATTEMPTS_PER_SCAN: usize = 256;
+
+impl Attempts {
+    /// A fresh budget. Made per scan; the cache within it persists across
+    /// scans when the caller keeps it.
+    pub fn new() -> Attempts {
+        Attempts::default()
+    }
+
+    /// Whether this pair has already been shown not to open.
+    pub fn known_bad(&self, id: &[u8; 32], expiry: u32) -> bool {
+        self.bad.contains(&(*id, expiry))
+    }
+
+    /// Record a pair that did not open.
+    pub fn remember_bad(&mut self, id: [u8; 32], expiry: u32) {
+        if self.bad.len() < MAX_REMEMBERED {
+            self.bad.insert((id, expiry));
+        }
+    }
+
+    /// Spend one attempt. `false` once the budget for this scan is gone.
+    pub fn charge(&mut self) -> bool {
+        if self.spent >= MAX_ATTEMPTS_PER_SCAN {
+            return false;
+        }
+        self.spent += 1;
+        true
+    }
+
+    /// Start a new scan: the budget refills, the cache does not.
+    pub fn refresh(&mut self) {
+        self.spent = 0;
+    }
+
+    /// Drop everything. The caller does this when the correspondent set or
+    /// the epoch changes, because either can change whether a pair opens.
+    pub fn clear(&mut self) {
+        self.bad.clear();
+        self.spent = 0;
+    }
+
+    /// How many pairs are remembered. Used by the bound's test.
+    #[cfg(test)]
+    pub fn remembered(&self) -> usize {
+        self.bad.len()
+    }
+}
+
 impl Inbox {
     /// Scan the corpus for mail this node can open.
     ///
     /// Returns plaintext the caller is expected to drop when the view changes.
     /// Nothing is cached and nothing is written.
+    /// A scan with no attempt state carried across calls.
+    ///
+    /// Only tests use this: production keeps an [`Attempts`] on the `App` so
+    /// the cache outlives one pass, which is the point of having one.
+    #[cfg(test)]
     pub fn scan(
         store: &Store,
         table: &TagTable,
         correspondents: &[Correspondent],
         ours: &[SecretKey],
         window: (u32, u32),
+    ) -> Scan {
+        let mut discard = Attempts::new();
+        Self::scan_with(store, table, correspondents, ours, window, &mut discard)
+    }
+
+    /// As [`Inbox::scan`], but carrying the caller's attempt state across
+    /// calls — which is the whole point of it.
+    ///
+    /// **RFC 2 §9 / RFC 1 §6.4.** An adversary who learns a current tag can
+    /// flood objects bearing it, and each one costs a full constant-time
+    /// trial decapsulation — about 10 ms — for nothing. Two requirements
+    /// follow, and RFC 2 states both as MUST where RFC 1 states the second as
+    /// SHOULD; the stricter governs:
+    ///
+    /// > Implementations MUST cache failed (id, epoch) pairs so a replay
+    /// > costs one lookup. Implementations MUST cap inbox-tagged
+    /// > decapsulation attempts per peer per epoch.
+    ///
+    /// Neither existed. Every object that matched a tag and failed to open
+    /// was retried in full on every refresh, and refresh runs on every tick
+    /// that drains an exchange — so an idle two-node network was already
+    /// paying it, which is how this was noticed.
+    pub fn scan_with(
+        store: &Store,
+        table: &TagTable,
+        correspondents: &[Correspondent],
+        ours: &[SecretKey],
+        window: (u32, u32),
+        attempts: &mut Attempts,
     ) -> Scan {
         let mut out = Scan {
             messages: Vec::new(),
@@ -339,6 +448,23 @@ impl Inbox {
                 continue;
             }
 
+            // **The cache, before the work.** A pair that failed once fails
+            // again: the object is immutable, the keys for that epoch are
+            // fixed, and the only thing that could change the answer is a new
+            // correspondent — which rebuilds the tag table and clears this.
+            if attempts.known_bad(&id.0, header.expiry_min) {
+                out.tag_match_decrypt_fail += 1;
+                continue;
+            }
+            // **The cap.** Beyond it, tag-matching objects are left alone
+            // this pass rather than decapsulated. They are still stored and
+            // still relayed; what is refused is the CPU, which is the thing
+            // being attacked.
+            if !attempts.charge() {
+                out.tag_match_decrypt_fail += 1;
+                continue;
+            }
+
             match Self::open_object(bytes, &header, candidates, correspondents, ours) {
                 Some((from, epoch, body, nodelist, picture, pq)) => out.messages.push(Message {
                     id,
@@ -349,7 +475,10 @@ impl Inbox {
                     picture,
                     post_quantum: pq,
                 }),
-                None => out.tag_match_decrypt_fail += 1,
+                None => {
+                    attempts.remember_bad(id.0, header.expiry_min);
+                    out.tag_match_decrypt_fail += 1;
+                }
             }
         }
 
@@ -451,6 +580,69 @@ impl Inbox {
             }
         }
         opened
+    }
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use super::*;
+
+    /// **RFC 2 §9's cache.** A pair shown not to open is not tried again.
+    #[test]
+    fn a_failed_pair_is_remembered_and_not_retried() {
+        let mut a = Attempts::new();
+        let id = [7u8; 32];
+        assert!(!a.known_bad(&id, 42));
+        a.remember_bad(id, 42);
+        assert!(a.known_bad(&id, 42));
+
+        // Keyed on the pair: the same object in a different epoch window is a
+        // different question and must still be attempted.
+        assert!(!a.known_bad(&id, 43));
+    }
+
+    /// **The cache is bounded**, or the flood that cost CPU costs memory.
+    #[test]
+    fn the_cache_stops_growing_and_stays_correct() {
+        let mut a = Attempts::new();
+        for i in 0..(MAX_REMEMBERED + 500) {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            a.remember_bad(id, 1);
+        }
+        assert_eq!(a.remembered(), MAX_REMEMBERED, "the cache is unbounded");
+
+        // Everything it did keep, it still answers correctly for.
+        let mut first = [0u8; 32];
+        first[..8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(a.known_bad(&first, 1));
+    }
+
+    /// **RFC 2 §9's cap.** Attempts are refused past the budget, and the
+    /// budget refills per scan rather than per process.
+    #[test]
+    fn attempts_are_capped_per_scan_and_refill() {
+        let mut a = Attempts::new();
+        for _ in 0..MAX_ATTEMPTS_PER_SCAN {
+            assert!(a.charge());
+        }
+        assert!(!a.charge(), "the cap does not bind");
+        assert!(!a.charge());
+
+        a.refresh();
+        assert!(a.charge(), "the budget did not refill");
+    }
+
+    /// A cleared cache forgets, because a new correspondent can change
+    /// whether a pair opens.
+    #[test]
+    fn clearing_forgets_everything() {
+        let mut a = Attempts::new();
+        a.remember_bad([1u8; 32], 9);
+        let _ = a.charge();
+        a.clear();
+        assert!(!a.known_bad(&[1u8; 32], 9));
+        assert_eq!(a.remembered(), 0);
     }
 }
 

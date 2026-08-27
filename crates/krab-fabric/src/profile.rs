@@ -107,6 +107,38 @@ impl LinkProfile {
         self.bytes_per_day() >= required_bytes_per_day
     }
 
+    /// **RFC 8 §9 — whether this link provides LOCATION privacy.**
+    ///
+    /// A transport property, per RFC 4 §10: a Tor link with restricted
+    /// discovery has it, plain IP does not. A courier has it in the sense
+    /// that matters — there is no network observation of where the operator
+    /// is — and so does a directly-wired serial line, which reveals a
+    /// location only to someone already standing at it.
+    ///
+    /// LoRa does not: a transmission is direction-findable, which is a
+    /// physical-layer property no protocol can undo (RFC 4 §11).
+    pub fn location_privacy(&self) -> bool {
+        matches!(self.kind, "socks" | "tor" | "courier" | "serial")
+    }
+
+    /// **RFC 8 §9 — whether this link provides VOLUME privacy.**
+    ///
+    /// RFC 0 §7.3: volume privacy requires cover traffic, and cover traffic
+    /// is unaffordable on a constrained link. So this is not a property a
+    /// deployment chooses — some links structurally cannot have it.
+    ///
+    /// A courier has it trivially: an observer sees a person, not a byte
+    /// count per correspondent. A metered or duty-cycled link cannot afford
+    /// the cover that would provide it.
+    pub fn volume_privacy(&self) -> bool {
+        if self.kind == "courier" {
+            return true;
+        }
+        // Cover traffic has to be affordable to exist. A duty cycle below one
+        // is a regulatory ceiling on airtime, and a metered link bills it.
+        !self.metered && self.duty_cycle >= 1.0
+    }
+
     /// A plain TCP link. RFC 4 §5.1.
     pub fn tcp() -> LinkProfile {
         LinkProfile {
@@ -200,6 +232,44 @@ impl LinkProfile {
             armor: false,
             fec: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    /// **RFC 8 §9 — two independent indicators, never averaged.**
+    ///
+    /// "A single 'secure' badge would average them into something false."
+    /// The test that matters is that some link has one and not the other; if
+    /// every profile agreed on both, one indicator would do and the RFC
+    /// would not have asked for two.
+    #[test]
+    fn the_two_privacy_properties_are_independent() {
+        let tcp = LinkProfile::tcp();
+        let lora = LinkProfile::lora_sf10();
+        let courier = LinkProfile::courier();
+
+        // Plain TCP: an observer sees where you are, but the link can afford
+        // cover traffic.
+        assert!(!tcp.location_privacy(), "plain TCP hides location");
+        assert!(tcp.volume_privacy(), "TCP cannot afford cover");
+
+        // LoRa: direction-findable, and too constrained for cover. Neither.
+        assert!(!lora.location_privacy());
+        assert!(!lora.volume_privacy());
+
+        // A courier: both, and for reasons no network property explains.
+        assert!(courier.location_privacy());
+        assert!(courier.volume_privacy());
+
+        // The point of two indicators: at least one link differs on them.
+        assert_ne!(
+            tcp.location_privacy(),
+            tcp.volume_privacy(),
+            "if no profile ever differs, one badge would have done"
+        );
     }
 }
 

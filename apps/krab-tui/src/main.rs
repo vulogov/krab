@@ -570,6 +570,9 @@ struct App {
     /// The correspondent names `tag_table` was built from. A table is stale
     /// when this no longer matches, not only when the epoch has rolled.
     tag_table_peers: Vec<String>,
+    /// RFC 2 §9's trial-decapsulation cache and cap. Lives on the App so it
+    /// survives between scans — a cache rebuilt every pass caches nothing.
+    attempts: receive::Attempts,
     /// Set by the confirmation prompt, consumed by the next command.
     confirmed: bool,
     /// Where the first-run ceremony has got to, if it is running.
@@ -648,6 +651,7 @@ impl Default for App {
             selected: 0,
             log: activity_log::ActivityLog::new(),
             tag_table: None,
+            attempts: receive::Attempts::new(),
             tag_table_peers: Vec::new(),
             confirmed: false,
             init_step: None,
@@ -1593,6 +1597,10 @@ fn inbox_row(m: &receive::Message) -> String {
         if !current {
             self.tag_table = Some(receive::TagTable::build(&peers, epoch));
             self.tag_table_peers = built_from;
+            // A new correspondent or a new epoch can change whether a pair
+            // opens, so everything remembered about failures stops being
+            // true at exactly the moment the table is rebuilt.
+            self.attempts.clear();
         }
         let table = self.tag_table.as_ref().expect("just built");
         // **Every private key this node holds**, in a fixed order: the
@@ -1602,7 +1610,18 @@ fn inbox_row(m: &receive::Message) -> String {
         let opening_keys = self.opening_keys();
         let scan = self
             .store
-            .with(|st| receive::Inbox::scan(st, table, &peers, &opening_keys, (0, u32::MAX)));
+            .with(|st| {
+                // The budget refills per scan; the cache does not.
+                self.attempts.refresh();
+                receive::Inbox::scan_with(
+                    st,
+                    table,
+                    &peers,
+                    &opening_keys,
+                    (0, u32::MAX),
+                    &mut self.attempts,
+                )
+            });
 
         // **Nodelists arriving from peers** — RFC 3 §8. A fragment is sealed
         // pairwise like any other message, so it opens here; it is separated
@@ -7949,6 +7968,22 @@ impl App {
                 Some(_) => "link down",
                 None => "not connected",
             };
+            // **RFC 8 §9 — two independent indicators, per link.**
+            //
+            // "A single 'secure' badge would average them into something
+            // false." Location privacy is a transport property; volume
+            // privacy needs cover traffic that a constrained link cannot
+            // afford. A link that is down has no properties to report, and
+            // saying nothing is better than reporting the last one's.
+            let privacy = match self.links.get(id).map(|l| l.profile.clone()) {
+                Some(p) => format!(
+                    "  {}  loc {}  vol {}",
+                    p.kind,
+                    if p.location_privacy() { "●" } else { "○" },
+                    if p.volume_privacy() { "●" } else { "○" },
+                ),
+                None => String::new(),
+            };
             let policy = if self.peer_path(id, artifact::PeerFile::Policy).exists() {
                 "terms current"
             } else {
@@ -8063,7 +8098,7 @@ impl App {
                 String::new()
             };
             out.push_str(&format!(
-                "{id}  peered  ·  {link}  ·  {policy}\n    {how}{budget}{nodelist}\n"
+                "{id}  peered  ·  {link}{privacy}  ·  {policy}\n    {how}{budget}{nodelist}\n"
             ));
         }
         // Links to nodes we have no peering with cannot exist — `establish`
@@ -8438,6 +8473,14 @@ impl App {
         std::thread::spawn(move || {
             // Ends when the receiver is dropped, which happens when the App
             // does. Nothing else needs to signal it.
+            //
+            // **RFC 4 §12's concurrency cap, satisfied at one.** This loop is
+            // the only caller of `accept`, and `accept` completes the
+            // handshake before returning — so there is never more than one
+            // in-progress handshake, against the SHOULD of four. That is a
+            // structural property, not a counter, and it stops being true the
+            // moment someone spawns a thread per connection here. Whoever
+            // does that owes the cap the requirement asks for.
             loop {
                 match l.accept() {
                     Ok(Some(pair)) => {
