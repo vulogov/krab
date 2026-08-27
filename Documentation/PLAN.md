@@ -498,3 +498,41 @@ So the honest expectation is that the next real gap is found the same way, not
 by reading. Phases 7–11 each end with an adversarial pass over what they
 touched, per §4 — and the pass that matters is the one driven through two
 processes rather than one test harness.
+
+---
+
+## 9. RFC 8 requirement audit, 2026-08-27 — partial
+
+Prompted by four usability reports that all turned out to be unmet §4.2
+requirements. Every numbered MUST in RFC 8 was enumerated; the ones below were
+checked against the code. **This is not the whole file** — the unchecked ones
+are listed so the gap in the audit is visible rather than implied.
+
+| requirement | verdict |
+|---|---|
+| §4.2 r1 — security context in the composer | **was unmet, now met.** There was no composer for a post at all |
+| §4.2 r2 — first post of a session confirms | met before, but by retyping the verb; now one keystroke |
+| §4.2 r3 — reply is private, publish is a separate key | reply was already private; the *author* it replies to was on screen nowhere. Now shown |
+| §4.2 r4 — roster divergence shown, never silently merged | met — `roster_divergences` |
+| §4.2 r5 — group-size and prekey warnings at join | met |
+| §3 — output over one line goes to the view pane or a zoomed command pane, never scrolls the two-line pane | met, and more nearly than before: the reveal added on 2026-08-26 is the zoomed form |
+| §4.3 — carriage warning at the point of enabling, default off | met |
+| §6 — decode/re-encode, pixel cap, no viewer, LoRa refusal | met |
+| §7 — fingerprint beside display names, confusable detection | met |
+| §9 — **per link, whether it provides LOCATION privacy** | **unmet.** Nothing renders it |
+| §9 — **per link, whether it provides VOLUME privacy** | **unmet.** Nothing renders it |
+
+**Not yet checked**: §2.1's zeroize-on-close and the MUST NOT on caching
+decrypted bodies (`self.messages` holds plaintext and is cleared on lock —
+whether that satisfies "not cached" needs reading, not guessing); §5's
+progress rules; §8's expired-peering state; §11's remote-ceremony
+restriction; §12's amateur-band acknowledgement; §13's TUI/node channel
+separation.
+
+**Add to the plan**: the two §9 items belong in Phase 10, beside the other
+per-peer evidence — they are the same panel and the same missing derivation.
+
+The pattern worth naming: all four reports came from an operator using the
+thing, and each mapped to a requirement that had been read as satisfied. The
+audit above is what should have been run when RFC 8 was implemented, and
+running it now found two more.
