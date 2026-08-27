@@ -90,14 +90,22 @@ pub enum Tab {
     Private,
     /// Public, signed, permanent.
     Channels,
+    /// Written to yourself. Never leaves the node — not an object, never
+    /// offered to a peer, and not public in any sense the other two tabs
+    /// mean it.
+    Notes,
 }
 
 impl Tab {
-    /// Switch.
+    /// The next tab in the cycle — what `Tab` (the key) moves to.
+    ///
+    /// Wraps back to `Private`, so inattention lands on the safe context
+    /// rather than on the one that publishes (RFC 8 §2).
     pub fn other(self) -> Tab {
         match self {
             Tab::Private => Tab::Channels,
-            Tab::Channels => Tab::Private,
+            Tab::Channels => Tab::Notes,
+            Tab::Notes => Tab::Private,
         }
     }
 }
@@ -330,7 +338,10 @@ impl Ui {
         match self.mode {
             Mode::Browse => None,
             Mode::Compose => Some(match self.tab {
-                Tab::Private => Banner::Private,
+                // A note is sealed and local. It gets the private banner:
+                // claiming PUBLIC over a draft that can never be published
+                // would train the operator to disbelieve the banner.
+                Tab::Private | Tab::Notes => Banner::Private,
                 Tab::Channels => Banner::PublicSignedPermanent,
             }),
         }
@@ -555,7 +566,11 @@ mod tests {
 
                 let banner = ui.banner().expect("composing always shows a banner");
                 match tab {
-                    Tab::Private => assert_eq!(banner, Banner::Private),
+                    // A note is sealed and never leaves the node, so it takes
+                    // the private banner. Claiming PUBLIC over a draft that
+                    // cannot be published would teach the operator that the
+                    // banner does not mean what it says.
+                    Tab::Private | Tab::Notes => assert_eq!(banner, Banner::Private),
                     Tab::Channels => {
                         assert_eq!(banner, Banner::PublicSignedPermanent);
                         assert_eq!(banner.text(), "PUBLIC — SIGNED — PERMANENT");

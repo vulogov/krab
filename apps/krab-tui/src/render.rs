@@ -122,14 +122,19 @@ fn draw_tabs(f: &mut Frame, area: Rect, ui: &Ui) {
         .bg(Color::White)
         .add_modifier(Modifier::BOLD);
     let un = Style::default().fg(Color::DarkGray);
-    let (a, b) = match ui.tab() {
-        Tab::Private => (sel, un),
-        Tab::Channels => (un, sel),
+    let (a, b, c) = match ui.tab() {
+        Tab::Private => (sel, un, un),
+        Tab::Channels => (un, sel, un),
+        Tab::Notes => (un, un, sel),
     };
     let line = Line::from(vec![
         Span::styled(" Private messages ", a),
         Span::raw(" "),
         Span::styled(" Channels ", b),
+        Span::raw(" "),
+        // Named for what it is rather than "Notes" alone: the tab's whole
+        // property is that nothing in it is ever offered to a peer.
+        Span::styled(" Notes (local) ", c),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -163,6 +168,7 @@ fn draw_list(f: &mut Frame, area: Rect, view: &View) {
             format!(" channels · {} ", view.me.unwrap_or("no identity"))
         }
         (Tab::Channels, Level::Messages) => " channel ▸ posts ".to_string(),
+        (Tab::Notes, _) => format!(" notes · local only · {} ", view.me.unwrap_or("no identity")),
     };
     let rows: Vec<Line> = view.list.iter().map(|s| Line::from(s.as_str())).collect();
     f.render_widget(

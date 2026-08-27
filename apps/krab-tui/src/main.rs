@@ -1733,7 +1733,42 @@ fn inbox_row(m: &receive::Message) -> String {
         // The Channels tab lists channels, not mail. Both are rebuilt here,
         // so switching tabs shows what is there rather than what was there
         // when the tab was last opened.
+        if self.ui.tab() == layout::Tab::Notes {
+            let Some(me) = self.identity.as_ref().map(|i| i.short_id()) else {
+                self.body = "no identity. `init` to create one.".into();
+                return;
+            };
+            if self.pin_key.is_none() {
+                self.body = "locked.".into();
+                return;
+            }
+            let archive = self.pinned();
+            let mine = archive.of(&me);
+            self.body = match mine.get(self.selected) {
+                Some(k) => format!(
+                    "note · local only · epoch {}\n\n{}\n\n\
+                     This is not an object. No peer is ever offered it and it \
+                     is not in the corpus. It is exempt from the epoch erasure \
+                     that makes mail unreadable (RFC 7 §8), so it stays until \
+                     `wipe` destroys it.",
+                    k.epoch,
+                    display::safe(&k.body).text
+                ),
+                None => "no note selected.\n\n`note <text>` keeps one; `note` \
+                         alone opens a composer."
+                    .into(),
+            };
+            return;
+        }
         if self.ui.tab() == layout::Tab::Channels {
+            // Notes: local, never offered, so they are built from the
+            // archive rather than from the corpus — there is nothing in the
+            // corpus to build them from, which is the point.
+            if self.ui.tab() == layout::Tab::Notes {
+                self.list = self.note_rows();
+                self.show_selected();
+                return;
+            }
             // **Two levels, and the second one now has content.**
             // `descend` set `Level::Messages` and nothing read it, so
             // pressing Enter on a channel changed the pane's title and left
@@ -3153,6 +3188,30 @@ fn inbox_row(m: &receive::Message) -> String {
         self.write_note(&key, text)
     }
 
+    /// One row per note, newest last, for the Notes tab's list pane.
+    fn note_rows(&self) -> Vec<String> {
+        let Some(me) = self.identity.as_ref().map(|i| i.short_id()) else {
+            return vec!["no identity. `init` to create one.".into()];
+        };
+        if self.pin_key.is_none() {
+            return vec!["(locked)".into()];
+        }
+        let archive = self.pinned();
+        let mine = archive.of(&me);
+        if mine.is_empty() {
+            return vec!["(no notes — `note <text>`, or `note` to compose)".into()];
+        }
+        mine.iter()
+            .map(|k| {
+                format!(
+                    "[{}]  {}",
+                    k.epoch,
+                    display::safe(k.body.lines().next().unwrap_or("")).text
+                )
+            })
+            .collect()
+    }
+
     /// Everything written to self, newest last.
     fn list_notes(&self) -> String {
         let Some(me) = self.identity.as_ref().map(|i| i.short_id()) else {
@@ -3183,7 +3242,7 @@ fn inbox_row(m: &receive::Message) -> String {
 
     /// Open the composer for a note. A note is not necessarily one line.
     fn compose_note(&mut self) -> String {
-        self.ui.select_tab(layout::Tab::Private);
+        self.ui.select_tab(layout::Tab::Notes);
         self.ui.compose();
         while self.ui.focus() != layout::Pane::View {
             self.ui.cycle_focus();
@@ -10420,6 +10479,40 @@ mod tests {
             .iter()
             .any(|k| k.body == "buy milk"));
         let _ = key;
+    }
+
+    /// **A note is encrypted at rest, and tamper-evident.**
+    ///
+    /// It is sealed with ChaCha20-Poly1305 under a KEK-derived subkey — the
+    /// same construction as pinned mail, because it *is* the pinned archive.
+    /// The AEAD tag is what makes it tamper-evident; there is deliberately no
+    /// signature, and §on-signing in the commit message says why.
+    #[test]
+    fn a_note_is_ciphertext_on_disk_and_will_not_open_if_altered() {
+        let mut a = ready_node("note-crypto");
+        type_command(&mut a, "note SECRETPLAINTEXTMARKER");
+
+        let path = a.path(artifact::Artifact::Pinned);
+        let sealed = std::fs::read(&path).expect("archive written");
+        assert!(
+            !sealed
+                .windows(b"SECRETPLAINTEXTMARKER".len())
+                .any(|w| w == b"SECRETPLAINTEXTMARKER"),
+            "the note is on disk in the clear"
+        );
+
+        // Flip a byte of the ciphertext: the AEAD tag must refuse it rather
+        // than hand back altered text.
+        let key = a.pin_key.expect("unlocked");
+        let mut tampered = sealed.clone();
+        let n = tampered.len();
+        tampered[n / 2] ^= 0x01;
+        assert!(
+            krab_crypto::kek::open_under(&key, pin::DOMAIN, &tampered).is_err(),
+            "an altered archive opened anyway"
+        );
+        // And the untouched one still does.
+        assert!(krab_crypto::kek::open_under(&key, pin::DOMAIN, &sealed).is_ok());
     }
 
     /// A note may be longer than a line, so it is composed.

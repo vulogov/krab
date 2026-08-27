@@ -226,6 +226,7 @@ impl Binding {
         match key.code {
             Key::F(1) => return Binding::SelectTab(crate::layout::Tab::Private),
             Key::F(2) => return Binding::SelectTab(crate::layout::Tab::Channels),
+            Key::F(3) => return Binding::SelectTab(crate::layout::Tab::Notes),
             Key::Char('m' | 'M' | '1') if key.ctrl || key.alt => {
                 return Binding::SelectTab(crate::layout::Tab::Private)
             }
