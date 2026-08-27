@@ -361,3 +361,140 @@ appeared to an operator exactly when they did what the preceding commits
 encouraged.
 
 The pass is not a release step. It is what makes the previous feature true.
+
+---
+
+# What is next — 0.2, compiled 2026-08-27
+
+Phases 1–6 are done and the release shipped. This is the survey that follows
+them, and it is a different list: what 0.1 does **not** do, as opposed to what
+it did not yet do when the plan above was written.
+
+## 5. How this was compiled, and what would make it wrong
+
+Four sources, because no one of them is complete:
+
+1. `grep` for `todo!`, `unimplemented!`, `FIXME`. **Nothing.** That is not
+   evidence of completeness — this codebase records gaps in prose, not
+   markers, so the search proves only that nobody left a marker.
+2. `Documentation/RFC-*-blocking-items.md` — rows still marked **open**.
+3. `AMENDMENTS.md` — findings against the frozen RFCs with nothing built.
+4. The `CHANGELOG` limitations, and what running two real nodes turned up
+   this week.
+
+**The standing risk on a list like this** is the one Phase 6 recorded against
+itself: a claim of absence asserted over a set that was not the whole set. A
+truncated `grep` reported a function as uncalled when it was called on the
+next line. So each item below names *how it was established*, and anything
+resting only on "I did not find it" says so.
+
+---
+
+## 6. The list
+
+### A — functionality that is absent
+
+| # | what | where it bites |
+|---|---|---|
+| **A1** | **Payload fragmentation.** `krab` refuses anything larger than one object: "too long for one object — split it" (`main.rs:6657`). The largest bucket is 256 KB. | A photograph cannot be sent. RFC 8 §6 permits pictures and SIM-0's traffic model assumes 50–500 KB ones, so the product refuses the traffic its own simulation is built on. `--frag` implements store-and-forward fragmentation **in the simulator**, so the network model has it and the client does not. Note `apps/krab-tui/src/fragment.rs` is RFC 3 §8 *nodelist* fragments — a different thing with the same word. |
+| **A2** | **The RFC 3 §12 per-peer panel is never populated.** `peers::Row`, `PeerMetrics` and `Coverage` are built and tested; `peers_panel` passes an empty `Vec` and says so in a comment. | §12 wants a disconnect decision one keystroke from the evidence for it. There is no evidence — the operator sees quota and today's counts, assembled separately, and nothing about what a peer actually brings. |
+| **A3** | **RFC 3 §13's coverage-ramp warning cannot fire.** `Coverage` has no production constructor; every one is in a test. | The other three §13 warnings do fire. This is the one that says possession has become evidence (SIM-1 §3), which is the warning with a consequence for the operator's safety rather than their availability. |
+| **A4** | **Channels carry no attachment.** `send <peer> --picture` exists; `channel post` publishes the flag as characters. Pinned by a test. | RFC 8 §6 permits pictures and does not scope them to private messages, so this is a gap rather than a decision — but a picture on a public, signed, permanent post is a privacy choice the operator should make knowingly, and that is a design question before it is a coding one. |
+
+### B — frozen numbers with no measurement behind them
+
+`RFC-1-blocking-items.md` exists so that "nothing reaches Draft on a number
+nobody measured". Four rows are still **open**, and the code ships values for
+all four anyway.
+
+| # | parameter | shipped | recorded status |
+|---|---|---|---|
+| **B1** | epoch length | 1 day | open — "the hardest": sneakernet pushes long, unlinkability short, and one counter is shared by tag derivation, key erasure and the reservoir |
+| **B2** | max object size | **256 KB** (`BUCKETS` top) | open — **and it conflicts**: B3 proposes 64 KB. The code has already chosen 4× that, without the sweep |
+| **B3** | size buckets | 6: 256 B … 256 KB | open — unmeasured |
+| **B4** | clock skew tolerance | **none** | open — and unlike B1–B3 there is no value to argue about, because `grep -i skew` across the workspace returns nothing |
+
+**B4 is the one that is also a bug.** The routing header's expiry is minutes
+since epoch and is read from the cleartext. Reconciliation admits a ±45-day
+window, which is not a skew tolerance — it is the TTL used as one. A node with
+a wrong clock mis-expires objects in both directions and nothing anywhere
+says so.
+
+### C — spec defects, not code
+
+`AMENDMENTS.md` #7, #8 and #9 are open: a rollcall entry whose stated size has
+no field list, a key table that never numbers its signature, and a credential
+that does not say which party is A. Each has drop-in text written. They need
+an RFC editor, and this project has one author, so they stay open and stay
+recorded — which is the honest outcome, not a blocked one.
+
+### D — release engineering
+
+- **RFC 1 §12's second implementation.** Refused, with reasons, in
+  `MILESTONE-0.1.md` §2.2.2. Not a task.
+- **Reproducibility is verified on `aarch64-apple-darwin` only.** Linux and
+  Windows use different linkers with their own stamps.
+
+---
+
+## 7. The plan
+
+Ordered by what makes the product *wrong now*, ahead of what is merely
+unmeasured, with one exception: B2 comes before A1 because the answer to
+"how big may an object be" is the input to "how do we split one".
+
+### Phase 7 — clock skew (B4)
+
+First because it is the only item that is both unmeasured **and** unbuilt, and
+because a wrong clock currently fails silently in both directions. Decide a
+tolerance, apply it where expiry is read, and say what happens outside it —
+refusing an object is a decision an operator should be told about, not one
+that shows up as mail that never arrived.
+
+### Phase 8 — settle B2, then B1 and B3
+
+`RFC-1-blocking-items.md` already names the experiment for B2: re-run SIM-1's
+`recon` and `idlen` sweeps with the traffic model capped at the chosen maximum
+and `--frag` on. It says half an hour of simulator time and no new code. B1
+and B3 follow the same shape.
+
+This phase produces numbers and a document, not a feature. It is worth its
+place because RFC 1 is frozen: these values are permanent, and one of them is
+already 4× the proposal.
+
+### Phase 9 — payload fragmentation (A1)
+
+Sized by Phase 8. The simulator has store-and-forward fragmentation; the
+client needs it, with reassembly, a partial-object state the interface can
+show, and a decision about what a missing fragment looks like to the reader.
+
+### Phase 10 — the evidence an operator disconnects on (A2, A3)
+
+Together, because both need the same thing: coverage by age bucket, derived
+from the corpus. A2 is the panel; A3 is the warning that panel makes
+actionable. Neither is worth building without the other.
+
+### Phase 11 — channel attachments (A4)
+
+A decision first: whether a picture belongs on a public, signed, permanent
+post at all, and if so what the interface says at the moment of posting. The
+code after that is small — the pipeline exists and is tested.
+
+### Not phases
+
+C is an editor's work. D is a platform matter and a refusal already argued.
+
+---
+
+## 8. What this list may still be missing
+
+It rests on markers that do not exist, documents I wrote, and this week's
+runs. The three defects found this week — a peering that could not read its
+own mail, received mail that never reached disk, a forced send that reported
+failure while succeeding — were **in none of those sources**. Every one came
+from running two real nodes and watching.
+
+So the honest expectation is that the next real gap is found the same way, not
+by reading. Phases 7–11 each end with an adversarial pass over what they
+touched, per §4 — and the pass that matters is the one driven through two
+processes rather than one test harness.
