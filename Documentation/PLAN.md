@@ -690,3 +690,93 @@ Three passes have now found unmet MUSTs in every document examined: RFC 8
 (two), RFC 1 (one), RFC 2 (three), RFC 3 (one). Seven in total, none of which
 the tests caught, because the tests were written from the same reading of the
 documents that the code was.
+
+---
+
+## 12. RFCs 4, 5 and 6, 2026-08-27 — third pass, audit complete
+
+The three remaining documents. With §9–§11 above, every RFC in the series has
+now had its MUSTs enumerated and its checkable ones checked.
+
+### Unmet
+
+**RFC 4 §12 — concurrent in-progress handshakes per peer are not capped.**
+
+> Handshake timeout MUST be enforced (SHOULD be 30 s on interactive links).
+> Concurrent in-progress handshakes per peer MUST be capped (SHOULD be 4).
+
+The timeout is enforced — `HANDSHAKE_TIMEOUT_S` in the listener. The cap is
+not: nothing counts in-progress handshakes, so a peer whose static key we
+accept can open them without limit, each holding a thread and a Noise state
+until it times out. The two requirements sit in the same three-line block and
+one of them was implemented; this is the shape of defect the passes keep
+finding, at the granularity of adjacent sentences.
+
+**RFC 6 §3.6 — channels do not occupy a separate shard space.**
+
+> Channels MUST occupy a separate shard space from sealed traffic.
+
+`shard_bits` exists on the filter and is negotiated between peers, but nothing
+assigns channels a different shard from sealed mail: there is one space and
+both live in it. RFC 1's B3 settles the default shard `k` at **0 in v1** with
+the field mandatory — so in v1 there is exactly one shard, and the separation
+RFC 6 requires cannot be expressed at all.
+
+This is **amendment #11**, not a code defect. RFC 6 requires a separation that
+RFC 1's v1 parameter choice makes unrepresentable. Either B3's default moves
+off 0, or RFC 6 §3.6 acknowledges that the requirement begins at v2. It cannot
+be satisfied as both documents currently stand.
+
+### Checked and met
+
+| requirement | evidence |
+|---|---|
+| RFC 4 §12 — handshake timeout enforced | `HANDSHAKE_TIMEOUT_S`, listener |
+| RFC 4 §12 — frame length validated against Noise's 65535 before allocation | `frame.rs`, `MAX_FRAME` |
+| RFC 4 §7 — courier archive is flat length-prefixed records, no foreign database opened | `courier.rs` |
+| RFC 5 §8 — receiver rejects passed expiry; tombstone set; `min_expiry` watermark | `krab-store/index.rs`: `Tombstoned`, `BelowWatermark`, `min_expiry_min` |
+| RFC 5 §6 — RBSR round trips capped | `RBSR_MAX_ROUNDS` |
+| RFC 5 §6.1 — Poisson schedule with randomised interval | `scheduler`, and `force-send` states the cost of the one exception |
+| RFC 6 §2.7 — fan-out staggered over a window derived from observed arrival rate, not a constant | `observed_arrivals` feeds the window |
+| RFC 6 §3.6 — carriage off by default; class 1 excludable via `class_mask` | Phase 6 |
+| RFC 6 §5 — the five interface requirements | met as of the channels work above; §4.2 of RFC 8 is the same five |
+
+### Not checked
+
+RFC 4's LoRa `max_bucket` ceiling and the amateur-band class restrictions
+(§10) — the constants exist and the refusal is written, but no test drives a
+LoRa profile end to end. RFC 4 §8's `short` class: `Class::Short = 3` is
+defined and documented as "not a corpus object", and nothing emits one, so
+the MUST NOTs about forwarding and storing it are satisfied vacuously — but
+that an *incoming* class 3 object is refused before the store was not
+verified. RFC 5 §7's "index MUST be fully rebuildable from the segments by one
+scan" is asserted by the store's design and was not exercised by deleting an
+index and rebuilding.
+
+### The audit, whole
+
+| document | MUSTs | unmet found |
+|---|---|---|
+| RFC 1 | 36 | 1 — no failed-`(id, epoch)` cache (§6.4) |
+| RFC 2 | 17 | 3 — the same cache, no decapsulation cap, no median-of-peers time (§7, §9) |
+| RFC 3 | 22 | 1 — no HJSON rendering of a credential (§2) |
+| RFC 4 | 25 | 1 — concurrent handshakes uncapped (§12) |
+| RFC 5 | 17 | 0 |
+| RFC 6 | 22 | 1 — channels share a shard space (§3.6) |
+| RFC 7 | 29 | 0 found; §10.3 and §6 unchecked |
+| RFC 8 | — | 2 — LOCATION and VOLUME privacy not shown per link (§9) |
+
+**Nine unmet requirements, and two conflicts between frozen documents**
+(#10 `EPOCH_WINDOW` vs W, #11 channel shard space vs v1's single shard).
+
+Every document examined had at least one, except RFC 5 — which is also the
+document whose requirements are most nearly mechanical, and therefore the
+easiest to check by grep. That is a caution about this audit's method, not a
+compliment to RFC 5: the requirements this pass could verify are the ones with
+a distinctive noun in them, and requirements without one were skipped and are
+listed as skipped.
+
+None of the nine was caught by 1045 tests, because the tests were written from
+the same reading of the documents as the code was. That is the finding that
+matters most, and it argues for conformance vectors driven from the RFC text
+rather than more tests written by the implementer.
