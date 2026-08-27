@@ -881,9 +881,18 @@ impl App {
             Binding::CycleFocus => self.ui.cycle_focus(),
             Binding::CycleFocusBack => self.ui.cycle_focus_back(),
             Binding::ToggleZoom => self.ui.toggle_zoom(),
-            Binding::SwitchTab => self.ui.switch_tab(),
+            Binding::SwitchTab => {
+                self.ui.switch_tab();
+                // The same reset and rebuild `SelectTab` does: cycling to a
+                // tab and jumping to it are the same act by different keys.
+                self.selected = 0;
+                self.refresh_inbox();
+            }
             Binding::SelectTab(t) => {
                 self.ui.select_tab(t);
+                // A different list, so the cursor starts at the top. This is
+                // the reset `refresh_inbox` used to do on every tick.
+                self.selected = 0;
                 // Rebuild the pane for the tab being entered. Without this the
                 // Channels tab showed the message list, or nothing at all.
                 self.refresh_inbox();
@@ -1563,7 +1572,13 @@ fn inbox_row(m: &receive::Message) -> String {
     /// Returns plaintext into `self.messages`, which `lock` destroys.
     fn refresh_inbox(&mut self) {
         self.messages.clear();
-        self.selected = 0;
+        // **The cursor is not reset here.** This runs on a tick — every time
+        // an exchange drains — so zeroing it meant the operator pressed Down,
+        // the cursor moved, and the next tick put it back. It looked like the
+        // arrow key bouncing. Where the list is rebuilt for a *different*
+        // list — a tab switch, descending into a channel — the caller resets
+        // it deliberately; here it is only clamped, at the end, once the new
+        // item count is known.
         let (Some(id), Some(w)) = (&self.identity, self.epoch_key) else {
             self.list = vec!["(locked)".into()];
             return;
@@ -1812,6 +1827,7 @@ fn inbox_row(m: &receive::Message) -> String {
             // inbox's "(no messages — n objects examined)" — the placeholder
             // for a tab the operator was not looking at.
             self.list = self.note_rows();
+            self.clamp_selection();
             let Some(me) = self.identity.as_ref().map(|i| i.short_id()) else {
                 self.body = "no identity. `init` to create one.".into();
                 return;
@@ -1834,6 +1850,7 @@ fn inbox_row(m: &receive::Message) -> String {
                 _ => self.channel_rows(),
             };
         }
+        self.clamp_selection();
         self.show_selected();
     }
 
@@ -4829,6 +4846,16 @@ impl App {
                 overwrite(&mut cut);
             }
         }
+    }
+
+    /// Keep the cursor on an item that still exists.
+    ///
+    /// Mail arrives and notes are added while the operator is reading, so the
+    /// count changes underneath the cursor. Clamping keeps it in range without
+    /// throwing away where they were, which zeroing did.
+    fn clamp_selection(&mut self) {
+        let n = self.selectable_len();
+        self.selected = if n == 0 { 0 } else { self.selected.min(n - 1) };
     }
 
     /// How many *items* the focused list holds.
@@ -10768,6 +10795,55 @@ mod tests {
             assert!(rest.starts_with("  "), "no gap after {verb:?}: {row:?}");
             assert_eq!(rest.trim_start(), *what, "{row:?}");
         }
+    }
+
+    /// **A tick must not move the cursor.**
+    ///
+    /// `refresh_inbox` zeroed `selected`, and it runs whenever an exchange
+    /// drains — so the operator pressed Down, the cursor moved, and the next
+    /// tick put it back. From outside it looked like the arrow key bouncing.
+    #[test]
+    fn a_refresh_leaves_the_cursor_where_the_operator_put_it() {
+        let mut a = ready_node("cursor-sticks");
+        for t in ["one", "two", "three"] {
+            type_command(&mut a, &format!("note {t}"));
+            if a.pending_post.is_some() {
+                a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+            }
+        }
+        a.ui.select_tab(layout::Tab::Notes);
+        a.refresh_inbox();
+        while a.ui.focus() != layout::Pane::List {
+            a.ui.cycle_focus();
+        }
+        a.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(a.selected, 1);
+
+        // What the tick does, repeatedly.
+        a.refresh_inbox();
+        assert_eq!(a.selected, 1, "a refresh moved the cursor back to the top");
+        a.refresh_inbox();
+        assert_eq!(a.selected, 1);
+    }
+
+    /// But a shorter list must not leave the cursor past the end.
+    #[test]
+    fn the_cursor_is_clamped_when_the_list_shrinks() {
+        let mut a = ready_node("cursor-clamp");
+        a.ui.select_tab(layout::Tab::Notes);
+        a.selected = 40;
+        a.refresh_inbox();
+        assert_eq!(a.selected, 0, "an empty list kept a cursor");
+    }
+
+    /// A tab switch is a different list, so it does start at the top.
+    #[test]
+    fn switching_tabs_starts_at_the_top() {
+        let mut a = ready_node("cursor-tab");
+        a.selected = 3;
+        a.on_key(KeyCode::F(3), KeyModifiers::NONE);
+        assert_eq!(a.ui.tab(), layout::Tab::Notes);
+        assert_eq!(a.selected, 0);
     }
 
     /// **Every list pane can be navigated.**
