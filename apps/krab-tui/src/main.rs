@@ -363,6 +363,9 @@ struct App {
     /// focus, so every editing key was silently dropped in the one pane where
     /// text is actually written.
     composer_at: usize,
+    /// Set by `Ctrl-R`. The run loop owns the terminal, so the key records
+    /// the request and the loop clears.
+    needs_clear: bool,
     /// Decrypted message plaintext. **Only** [`App::show_selected`] writes
     /// here, and RFC 7 §8 says it exists only while displayed.
     body: String,
@@ -601,6 +604,7 @@ impl Default for App {
             command: line::Line::default(),
             composer: String::new(),
             composer_at: 0,
+            needs_clear: false,
             // Not "no message selected": on a fresh node that is true and
             // useless. The first screen has to say what to type, because
             // nothing else on it does.
@@ -787,6 +791,9 @@ impl App {
         while !self.quit {
             let log_lines = self.log.recent(activity_log::CAPACITY);
             let me = self.identity.as_ref().map(|i| i.short_id());
+            if std::mem::take(&mut self.needs_clear) {
+                term.clear()?;
+            }
             term.draw(|f| render::draw(f, &self.view(&log_lines, me.as_deref())))?;
 
             if event::poll(TICK)? {
@@ -926,6 +933,11 @@ impl App {
                         .into(),
                 };
             }
+            // **Ctrl-R was a binding with no arm.** It fell through to
+            // `_ => {}`, so the one key an operator reaches for when the
+            // screen is wrong did nothing at all. The run loop clears on the
+            // next pass; this only has to ask.
+            Binding::Redraw => self.needs_clear = true,
             Binding::Deliver if !self.locked => self.deliver(),
             // **RFC 8 §4.2 requirement 3.** In the channels tab `r` is
             // ambiguous between "privately message the author" and "publish a
@@ -9442,7 +9454,17 @@ fn overwrite(s: &mut String) {
 fn setup() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(io::stdout()))
+    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    // **Clear before the first frame.**
+    //
+    // ratatui writes only the cells that differ from its previous buffer, and
+    // that buffer starts empty — so on the first draw every cell the frame
+    // considers blank is simply not written. Entering the alternate screen
+    // does not reliably blank it either. The result is the shell's scrollback
+    // and the previous run's output showing through the gaps in the layout:
+    // a garbled interface built from real text that is not this program's.
+    term.clear()?;
+    Ok(term)
 }
 
 fn restore() -> io::Result<()> {
@@ -10688,6 +10710,22 @@ mod tests {
             assert!(rest.starts_with("  "), "no gap after {verb:?}: {row:?}");
             assert_eq!(rest.trim_start(), *what, "{row:?}");
         }
+    }
+
+    /// **Ctrl-R asks for a clear.** The binding existed and had no arm, so
+    /// the one key an operator reaches for when the screen is wrong fell
+    /// through to `_ => {}` and did nothing.
+    #[test]
+    fn ctrl_r_requests_a_clear() {
+        let mut a = ready_node("redraw");
+        assert!(!a.needs_clear);
+        a.on_key(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(a.needs_clear, "Ctrl-R did not ask for a redraw");
+
+        // And it is consumed once: the loop takes it, and a second frame
+        // does not clear again for no reason.
+        assert!(std::mem::take(&mut a.needs_clear));
+        assert!(!a.needs_clear);
     }
 
     /// **The composer takes editing keys.** It was a `String` with `push`:
