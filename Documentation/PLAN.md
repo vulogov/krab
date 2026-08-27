@@ -536,3 +536,74 @@ The pattern worth naming: all four reports came from an operator using the
 thing, and each mapped to a requirement that had been read as satisfied. The
 audit above is what should have been run when RFC 8 was implemented, and
 running it now found two more.
+
+---
+
+## 10. RFCs 1–7 requirement audit, 2026-08-27 — first pass, incomplete
+
+168 MUST lines across RFCs 1–7. This pass enumerated all of them and checked
+a prioritised subset: RFC 1 because it is frozen and permanent, RFC 7 because
+it is key custody. **Most of the 168 are still unchecked**, and they are named
+below so the gap in the audit is visible rather than implied — an audit that
+reports only what it looked at is the truncated-`grep` failure in another form.
+
+### Found unmet
+
+**RFC 1 §6.4 — no cache of failed `(id, epoch)` pairs.**
+
+> An adversary who learns a current tag can flood objects bearing it, forcing
+> full constant-time trial decapsulation at roughly 10 ms per object for zero
+> cost. Implementations **MUST** cache failed `(id, epoch)` pairs so a
+> replayed object costs one lookup.
+
+There is no such cache: `grep` for one across the workspace returns nothing.
+Every object that matches a tag and fails to open is retried in full on every
+`refresh_inbox`, which now runs on every tick that drains an exchange.
+
+This is not hypothetical. The live runs this week printed
+`! 3 matched a tag and did not open` — three objects paying full trial
+decapsulation on every refresh, on an idle two-node network with no adversary
+at all. The cost is linear in objects that match a tag, and an attacker who
+learns a tag chooses that number.
+
+**Not fixed in this commit, deliberately.** A cache keyed on attacker-supplied
+identifiers is itself unbounded memory, so it needs a bound and an eviction
+rule before it is written, and the §6.4 sentence continues into a SHOULD about
+per-peer attempt caps and a quota signal that belong in the same design. It is
+Phase 12 below.
+
+### Checked and met
+
+| requirement | evidence |
+|---|---|
+| RFC 1 §4.3 — indefinite-length CBOR rejected | `krab-core/src/cbor.rs`, `AI_INDEFINITE` |
+| RFC 1 §8.1 — padding is zero, non-zero rejected on ingest | `object.rs:233`, `object.rs:531` |
+| RFC 1 §10 — reserved header bits zero on emission, ignored on receipt | `FLAG_RESERVED` |
+| RFC 7 §5.1 — signed prekey rotation cadence | `republish_prekeys_if_due` |
+| RFC 7 §8.2 — store ciphertext, derive on display | `refresh_inbox` clears and rebuilds plaintext |
+
+### Not checked
+
+RFC 1: the six ingest checks I1–I6 and their ordering (§11), silent rejection,
+cover-object indistinguishability (§5.3), `EPOCH_WINDOW` ±45 (§7), the
+full-private-key-set attempt (§6.3), the base32 short form (§9).
+**RFC 2, 3, 4, 5, 6: nothing.** RFC 7: the destruction of `root_N` (§6),
+part-finished ceremony handling (§10.3), and the reservoir's
+no-post-quantum-property disclosure (§7.4) — that last one is recorded as met
+"in seven places" by Phase 6 but was not re-checked here.
+
+### Phase 12 — the trial-decapsulation cache (RFC 1 §6.4)
+
+Bounded, evicted on epoch rollover, and paired with §6.4's SHOULDs: a cap on
+decapsulation attempts per epoch per peer, and the tag-match/decrypt-success
+ratio feeding RFC 3's quota reduction. The ratio is already computed for the
+`! n matched a tag and did not open` line, so the signal exists and is
+currently only printed.
+
+### What this pass says about the others
+
+Two audits in two days, of two different documents, each found unmet MUSTs in
+code that had been written against them. That is a poor rate, and it is
+evidence about method rather than about any one requirement: implementing a
+paragraph and believing it satisfied is not the same as checking it. The
+remaining ~150 should be treated as unaudited rather than as probably fine.
