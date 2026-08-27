@@ -757,6 +757,8 @@ impl App {
             output_height: &self.output_height,
             waiting: self.waiting(),
             composer_at: self.composer_at,
+            selected: self.selected,
+            items: self.selectable_len(),
             showing: self.showing.as_deref(),
             // While the passphrase is being taken the prompt shows its length,
             // not the command line — see `masked`.
@@ -889,18 +891,33 @@ impl App {
             Binding::ToggleFullScreen => self.ui.toggle_full_screen(),
             // **History.** Typed commands only, never the passphrase — see
             // `push_history`.
+            // **Up and Down mean what the focused pane means.**
+            //
+            // They were bound to command history before anything else looked
+            // at them, so on a list they scrolled history and the list showed
+            // its first item and no other. History is what they mean on the
+            // command line — and, per RFC 8 §2, nowhere else: a pane that is
+            // not the command line has no history to recall.
             Binding::History(d) => {
                 if self.init_step == Some(InitStep::Passphrase) {
                     return;
                 }
-                // In a composer, Up and Down are line motion. Recalling a
-                // command into a half-written message would be the wrong
-                // action taken from the right key.
-                if !typing && self.ui.mode() == Mode::Compose {
-                    self.composer_vertical(d);
-                    return;
+                match self.ui.focus() {
+                    // The command line: history, which is the only place it
+                    // exists.
+                    layout::Pane::Command => self.recall(d),
+                    // The list: choose an item.
+                    layout::Pane::List => self.move_selection(d),
+                    // The view pane holds a draft while composing — line
+                    // motion — and a message otherwise, which the output
+                    // pane's PgUp/PgDn already scrolls. Doing nothing is
+                    // correct rather than lazy: recalling a command here
+                    // would be the wrong action taken from the right key.
+                    layout::Pane::View if self.ui.mode() == Mode::Compose => {
+                        self.composer_vertical(d)
+                    }
+                    _ => {}
                 }
-                self.recall(d);
             }
             // **Scroll the output pane.** By screens, so a long `help` or
             // `peers` can be read without zooming.
@@ -4812,6 +4829,47 @@ impl App {
                 overwrite(&mut cut);
             }
         }
+    }
+
+    /// How many *items* the focused list holds.
+    ///
+    /// Not `list.len()`: the private list can carry first-contact requests
+    /// above the mail, and those are rows without a message behind them.
+    /// Selection is over items, so its bound has to be too.
+    fn selectable_len(&self) -> usize {
+        match (self.ui.tab(), self.ui.level()) {
+            (layout::Tab::Private, _) => self.messages.len(),
+            (layout::Tab::Notes, _) => self
+                .identity
+                .as_ref()
+                .map(|i| self.pinned().of(&i.short_id()).len())
+                .unwrap_or(0),
+            (layout::Tab::Channels, layout::Level::Messages) => self
+                .channel_open
+                .map(|id| self.channel_post_items(&id).len())
+                .unwrap_or(0),
+            (layout::Tab::Channels, layout::Level::Channels) => self.channel_ids().len(),
+        }
+    }
+
+    /// Move the cursor in the focused list — RFC 8 §2's list pane.
+    ///
+    /// **Nothing moved it before.** `selected` was written only as `0` and
+    /// read everywhere, so every list in the interface showed its first item
+    /// and no other: no message could be opened but the newest, no channel
+    /// entered but the first, no note read but one.
+    fn move_selection(&mut self, d: i8) {
+        let n = self.selectable_len();
+        if n == 0 {
+            return;
+        }
+        let last = n - 1;
+        self.selected = if d < 0 {
+            self.selected.saturating_sub(1)
+        } else {
+            (self.selected + 1).min(last)
+        };
+        self.show_selected();
     }
 
     /// Up and Down while composing: move a line, not through history.
@@ -10710,6 +10768,103 @@ mod tests {
             assert!(rest.starts_with("  "), "no gap after {verb:?}: {row:?}");
             assert_eq!(rest.trim_start(), *what, "{row:?}");
         }
+    }
+
+    /// **Every list pane can be navigated.**
+    ///
+    /// `selected` was written only as `0` and read everywhere, and Up/Down
+    /// were bound to command history before anything else looked at them —
+    /// so on the notes pane the arrows scrolled the command history and the
+    /// list showed its first item and no other. The same in every tab.
+    #[test]
+    fn arrows_choose_an_item_in_every_list() {
+        let mut a = ready_node("list-nav");
+
+        // Notes, because that is where it was reported.
+        type_command(&mut a, "note one");
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        type_command(&mut a, "note two");
+        type_command(&mut a, "note three");
+        a.ui.select_tab(layout::Tab::Notes);
+        a.refresh_inbox();
+        while a.ui.focus() != layout::Pane::List {
+            a.ui.cycle_focus();
+        }
+        assert_eq!(a.selectable_len(), 3, "{:?}", a.list);
+        assert_eq!(a.selected, 0);
+
+        a.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(a.selected, 1, "Down did not move the cursor");
+        a.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(a.selected, 2);
+        // It stops at the end rather than wrapping or running off.
+        a.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(a.selected, 2, "the cursor ran past the last item");
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(a.selected, 1);
+
+        // The body follows the cursor, which is the point of moving it.
+        let at_one = a.body.clone();
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_ne!(a.body, at_one, "the view pane did not follow the cursor");
+    }
+
+    /// On the command line the same keys still mean history — the behaviour
+    /// that was displacing selection must not be displaced in turn.
+    #[test]
+    fn arrows_on_the_command_line_still_recall_history() {
+        let mut a = ready_node("list-nav-history");
+        type_command(&mut a, "keys");
+        assert_eq!(a.ui.focus(), layout::Pane::Command);
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "keys", "history was lost to the list");
+    }
+
+    /// **History belongs to the command pane and to nowhere else.**
+    ///
+    /// Up/Down were dispatched to `recall` from any pane that was not the
+    /// list, so the view and output panes recalled commands too — a pane
+    /// with no history of its own answering as though it had one.
+    #[test]
+    fn only_the_command_pane_recalls_history() {
+        let mut a = ready_node("history-scope");
+        type_command(&mut a, "keys");
+        type_command(&mut a, "peers");
+
+        // View and Output: Up must not put a command anywhere.
+        for pane in [layout::Pane::View, layout::Pane::Output] {
+            while a.ui.focus() != pane {
+                a.ui.cycle_focus();
+            }
+            let before = a.command.as_string();
+            a.on_key(KeyCode::Up, KeyModifiers::NONE);
+            assert_eq!(
+                a.command.as_string(),
+                before,
+                "{pane:?} recalled history"
+            );
+        }
+
+        // The command line still does.
+        while a.ui.focus() != layout::Pane::Command {
+            a.ui.cycle_focus();
+        }
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(a.command.as_string(), "peers");
+    }
+
+    /// An empty list has nothing to select, and must not move anyway.
+    #[test]
+    fn an_empty_list_has_no_cursor_to_move() {
+        let mut a = ready_node("list-nav-empty");
+        a.ui.select_tab(layout::Tab::Notes);
+        a.refresh_inbox();
+        while a.ui.focus() != layout::Pane::List {
+            a.ui.cycle_focus();
+        }
+        assert_eq!(a.selectable_len(), 0);
+        a.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(a.selected, 0);
     }
 
     /// **Ctrl-R asks for a clear.** The binding existed and had no arm, so

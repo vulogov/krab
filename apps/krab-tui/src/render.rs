@@ -61,6 +61,10 @@ pub struct View<'a> {
     pub waiting: Option<&'a str>,
     /// Where the caret is in `composer`, as a character index.
     pub composer_at: usize,
+    /// Which item the list pane's cursor is on, and how many items there are.
+    /// Two numbers because `list` may hold rows that are not items.
+    pub selected: usize,
+    pub items: usize,
     /// Lines the output pane is scrolled back from the newest.
     pub scroll: usize,
     /// Composer contents, shown when `ui.mode()` is `Compose`.
@@ -172,7 +176,24 @@ fn draw_list(f: &mut Frame, area: Rect, view: &View) {
         (Tab::Channels, Level::Messages) => " channel ▸ posts ".to_string(),
         (Tab::Notes, _) => format!(" notes · local only · {} ", view.me.unwrap_or("no identity")),
     };
-    let rows: Vec<Line> = view.list.iter().map(|s| Line::from(s.as_str())).collect();
+    // **The cursor, drawn.** `selected` indexes items; the list can carry
+    // rows above them — first-contact requests sit on top of the mail — so
+    // the highlighted row is offset by however many of those there are.
+    let offset = view.list.len().saturating_sub(view.items);
+    let here = offset + view.selected;
+    let cursor = Style::default().add_modifier(Modifier::REVERSED);
+    let rows: Vec<Line> = view
+        .list
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if i == here && view.items > 0 {
+                Line::from(Span::styled(s.clone(), cursor))
+            } else {
+                Line::from(s.as_str())
+            }
+        })
+        .collect();
     f.render_widget(
         Paragraph::new(rows).block(frame_for(view.ui, Pane::List, title)),
         area,
