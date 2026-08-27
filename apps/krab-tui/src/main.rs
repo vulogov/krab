@@ -9871,6 +9871,122 @@ mod tests {
         assert!(a.output.contains("connect"), "no way out named: {}", a.output);
     }
 
+    /// **A channel post crosses a session and a follower reads it.**
+    ///
+    /// The single-node test covers create/post/read in one process. This is
+    /// the other half: the post has to survive reconciliation and be readable
+    /// by a node that was not there when it was written.
+    ///
+    /// The order is not interchangeable and the verbs say so — carrying
+    /// public content is off by default (RFC 6), and a channel cannot be
+    /// followed until one of its posts has arrived, because there is no
+    /// directory to look one up in.
+    #[test]
+    fn a_channel_post_crosses_to_a_follower_and_is_read() {
+        let (mut a, mut b, a_id, b_id) = peered_pair("channel-cross");
+
+        type_command(&mut a, "channel carry on");
+        type_command(&mut a, "channel carry on");
+        assert!(a.roster.carriage.enabled, "{}", a.output);
+
+        type_command(&mut a, "channel new");
+        assert!(a.output.contains("created"), "{}", a.output);
+        let chan = a.roster.mine.as_ref().unwrap().id();
+        let short = channels::short(&chan);
+
+        // RFC 8 §4.2: the first post of a session confirms rather than
+        // publishes. Issuing it once and assuming it went out is how a
+        // "post" that never left would look like a delivery failure.
+        type_command(&mut a, "channel post the meeting is moved to thursday");
+        assert!(
+            a.output.contains("PUBLIC — SIGNED — PERMANENT"),
+            "the post did not state what it is: {}",
+            a.output
+        );
+        type_command(&mut a, "channel post the meeting is moved to thursday");
+        assert!(a.output.contains("published post"), "{}", a.output);
+        assert_eq!(a.channel_posts(&chan).len(), 1, "the post did not publish");
+
+        // B hosts public content. Off by default, and enabling it is two
+        // steps — RFC 8 §4.3 wants the warning at the moment of enabling,
+        // so the first invocation arms and the second commits.
+        type_command(&mut b, "channel carry on");
+        assert!(b.output.contains("again to enable"), "{}", b.output);
+        type_command(&mut b, "channel carry on");
+        assert!(b.roster.carriage.enabled, "carriage did not come on: {}", b.output);
+        assert!(b.channel_posts(&chan).is_empty(), "B has it before anything moved");
+
+        // Cross a real session, both halves.
+        let (sa, sb) = session_pair();
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+        a.links.established(&b_id, Some(Box::new(sa)));
+        b.links.connect(&a_id, profile_named("tcp").unwrap());
+        b.links.established(&a_id, Some(Box::new(sb)));
+
+        let a_peer = a_id.clone();
+        let chan_for_b = chan;
+        let responder = std::thread::spawn(move || {
+            b.answer_reconciliation(&a_peer);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                b.drain_exchanges();
+                if !b.channel_posts(&chan_for_b).is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            b
+        });
+        a.reconcile_with(&b_id);
+        let mut b = responder.join().expect("B's thread");
+
+        let posts = b.channel_posts(&chan);
+        assert!(
+            posts.iter().any(|p| p.contains("moved to thursday")),
+            "the post did not cross: {posts:?}"
+        );
+
+        // Now it can be followed, and only now.
+        type_command(&mut b, &format!("channel follow {short}"));
+        assert!(
+            !b.output.contains("no channel"),
+            "a channel whose post arrived could not be followed: {}",
+            b.output
+        );
+        type_command(&mut b, "channel list");
+        assert!(
+            b.output.contains(&short),
+            "a followed channel is not listed: {}",
+            b.output
+        );
+    }
+
+    /// **A channel post carries text and no attachment.**
+    ///
+    /// `send <peer> --picture` exists; `channel post` has no equivalent, so a
+    /// path that looks like a file is posted as the characters in it. Pinned
+    /// so that if channel attachments are ever added this test is what has to
+    /// be changed deliberately, rather than the gap being discovered by
+    /// someone who assumed the flag worked here too.
+    #[test]
+    fn a_channel_post_has_no_attachment_path() {
+        let mut a = ready_node("channel-attach");
+        type_command(&mut a, "channel new");
+        let chan = a.roster.mine.as_ref().unwrap().id();
+
+        type_command(&mut a, "channel post --picture /tmp/holiday.png");
+        type_command(&mut a, "channel post --picture /tmp/holiday.png");
+        let posts = a.channel_posts(&chan);
+        assert!(
+            posts.iter().any(|p| p.contains("--picture")),
+            "the flag was consumed as though it meant something: {posts:?}"
+        );
+        assert!(
+            a.messages.iter().all(|m| m.picture.is_none()),
+            "a channel post produced an attachment"
+        );
+    }
+
     /// **A node that peers while running must be able to read the mail.**
     ///
     /// The tag table was rebuilt on epoch rollover and on nothing else. A

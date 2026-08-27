@@ -75,6 +75,68 @@ and will not dial one for you:
 \`send\` addresses the composition to that peer. \`message\` also opens a
 composer, but an unaddressed one — it will not reach anybody.
 
+To send a picture instead of typing a body:
+
+  send <their-short-id> --picture <file.png>
+
+It is decoded and re-encoded before it leaves — no EXIF, no GPS, no ICC, and
+no setting to keep them (RFC 8 §6). The bytes that arrive are pixel data this
+program generated, so the received file is NOT identical to the one you sent.
+That is the point. At the other end the row is marked \`▣\`, and:
+
+  picture save <file.png>   write it out
+  picture show              draw it in the message pane
+
+\`picture show\` needs a terminal advertising 24-bit colour (COLORTERM), and
+Krab will not open a viewer for you at any point.
+
+---------------------------------------------------------------------------
+Channels — public, signed, permanent
+---------------------------------------------------------------------------
+
+A channel is the unencrypted half: anyone holding a post can read it, and it
+cannot be edited or withdrawn. Two steps in this flow ask twice on purpose,
+and both are the same kind of decision.
+
+On both nodes, if you want them to host public content at all:
+
+  channel carry on          arms, and prints what you are agreeing to
+  channel carry on          again — this one commits it
+
+Off is the default (RFC 6 §3.6): what a node hosts has consequences that
+depend on where the operator lives. With it off, a link carries sealed mail
+only and channel posts will not cross — which looks exactly like a delivery
+failure if you have forgotten this.
+
+On the publishing node:
+
+  channel new               one posting identity per node
+  channel list              shows its short id — give that to readers
+  channel post the meeting is moved
+  channel post the meeting is moved
+
+The first \`channel post\` of a session does not publish. It prints
+PUBLIC — SIGNED — PERMANENT and waits; the second one publishes and says
+"published post 1". A single invocation looks like it worked and did not.
+
+Then move it, as before:
+
+  connect <their-short-id> tcp 127.0.0.1:4000{0,1}
+  force-send <their-short-id>
+
+On the reading node, once a post has arrived:
+
+  channel follow <channel-short-id>
+  channel list
+
+Follow only works after one of that channel's posts is in your corpus —
+there is no directory to look one up in, which is why the id has to reach you
+some other way. Ctrl-T switches to the Channels tab to read them.
+
+A channel post carries text and nothing else: \`--picture\` has no meaning
+here and would be published as those characters. Pictures are private-message
+only in this build.
+
 Two things this shortcut costs, and they are real:
 
   * \`peer verified\` on one host asserts you compared fingerprint words aloud.
@@ -110,7 +172,12 @@ for t in \
     a_message_encapsulated_to_a_prekey_is_readable \
     a_group_message_is_sealed_once_per_member_and_opens \
     courier_only_peering_completes_with_no_network \
-    init_ends_by_saying_whether_the_node_is_ready
+    init_ends_by_saying_whether_the_node_is_ready \
+    a_channel_post_crosses_to_a_follower_and_is_read \
+    a_channel_post_has_no_attachment_path \
+    a_peering_made_while_running_is_visible_without_a_restart \
+    received_mail_reaches_the_disk_not_only_the_pane \
+    forcing_over_a_live_session_reports_that_it_started
 do
     printf '  %-62s ' "$t"
     if cargo test --quiet -p krab-tui -- --exact "tests::$t" >/dev/null 2>&1; then
@@ -125,7 +192,13 @@ done
 echo
 echo "A message goes from one node to another: over a stick, over a live"
 echo "reconciliation, to a prekey, and to a group — with all interfaces down"
-echo "for the courier case, which is RFC 3 §11.3's release gate."
+echo "for the courier case, which is RFC 3 §11.3's release gate. A channel"
+echo "post crosses to a follower and is read, and carries no attachment."
+echo
+echo "The last three are regressions, and each one was found by running two"
+echo "real nodes rather than by reading the code: a peering made while"
+echo "running could not read its own mail, received mail never reached the"
+echo "disk, and a forced send that worked reported that it had not."
 echo
 echo "What this does not cover: the ratatui frame, a real network, and a"
 echo "second operator. Every test above was written by whoever wrote the code."
