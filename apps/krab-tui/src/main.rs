@@ -355,6 +355,14 @@ struct App {
     spinner: Spinner,
     command: line::Line,
     composer: String,
+    /// Where the caret sits in `composer`, as a **character** index.
+    ///
+    /// The composer was a `String` with `push` and nothing else: no
+    /// backspace, no arrows, no way to correct a typo except to discard the
+    /// draft. `Binding::Edit` returned early unless the command line had
+    /// focus, so every editing key was silently dropped in the one pane where
+    /// text is actually written.
+    composer_at: usize,
     /// Decrypted message plaintext. **Only** [`App::show_selected`] writes
     /// here, and RFC 7 §8 says it exists only while displayed.
     body: String,
@@ -592,6 +600,7 @@ impl Default for App {
             spinner: Spinner::default(),
             command: line::Line::default(),
             composer: String::new(),
+            composer_at: 0,
             // Not "no message selected": on a fresh node that is true and
             // useless. The first screen has to say what to type, because
             // nothing else on it does.
@@ -743,6 +752,7 @@ impl App {
             output_rows: &self.output_rows,
             output_height: &self.output_height,
             waiting: self.waiting(),
+            composer_at: self.composer_at,
             showing: self.showing.as_deref(),
             // While the passphrase is being taken the prompt shows its length,
             // not the command line — see `masked`.
@@ -876,6 +886,13 @@ impl App {
                 if self.init_step == Some(InitStep::Passphrase) {
                     return;
                 }
+                // In a composer, Up and Down are line motion. Recalling a
+                // command into a half-written message would be the wrong
+                // action taken from the right key.
+                if !typing && self.ui.mode() == Mode::Compose {
+                    self.composer_vertical(d);
+                    return;
+                }
                 self.recall(d);
             }
             // **Scroll the output pane.** By screens, so a long `help` or
@@ -928,6 +945,13 @@ impl App {
             // passphrase gets the same vocabulary as the command line: it is
             // masked, so an operator who cannot correct it cannot recover.
             Binding::Edit(e) => {
+                if !typing
+                    && self.init_step.is_none()
+                    && self.ui.mode() == Mode::Compose
+                {
+                    self.composer_edit(e);
+                    return;
+                }
                 let line = if self.init_step == Some(InitStep::Passphrase) {
                     &mut self.passphrase
                 } else if typing {
@@ -958,6 +982,7 @@ impl App {
                 // RFC 7 §8: plaintext exists only while displayed, so a draft
                 // being abandoned is overwritten rather than dropped.
                 overwrite(&mut self.composer);
+                self.composer_at = 0;
                 self.command.clear();
                 // A post awaiting confirmation is a draft like any other, and
                 // Esc means the same thing here as everywhere: it is gone.
@@ -1000,7 +1025,7 @@ impl App {
                         self.submit();
                     }
                 } else if self.ui.mode() == Mode::Compose {
-                    self.composer.push('\n');
+                    self.composer_insert('\n');
                 } else {
                     // Descending into a channel has to record *which* one, or
                     // the level changes and the pane has nothing to show for
@@ -1022,7 +1047,7 @@ impl App {
                 } else if typing {
                     self.command.insert(c);
                 } else if self.ui.mode() == Mode::Compose {
-                    self.composer.push(c);
+                    self.composer_insert(c);
                 }
             }
             _ => {}
@@ -1753,6 +1778,11 @@ fn inbox_row(m: &receive::Message) -> String {
         // so switching tabs shows what is there rather than what was there
         // when the tab was last opened.
         if self.ui.tab() == layout::Tab::Notes {
+            // **The list, first.** This branch set only the body, so the pane
+            // showed a note while the list beside it still held the private
+            // inbox's "(no messages — n objects examined)" — the placeholder
+            // for a tab the operator was not looking at.
+            self.list = self.note_rows();
             let Some(me) = self.identity.as_ref().map(|i| i.short_id()) else {
                 self.body = "no identity. `init` to create one.".into();
                 return;
@@ -1761,33 +1791,11 @@ fn inbox_row(m: &receive::Message) -> String {
                 self.body = "locked.".into();
                 return;
             }
-            let archive = self.pinned();
-            let mine = archive.of(&me);
-            self.body = match mine.get(self.selected) {
-                Some(k) => format!(
-                    "note · local only · epoch {}\n\n{}\n\n\
-                     This is not an object. No peer is ever offered it and it \
-                     is not in the corpus. It is exempt from the epoch erasure \
-                     that makes mail unreadable (RFC 7 §8), so it stays until \
-                     `wipe` destroys it.",
-                    k.epoch,
-                    display::safe(&k.body).text
-                ),
-                None => "no note selected.\n\n`note <text>` keeps one; `note` \
-                         alone opens a composer."
-                    .into(),
-            };
+            let _ = me;
+            self.body = self.note_body();
             return;
         }
         if self.ui.tab() == layout::Tab::Channels {
-            // Notes: local, never offered, so they are built from the
-            // archive rather than from the corpus — there is nothing in the
-            // corpus to build them from, which is the point.
-            if self.ui.tab() == layout::Tab::Notes {
-                self.list = self.note_rows();
-                self.show_selected();
-                return;
-            }
             // **Two levels, and the second one now has content.**
             // `descend` set `Level::Messages` and nothing read it, so
             // pressing Enter on a channel changed the pane's title and left
@@ -3207,6 +3215,37 @@ fn inbox_row(m: &receive::Message) -> String {
         self.write_note(&key, text)
     }
 
+    /// The selected note, whole, for the view pane.
+    ///
+    /// Shared by `refresh_inbox` and `show_selected`: the first builds the
+    /// tab, the second runs on every cursor move, and a note that only
+    /// appeared on one of those paths would change when the list was rebuilt
+    /// and not when the selection moved.
+    fn note_body(&self) -> String {
+        let Some(me) = self.identity.as_ref().map(|i| i.short_id()) else {
+            return "no identity. `init` to create one.".into();
+        };
+        if self.pin_key.is_none() {
+            return "locked.".into();
+        }
+        let archive = self.pinned();
+        let mine = archive.of(&me);
+        match mine.get(self.selected) {
+            Some(k) => format!(
+                "note · local only · epoch {}\n\n{}\n\n\
+                 This is not an object. No peer is ever offered it and it is \
+                 not in the corpus. It is exempt from the epoch erasure that \
+                 makes mail unreadable (RFC 7 §8), so it stays until `wipe` \
+                 destroys it.",
+                k.epoch,
+                display::safe(&k.body).text
+            ),
+            None => "no note selected.\n\n`note <text>` keeps one; `note` \
+                     alone opens a composer."
+                .into(),
+        }
+    }
+
     /// One row per note, newest last, for the Notes tab's list pane.
     fn note_rows(&self) -> Vec<String> {
         let Some(me) = self.identity.as_ref().map(|i| i.short_id()) else {
@@ -4623,6 +4662,158 @@ impl App {
     /// worth composing over several lines is one where Enter must not send it
     /// halfway through — and a message sent early cannot be recalled, since
     /// RFC 3 §6.1 forbids any mechanism that could.
+    /// Characters in the composer.
+    fn composer_len(&self) -> usize {
+        self.composer.chars().count()
+    }
+
+    /// Byte offset of character index `at`.
+    fn composer_byte(&self, at: usize) -> usize {
+        self.composer
+            .char_indices()
+            .nth(at)
+            .map(|(b, _)| b)
+            .unwrap_or(self.composer.len())
+    }
+
+    /// Put `text` in the composer with the caret after it.
+    ///
+    /// The caret and the text are one state, and anything that sets the text
+    /// without setting the caret leaves the next keystroke inserting at the
+    /// front. Nothing in production fills the composer directly today; this
+    /// exists so that when something does, the invariant comes with it —
+    /// and the tests use it, which is what keeps it correct until then.
+    #[cfg(test)]
+    fn composer_set(&mut self, text: &str) {
+        overwrite(&mut self.composer);
+        self.composer.push_str(text);
+        self.composer_at = self.composer_len();
+    }
+
+    /// Insert at the caret and step over it.
+    fn composer_insert(&mut self, c: char) {
+        let at = self.composer_byte(self.composer_at);
+        self.composer.insert(at, c);
+        self.composer_at += 1;
+    }
+
+    /// Delete the character before the caret.
+    fn composer_backspace(&mut self) {
+        if self.composer_at == 0 {
+            return;
+        }
+        let at = self.composer_byte(self.composer_at - 1);
+        self.composer.remove(at);
+        self.composer_at -= 1;
+    }
+
+    /// Delete the character under the caret.
+    fn composer_delete(&mut self) {
+        if self.composer_at >= self.composer_len() {
+            return;
+        }
+        let at = self.composer_byte(self.composer_at);
+        self.composer.remove(at);
+    }
+
+    /// (row, column) of the caret, both zero-based.
+    fn composer_rowcol(&self) -> (usize, usize) {
+        let before: String = self.composer.chars().take(self.composer_at).collect();
+        let row = before.matches('\n').count();
+        let col = before.rsplit('\n').next().map(|l| l.chars().count()).unwrap_or(0);
+        (row, col)
+    }
+
+    /// Move the caret to `row`, as close to `col` as that row allows.
+    fn composer_goto(&mut self, row: usize, col: usize) {
+        let lines: Vec<&str> = self.composer.split('\n').collect();
+        let row = row.min(lines.len().saturating_sub(1));
+        let col = col.min(lines[row].chars().count());
+        let mut at = 0usize;
+        for l in lines.iter().take(row) {
+            at += l.chars().count() + 1; // the newline
+        }
+        self.composer_at = at + col;
+    }
+
+    /// Editing keys, routed to the composer. RFC 8 §2.1's pane is where text
+    /// is written, so it is the pane that has to accept them.
+    fn composer_edit(&mut self, e: keys::Edit) {
+        use keys::Edit;
+        let (row, _col) = self.composer_rowcol();
+        match e {
+            Edit::Backspace => self.composer_backspace(),
+            Edit::Delete => self.composer_delete(),
+            Edit::Left => self.composer_at = self.composer_at.saturating_sub(1),
+            Edit::Right => self.composer_at = (self.composer_at + 1).min(self.composer_len()),
+            Edit::Home => self.composer_goto(row, 0),
+            Edit::End => self.composer_goto(row, usize::MAX),
+            // Word motion, over the draft rather than over one line: a
+            // composer is multi-line and a word boundary does not stop at a
+            // newline any more than the caret does.
+            Edit::WordLeft => {
+                let chars: Vec<char> = self.composer.chars().collect();
+                let mut i = self.composer_at;
+                while i > 0 && chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                while i > 0 && !chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                self.composer_at = i;
+            }
+            Edit::WordRight => {
+                let chars: Vec<char> = self.composer.chars().collect();
+                let n = chars.len();
+                let mut i = self.composer_at;
+                while i < n && !chars[i].is_whitespace() {
+                    i += 1;
+                }
+                while i < n && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                self.composer_at = i;
+            }
+            // **Deletions overwrite.** RFC 7 §8: plaintext that is discarded
+            // is overwritten rather than dropped, and a killed word is
+            // discarded plaintext like any other.
+            Edit::KillWord => {
+                let before = self.composer_at;
+                self.composer_edit(Edit::WordLeft);
+                let from = self.composer_byte(self.composer_at);
+                let to = self.composer_byte(before);
+                let mut cut: String = self.composer[from..to].to_string();
+                self.composer.replace_range(from..to, "");
+                overwrite(&mut cut);
+            }
+            Edit::KillToStart => {
+                let to = self.composer_byte(self.composer_at);
+                let mut cut: String = self.composer[..to].to_string();
+                self.composer.replace_range(..to, "");
+                self.composer_at = 0;
+                overwrite(&mut cut);
+            }
+            Edit::KillToEnd => {
+                let from = self.composer_byte(self.composer_at);
+                let mut cut: String = self.composer[from..].to_string();
+                self.composer.truncate(from);
+                overwrite(&mut cut);
+            }
+        }
+    }
+
+    /// Up and Down while composing: move a line, not through history.
+    fn composer_vertical(&mut self, d: i8) {
+        let (row, col) = self.composer_rowcol();
+        if d < 0 {
+            if row > 0 {
+                self.composer_goto(row - 1, col);
+            }
+        } else {
+            self.composer_goto(row + 1, col);
+        }
+    }
+
     fn deliver(&mut self) {
         if self.ui.mode() != Mode::Compose {
             self.output = "nothing is being composed. `send <peer>` starts one.".into();
@@ -4635,6 +4826,7 @@ impl App {
         if self.composing_note {
             let text = self.composer.trim().to_string();
             overwrite(&mut self.composer);
+        self.composer_at = 0;
             self.ui.end_compose();
             self.composing_note = false;
             self.output = match (self.pin_key, text.is_empty()) {
@@ -4665,6 +4857,7 @@ impl App {
         // The draft is gone either way: RFC 7 §8 keeps plaintext only while
         // displayed, and a failed send is not a reason to hold it longer.
         overwrite(&mut self.composer);
+        self.composer_at = 0;
         self.ui.end_compose();
         self.composing_to = None;
         self.composing_to_many.clear();
@@ -5256,6 +5449,10 @@ impl App {
     /// Put the selected message in the view pane.
     fn show_selected(&mut self) {
         overwrite(&mut self.body);
+        if self.ui.tab() == layout::Tab::Notes {
+            self.body = self.note_body();
+            return;
+        }
         if self.ui.tab() == layout::Tab::Channels {
             // Inside a channel: one post, whole, with who signed it. The body
             // used to receive every post of the channel joined together, so a
@@ -7012,6 +7209,7 @@ impl App {
             return "nothing to publish. Esc discards this.".into();
         }
         overwrite(&mut self.composer);
+        self.composer_at = 0;
         self.ui.end_compose();
         self.composing_channel = false;
         // **RFC 8 §4.2 requirement 2** — the first post of a session is
@@ -8377,6 +8575,7 @@ impl App {
         self.messages.clear();
         self.passphrase.clear();
         overwrite(&mut self.composer);
+        self.composer_at = 0;
         overwrite(&mut self.output);
         self.locked = true;
         self.list = vec!["(wiped)".into()];
@@ -9133,6 +9332,7 @@ impl App {
         self.list = vec!["(locked)".into()];
         self.passphrase.clear();
         overwrite(&mut self.composer);
+        self.composer_at = 0;
         // Both panes. `body` holds decrypted message plaintext and `output`
         // holds command output, and RFC 7 §8 does not distinguish: what is on
         // screen when the node locks must not survive the lock.
@@ -9271,7 +9471,7 @@ mod tests {
 
     fn app() -> App {
         let mut a = App::default();
-        a.composer.push_str("a draft");
+        a.composer_set("a draft");
         a.body.push_str(" decrypted text");
         a
     }
@@ -10488,6 +10688,69 @@ mod tests {
             assert!(rest.starts_with("  "), "no gap after {verb:?}: {row:?}");
             assert_eq!(rest.trim_start(), *what, "{row:?}");
         }
+    }
+
+    /// **The composer takes editing keys.** It was a `String` with `push`:
+    /// no backspace, no arrows, no way to fix a typo but to discard the
+    /// draft. `Binding::Edit` returned early unless the command line had
+    /// focus, so every editing key was dropped in the one pane where text is
+    /// written.
+    #[test]
+    fn the_composer_can_be_edited() {
+        let mut a = ready_node("compose-edit");
+        type_command(&mut a, "note");
+        assert_eq!(a.ui.mode(), Mode::Compose);
+
+        for c in "helo".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        // Back over the typo and insert.
+        a.on_key(KeyCode::Left, KeyModifiers::NONE);
+        a.on_key(KeyCode::Char('l'), KeyModifiers::NONE);
+        assert_eq!(a.composer, "hello", "arrows and insert do not work");
+
+        a.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(a.composer, "helo");
+        a.on_key(KeyCode::End, KeyModifiers::NONE);
+        a.on_key(KeyCode::Char('!'), KeyModifiers::NONE);
+        assert_eq!(a.composer, "helo!");
+        a.on_key(KeyCode::Home, KeyModifiers::NONE);
+        a.on_key(KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(a.composer, "elo!");
+    }
+
+    /// Up and Down move a line in a composer, and do not recall history.
+    #[test]
+    fn arrows_move_between_composer_lines() {
+        let mut a = ready_node("compose-lines");
+        type_command(&mut a, "note");
+        for c in "one".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        for c in "two".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(a.composer, "one\ntwo");
+
+        // Up to the first line, Home, then insert: it lands on line one.
+        a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        a.on_key(KeyCode::Home, KeyModifiers::NONE);
+        a.on_key(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert_eq!(a.composer, "Xone\ntwo", "Up did not move a line");
+    }
+
+    /// A killed word is overwritten, not merely dropped — RFC 7 §8 applies to
+    /// discarded plaintext however small.
+    #[test]
+    fn killing_a_word_shortens_the_draft() {
+        let mut a = ready_node("compose-kill");
+        type_command(&mut a, "note");
+        for c in "alpha beta".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(a.composer, "alpha ");
     }
 
     /// **A note to self is kept, and is not an object.**
@@ -13579,7 +13842,7 @@ mod tests {
         let mut a = ready_node("tick");
         // Peer names are short node identifiers, so they are hex.
         type_command(&mut a, "connect a1b2c3d4 tcp");
-        a.composer.push_str("a draft in progress");
+        a.composer_set("a draft in progress");
         a.command = line::Line::from("half-typed");
         let before = (a.composer.clone(), a.command.clone());
 
@@ -14800,7 +15063,7 @@ mod tests {
         a.on_key(KeyCode::Char('2'), KeyModifiers::CONTROL);
         a.ui.descend();
         a.ui.compose();
-        a.composer.push_str("a draft");
+        a.composer_set("a draft");
         a.ui.cycle_focus();
         a.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
         a.command = line::Line::from("half typed");
@@ -17236,7 +17499,7 @@ mod tests {
 
         // Every message event the interface offers.
         a.ui.compose();
-        a.composer.push_str("a draft in progress");
+        a.composer_set("a draft in progress");
         type_command(&mut a, &format!("send {b_id} the meeting is moved"));
         a.refresh_inbox();
         a.show_selected();
@@ -17978,7 +18241,7 @@ mod tests {
         let mut a = ready_node("compose-nobody");
         a.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
         a.ui.compose();
-        a.composer.push_str("to nobody");
+        a.composer_set("to nobody");
         a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert!(a.output.contains("not addressed"), "{}", a.output);
 

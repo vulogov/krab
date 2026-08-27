@@ -59,6 +59,8 @@ pub struct View<'a> {
     /// Takes the status rule when set, because nothing else on screen is
     /// more useful than "this is stopped, and here is what unsticks it".
     pub waiting: Option<&'a str>,
+    /// Where the caret is in `composer`, as a character index.
+    pub composer_at: usize,
     /// Lines the output pane is scrolled back from the newest.
     pub scroll: usize,
     /// Composer contents, shown when `ui.mode()` is `Compose`.
@@ -332,6 +334,36 @@ fn draw_output(f: &mut Frame, area: Rect, view: &View) {
     );
 }
 
+/// The draft with the caret drawn on it.
+///
+/// A composer with editing keys and no visible caret is worse than one
+/// without either: the operator can move it and cannot see where it went.
+/// The character under the caret is reversed, and at end-of-line a space
+/// stands in so the caret has something to sit on.
+fn caret_lines(text: &str, at: usize) -> Vec<Line<'static>> {
+    let caret = Style::default().add_modifier(Modifier::REVERSED);
+    let mut out = Vec::new();
+    let mut seen = 0usize;
+    for line in text.split('\n') {
+        let n = line.chars().count();
+        if at >= seen && at <= seen + n {
+            let col = at - seen;
+            let before: String = line.chars().take(col).collect();
+            let under: String = line.chars().skip(col).take(1).collect();
+            let after: String = line.chars().skip(col + 1).collect();
+            out.push(Line::from(vec![
+                Span::raw(before),
+                Span::styled(if under.is_empty() { " ".into() } else { under }, caret),
+                Span::raw(after),
+            ]));
+        } else {
+            out.push(Line::from(line.to_string()));
+        }
+        seen += n + 1;
+    }
+    out
+}
+
 /// The composer, and the banner that must always accompany it.
 ///
 /// RFC 8 §2.1: *"A zoomed or overlaid composer MUST render its security
@@ -373,7 +405,7 @@ fn draw_composer(f: &mut Frame, area: Rect, view: &View) {
     }
     if inner.height > 2 {
         f.render_widget(
-            Paragraph::new(view.composer),
+            Paragraph::new(caret_lines(view.composer, view.composer_at)),
             Rect {
                 y: inner.y + 2,
                 height: inner.height - 2,
