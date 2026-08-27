@@ -780,3 +780,50 @@ None of the nine was caught by 1045 tests, because the tests were written from
 the same reading of the documents as the code was. That is the finding that
 matters most, and it argues for conformance vectors driven from the RFC text
 rather than more tests written by the implementer.
+
+---
+
+## 13. Status of the nine, 2026-08-27
+
+| # | requirement | status |
+|---|---|---|
+| 1 | RFC 1 §6.4 / RFC 2 §9 — cache failed `(id, epoch)` pairs | **fixed** — bounded at 4096, cleared with the tag table |
+| 2 | RFC 2 §9 — cap decapsulation attempts | **fixed** — 256 per scan, stricter than per-peer-per-epoch |
+| 3 | RFC 8 §9 — LOCATION privacy shown per link | **fixed** |
+| 4 | RFC 8 §9 — VOLUME privacy shown per link | **fixed** |
+| 5 | RFC 4 §12 — cap concurrent handshakes | **was never unmet.** Met at one by the listener's structure; the audit read a missing counter as a missing property |
+| 6 | RFC 2 §7 — median-of-peers time estimate | open — needs a wire field |
+| 7 | RFC 3 §2 — render a credential as HJSON | open — needs a serialiser and a verb |
+| 8 | RFC 6 §3.6 — channels in a separate shard space | **not fixable in code** — amendment #11 |
+| 9 | RFC 1 §7 vs RFC 2 §7 — `EPOCH_WINDOW` ±45 against W ±30 | **not fixable in code** — amendment #10 |
+
+### Why 6 and 7 were not done here
+
+**#6, the median-of-peers time estimate**, is not a local computation. RFC 2 §7
+forbids *emitting* when the estimate diverges from local time, so the node has
+to learn what its peers think the time is — and nothing on the wire carries
+that today. Adding a field to the reconciliation handshake is a protocol
+change to a frozen series, which needs an amendment before an implementation,
+not after. It is also the same hole as B4 and belongs with Phase 7, where the
+skew tolerance is decided; doing it twice would settle the number twice.
+
+**#7, HJSON credential rendering**, is a day's work rather than an hour's: a
+credential is a flat CBOR map (RFC 3 §2 requires flat precisely so this is
+possible), so the serialiser is small, but it needs a verb, a place to render
+into, and a decision about whether an *incoming* credential can be rendered
+before it is countersigned — which is the case that matters, since the point
+is to read what you are agreeing to. Rushing it would produce the thing the
+requirement exists to prevent: a rendering nobody reads.
+
+### The correction, and what it says about the audit
+
+Finding 5 was not a defect. I searched for a counter, found none, and reported
+the property missing — when the property was satisfied structurally by code
+that cannot have more than one handshake in flight. That is the
+truncated-`grep` failure Phase 6 recorded against itself, committed again by
+the audit that was written to catch this class of thing.
+
+It argues the eight remaining findings should each be confirmed the way this
+one was disconfirmed: by reading the path, not by grepping for the mechanism I
+expected. Two have been (#8 and #9 are conflicts between documents, checked
+against both texts). Six have not.
