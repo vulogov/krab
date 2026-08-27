@@ -464,6 +464,15 @@ struct App {
     /// A composition with no recipient cannot be sent — the alternative is a
     /// prompt at the moment of sending, which is the worst time to ask.
     composing_to: Option<String>,
+    /// The composer is addressed to this node's channel, not to a peer.
+    /// RFC 8 §4.2 requirement 1 puts the security context in the composer,
+    /// which means channel posts are composed rather than typed as an
+    /// argument — a post is not a one-liner.
+    composing_channel: bool,
+    /// A composed post waiting on that confirmation.
+    pending_post: Option<String>,
+    /// Which channel the Channels tab has been descended into.
+    channel_open: Option<[u8; 32]>,
     /// A picture currently drawn in the message pane, as character cells.
     ///
     /// **Plaintext-adjacent**, so `lock` drops it with everything else: a
@@ -611,6 +620,9 @@ impl Default for App {
             meeting: None,
             composing_to_many: Vec::new(),
             composing_to: None,
+            composing_channel: false,
+            pending_post: None,
+            channel_open: None,
             showing: None,
             prompt: None,
             history: Vec::new(),
@@ -902,10 +914,7 @@ impl App {
             // design.
             Binding::Reply if !self.locked => self.reply_privately(),
             Binding::Publish if !self.locked => {
-                self.output = "publishing is `channel post <text>`.\n\n\
-                     It is a separate action from reply on purpose (RFC 8 §4.2): \
-                     a channel post is PUBLIC, SIGNED and PERMANENT."
-                    .into();
+                self.output = self.compose_post();
             }
 
             // Editing goes to whichever line is being typed into. The
@@ -943,6 +952,14 @@ impl App {
                 // being abandoned is overwritten rather than dropped.
                 overwrite(&mut self.composer);
                 self.command.clear();
+                // A post awaiting confirmation is a draft like any other, and
+                // Esc means the same thing here as everywhere: it is gone.
+                if let Some(mut p) = self.pending_post.take() {
+                    overwrite(&mut p);
+                    self.output = "not published. The draft is gone.".into();
+                }
+                self.composing_channel = false;
+                self.channel_open = None;
                 self.ui.reset();
                 // The first-run ceremony is deliberately not cancelled here.
                 // It owns Enter while it runs, it holds a passphrase that is
@@ -956,6 +973,20 @@ impl App {
             // confirmation a deliberate act rather than a screen to skip past.
             Binding::Activate if self.init_step.is_some() => self.advance_init(),
             Binding::Activate => {
+                // **RFC 8 §4.2 requirement 2**, as one keystroke rather than
+                // retyping the verb. The confirmation has to be explicit; it
+                // does not have to be tedious, and a command typed twice
+                // teaches the operator to type it twice without reading.
+                if self.pending_post.is_some() && self.command.is_empty() {
+                    let text = self.pending_post.take().unwrap_or_default();
+                    // The gate `channel_post` keeps for the typed form. The
+                    // operator has just confirmed; asking again inside it
+                    // would be the double-prompt this replaced.
+                    self.roster.first_post_confirmed = true;
+                    self.output = self.channel_post(&text);
+                    self.reveal_output();
+                    return;
+                }
                 if typing {
                     if !self.command.is_empty() {
                         self.submit();
@@ -963,7 +994,18 @@ impl App {
                 } else if self.ui.mode() == Mode::Compose {
                     self.composer.push('\n');
                 } else {
+                    // Descending into a channel has to record *which* one, or
+                    // the level changes and the pane has nothing to show for
+                    // it.
+                    if self.ui.tab() == layout::Tab::Channels
+                        && self.ui.level() == layout::Level::Channels
+                    {
+                        self.channel_open = self.channel_ids().get(self.selected).copied();
+                        self.selected = 0;
+                    }
                     self.ui.descend();
+                    self.refresh_inbox();
+                    self.show_selected();
                 }
             }
             Binding::Input(c) => {
@@ -1688,7 +1730,14 @@ fn inbox_row(m: &receive::Message) -> String {
         // so switching tabs shows what is there rather than what was there
         // when the tab was last opened.
         if self.ui.tab() == layout::Tab::Channels {
-            self.list = self.channel_rows();
+            // **Two levels, and the second one now has content.**
+            // `descend` set `Level::Messages` and nothing read it, so
+            // pressing Enter on a channel changed the pane's title and left
+            // the same list of channels underneath it.
+            self.list = match (self.ui.level(), self.channel_open) {
+                (layout::Level::Messages, Some(id)) => self.channel_post_rows(&id),
+                _ => self.channel_rows(),
+            };
         }
         self.show_selected();
     }
@@ -4370,6 +4419,10 @@ impl App {
             self.output = "nothing is being composed. `send <peer>` starts one.".into();
             return;
         }
+        if self.composing_channel {
+            self.output = self.seal_post();
+            return;
+        }
         let to = if self.composing_to_many.is_empty() {
             self.composing_to.clone().into_iter().collect::<Vec<_>>()
         } else {
@@ -4862,6 +4915,44 @@ impl App {
     ///
     /// The tab rendered an empty pane: it was drawn, selectable and
     /// advertised, and nothing ever put anything in it.
+    /// The channels this node can see, in the order `channel_ids` gives.
+    fn channel_ids(&self) -> Vec<[u8; 32]> {
+        self.roster
+            .mine
+            .as_ref()
+            .map(|c| c.id())
+            .into_iter()
+            .chain(self.roster.following.iter().copied())
+            .collect()
+    }
+
+    /// One row per post: who signed it, its sequence, and its first line.
+    ///
+    /// The author is on every row because RFC 8 §4.2 requirement 3 makes
+    /// reply resolve to a private message *to the author* — an operator
+    /// cannot judge that with no author on screen.
+    fn channel_post_rows(&self, id: &[u8; 32]) -> Vec<String> {
+        let posts = self.channel_post_items(id);
+        if posts.is_empty() {
+            return vec![format!("channel {} — no posts yet", channels::short(id))];
+        }
+        // **The channel's short id, not the signing key's.** They are
+        // different values — the id is derived from the key — and the id is
+        // the one the operator sees in `channel list` and types into
+        // `channel follow`. Showing the key here would name the same author
+        // with a string that appears nowhere else.
+        let who = channels::short(id);
+        posts
+            .iter()
+            .map(|(seq, _author, text)| {
+                format!(
+                    "{who}  #{seq}  {}",
+                    display::safe(text.lines().next().unwrap_or("")).text
+                )
+            })
+            .collect()
+    }
+
     fn channel_rows(&self) -> Vec<String> {
         let mut rows = Vec::new();
         let mut counts: Vec<([u8; 32], usize)> = Vec::new();
@@ -4902,6 +4993,30 @@ impl App {
     }
 
     /// Posts in a channel, newest first.
+    /// Posts on `id`, newest first: sequence, author, text.
+    ///
+    /// Structured rather than pre-formatted so the list and the body pane
+    /// can render the same post differently — the list needs one line, the
+    /// body needs all of them.
+    fn channel_post_items(&self, id: &[u8; 32]) -> Vec<(u64, [u8; 32], String)> {
+        let mut out: Vec<(u64, [u8; 32], String)> = Vec::new();
+        self.store.with(|s| {
+            for (_, oid) in s.entries_in_range(0, u32::MAX) {
+                if let Some(p) = s.get(&oid).and_then(channels::from_object) {
+                    if p.channel_id() == *id {
+                        out.push((
+                            p.sequence,
+                            p.author,
+                            String::from_utf8_lossy(&p.payload).into_owned(),
+                        ));
+                    }
+                }
+            }
+        });
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out
+    }
+
     fn channel_posts(&self, id: &[u8; 32]) -> Vec<String> {
         let mut out: Vec<(u64, String)> = Vec::new();
         self.store.with(|s| {
@@ -4921,14 +5036,27 @@ impl App {
     fn show_selected(&mut self) {
         overwrite(&mut self.body);
         if self.ui.tab() == layout::Tab::Channels {
-            let ids: Vec<[u8; 32]> = self
-                .roster
-                .mine
-                .as_ref()
-                .map(|c| c.id())
-                .into_iter()
-                .chain(self.roster.following.iter().copied())
-                .collect();
+            // Inside a channel: one post, whole, with who signed it. The body
+            // used to receive every post of the channel joined together, so a
+            // post longer than a line could not be read on its own and the
+            // author appeared nowhere at all.
+            if self.ui.level() == layout::Level::Messages {
+                if let Some(id) = self.channel_open {
+                    let posts = self.channel_post_items(&id);
+                    self.body = match posts.get(self.selected) {
+                        Some((seq, _author, text)) => format!(
+                            "channel {}  —  PUBLIC, SIGNED, PERMANENT\n\
+                             from {}  ·  post #{seq}\n\n{}",
+                            channels::short(&id),
+                            channels::short(&id),
+                            display::safe(text).text
+                        ),
+                        None => format!("channel {}\n\nno posts yet", channels::short(&id)),
+                    };
+                    return;
+                }
+            }
+            let ids: Vec<[u8; 32]> = self.channel_ids();
             self.body = match ids.get(self.selected) {
                 Some(id) => {
                     let posts = self.channel_posts(id);
@@ -5276,7 +5404,15 @@ impl App {
                         let text = words::split(line)
                             .map(|w| words::rest(&w, 2))
                             .unwrap_or_default();
-                        self.channel_post(text.trim())
+                        // **No text means compose it.** RFC 8 §4.2
+                        // requirement 1 puts the security context in the
+                        // composer, which presumes one; and a post is not
+                        // necessarily a single line, which an argument is.
+                        if text.trim().is_empty() {
+                            self.compose_post()
+                        } else {
+                            self.channel_post(text.trim())
+                        }
                     }
                     "follow" => self.channel_follow(arg(line, 2).as_deref(), true),
                     "unfollow" => self.channel_follow(arg(line, 2).as_deref(), false),
@@ -6621,6 +6757,58 @@ impl App {
     }
 
     /// Publish — the one irreversible thing an operator does routinely.
+    /// Open the composer for a channel post — RFC 8 §4.2 requirement 1.
+    ///
+    /// Switching to the Channels tab is what puts the red
+    /// `PUBLIC — SIGNED — PERMANENT` banner on the composer: the banner is
+    /// derived from the tab rather than passed in, so a composer for a post
+    /// cannot be opened without it.
+    fn compose_post(&mut self) -> String {
+        if self.roster.mine.is_none() {
+            return "no channel — `channel new` first".into();
+        }
+        self.ui.select_tab(layout::Tab::Channels);
+        self.ui.compose();
+        // Focus has to leave the command line, or the keystrokes go to it
+        // rather than to the draft — the same move `send` makes.
+        while self.ui.focus() != layout::Pane::View {
+            self.ui.cycle_focus();
+        }
+        self.composing_channel = true;
+        "composing a post. Enter is a newline; Ctrl-D publishes it; Esc \
+         discards it.\n\n\
+         It will be PUBLIC, SIGNED and PERMANENT: anyone holding it can read \
+         it, it carries your channel's signature, and it cannot be edited or \
+         withdrawn (RFC 8 §4.1)."
+            .into()
+    }
+
+    /// Ctrl-D on a channel composition.
+    fn seal_post(&mut self) -> String {
+        let text = self.composer.trim().to_string();
+        if text.is_empty() {
+            return "nothing to publish. Esc discards this.".into();
+        }
+        overwrite(&mut self.composer);
+        self.ui.end_compose();
+        self.composing_channel = false;
+        // **RFC 8 §4.2 requirement 2** — the first post of a session is
+        // confirmed. Once per session: the friction is a reminder, not a toll
+        // on every line.
+        if self.roster.first_post_confirmed {
+            return self.channel_post(&text);
+        }
+        let preview: String = text.lines().next().unwrap_or("").chars().take(60).collect();
+        self.pending_post = Some(text);
+        format!(
+            "PUBLIC — SIGNED — PERMANENT\n\n\
+             \x20 {preview}\n\n\
+             Press Enter to publish it. Esc discards it.\n\n\
+             Asked once a session, because this is the one action in Krab \
+             that cannot be undone (RFC 8 §4.1)."
+        )
+    }
+
     fn channel_post(&mut self, text: &str) -> String {
         if text.is_empty() {
             return "usage: channel post <text>\n\n\
@@ -6635,7 +6823,11 @@ impl App {
         // a reminder of what publishing means, and a reminder given once a
         // year is not one.
         if !self.roster.first_post_confirmed {
-            self.roster.first_post_confirmed = true;
+            // Hold the text so Enter can publish exactly what was confirmed.
+            // It used to ask for the command to be retyped, which meant the
+            // operator confirmed by typing rather than by reading, and left
+            // the first attempt doing nothing at all.
+            self.pending_post = Some(text.to_string());
             return format!(
                 "PUBLIC — SIGNED — PERMANENT\n\n\
                  This will be signed with channel {}, flooded to every peer, \
@@ -6643,7 +6835,7 @@ impl App {
                  §6.1 forbids a recall mechanism, so it cannot be deleted, \
                  edited, or made unreadable later — unlike a sealed message, \
                  which expires with its epoch key.\n\n\
-                 Type the same command again to publish it.",
+                 Press Enter to publish it. Esc discards it.",
                 channels::short(&c.id())
             );
         }
@@ -8873,6 +9065,17 @@ mod tests {
     /// Two nodes with a completed peering, and the short id each uses for the
     /// other. The sneakernet path, because that is the one that keeps the
     /// post-quantum property and so is the interesting starting point.
+    /// Publish `text`, confirming if this is the session's first post.
+    ///
+    /// The confirmation is one keystroke now, not the command typed twice, so
+    /// tests that doubled the verb were encoding the old behaviour.
+    fn post_now(a: &mut App, text: &str) {
+        type_command(a, &format!("channel post {text}"));
+        if a.pending_post.is_some() {
+            a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        }
+    }
+
     fn peered_pair(tag: &str) -> (App, App, String, String) {
         let mut a = ready_node(&format!("{tag}-a"));
         let mut b = ready_node(&format!("{tag}-b"));
@@ -10041,6 +10244,139 @@ mod tests {
         }
     }
 
+    /// **A post is composed, not typed as an argument.**
+    ///
+    /// RFC 8 §4.2 requirement 1 puts the security context *in the composer*,
+    /// which presumes one. `channel post <text>` was the only way in, so a
+    /// post was a single line and the banner requirement had nowhere to
+    /// apply.
+    #[test]
+    fn channel_post_with_no_text_opens_a_composer_with_its_banner() {
+        let mut a = ready_node("post-compose");
+        type_command(&mut a, "channel new");
+        type_command(&mut a, "channel post");
+
+        assert_eq!(a.ui.mode(), Mode::Compose, "{}", a.output);
+        assert_eq!(a.ui.tab(), layout::Tab::Channels);
+        assert_eq!(
+            a.ui.banner(),
+            Some(layout::Banner::PublicSignedPermanent),
+            "the composer opened without the banner §4.2 requires"
+        );
+
+        // Multi-line, which an argument could never be.
+        for c in "first line\nsecond line".chars() {
+            a.on_key(
+                if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) },
+                KeyModifiers::NONE,
+            );
+        }
+        assert!(a.composer.contains('\n'), "the composer refused a newline");
+    }
+
+    /// **Confirmation is one keystroke, not the verb typed twice.**
+    ///
+    /// §4.2 requirement 2 requires explicit confirmation of the first post of
+    /// a session. It does not require retyping the command, and a command
+    /// typed twice teaches the operator to type it twice without reading.
+    #[test]
+    fn the_first_post_confirms_with_a_key_and_later_posts_do_not() {
+        let mut a = ready_node("post-confirm");
+        type_command(&mut a, "channel new");
+        let chan = a.roster.mine.as_ref().unwrap().id();
+
+        type_command(&mut a, "channel post");
+        for c in "the meeting moved".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        // Not published yet, and the pane says what it is about to do.
+        assert!(a.channel_posts(&chan).is_empty(), "published without confirming");
+        assert!(a.output.contains("PUBLIC — SIGNED — PERMANENT"), "{}", a.output);
+        assert!(a.output.contains("Enter"), "the key is not named: {}", a.output);
+
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(a.channel_posts(&chan).len(), 1, "{}", a.output);
+
+        // Second post of the session: composed, sealed, published. No prompt.
+        type_command(&mut a, "channel post");
+        for c in "and again".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(
+            a.channel_posts(&chan).len(),
+            2,
+            "the second post of a session asked again: {}",
+            a.output
+        );
+    }
+
+    /// Esc on a post awaiting confirmation discards it, like any draft.
+    #[test]
+    fn a_post_awaiting_confirmation_can_be_discarded() {
+        let mut a = ready_node("post-discard");
+        type_command(&mut a, "channel new");
+        let chan = a.roster.mine.as_ref().unwrap().id();
+        type_command(&mut a, "channel post");
+        for c in "never mind".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        a.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(a.pending_post.is_none());
+        assert!(a.channel_posts(&chan).is_empty(), "Esc published it");
+
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(a.channel_posts(&chan).is_empty(), "Enter published a discarded draft");
+    }
+
+    /// **A channel can be entered, and a post read on its own.**
+    ///
+    /// `descend` set `Level::Messages` and nothing read it: Enter on a
+    /// channel changed the pane title and left the channel list underneath.
+    /// The body received every post joined together, so a post longer than a
+    /// line could not be read by itself and the author appeared nowhere.
+    #[test]
+    fn a_channel_opens_to_its_posts_and_each_post_names_its_author() {
+        let mut a = ready_node("channel-nav");
+        type_command(&mut a, "channel new");
+        let chan = a.roster.mine.as_ref().unwrap().id();
+        // Typed once, then confirmed with a key — not typed twice.
+        type_command(&mut a, "channel post the agreed line");
+        assert!(a.channel_posts(&chan).is_empty(), "published unconfirmed");
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(a.channel_posts(&chan).len(), 1, "{}", a.output);
+
+        a.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(a.ui.tab(), layout::Tab::Channels);
+        a.selected = 0;
+        // Focus has to be on the list: Enter on the command line submits a
+        // command, and an empty one does nothing. This is how an operator
+        // reaches it — Tab, then Enter.
+        while a.ui.focus() != layout::Pane::List {
+            a.ui.cycle_focus();
+        }
+
+        // Enter descends into the channel under the cursor.
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(a.ui.level(), layout::Level::Messages);
+        assert_eq!(a.channel_open, Some(chan), "no channel was entered");
+
+        let author = channels::short(&chan);
+        assert!(
+            a.list.iter().any(|r| r.contains(&author)),
+            "no author on any row: {:?}",
+            a.list
+        );
+        assert!(
+            a.body.contains("from ") && a.body.contains(&author),
+            "the body does not say who posted:\n{}",
+            a.body
+        );
+    }
+
     /// **Pass 13. The reveal must not hide the prompt it needs.**
     ///
     /// `Zoom::One` renders that pane and nothing else — no command line, so
@@ -10329,15 +10665,16 @@ mod tests {
         let short = channels::short(&chan);
 
         // RFC 8 §4.2: the first post of a session confirms rather than
-        // publishes. Issuing it once and assuming it went out is how a
-        // "post" that never left would look like a delivery failure.
+        // publishes — it holds the text and asks. Issuing it once and
+        // assuming it went out is how a "post" that never left would look
+        // like a delivery failure.
         type_command(&mut a, "channel post the meeting is moved to thursday");
         assert!(
             a.output.contains("PUBLIC — SIGNED — PERMANENT"),
             "the post did not state what it is: {}",
             a.output
         );
-        type_command(&mut a, "channel post the meeting is moved to thursday");
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(a.output.contains("published post"), "{}", a.output);
         assert_eq!(a.channel_posts(&chan).len(), 1, "the post did not publish");
 
@@ -10408,8 +10745,7 @@ mod tests {
         type_command(&mut a, "channel new");
         let chan = a.roster.mine.as_ref().unwrap().id();
 
-        type_command(&mut a, "channel post --picture /tmp/holiday.png");
-        type_command(&mut a, "channel post --picture /tmp/holiday.png");
+        post_now(&mut a, "--picture /tmp/holiday.png");
         let posts = a.channel_posts(&chan);
         assert!(
             posts.iter().any(|p| p.contains("--picture")),
@@ -15428,7 +15764,9 @@ mod tests {
             0
         );
 
-        type_command(&mut a, "channel post the meeting is moved");
+        // One keystroke confirms it — §4.2 requirement 2 asks for an explicit
+        // act, not for the verb to be typed a second time.
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(a.output.contains("published post 1"), "{}", a.output);
 
         let posts = a.channel_posts(&a.roster.mine.as_ref().unwrap().id());
@@ -15455,8 +15793,7 @@ mod tests {
     fn only_the_first_post_of_a_session_confirms() {
         let mut a = ready_node("channel-confirm-once");
         type_command(&mut a, "channel new");
-        type_command(&mut a, "channel post one");
-        type_command(&mut a, "channel post one");
+        post_now(&mut a, "one");
         type_command(&mut a, "channel post two");
         assert!(a.output.contains("published post 2"), "{}", a.output);
     }
@@ -15467,8 +15804,7 @@ mod tests {
     fn sequence_numbers_survive_a_restart() {
         let mut a = ready_node("channel-seq");
         type_command(&mut a, "channel new");
-        type_command(&mut a, "channel post first");
-        type_command(&mut a, "channel post first");
+        post_now(&mut a, "first");
         type_command(&mut a, "channel post second");
 
         let mut fresh = App {
@@ -15500,8 +15836,7 @@ mod tests {
         let mut a = ready_node("channel-follow-a");
         let mut b = ready_node("channel-follow-b");
         type_command(&mut b, "channel new");
-        type_command(&mut b, "channel post hello");
-        type_command(&mut b, "channel post hello");
+        post_now(&mut b, "hello");
         let id = channels::short(&b.roster.mine.as_ref().unwrap().id());
 
         let now_min = now_epoch().0 * 1440;
@@ -15594,8 +15929,7 @@ mod tests {
     fn reply_never_publishes_and_publish_is_a_separate_key() {
         let mut a = ready_node("reply-private");
         type_command(&mut a, "channel new");
-        type_command(&mut a, "channel post hello");
-        type_command(&mut a, "channel post hello");
+        post_now(&mut a, "hello");
         let before = a.channel_posts(&a.roster.mine.as_ref().unwrap().id()).len();
 
         a.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
@@ -15614,15 +15948,21 @@ mod tests {
             a.output
         );
 
-        // And `P` does not publish either — it names the verb that does, so
-        // publishing is always something typed in full.
+        // And `P` does not publish either. It opens a composer — RFC 8 §4.2
+        // requirement 1 wants the security context there — and publishing is
+        // still a further, separate act.
         a.on_key(KeyCode::Char('P'), KeyModifiers::SHIFT);
         assert_eq!(
             a.channel_posts(&a.roster.mine.as_ref().unwrap().id()).len(),
             before,
-            "the publish key published without a command"
+            "the publish key published without confirmation"
         );
-        assert!(a.output.contains("channel post"), "{}", a.output);
+        assert_eq!(a.ui.mode(), Mode::Compose, "{}", a.output);
+        assert_eq!(
+            a.ui.banner(),
+            Some(layout::Banner::PublicSignedPermanent),
+            "a post is being composed without its banner"
+        );
     }
 
     /// In private mail, reply addresses the sender — the same key, the same
