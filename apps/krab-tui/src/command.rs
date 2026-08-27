@@ -53,6 +53,8 @@ pub enum Command {
     ///
     /// "Pinning is a conscious act; the default is forgetting."
     Pin,
+    /// A note to yourself — never leaves this node.
+    Note,
     /// **Not in RFC 8 §5.** Write a received picture to a file — RFC 8 §6.
     ///
     /// Writes bytes and stops. RFC 8 §6 forbids passing received bytes to a
@@ -182,8 +184,9 @@ impl Command {
     /// to 19 of 26 without anything noticing. `every_variant_is_in_all` closes
     /// that: it matches on `Command` exhaustively, so a new variant does not
     /// compile until it appears here.
-    pub const ALL: [Command; 29] = [
+    pub const ALL: [Command; 30] = [
         Command::Pin,
+        Command::Note,
         Command::Picture,
         Command::Group,
         Command::Channel,
@@ -242,6 +245,7 @@ impl Command {
             "channel" | "chan" => Command::Channel,
             "group" => Command::Group,
             "pin" => Command::Pin,
+            "note" | "notes" => Command::Note,
             "picture" | "pic" => Command::Picture,
             "force-send" => Command::ForceSend,
             "status" => Command::Status,
@@ -255,6 +259,10 @@ impl Command {
     /// two that end things.
     pub const SYNOPSES: &'static [(&'static str, &'static str)] = &[
         ("init", "create this node's key hierarchy — run once, first"),
+        (
+            "note [text]",
+            "a note to yourself — never leaves this node; no text opens a composer",
+        ),
         ("keys", "show what key material exists"),
         ("verify", "print this node's fingerprint, to read aloud"),
         (
@@ -470,6 +478,7 @@ impl fmt::Display for Command {
             Command::Channel => "channel",
             Command::Group => "group",
             Command::Pin => "pin",
+            Command::Note => "note",
             Command::Picture => "picture",
             Command::ForceSend => "force-send",
             Command::Status => "status",
@@ -699,6 +708,7 @@ mod tests {
         for c in Command::ALL {
             match c {
                 Command::Pin => {}
+                Command::Note => {}
                 Command::Picture => {}
                 Command::Group => {}
                 Command::Channel => {}
@@ -729,7 +739,7 @@ mod tests {
                 Command::Verify => {}
             }
         }
-        assert_eq!(Command::ALL.len(), 29);
+        assert_eq!(Command::ALL.len(), 30);
     }
 
     /// **Every verb round-trips.** RFC 8 §5's ten, and the sixteen it omits.

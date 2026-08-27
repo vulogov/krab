@@ -469,6 +469,8 @@ struct App {
     /// which means channel posts are composed rather than typed as an
     /// argument — a post is not a one-liner.
     composing_channel: bool,
+    /// The composer is a note to self.
+    composing_note: bool,
     /// A composed post waiting on that confirmation.
     pending_post: Option<String>,
     /// Which channel the Channels tab has been descended into.
@@ -621,6 +623,7 @@ impl Default for App {
             composing_to_many: Vec::new(),
             composing_to: None,
             composing_channel: false,
+            composing_note: false,
             pending_post: None,
             channel_open: None,
             showing: None,
@@ -959,6 +962,7 @@ impl App {
                     self.output = "not published. The draft is gone.".into();
                 }
                 self.composing_channel = false;
+                self.composing_note = false;
                 self.channel_open = None;
                 self.ui.reset();
                 // The first-run ceremony is deliberately not cancelled here.
@@ -3102,6 +3106,133 @@ fn inbox_row(m: &receive::Message) -> String {
     ///
     /// Bare `pin` reports the archive; `pin <peer>` keeps their conversation;
     /// `pin release <peer>` gives it back to the erasure.
+    /// `note [text]` — something you write to yourself.
+    ///
+    /// # Why this is not a message addressed to your own node
+    ///
+    /// Sealing to your own correspondence key would work — the key is here
+    /// and `seal_one` does not care who the recipient is. It would also put
+    /// the note in the corpus, and everything in the corpus is offered at the
+    /// next reconciliation. Peers would carry ciphertext they can never open,
+    /// spending the bandwidth and storage RFC 3 §6 meters, and it would count
+    /// as a contribution in §12's figures while contributing nothing.
+    ///
+    /// Excluding it with a flag would work until somebody adds the next code
+    /// path that walks the store — which is the defect this codebase keeps
+    /// finding. So a note is not an object at all.
+    ///
+    /// # Where it lives
+    ///
+    /// In the pinned archive, because that is already exactly this: plaintext
+    /// held under a KEK-derived key, deliberately exempt from RFC 7 §8's
+    /// epoch erasure, wiped by panic and duress, and carrying a warning that
+    /// says how much is exempt. A second archive with the same properties
+    /// would be a second thing to remember in every one of those paths.
+    fn note_command(&mut self, line: &str) -> String {
+        let Ok(words) = words::split(line) else {
+            return "unbalanced quotes".into();
+        };
+        let text = words::rest(&words, 1);
+        let text = text.trim();
+        let (Some(key), Some(_)) = (self.pin_key, self.epoch_key) else {
+            return "locked — unlock to reach your notes".into();
+        };
+        // `notes` lists; `note` composes. Same verb, and the plural is the
+        // one an operator reaches for when they want to read rather than
+        // write.
+        let listing = words
+            .first()
+            .map(|w| w.text() == "notes")
+            .unwrap_or(false);
+        if listing {
+            return self.list_notes();
+        }
+        if text.is_empty() {
+            return self.compose_note();
+        }
+        self.write_note(&key, text)
+    }
+
+    /// Everything written to self, newest last.
+    fn list_notes(&self) -> String {
+        let Some(me) = self.identity.as_ref().map(|i| i.short_id()) else {
+            return "no identity — `init` first".into();
+        };
+        let archive = self.pinned();
+        let mine = archive.of(&me);
+        if mine.is_empty() {
+            return "no notes.\n\n\
+                    `note <text>` keeps one, or `note` alone opens a composer \
+                    for something longer. A note never leaves this node."
+                .into();
+        }
+        let mut out = format!("{} note(s):\n", mine.len());
+        for (i, k) in mine.iter().enumerate() {
+            out.push_str(&format!(
+                "\n{:>3}. [epoch {}] {}\n",
+                i + 1,
+                k.epoch,
+                display::safe(&k.body).text
+            ));
+        }
+        if let Some(w) = archive.warning() {
+            out.push_str(&format!("\n{w}"));
+        }
+        out
+    }
+
+    /// Open the composer for a note. A note is not necessarily one line.
+    fn compose_note(&mut self) -> String {
+        self.ui.select_tab(layout::Tab::Private);
+        self.ui.compose();
+        while self.ui.focus() != layout::Pane::View {
+            self.ui.cycle_focus();
+        }
+        self.composing_note = true;
+        "composing a note. Enter is a newline; Ctrl-D keeps it; Esc discards \
+         it.\n\n\
+         It never leaves this node — it is not an object and is never offered \
+         to a peer. It is held with your pinned mail, which means it outlives \
+         the epoch that would otherwise erase it (RFC 7 §8). `wipe` destroys \
+         it; nothing else does."
+            .into()
+    }
+
+    /// Add `text` to the archive under this node's own short id.
+    fn write_note(&mut self, key: &[u8; 32], text: &str) -> String {
+        let me = match self.identity.as_ref() {
+            Some(i) => i.short_id(),
+            None => return "no identity — `init` first".into(),
+        };
+        let mut archive = self.pinned();
+        if archive.kept.len() >= pin::MAX_PINNED {
+            return format!(
+                "the archive is full at {} entries.\n\n\
+                 It is capped because everything in it is exempt from epoch \
+                 erasure: an unbounded archive is an unbounded amount of \
+                 plaintext a seizure would find. `pin forget` makes room.",
+                pin::MAX_PINNED
+            );
+        }
+        archive.kept.push(pin::Kept {
+            from: me.clone(),
+            epoch: now_epoch().0,
+            body: text.to_string(),
+        });
+        let n = archive.of(&me).len();
+        if self.save_pinned(key, &archive).is_none() {
+            return "the note could not be written".into();
+        }
+        format!(
+            "kept. {n} note(s).\n\n\
+             It is not an object: no peer will ever be offered it, and it is \
+             not in the corpus. It is exempt from epoch erasure like anything \
+             pinned — `note` lists them, `wipe` destroys them.\n\n\
+             {}",
+            self.pinned().warning().unwrap_or_default()
+        )
+    }
+
     fn pin_command(&mut self, line: &str) -> String {
         let Ok(words) = words::split(line) else {
             return "unbalanced quotes".into();
@@ -4423,6 +4554,18 @@ impl App {
             self.output = self.seal_post();
             return;
         }
+        if self.composing_note {
+            let text = self.composer.trim().to_string();
+            overwrite(&mut self.composer);
+            self.ui.end_compose();
+            self.composing_note = false;
+            self.output = match (self.pin_key, text.is_empty()) {
+                (_, true) => "nothing to keep. Esc discards this.".into(),
+                (Some(k), false) => self.write_note(&k, &text),
+                (None, false) => "locked — unlock to reach your notes".into(),
+            };
+            return;
+        }
         let to = if self.composing_to_many.is_empty() {
             self.composing_to.clone().into_iter().collect::<Vec<_>>()
         } else {
@@ -5548,6 +5691,7 @@ impl App {
             Command::Reach => self.output = self.reach_report(line),
             Command::Keys => self.output = self.keys_report(),
             Command::Pin => self.output = self.pin_command(line),
+            Command::Note => self.output = self.note_command(line),
             Command::Status => self.output = self.status_report(),
             Command::ForceSend => self.output = self.force_send(line),
             Command::Rollcall => self.output = self.rollcall_command(line),
@@ -10242,6 +10386,81 @@ mod tests {
             assert!(rest.starts_with("  "), "no gap after {verb:?}: {row:?}");
             assert_eq!(rest.trim_start(), *what, "{row:?}");
         }
+    }
+
+    /// **A note to self is kept, and is not an object.**
+    ///
+    /// Sealing one to this node's own correspondence key would work and would
+    /// put it in the corpus, where everything is offered at the next
+    /// reconciliation — peers carrying ciphertext they can never open, metered
+    /// against RFC 3 §6's quota and counted in §12's figures as a
+    /// contribution that contributes nothing. So the store must not gain an
+    /// entry.
+    #[test]
+    fn a_note_is_kept_without_becoming_an_object() {
+        let mut a = ready_node("note-basic");
+        let before = a.store.with(|s| s.entries_in_range(0, u32::MAX).len());
+
+        type_command(&mut a, "note buy milk");
+        assert!(a.output.contains("kept"), "{}", a.output);
+        assert_eq!(
+            a.store.with(|s| s.entries_in_range(0, u32::MAX).len()),
+            before,
+            "a note reached the corpus, where it will be offered to peers"
+        );
+
+        type_command(&mut a, "notes");
+        assert!(a.output.contains("buy milk"), "{}", a.output);
+
+        // It survives the process, like anything in the archive.
+        let key = a.pin_key.expect("unlocked");
+        assert!(a
+            .pinned()
+            .of(&a.identity.as_ref().unwrap().short_id())
+            .iter()
+            .any(|k| k.body == "buy milk"));
+        let _ = key;
+    }
+
+    /// A note may be longer than a line, so it is composed.
+    #[test]
+    fn a_note_can_be_composed_over_several_lines() {
+        let mut a = ready_node("note-compose");
+        type_command(&mut a, "note");
+        assert_eq!(a.ui.mode(), Mode::Compose, "{}", a.output);
+        // Private tab: a note is not public, and the banner must not claim
+        // otherwise.
+        assert_eq!(a.ui.banner(), Some(layout::Banner::Private));
+
+        for c in "first".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        for c in "second".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        type_command(&mut a, "notes");
+        assert!(a.output.contains("first"), "{}", a.output);
+        assert!(a.output.contains("second"), "{}", a.output);
+    }
+
+    /// **A wipe destroys notes.** They are plaintext exempt from epoch
+    /// erasure; the panic path is the only thing that removes them, and it
+    /// has to.
+    #[test]
+    fn a_wipe_destroys_notes() {
+        let mut a = ready_node("note-wipe");
+        type_command(&mut a, "note something incriminating");
+        assert!(!a.pinned().kept.is_empty());
+
+        a.panic_wipe();
+        assert!(
+            a.pinned().kept.is_empty(),
+            "notes survived a wipe: {:?}",
+            a.pinned().kept
+        );
     }
 
     /// **A post is composed, not typed as an argument.**
