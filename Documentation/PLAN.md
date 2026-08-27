@@ -607,3 +607,86 @@ code that had been written against them. That is a poor rate, and it is
 evidence about method rather than about any one requirement: implementing a
 paragraph and believing it satisfied is not the same as checking it. The
 remaining ~150 should be treated as unaudited rather than as probably fine.
+
+---
+
+## 11. RFCs 2 and 3, 2026-08-27 — second pass
+
+RFC 2's MUSTs were enumerated and the ones with a checkable footprint were
+checked; the same for RFC 3. **RFCs 4, 5 and 6 remain unaudited.**
+
+### Unmet
+
+**RFC 2 §9 — no cap on decapsulation attempts per peer per epoch.**
+
+> Implementations MUST cache failed (id, epoch) pairs so a replay costs one
+> lookup. Implementations MUST cap inbox-tagged decapsulation attempts per
+> peer per epoch.
+
+Two MUSTs, neither built. The first is the RFC 1 §6.4 finding from the pass
+above — and note that what RFC 1 states as a SHOULD ("SHOULD cap decapsulation
+attempts per epoch per peer"), **RFC 2 states as a MUST**. The stricter of the
+two governs. Both belong in Phase 12, which should be read against RFC 2 §9
+rather than RFC 1 §6.4 alone.
+
+**RFC 2 §7 — no median-of-peers time estimate.**
+
+> Implementations MUST accept objects whose epoch falls within W of local
+> time. Implementations MUST NOT emit objects when the median-of-peers time
+> estimate [diverges from local time].
+
+Nothing computes a median of peers' clocks; `grep` finds no time estimate at
+all. This is the same hole as B4 in §6 above, and it is worse than recorded
+there: B4 called clock skew an unmeasured parameter, and it is in fact an
+unimplemented MUST. A node with a wrong clock will emit objects it should
+withhold, and there is no machinery to notice.
+
+**RFC 3 §2 — a credential cannot be rendered as HJSON.**
+
+> Implementations MUST render any credential as HJSON on request, so that a
+> human can read what they are agreeing to.
+
+HJSON exists in this codebase only for the courier's `MANIFEST.hjson`. No verb
+renders a credential. `peer` has `counter`, `countersign`, `renew`, `forget`,
+`share`, `carry` and `fragment`, and none of them shows the document. An
+operator countersigns terms they are told about in prose rather than shown.
+
+### A conflict between two frozen documents
+
+RFC 1 §7: **`EPOCH_WINDOW` MUST be at least `MAX_TTL / EPOCH`, and is
+therefore ±45.**
+RFC 2 §7: **W MUST default to ±30 epochs**, and MUST NOT be below ±14.
+
+With `MAX_TTL` = 45 d and a 1-day epoch, RFC 2's default of ±30 is below
+RFC 1's floor of ±45. The two cannot both be satisfied. The code ships
+`EPOCH_WINDOW = 45` and so follows RFC 1.
+
+This is **amendment #10**: not a code defect, and not resolvable by an
+implementer. It also interacts with B1 — if the epoch length moves from 1 day
+to 7, RFC 1's floor becomes ±7 and the conflict disappears, so settling B1
+may settle this too. That is an argument for doing Phase 8 before touching
+either number.
+
+### Checked and met
+
+| requirement | evidence |
+|---|---|
+| RFC 2 §5 — unknown keys preserved and ignored, not stripped | RFC 1 §4.3 path, shared |
+| RFC 2 §8 — envelope does not indicate which recipient key was used | prekey trial set |
+| RFC 3 §12 — aggregates only, no per-object provenance retained | `PeerMetrics` is counters-only by construction |
+| RFC 3 §10 — a token is bound to the requester's `sig_pk` and single-use | `introduction.rs`, `Spent` |
+| RFC 3 §4 — reject a link whose validity exceeds 180 days | `MAX_TERM_DAYS` |
+
+### Still unaudited
+
+RFC 4 (25 MUSTs), RFC 5 (17), RFC 6 (22) — **untouched**. Within RFC 2 and 3,
+the requirements without a mechanical footprint were not checked: RFC 2's
+constant-time batch attempts (§9), its zeroize-on-drop of table entries (§6),
+RFC 3's signing-input domain separation (§2 — likely met, the codebase is
+careful about domains, but "likely" is what this audit exists to replace),
+and §11.3's release-gate demonstration.
+
+Three passes have now found unmet MUSTs in every document examined: RFC 8
+(two), RFC 1 (one), RFC 2 (three), RFC 3 (one). Seven in total, none of which
+the tests caught, because the tests were written from the same reading of the
+documents that the code was.
