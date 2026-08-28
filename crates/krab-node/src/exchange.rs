@@ -87,6 +87,34 @@ pub const MAX_MESSAGES: usize = 64 * 1024;
 /// 900 objects and the courier gate used five.
 pub const MAX_PER_EXCHANGE: usize = (frame::MAX_FRAME - MANIFEST_OVERHEAD) / MANIFEST_ROW;
 
+/// Objects one session will serve, however often it is asked.
+///
+/// # `MAX_MESSAGES` bounds messages, not work
+///
+/// A `Want` is a few bytes per identifier and the reply is a whole object, so
+/// one 35 KB frame listing [`MAX_PER_EXCHANGE`] truncated identifiers could
+/// draw up to 740 MB back out — and nothing stopped a peer sending that frame
+/// again, and again, up to [`MAX_MESSAGES`] times. That is the amplification
+/// RFC 5 §12 names, on the side that does not require the attacker to store
+/// anything or to have been countersigned.
+///
+/// RFC 3 §6's quota does not close it. That budget meters what a peer *sends*
+/// this node, and it is per-window rather than per-session; neither half
+/// bounds what this node gives away inside one conversation.
+///
+/// **Derived, not chosen.** A `Want` answers a `Manifest`, a manifest carries
+/// at most [`MAX_PER_EXCHANGE`] rows, and RFC 5 §4.4's round cap lets an RBSR
+/// descent list that many per round. So everything a session could honestly
+/// have offered is `MAX_PER_EXCHANGE * RBSR_MAX_ROUNDS`, and an honest peer
+/// never reaches this. Nor does the volume run away once it is in force: the
+/// bytes behind those objects are bounded by the corpus, which
+/// [`krab_store::index::Store::evict_to`] already caps.
+///
+/// Reaching it is not an error, for the same reason `MAX_MESSAGES` is not: the
+/// exchange ends, the schedule fires again later, and a peer with more to
+/// collect collects it then.
+pub const MAX_SERVED: usize = MAX_PER_EXCHANGE * RBSR_MAX_ROUNDS;
+
 /// Bytes a manifest row costs on the wire, as CBOR.
 const MANIFEST_ROW: usize = 22;
 
@@ -174,6 +202,7 @@ pub fn initiate<C: Corpus + ?Sized>(
     salt: u64,
 ) -> Result<Moved, Error> {
     let mut moved = Moved::default();
+    let mut budget = MAX_SERVED;
 
     // Offer what we hold, from a sub-range that fits a frame. Which sub-range
     // varies per exchange, so the whole window is covered over rounds — see
@@ -192,7 +221,7 @@ pub fn initiate<C: Corpus + ?Sized>(
 
     loop {
         match session.recv()? {
-            Some(Control::Want(ids)) => moved.sent += serve_wants(session, corpus, &ids)?,
+            Some(Control::Want(ids)) => moved.sent += serve_wants(session, corpus, &ids, &mut budget)?,
             Some(Control::Manifest {
                 filter_digest: theirs,
                 entries,
@@ -235,6 +264,7 @@ pub fn respond_to<C: Corpus + ?Sized>(
     // when the initiator had nothing in its chosen range.
     let (mut lo, mut hi) = (lo, hi);
     let mut moved = Moved::default();
+    let mut budget = MAX_SERVED;
     let (mut offered, mut served) = (false, false);
 
     loop {
@@ -274,7 +304,7 @@ pub fn respond_to<C: Corpus + ?Sized>(
                 }
             }
             Some(Control::Want(ids)) => {
-                moved.sent += serve_wants(session, corpus, &ids)?;
+                moved.sent += serve_wants(session, corpus, &ids, &mut budget)?;
                 served = true;
             }
             Some(Control::Obj(bytes)) => {
@@ -428,6 +458,7 @@ fn descend<C: Corpus + ?Sized>(
     half: Half,
 ) -> Result<Moved, Error> {
     let mut moved = Moved::default();
+    let mut budget = MAX_SERVED;
     let mut resolved: BTreeSet<(u32, u32)> = BTreeSet::new();
     let mut rounds = 0usize;
     let mut said_done = false;
@@ -489,7 +520,7 @@ fn descend<C: Corpus + ?Sized>(
                     session.send(&Control::Want(want))?;
                 }
             }
-            Some(Control::Want(ids)) => moved.sent += serve_wants(session, corpus, &ids)?,
+            Some(Control::Want(ids)) => moved.sent += serve_wants(session, corpus, &ids, &mut budget)?,
             Some(Control::Obj(bytes)) => {
                 moved.offered += 1;
                 moved.received += take(corpus, bytes)
@@ -514,7 +545,7 @@ fn descend<C: Corpus + ?Sized>(
                                     moved.received += take(corpus, bytes)
                                 }
                                 Some(Control::Want(ids)) => {
-                                    moved.sent += serve_wants(session, corpus, &ids)?
+                                    moved.sent += serve_wants(session, corpus, &ids, &mut budget)?
                                 }
                                 Some(_) => continue,
                                 None => break,
@@ -531,19 +562,27 @@ fn descend<C: Corpus + ?Sized>(
     Ok(moved)
 }
 
-/// Send the objects a peer asked for.
+/// Send the objects a peer asked for, against the session's remaining budget.
 ///
 /// A request for something not held is skipped, not an error: a peer may ask
 /// for an object this node evicted between offering it and being asked.
+///
+/// `remaining` is decremented across every call in one session — see
+/// [`MAX_SERVED`] for why the budget is per session rather than per message.
 fn serve_wants<C: Corpus + ?Sized>(
     session: &mut dyn Session,
     corpus: &C,
     ids: &[[u8; TRUNC]],
+    remaining: &mut usize,
 ) -> Result<usize, Error> {
     let mut sent = 0;
     for id in ids.iter().take(MAX_PER_EXCHANGE) {
+        if *remaining == 0 {
+            break;
+        }
         if let Some(bytes) = corpus.get(id) {
             session.send(&Control::Obj(bytes))?;
+            *remaining -= 1;
             sent += 1;
         }
     }
@@ -973,6 +1012,44 @@ mod tests {
         let mut end = fabric.end_a();
         let view = StoreView(&mut store);
         let absent = [[9u8; TRUNC]; 3];
-        assert_eq!(serve_wants(&mut end, &view, &absent).unwrap(), 0);
+        let mut budget = MAX_SERVED;
+        assert_eq!(serve_wants(&mut end, &view, &absent, &mut budget).unwrap(), 0);
+        // Nothing was sent, so nothing was spent. A budget charged for misses
+        // would let a peer exhaust it with identifiers we do not hold.
+        assert_eq!(budget, MAX_SERVED);
+    }
+
+    /// **A `Want` is cheap to write and expensive to answer.** Asking for the
+    /// same object repeatedly used to be free: `MAX_MESSAGES` bounds how many
+    /// frames a session handles, not how much it gives away in each.
+    #[test]
+    fn a_session_stops_serving_once_it_has_given_its_budget() {
+        use krab_fabric::backend::sim::SimFabric;
+        let mut store = store_with(0..4);
+        let held: Vec<[u8; TRUNC]> = store
+            .entries_in_range(0, u32::MAX)
+            .iter()
+            .map(|(_, id)| id.truncated())
+            .collect();
+        assert_eq!(held.len(), 4);
+
+        let fabric = SimFabric::new(LinkProfile::tcp());
+        let mut end = fabric.end_a();
+        let view = StoreView(&mut store);
+
+        // A peer that keeps asking for the four objects it already has.
+        let mut budget = MAX_SERVED;
+        let mut total = 0;
+        for _ in 0..(MAX_SERVED / 4 + 100) {
+            total += serve_wants(&mut end, &view, &held, &mut budget).unwrap();
+        }
+        assert_eq!(
+            total, MAX_SERVED,
+            "the session served past its budget, or stopped early"
+        );
+        assert_eq!(budget, 0);
+
+        // And it stays stopped: a further request moves nothing.
+        assert_eq!(serve_wants(&mut end, &view, &held, &mut budget).unwrap(), 0);
     }
 }

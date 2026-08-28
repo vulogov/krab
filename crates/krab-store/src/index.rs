@@ -10,6 +10,35 @@ use krab_core::object::{ObjectId, RoutingHeader, TRUNC_LEN};
 use krab_crypto::Fingerprint;
 use std::collections::BTreeMap;
 
+/// The index keys covering the expiry range `[lo, hi)`.
+///
+/// The index is keyed by `(expiry, id)`, and `ObjectId` orders after the
+/// expiry, so the all-zero identifier is the least key at any given minute.
+/// That makes a half-open range of minutes a half-open range of keys with no
+/// special casing at either end — and it is what lets `BTreeMap::range` answer
+/// in `O(log n + k)` where a filtered walk of every key was `O(n)`.
+fn key_range(lo_min: u32, hi_min: u32) -> std::ops::Range<(u32, ObjectId)> {
+    const LEAST: ObjectId = ObjectId([0; 32]);
+    if lo_min >= hi_min {
+        // `BTreeMap::range` panics on an inverted range rather than yielding
+        // nothing, and both callers can be handed one by a peer.
+        return (hi_min, LEAST)..(hi_min, LEAST);
+    }
+    (lo_min, LEAST)..(hi_min, LEAST)
+}
+
+/// A bucket's upper edge as a minute count, for the two places that store one.
+///
+/// A tombstone's expiry and the watermark are both `u32` minutes, and the top
+/// bucket's true edge is 1_185 past `u32::MAX`. Clamping keeps a tombstone
+/// longer and advertises a higher watermark than the exact value would, which
+/// is the direction both already err in: pruning a tombstone early lets an
+/// evicted object return (RFC 5 §8), and a watermark that is too low invites a
+/// re-offer this node will only refuse.
+fn tombstone_bound(bucket: u32) -> u32 {
+    crate::segment::bucket_end(bucket).min(u32::MAX as u64) as u32
+}
+
 /// Where an object lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {
@@ -260,18 +289,27 @@ impl Store {
     /// what lets a locked node serve reconciliation (RFC 7 §7).
     pub fn entries_in_range(&self, lo_min: u32, hi_min: u32) -> Vec<(u32, ObjectId)> {
         self.index
-            .keys()
-            .filter(|(e, _)| *e >= lo_min && *e < hi_min)
-            .map(|(e, id)| (*e, *id))
+            .range(key_range(lo_min, hi_min))
+            .map(|((e, id), _)| (*e, *id))
             .collect()
     }
 
     /// Objects within `[lo, hi)`.
+    ///
+    /// Whole buckets are counted from the segment's maintained length and only
+    /// the cut edges are walked — the same decomposition as
+    /// [`Store::range_fingerprint`], and for the same reason: a peer names the
+    /// range, so anything linear in the corpus is linear in something the peer
+    /// chose. See that method for the measurement.
     pub fn count_in_range(&self, lo_min: u32, hi_min: u32) -> u32 {
-        self.index
-            .keys()
-            .filter(|(e, _)| *e >= lo_min && *e < hi_min)
-            .count() as u32
+        self.fold_range(
+            lo_min,
+            hi_min,
+            0u64,
+            |n, seg| n + seg.count() as u64,
+            |n, _| n + 1,
+        )
+        .min(u32::MAX as u64) as u32
     }
 
     /// Fetch by a 12-byte truncated identifier (RFC 1 §9.3).
@@ -298,34 +336,98 @@ impl Store {
     /// Additive fingerprint over an expiry range, `[lo, hi)`.
     ///
     /// Whole buckets are summed from their maintained aggregates; only the two
-    /// partial buckets at the edges are scanned. That is the `O(1)`-per-bucket
+    /// partial buckets at the edges are walked. That is the `O(1)`-per-bucket
     /// property RBSR depends on (RFC 5 §7).
+    ///
+    /// # Why the cost of this function is a security property
+    ///
+    /// RBSR is driven by the *peer*: it names the ranges, one frame holds
+    /// 1 342 of them, and RFC 5 §4.4's round cap lets it send eight such
+    /// frames per session. `recon::respond` describes every range it is given
+    /// — a `count` and a `fingerprint` each — so whatever this function costs,
+    /// a peer spends it about ten thousand times per session for the price of
+    /// a few kilobytes, and it need not be a peer in good standing: a peering
+    /// whose credential was never countersigned reconciles like any other.
+    ///
+    /// It used to cost far more than it looks. The edge branch called a
+    /// `locate` that scanned the whole index for one identifier, once per
+    /// object in the edge bucket — quadratic in the corpus — and the whole-
+    /// bucket test `b > lo_b && b < hi_b` never held for a single-bucket
+    /// range, so the commonest shapes took the quadratic path. Measured by
+    /// `tests/range_cost.rs`, one session's worth of ranges cost **30.5 s**
+    /// against a 10 000-object corpus and **14.6 minutes** against 50 000 —
+    /// corpus sizes RFC 1 §9.3's own table calls ordinary. It is now 0.25 s
+    /// and 0.85 s: 124× and 1 031×, for identical answers. What remains is
+    /// proportional to the objects the named ranges actually contain, which is
+    /// the work the answer requires.
+    ///
+    /// # Why the whole-bucket shortcut needs the watermark
+    ///
+    /// A segment's fingerprint covers every object ever appended to it, and
+    /// `expire` removes individually-expired objects from the *index* while
+    /// leaving the segment intact until the whole bucket can be unlinked. So
+    /// in a bucket `expire` has already cut into, the segment's aggregate and
+    /// the index disagree — and `entries_in_range` answers from the index.
+    ///
+    /// A fingerprint that does not cover exactly the rows the manifest lists
+    /// is worse than a slow one: the two ends see a difference that no
+    /// exchange of rows can close, so the descent finds divergence, resolves
+    /// it to nothing, and finds it again next time. `fold_range` only takes
+    /// the shortcut above the watermark, which is precisely where no `expire`
+    /// pass has reached.
     pub fn range_fingerprint(&self, lo_min: u32, hi_min: u32) -> Fingerprint {
-        let (lo_b, hi_b) = (bucket_of(lo_min), bucket_of(hi_min.saturating_sub(1)));
-        let mut fp = Fingerprint::ZERO;
-        for (&b, seg) in self.segments.range(lo_b..=hi_b) {
-            let whole = b > lo_b && b < hi_b;
-            if whole {
-                fp = fp.add(seg.fingerprint());
-            } else {
-                // Edge bucket: scan it, because the range cuts through.
-                for id in seg.ids() {
-                    if let Some(loc) = self.locate(id) {
-                        if loc.expiry_min >= lo_min && loc.expiry_min < hi_min {
-                            fp = fp.add(Fingerprint::of(id));
-                        }
-                    }
-                }
-            }
-        }
-        fp
+        self.fold_range(
+            lo_min,
+            hi_min,
+            Fingerprint::ZERO,
+            |fp, seg| fp.add(seg.fingerprint()),
+            |fp, id| fp.add(Fingerprint::of(id)),
+        )
     }
 
-    fn locate(&self, id: &ObjectId) -> Option<Location> {
-        self.index
-            .iter()
-            .find(|((_, i), _)| i == id)
-            .map(|(_, l)| *l)
+    /// Walk `[lo, hi)` bucket by bucket, taking each bucket's maintained
+    /// aggregate where that is exact and reading the index where it is not.
+    ///
+    /// The shared shape behind [`Store::count_in_range`] and
+    /// [`Store::range_fingerprint`]. One function rather than two because the
+    /// two must classify buckets identically: a count that disagrees with a
+    /// fingerprint about which objects a range holds sends RBSR down a range
+    /// it has no rows to resolve.
+    fn fold_range<T>(
+        &self,
+        lo_min: u32,
+        hi_min: u32,
+        init: T,
+        whole: impl Fn(T, &Segment) -> T,
+        edge: impl Fn(T, &ObjectId) -> T,
+    ) -> T {
+        let mut acc = init;
+        if lo_min >= hi_min {
+            return acc;
+        }
+        let (lo_b, hi_b) = (bucket_of(lo_min), bucket_of(hi_min - 1));
+        for (&b, seg) in self.segments.range(lo_b..=hi_b) {
+            let start = crate::segment::bucket_start(b);
+            let end = crate::segment::bucket_end(b);
+            // Above the watermark the segment holds exactly what the index
+            // does, so its aggregate is the answer — see the note on
+            // `range_fingerprint` for why `>` and not `>=`.
+            let intact = start > self.min_expiry_min;
+            if intact && start >= lo_min && end <= hi_min as u64 {
+                acc = whole(acc, seg);
+                continue;
+            }
+            // Cut, or possibly pruned: read the index over the overlap. The
+            // narrowing is by construction, not a clamp — `end` exceeds
+            // `u32::MAX` only for the top bucket, whose `end` then exceeds any
+            // `hi_min`, so the `min` has already chosen `hi_min`.
+            let a = lo_min.max(start);
+            let z = (hi_min as u64).min(end) as u32;
+            for ((_, id), _) in self.index.range(key_range(a, z)) {
+                acc = edge(acc, id);
+            }
+        }
+        acc
     }
 
     /// Drop everything that has expired, tombstoning it.
@@ -337,7 +439,7 @@ impl Store {
             .segments
             .keys()
             .copied()
-            .filter(|&b| crate::segment::bucket_end(b) <= now_min)
+            .filter(|&b| crate::segment::bucket_end(b) <= now_min as u64)
             .collect();
         let mut n = 0;
         for b in dead {
@@ -345,8 +447,9 @@ impl Store {
                 // The bucket's upper edge bounds every expiry inside it. Using
                 // it rather than the exact value keeps a tombstone slightly
                 // longer than strictly needed, which is the safe direction:
-                // pruning early would let an evicted object return.
-                let bound = crate::segment::bucket_end(b);
+                // pruning early would let an evicted object return. Clamping
+                // errs the same way, and only for the top bucket.
+                let bound = tombstone_bound(b);
                 for id in seg.ids() {
                     self.by_trunc.remove(&id.truncated());
                     self.tombstones.insert(*id, bound);
@@ -380,17 +483,20 @@ impl Store {
             let Some(seg) = self.segments.remove(&oldest) else {
                 break;
             };
-            let bound = crate::segment::bucket_end(oldest);
+            let bound = tombstone_bound(oldest);
             for id in seg.ids() {
                 self.by_trunc.remove(&id.truncated());
                 self.tombstones.insert(*id, bound);
                 dropped += 1;
             }
-            let floor = bound;
-            self.index.retain(|(e, _), _| *e >= floor);
+            // The index is pruned against the *exact* edge, not the clamped
+            // one: an entry is kept when a later segment still holds it, and
+            // for the top bucket there is no later segment.
+            let floor = crate::segment::bucket_end(oldest);
+            self.index.retain(|(e, _), _| *e as u64 >= floor);
             // Advertising the raised watermark is what stops a peer re-offering
             // what we just chose not to keep -- SIM-1 §4's +68% re-fetch loop.
-            self.min_expiry_min = self.min_expiry_min.max(floor);
+            self.min_expiry_min = self.min_expiry_min.max(bound);
         }
         dropped
     }
@@ -497,6 +603,53 @@ mod tests {
         assert_eq!(s.len(), 0);
         assert!(!s.contains(&id));
         assert!(s.is_empty());
+    }
+
+    /// **The invariant reconciliation rests on.** A range's fingerprint must
+    /// cover exactly the rows `entries_in_range` would list for it — otherwise
+    /// the two ends of a descent see a difference no exchange of rows can
+    /// close, and RBSR finds it, resolves it to nothing, and finds it again.
+    ///
+    /// The interesting case is a bucket `expire` has cut into: it drops the
+    /// index entry for an object whose minute has passed but leaves the object
+    /// in its segment, because segments are unlinked whole. A whole-bucket
+    /// shortcut taken from the segment's aggregate there covers rows the
+    /// manifest does not.
+    #[test]
+    fn the_fingerprint_covers_exactly_the_rows_a_manifest_lists() {
+        let objs: Vec<(u32, u8)> = (0..40).map(|i| (1 + i as u32 * 90, i)).collect();
+        let mut s = store_with(0, &objs);
+
+        let agrees = |s: &Store, lo, hi| {
+            let listed = s.entries_in_range(lo, hi);
+            let over = Fingerprint::over(listed.iter().map(|(_, id)| id));
+            assert_eq!(
+                s.range_fingerprint(lo, hi),
+                over,
+                "fingerprint and rows disagree over [{lo}, {hi})"
+            );
+            assert_eq!(s.count_in_range(lo, hi), listed.len() as u32, "count too");
+        };
+
+        // Whole window, one bucket, a cut bucket, and an empty range.
+        for (lo, hi) in [(0, u32::MAX), (0, DAY), (DAY, 3 * DAY), (500, 900), (7, 7)] {
+            agrees(&s, lo, hi);
+        }
+
+        // Now expire part of the first bucket and ask again. The segment still
+        // holds what was pruned from the index, so the shortcut must not be
+        // taken over it.
+        assert!(s.expire(600) > 0 || s.len() < 40);
+        for (lo, hi) in [(0, u32::MAX), (0, DAY), (0, 2 * DAY), (600, 800)] {
+            agrees(&s, lo, hi);
+        }
+
+        // And after the other path that removes objects.
+        s.evict_to(s.bytes() / 2);
+        assert!(!s.is_empty(), "the test needs something left to compare");
+        for (lo, hi) in [(0, u32::MAX), (0, DAY), (DAY, 3 * DAY), (600, 800)] {
+            agrees(&s, lo, hi);
+        }
     }
 
     /// RFC 1 §11 check 2 — what stops a relay extending TTL to force
