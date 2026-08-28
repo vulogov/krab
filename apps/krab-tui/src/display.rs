@@ -70,17 +70,82 @@ pub const MAX_RENDERED: usize = 64;
 /// bidirectional and zero-width formatting characters are worse: they change
 /// what the *rest* of the line looks like without being visible themselves,
 /// which is the whole mechanism of a display-spoofing attack.
+///
+/// # Why this is a category and not a list
+///
+/// It was a list: the bidi controls, the zero-width range, the byte-order
+/// mark, the invisible mathematical operators. Everything on it was correctly
+/// there and the list was the wrong shape, because an invisible character
+/// defeats [`skeleton`] whether or not anyone thought of it. `skeleton` drops
+/// exactly what this function calls dangerous, so a character that renders as
+/// nothing and is *not* named here survives into the skeleton — and two
+/// strings that look identical then produce different skeletons, which is the
+/// one thing confusable detection must never do. U+00AD, U+061C, U+3164,
+/// U+FE00 and the tag characters at U+E0020 all walked through.
+///
+/// So the rule is now the Unicode general category `Cf` in full, plus the
+/// characters that are not `Cf` and still occupy no visible space. That is
+/// still a subset of TR39 and still stated rather than implied — see the
+/// module header — but it is a subset of a *category* rather than a list of
+/// the attacks somebody happened to enumerate.
+///
+/// # What is deliberately still allowed
+///
+/// Combining marks. A long run of them stacks glyphs on one base character
+/// and can overflow a row, which is a layout problem rather than an
+/// impersonation one, and removing them would mangle every script that needs
+/// them. Only the invisible ones — the variation selectors — are taken.
 fn is_dangerous(c: char) -> bool {
-    c.is_control()
-        // Bidi overrides and embeddings — U+202A..U+202E, U+2066..U+2069.
-        || ('\u{202a}'..='\u{202e}').contains(&c)
-        || ('\u{2066}'..='\u{2069}').contains(&c)
-        // Zero-width space, non-joiner, joiner, and the marks.
-        || ('\u{200b}'..='\u{200f}').contains(&c)
-        // Byte-order mark, used as a zero-width no-break space.
-        || c == '\u{feff}'
-        // Invisible mathematical operators, which render as nothing.
-        || ('\u{2061}'..='\u{2064}').contains(&c)
+    c.is_control() || is_format(c) || is_invisible(c)
+}
+
+/// Unicode general category `Cf`, as of Unicode 15.1.
+///
+/// Transcribed from `DerivedGeneralCategory.txt` rather than assembled from
+/// the characters that had been used against this code, which is the whole
+/// point of the change. A future Unicode version may add to it; that is a
+/// table to refresh, not a mechanism to redesign.
+fn is_format(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD                  // soft hyphen
+        | 0x0600..=0x0605       // Arabic number signs
+        | 0x061C                // Arabic letter mark
+        | 0x06DD | 0x070F
+        | 0x0890..=0x0891
+        | 0x08E2
+        | 0x180E                // Mongolian vowel separator
+        | 0x200B..=0x200F       // zero-width space, ZWNJ, ZWJ, LRM, RLM
+        | 0x202A..=0x202E       // bidi embeddings and overrides
+        | 0x2060..=0x206F       // word joiner, invisible operators, isolates
+        | 0xFEFF                // byte-order mark, as a zero-width no-break space
+        | 0xFFF9..=0xFFFB       // interlinear annotation
+        | 0x110BD | 0x110CD
+        | 0x13430..=0x1343F
+        | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A
+        | 0xE0001               // language tag
+        | 0xE0020..=0xE007F     // tag characters: a whole hidden ASCII alphabet
+    )
+}
+
+/// Characters outside `Cf` that still render as nothing.
+///
+/// `Cf` is the category for "affects the text around it"; these are in letter,
+/// mark and symbol categories and simply have no glyph. A reader cannot see
+/// them and a skeleton must not keep them.
+fn is_invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x034F                  // combining grapheme joiner
+        | 0x115F | 0x1160       // Hangul choseong and jungseong fillers
+        | 0x17B4 | 0x17B5       // Khmer inherent vowels
+        | 0x180B..=0x180D | 0x180F  // Mongolian free variation selectors
+        | 0x2800                // braille pattern blank
+        | 0x3164                // Hangul filler
+        | 0xFE00..=0xFE0F       // variation selectors 1–16
+        | 0xFFA0                // halfwidth Hangul filler
+        | 0xFFF0..=0xFFF8       // unassigned, reserved as default-ignorable
+        | 0xE0100..=0xE01EF     // variation selectors 17–256
+    )
 }
 
 /// What rendering someone else's text produced.
@@ -394,6 +459,59 @@ mod tests {
             confusable_with_known(spoof, std::slice::from_ref(&real)),
             Some(real),
             "a homoglyph of a known identifier went unmarked"
+        );
+    }
+
+    /// **An invisible character must not change the skeleton.** `skeleton`
+    /// drops what `is_dangerous` names, so anything invisible it does not name
+    /// survives — and two strings that render identically then fold to
+    /// different skeletons, which is the one failure confusable detection
+    /// cannot have.
+    ///
+    /// Every character here rendered as nothing and walked past the old list.
+    #[test]
+    fn an_invisible_character_does_not_defeat_the_skeleton() {
+        let real = "0797c2c1".to_string();
+        for (name, hidden) in [
+            ("soft hyphen", '\u{00ad}'),
+            ("Arabic letter mark", '\u{061c}'),
+            ("Hangul filler", '\u{3164}'),
+            ("variation selector 1", '\u{fe00}'),
+            ("tag latin capital A", '\u{e0041}'),
+            ("zero-width joiner", '\u{200d}'),
+            ("braille blank", '\u{2800}'),
+            ("word joiner", '\u{2060}'),
+            ("combining grapheme joiner", '\u{034f}'),
+        ] {
+            // The spoof: Cyrillic с for Latin c, with the invisible character
+            // spliced in to break the fold.
+            let spoof = format!("from 0797с2{hidden}с1 — trust me");
+            assert_eq!(
+                confusable_with_known(&spoof, std::slice::from_ref(&real)),
+                Some(real.clone()),
+                "{name} (U+{:04X}) carried a homoglyph past the check",
+                hidden as u32
+            );
+            // And it never reaches the pane.
+            let shown = safe(&spoof);
+            assert!(
+                !shown.text.contains(hidden),
+                "{name} was rendered"
+            );
+            assert!(shown.removed > 0, "{name} was dropped without saying so");
+        }
+    }
+
+    /// The same character must not hide an identifier from the check either:
+    /// splicing one into a *known* identifier is the mirror of the attack
+    /// above.
+    #[test]
+    fn an_invisible_character_cannot_disguise_the_target() {
+        let real = "acedface".to_string();
+        let spoof = "from a\u{00ad}сеdfасе, vouching";
+        assert_eq!(
+            confusable_with_known(spoof, std::slice::from_ref(&real)),
+            Some(real)
         );
     }
 
