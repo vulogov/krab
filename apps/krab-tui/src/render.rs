@@ -63,6 +63,8 @@ pub struct View<'a> {
     pub composer_at: usize,
     /// Which item the list pane's cursor is on, and how many items there are.
     /// Two numbers because `list` may hold rows that are not items.
+    /// Show the body's bytes rather than its rendering.
+    pub raw_body: bool,
     pub selected: usize,
     pub items: usize,
     /// Lines the output pane is scrolled back from the newest.
@@ -200,6 +202,43 @@ fn draw_list(f: &mut Frame, area: Rect, view: &View) {
     );
 }
 
+/// One body line, styled by the subset in [`crate::markdown`].
+///
+/// Weight and colour only: none of these can paint a full-width reversed bar,
+/// so a body cannot be made to resemble the interface's own banners. The
+/// styles are chosen here rather than carried in the text, so a body cannot
+/// select one.
+fn body_lines(text: &str) -> Vec<Line<'static>> {
+    use crate::markdown::{Kind, Row};
+    crate::markdown::parse(text)
+        .into_iter()
+        .map(|Row { kind, pieces }| {
+            let mut spans = Vec::new();
+            let base = match kind {
+                Kind::Heading(_) => Style::default().add_modifier(Modifier::BOLD),
+                _ => Style::default(),
+            };
+            if kind == Kind::Bullet {
+                spans.push(Span::raw("  • "));
+            }
+            for p in pieces {
+                let mut st = base;
+                if p.bold {
+                    st = st.add_modifier(Modifier::BOLD);
+                }
+                if p.italic {
+                    st = st.add_modifier(Modifier::ITALIC);
+                }
+                if p.code {
+                    st = Style::default().fg(Color::Cyan);
+                }
+                spans.push(Span::styled(p.text, st));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn draw_view(f: &mut Frame, area: Rect, view: &View) {
     if view.ui.mode() == Mode::Compose {
         return draw_composer(f, area, view);
@@ -238,10 +277,20 @@ fn draw_view(f: &mut Frame, area: Rect, view: &View) {
     } else {
         view.body
     };
-    f.render_widget(
-        Paragraph::new(body).block(frame_for(view.ui, Pane::View, " message ".into())),
-        area,
-    );
+    // **Rendered, unless the operator asked for the bytes.** `Ctrl-Y` is not
+    // a preference to be set once and forgotten: it is the check that what is
+    // displayed is what arrived, so the title says which one this is.
+    let title = if view.raw_body {
+        " message · raw ".to_string()
+    } else {
+        " message ".to_string()
+    };
+    let block = frame_for(view.ui, Pane::View, title);
+    if view.raw_body || view.locked {
+        f.render_widget(Paragraph::new(body).block(block), area);
+    } else {
+        f.render_widget(Paragraph::new(body_lines(body)).block(block), area);
+    }
 }
 
 /// Break `text` into rows no wider than `width`, breaking on whitespace where

@@ -40,6 +40,7 @@ mod entropy;
 mod fanout;
 mod filter;
 mod fragment;
+mod markdown;
 mod groups;
 mod identity;
 mod introduction;
@@ -366,6 +367,8 @@ struct App {
     /// Set by `Ctrl-R`. The run loop owns the terminal, so the key records
     /// the request and the loop clears.
     needs_clear: bool,
+    /// Show the body's bytes rather than its rendering — `Ctrl-Y`.
+    raw_body: bool,
     /// Decrypted message plaintext. **Only** [`App::show_selected`] writes
     /// here, and RFC 7 §8 says it exists only while displayed.
     body: String,
@@ -605,6 +608,7 @@ impl Default for App {
             composer: String::new(),
             composer_at: 0,
             needs_clear: false,
+            raw_body: false,
             // Not "no message selected": on a fresh node that is true and
             // useless. The first screen has to say what to type, because
             // nothing else on it does.
@@ -757,6 +761,7 @@ impl App {
             output_height: &self.output_height,
             waiting: self.waiting(),
             composer_at: self.composer_at,
+            raw_body: self.raw_body,
             selected: self.selected,
             items: self.selectable_len(),
             showing: self.showing.as_deref(),
@@ -964,6 +969,20 @@ impl App {
             // screen is wrong did nothing at all. The run loop clears on the
             // next pass; this only has to ask.
             Binding::Redraw => self.needs_clear = true,
+            Binding::ToggleRaw => {
+                self.raw_body = !self.raw_body;
+                self.output = if self.raw_body {
+                    "showing the body's bytes. Ctrl-Y renders it again.\n\n\
+                     Markdown here is emphasis, code spans, bullets and \
+                     headings, and nothing else — no links, no images, no \
+                     HTML. Those are not refused, they are not implemented: \
+                     there is no code that could render one, so `[a](b)` is \
+                     those characters (RFC 8 §7)."
+                        .into()
+                } else {
+                    "rendering the body. Ctrl-Y shows its bytes.".into()
+                };
+            }
             Binding::Deliver if !self.locked => self.deliver(),
             // **RFC 8 §4.2 requirement 3.** In the channels tab `r` is
             // ambiguous between "privately message the author" and "publish a
@@ -10794,6 +10813,30 @@ mod tests {
             assert!(rest.starts_with("  "), "no gap after {verb:?}: {row:?}");
             assert_eq!(rest.trim_start(), *what, "{row:?}");
         }
+    }
+
+    /// **Ctrl-Y shows the bytes.** Rendering is a view of the text and never
+    /// a replacement for it — "what you see is what is there" is the property
+    /// RFC 8 §7 leans on, and a renderer that consumes syntax weakens it.
+    #[test]
+    fn ctrl_y_toggles_the_raw_body() {
+        let mut a = ready_node("raw-toggle");
+        assert!(!a.raw_body, "the default is rendered");
+        a.on_key(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert!(a.raw_body, "Ctrl-Y did nothing");
+        assert!(a.output.contains("bytes"), "{}", a.output);
+        a.on_key(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert!(!a.raw_body);
+    }
+
+    /// **A body cannot render a link, an image or HTML**, because nothing
+    /// renders one. The characters arrive and are displayed.
+    #[test]
+    fn a_hostile_body_renders_as_its_own_characters() {
+        let hostile = "[bob's key](https://evil.example) ![](t.png) <b>x</b>";
+        let rows = markdown::parse(hostile);
+        let flat: String = rows[0].pieces.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(flat, hostile, "a body was transformed");
     }
 
     /// **A tick must not move the cursor.**

@@ -112,6 +112,8 @@ pub enum Binding {
     PanicWipe,
     /// Redraw. Displaced from `Ctrl-L`.
     Redraw,
+    /// Show the body's bytes rather than its rendering — `Ctrl-Y`.
+    ToggleRaw,
     /// Cycle pane focus forwards.
     CycleFocus,
     /// Cycle pane focus backwards.
@@ -227,6 +229,9 @@ impl Binding {
             Key::F(1) => return Binding::SelectTab(crate::layout::Tab::Private),
             Key::F(2) => return Binding::SelectTab(crate::layout::Tab::Channels),
             Key::F(3) => return Binding::SelectTab(crate::layout::Tab::Notes),
+            // **The raw view.** Rendering is a view of the text and never a
+            // replacement for it, so the bytes are always one key away.
+            Key::Char('y' | 'Y') if key.ctrl => return Binding::ToggleRaw,
             Key::Char('m' | 'M' | '1') if key.ctrl || key.alt => {
                 return Binding::SelectTab(crate::layout::Tab::Private)
             }
