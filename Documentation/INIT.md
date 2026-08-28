@@ -17,12 +17,15 @@ nothing to prepare, edit, or copy onto the machine first.
 Two arguments exist:
 
 ```
-krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>] [--relay]
+krab --home <dir> [--sync-interval <seconds>] [--listen <address>] [--relay]
 ```
 
-- `--home` is where the store lives. **Default is the working directory.**
-  Give it explicitly if you are running more than one node on a host, or if
-  you care where the files land.
+- `--home` is where the store lives, and it is **required — there is no
+  default.** It used to fall back to the working directory, which meant the
+  same command typed in two shells opened two different nodes; the symptom
+  was a channel or a peering that had "vanished", which reads as data loss
+  rather than as a wrong path. Refusing is the only answer that cannot be
+  silently wrong. Use the same directory every time.
 - `--listen` names the address inbound links arrive on. Optional; a node that
   only dials never needs it.
 - `--relay` locks the node the moment it opens — see §8.

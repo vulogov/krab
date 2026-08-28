@@ -289,9 +289,14 @@ fn default_home() -> PathBuf {
             N.fetch_add(1, Ordering::Relaxed)
         ))
     }
+    // **Not reachable in a real run.** `--home` is required, so nothing
+    // outside the test suite calls this. The value is deliberately one that
+    // cannot be mistaken for a store an operator meant to open, rather than
+    // `.`, which is what it used to be and what made a missing `--home` open
+    // whatever directory the shell happened to be in.
     #[cfg(not(test))]
     {
-        PathBuf::from(".")
+        PathBuf::from("/nonexistent/krab-home-not-set")
     }
 }
 
@@ -311,7 +316,15 @@ fn main() -> io::Result<()> {
         Ok(app) => app,
         Err(usage) => {
             eprintln!("{usage}");
-            return Ok(());
+            // **A refusal has to be detectable.** Every argument error exited
+            // 0, so a script could not tell "started and stopped" from "never
+            // started" — and now that `--home` is required, that is the
+            // difference between a node running and a node that refused.
+            // Asking for help is not an error and keeps its 0.
+            let asked_for_help = std::env::args()
+                .skip(1)
+                .any(|a| a == "-h" || a == "--help");
+            std::process::exit(if asked_for_help { 0 } else { 2 });
         }
     };
     // Which verb this run needs. A node that has been restarted has a store it
@@ -691,10 +704,15 @@ impl App {
     /// parent process would be choosing on the operator's behalf without the
     /// operator seeing it.
     fn from_args(args: impl Iterator<Item = String>) -> Result<App, String> {
-        const USAGE: &str = "krab [--home <dir>] [--sync-interval <seconds>] [--listen <address>] \
+        const USAGE: &str = "krab --home <dir> [--sync-interval <seconds>] [--listen <address>] \
              [--relay]\n\n\
              krab reads no configuration file. Everything else is set by a \
              command-pane verb during the session.\n\n\
+             --home is required. It is where the identity, the corpus and \
+             every peering live, and there is deliberately no default: a \
+             store that followed the working directory meant the same command \
+             typed in two shells was two different nodes, and the failure \
+             looked like data loss rather than like a wrong path.\n\n\
              --listen binds one socket and accepts calls from any node this \
              one has peered with. There is no port per peer: that would \
              publish the size of the operator's friend list to a port \
@@ -705,11 +723,12 @@ impl App {
              RFC 0 §4.4's \"seizure yields nothing\" would be false for it.";
 
         let mut app = App::default();
+        let mut home: Option<PathBuf> = None;
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--home" => {
-                    app.home = PathBuf::from(args.next().ok_or(USAGE)?);
+                    home = Some(PathBuf::from(args.next().ok_or(USAGE)?));
                 }
                 "--relay" => {
                     app.relay = true;
@@ -742,6 +761,24 @@ impl App {
                 other => return Err(format!("unknown argument {other:?}\n\n{USAGE}")),
             }
         }
+        // **No default, and no guess.** The store used to be the current
+        // directory, so `krab` from one shell and `krab` from another were
+        // different nodes with different identities — and the symptom was a
+        // channel or a peering that had "vanished", which is the most
+        // alarming way for a path mistake to present itself. Refusing is the
+        // only answer that cannot be silently wrong; picking a default under
+        // the user's home would still be a guess, and would quietly adopt
+        // whichever store happened to be there.
+        app.home = home.ok_or(
+            "krab --home <dir> is required.\n\n\
+             There is no default. The store holds the identity, the corpus \
+             and every peering, and a default would mean the same command \
+             opening different nodes depending on where it was typed — which \
+             presents as data loss, not as a wrong path.\n\n\
+             \x20 krab --home ~/.krab\n\n\
+             Any directory will do, and it is created if it does not exist. \
+             Use the same one every time.",
+        )?;
         Ok(app)
     }
 
@@ -14797,11 +14834,27 @@ mod tests {
         // An environment variable is deliberately not consulted: environment
         // is inherited, so a parent process would choose unseen.
         std::env::set_var("KRAB_HOME", "/tmp/should-be-ignored");
-        let b = App::from_args(std::iter::empty()).unwrap();
-        assert_ne!(
+        let b = App::from_args(
+            ["--home", "/tmp/krab-argv"].iter().map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert_eq!(
             b.home,
-            PathBuf::from("/tmp/should-be-ignored"),
+            PathBuf::from("/tmp/krab-argv"),
             "the environment must not decide"
+        );
+
+        // And with no `--home` at all it refuses rather than choosing. There
+        // is nothing for the environment to override, which is the strongest
+        // form of "argv only".
+        let why = match App::from_args(std::iter::empty()) {
+            Ok(_) => panic!("a node started with no store to open"),
+            Err(e) => e,
+        };
+        assert!(why.contains("--home"), "{why}");
+        assert!(
+            why.contains("no default"),
+            "the refusal does not say why: {why}"
         );
         std::env::remove_var("KRAB_HOME");
     }
@@ -19011,7 +19064,8 @@ mod tests {
     /// machine can read.
     #[test]
     fn a_relay_still_needs_a_passphrase() {
-        let a = App::from_args(["--relay"].iter().map(|s| s.to_string())).expect("parses");
+        let a = App::from_args(["--home", "/tmp/krab-relay", "--relay"].iter().map(|s| s.to_string()))
+            .expect("parses");
         assert!(a.relay);
         assert!(a.identity.is_none(), "it started with a key from nowhere");
         assert!(a.epoch_key.is_none());
