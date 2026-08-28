@@ -66,6 +66,9 @@ pub struct View<'a> {
     /// Show the body's bytes rather than its rendering.
     pub raw_body: bool,
     pub selected: usize,
+    /// First row the list pane draws. Kept between frames so the pane scrolls
+    /// by a row instead of snapping the cursor to an edge.
+    pub list_top: &'a std::cell::Cell<usize>,
     pub items: usize,
     /// Lines the output pane is scrolled back from the newest.
     pub scroll: usize,
@@ -181,13 +184,36 @@ fn draw_list(f: &mut Frame, area: Rect, view: &View) {
     // **The cursor, drawn.** `selected` indexes items; the list can carry
     // rows above them — first-contact requests sit on top of the mail — so
     // the highlighted row is offset by however many of those there are.
-    let offset = view.list.len().saturating_sub(view.items);
-    let here = offset + view.selected;
+    let lead = view.list.len().saturating_sub(view.items);
+    let here = lead + view.selected;
     let cursor = Style::default().add_modifier(Modifier::REVERSED);
+
+    // **The pane scrolls with the cursor.**
+    //
+    // It did not: rows were rendered from the top with no offset, so on a
+    // list longer than the pane the cursor could be moved to an item that
+    // was never drawn — selection working, and nothing on screen to show it.
+    // The offset persists between frames so the list moves by one row rather
+    // than jumping the cursor to an edge every time it leaves the window.
+    let visible = area.height.saturating_sub(2) as usize;
+    let mut top = view.list_top.get().min(view.list.len());
+    if visible > 0 {
+        if here < top {
+            top = here;
+        } else if here >= top + visible {
+            top = here + 1 - visible;
+        }
+        // A list that shrank under a scrolled pane must not leave it empty.
+        top = top.min(view.list.len().saturating_sub(visible.min(view.list.len())));
+    }
+    view.list_top.set(top);
+
     let rows: Vec<Line> = view
         .list
         .iter()
         .enumerate()
+        .skip(top)
+        .take(visible.max(1))
         .map(|(i, s)| {
             if i == here && view.items > 0 {
                 Line::from(Span::styled(s.clone(), cursor))

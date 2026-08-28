@@ -535,6 +535,8 @@ struct App {
     /// — it measures, it does not decide anything.
     output_width: std::cell::Cell<u16>,
     output_rows: std::cell::Cell<usize>,
+    /// First row the list pane draws — see `render::draw_list`.
+    list_top: std::cell::Cell<usize>,
     output_height: std::cell::Cell<u16>,
     /// Ticks remaining on the inbound and outbound indicators.
     ///
@@ -670,6 +672,7 @@ impl Default for App {
             output_scroll: 0,
             output_width: std::cell::Cell::new(0),
             output_rows: std::cell::Cell::new(0),
+            list_top: std::cell::Cell::new(0),
             output_height: std::cell::Cell::new(0),
             inbound_ticks: 0,
             outbound_ticks: 0,
@@ -804,6 +807,7 @@ impl App {
             composer_at: self.composer_at,
             raw_body: self.raw_body,
             selected: self.selected,
+            list_top: &self.list_top,
             items: self.selectable_len(),
             showing: self.showing.as_deref(),
             // While the passphrase is being taken the prompt shows its length,
@@ -11096,6 +11100,127 @@ mod tests {
         let rows = markdown::parse(hostile);
         let flat: String = rows[0].pieces.iter().map(|p| p.text.as_str()).collect();
         assert_eq!(flat, hostile, "a body was transformed");
+    }
+
+    /// **A two-line note renders as two lines.**
+    ///
+    /// The outstanding check from the `safe_block` fix. `display::safe`
+    /// strips `\n` — right for a row in a list, wrong for a body — and the
+    /// note pane called it, so "abc" and "sdd" came back as "abcsdd". Driven
+    /// through the real frame rather than a pty, which is what two attempts
+    /// at a terminal probe failed to produce.
+    #[test]
+    fn a_two_line_note_renders_on_two_lines() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut a = ready_node("note-two-lines");
+        type_command(&mut a, "note");
+        for c in "abc".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        for c in "sdd".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        a.on_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        a.ui.reset();
+        a.ui.select_tab(layout::Tab::Notes);
+        a.refresh_inbox();
+
+        let mut term = Terminal::new(TestBackend::new(100, 24)).expect("a terminal");
+        let log: Vec<String> = Vec::new();
+        let me = a.identity.as_ref().map(|i| i.short_id());
+        term.draw(|f| render::draw(f, &a.view(&log, me.as_deref())))
+            .expect("draws");
+
+        // Read the frame row by row: the two halves must land on different
+        // rows, which is the whole claim.
+        let buf = term.backend().buffer();
+        let mut rows: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            for x in 0..buf.area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            rows.push(row);
+        }
+        let abc = rows.iter().position(|r| r.contains("abc"));
+        let sdd = rows.iter().position(|r| r.contains("sdd"));
+        assert!(abc.is_some() && sdd.is_some(), "the note is not on screen");
+        assert_ne!(abc, sdd, "the two lines were joined into one row");
+        assert!(
+            !rows.iter().any(|r| r.contains("abcsdd")),
+            "the newline was eaten"
+        );
+    }
+
+    /// **A cursor moved past the pane must still be on screen.**
+    ///
+    /// The list drew from row zero with no offset, so on a list longer than
+    /// the pane an operator could arrow down to an item that was never
+    /// rendered — the selection working and nothing visible to show it.
+    #[test]
+    fn the_list_pane_scrolls_to_keep_the_cursor_visible() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut a = ready_node("list-scroll");
+        // More notes than a short pane can hold.
+        for i in 0..40 {
+            type_command(&mut a, &format!("note item{i:02}"));
+            if a.pending_post.is_some() {
+                a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+            }
+        }
+        // Each `note` reveals its reply, which zooms the output pane — so
+        // put the layout back before asking what the list pane drew.
+        a.ui.reset();
+        a.ui.select_tab(layout::Tab::Notes);
+        a.refresh_inbox();
+        while a.ui.focus() != layout::Pane::List {
+            a.ui.cycle_focus();
+        }
+        assert_eq!(a.selectable_len(), 40);
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("a terminal");
+        let render = |a: &App, term: &mut Terminal<TestBackend>| -> String {
+            let log: Vec<String> = Vec::new();
+            let me = a.identity.as_ref().map(|i| i.short_id());
+            term.draw(|f| render::draw(f, &a.view(&log, me.as_deref())))
+                .expect("draws");
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        // Near the top: the first item is on screen, the last is not.
+        let top = render(&a, &mut term);
+        assert!(top.contains("item00"), "the first item is not drawn");
+        assert!(!top.contains("item39"), "the whole list fits; widen the test");
+
+        // Walk the cursor to the end.
+        for _ in 0..39 {
+            a.on_key(KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert_eq!(a.selected, 39);
+        let bottom = render(&a, &mut term);
+        assert!(
+            bottom.contains("item39"),
+            "the cursor left the pane and took the selection with it"
+        );
+
+        // And back up: the pane follows in the other direction too.
+        for _ in 0..39 {
+            a.on_key(KeyCode::Up, KeyModifiers::NONE);
+        }
+        assert_eq!(a.selected, 0);
+        assert!(
+            render(&a, &mut term).contains("item00"),
+            "the pane did not scroll back"
+        );
     }
 
     /// **A tick must not move the cursor.**
