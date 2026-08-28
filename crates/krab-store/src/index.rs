@@ -337,7 +337,7 @@ impl Store {
             .segments
             .keys()
             .copied()
-            .filter(|&b| (b + 1) * crate::segment::BUCKET_MINUTES <= now_min)
+            .filter(|&b| crate::segment::bucket_end(b) <= now_min)
             .collect();
         let mut n = 0;
         for b in dead {
@@ -346,7 +346,7 @@ impl Store {
                 // it rather than the exact value keeps a tombstone slightly
                 // longer than strictly needed, which is the safe direction:
                 // pruning early would let an evicted object return.
-                let bound = (b + 1) * crate::segment::BUCKET_MINUTES;
+                let bound = crate::segment::bucket_end(b);
                 for id in seg.ids() {
                     self.by_trunc.remove(&id.truncated());
                     self.tombstones.insert(*id, bound);
@@ -380,13 +380,13 @@ impl Store {
             let Some(seg) = self.segments.remove(&oldest) else {
                 break;
             };
-            let bound = (oldest + 1) * crate::segment::BUCKET_MINUTES;
+            let bound = crate::segment::bucket_end(oldest);
             for id in seg.ids() {
                 self.by_trunc.remove(&id.truncated());
                 self.tombstones.insert(*id, bound);
                 dropped += 1;
             }
-            let floor = (oldest + 1) * crate::segment::BUCKET_MINUTES;
+            let floor = bound;
             self.index.retain(|(e, _), _| *e >= floor);
             // Advertising the raised watermark is what stops a peer re-offering
             // what we just chose not to keep -- SIM-1 §4's +68% re-fetch loop.
@@ -469,6 +469,34 @@ mod tests {
         assert_eq!(s.ingest(id, b.clone(), 0, MAX_TTL), Ok(()));
         assert_eq!(s.ingest(id, b, 0, MAX_TTL), Err(Reject::Duplicate));
         assert_eq!(s.len(), 1);
+    }
+
+    /// The top bucket's edge does not fit in `u32`, and computing it inline
+    /// overflowed: a debug build panicked, and a release build wrapped to
+    /// 1_184 — a bound so small that `expire` unlinked the segment as though
+    /// it were long dead while the next line's `retain` kept its index
+    /// entries, leaving the index describing objects no segment holds.
+    #[test]
+    fn the_top_bucket_survives_its_own_edge() {
+        let top = u32::MAX / DAY;
+        let start = top * DAY;
+        let mut s = Store::new();
+        let (id, b) = object(start + 60, 7);
+        s.ingest(id, b, start, DAY).unwrap();
+
+        // Live, and nowhere near expiry. Under the wrapped bound this call
+        // dropped it and reported having done so.
+        assert_eq!(s.expire(start), 0);
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(&id));
+        assert!(s.get(&id).is_some(), "index and segments disagree");
+
+        // Eviction tombstones at the clamped edge rather than a wrapped one,
+        // and leaves no index entry behind it.
+        assert_eq!(s.evict_to(0), 1);
+        assert_eq!(s.len(), 0);
+        assert!(!s.contains(&id));
+        assert!(s.is_empty());
     }
 
     /// RFC 1 §11 check 2 — what stops a relay extending TTL to force

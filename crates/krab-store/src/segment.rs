@@ -22,6 +22,31 @@ pub fn bucket_of(expiry_min: u32) -> u32 {
     expiry_min / BUCKET_MINUTES
 }
 
+/// The exclusive upper edge of `bucket` — one past the last minute in it.
+///
+/// # Why this is a function and not `(b + 1) * BUCKET_MINUTES`
+///
+/// The top bucket is `u32::MAX / BUCKET_MINUTES`, and one past its start does
+/// not fit: `(2_982_616 + 1) * 1_440` is 4_295_000_480, which is 33_185 more
+/// than `u32::MAX`. Written inline the expression panicked in a debug build
+/// and, worse, wrapped to 1_185 in a release build — a bound so small that
+/// `expire` unlinked the segment as though it were already dead while the very
+/// next line's `retain` kept its index entries, leaving the index describing
+/// objects no segment holds.
+///
+/// Saturating is the correct clamp and not merely the safe one: the edge of
+/// the last representable bucket *is* the end of representable time. An object
+/// there is expired only once `now_min` reaches `u32::MAX`, which is the same
+/// answer unbounded arithmetic would give.
+///
+/// Ingest refuses expiries this far out (RFC 1 §11 I2), so no honest path
+/// reaches the top bucket. That is a reason the bug was unreachable, not a
+/// reason the arithmetic may be partial: a bound that holds only because a
+/// check elsewhere holds is one edit deep.
+pub fn bucket_end(bucket: u32) -> u32 {
+    bucket.saturating_add(1).saturating_mul(BUCKET_MINUTES)
+}
+
 /// An append-only segment: every object expiring in one bucket.
 #[derive(Debug, Default, Clone)]
 pub struct Segment {
@@ -104,6 +129,25 @@ mod tests {
         assert_eq!(bucket_of(BUCKET_MINUTES), 1);
         // MAX_TTL is 45 days, so a node holds at most 46 live segments.
         assert_eq!(bucket_of(45 * BUCKET_MINUTES) - bucket_of(0), 45);
+    }
+
+    /// `bucket_end` is total over `u32`, which the inline expression it
+    /// replaced was not: the top bucket's edge is 33_185 past `u32::MAX`.
+    #[test]
+    fn the_bucket_edge_is_total() {
+        assert_eq!(bucket_end(0), BUCKET_MINUTES);
+        assert_eq!(bucket_end(44), 45 * BUCKET_MINUTES);
+        // The one that overflowed. Saturating, not wrapping: the edge of the
+        // last representable bucket is the end of representable time.
+        let top = u32::MAX / BUCKET_MINUTES;
+        assert_eq!(bucket_end(top), u32::MAX);
+        assert_eq!(bucket_end(u32::MAX), u32::MAX);
+        // And every edge still bounds its own bucket, which is the property
+        // `expire` and `evict_to` rely on.
+        for b in [0, 1, 45, 1_000, top - 1, top] {
+            assert!(bucket_end(b) > b * BUCKET_MINUTES || b == top);
+            assert_eq!(bucket_of(bucket_end(b).saturating_sub(1)), b.min(top));
+        }
     }
 
     #[test]
