@@ -5643,7 +5643,9 @@ impl App {
         // the one the operator sees in `channel list` and types into
         // `channel follow`. Showing the key here would name the same author
         // with a string that appears nowhere else.
-        let who = channels::short(id);
+        let who = self
+            .aliases()
+            .show(alias::Kind::Channel, &channels::short(id));
         posts
             .iter()
             .map(|(seq, _author, text)| {
@@ -5656,6 +5658,10 @@ impl App {
     }
 
     fn channel_rows(&self) -> Vec<String> {
+        // A local name beside the identifier, never instead of it — the
+        // identifier is what `channel follow` takes and what the fingerprint
+        // rule (RFC 8 §7) wants present wherever a name is.
+        let names = self.aliases();
         let mut rows = Vec::new();
         let mut counts: Vec<([u8; 32], usize)> = Vec::new();
         self.store.with(|s| {
@@ -5677,7 +5683,7 @@ impl App {
                 .unwrap_or(0);
             rows.push(format!(
                 "{} (yours)  {n} posts",
-                channels::short(&mine.id())
+                names.show(alias::Kind::Channel, &channels::short(&mine.id()))
             ));
         }
         for c in &self.roster.following {
@@ -5686,7 +5692,10 @@ impl App {
                 .find(|(k, _)| k == c)
                 .map(|(_, n)| *n)
                 .unwrap_or(0);
-            rows.push(format!("{}  {n} posts", channels::short(c)));
+            rows.push(format!(
+                "{}  {n} posts",
+                names.show(alias::Kind::Channel, &channels::short(c))
+            ));
         }
         if rows.is_empty() {
             rows.push("(no channels — `channel new`, or `channel follow <id>`)".into());
@@ -8447,6 +8456,7 @@ impl App {
         // moment ago. Reporting only links meant a restarted node said "no
         // peers" while its peer-links sat on disk beside it, and told an
         // operator whose ceremony had completed to start another one.
+        let names = self.aliases();
         let peerings = self.peer_ids();
         if peerings.is_empty() && self.links.up_count() == 0 {
             return peers::render(&rows, peers::DISCONNECT_KEY);
@@ -8466,6 +8476,9 @@ impl App {
             // privacy needs cover traffic that a constrained link cannot
             // afford. A link that is down has no properties to report, and
             // saying nothing is better than reporting the last one's.
+            // The operator's own name for this peer, beside the identifier
+            // the ceremony verified — never instead of it.
+            let who = names.show(alias::Kind::Peer, id);
             let privacy = match self.links.get(id).map(|l| l.profile.clone()) {
                 Some(p) => format!(
                     "  {}  loc {}  vol {}",
@@ -8589,7 +8602,7 @@ impl App {
                 String::new()
             };
             out.push_str(&format!(
-                "{id}  peered  ·  {link}{privacy}  ·  {policy}\n    {how}{budget}{nodelist}\n"
+                "{who}  peered  ·  {link}{privacy}  ·  {policy}\n    {how}{budget}{nodelist}\n"
             ));
         }
         // Links to nodes we have no peering with cannot exist — `establish`
@@ -11243,6 +11256,49 @@ mod tests {
         }
         a.on_key(KeyCode::Char('w'), KeyModifiers::CONTROL);
         assert_eq!(a.composer, "alpha ");
+    }
+
+    /// **Names appear beside identifiers wherever a list shows one.**
+    ///
+    /// And never instead of one: `channel follow` and `connect` take the
+    /// identifier, so a list showing only a name would be a list of things
+    /// the operator cannot act on — as well as a name standing in for a
+    /// verification it did not perform (RFC 8 §7).
+    #[test]
+    fn names_annotate_the_channel_list_and_the_peers_panel() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("alias-panels");
+        type_command(&mut a, "channel new");
+        let chan = channels::short(&a.roster.mine.as_ref().unwrap().id());
+
+        type_command(&mut a, &format!("alias-channel {chan} weather"));
+        type_command(&mut a, &format!("alias-peer {b_id} bob"));
+
+        let rows = a.channel_rows();
+        assert!(
+            rows.iter().any(|r| r.contains("weather") && r.contains(&chan)),
+            "the channel list shows neither, or only one: {rows:?}"
+        );
+
+        let panel = a.peers_panel();
+        assert!(
+            panel.contains("bob") && panel.contains(&b_id),
+            "the peers panel shows neither, or only one:\n{panel}"
+        );
+    }
+
+    /// A name in one table does not annotate another table's identifier.
+    #[test]
+    fn a_peer_name_does_not_leak_into_the_channel_list() {
+        let mut a = ready_node("alias-namespaces");
+        type_command(&mut a, "channel new");
+        let chan = channels::short(&a.roster.mine.as_ref().unwrap().id());
+        // Named in the *peer* table, using the channel's identifier.
+        type_command(&mut a, &format!("alias-peer {chan} wrongtable"));
+        assert!(
+            !a.channel_rows().iter().any(|r| r.contains("wrongtable")),
+            "a peer name annotated a channel: {:?}",
+            a.channel_rows()
+        );
     }
 
     /// **An alias never reaches the corpus.** It is a separate file that no
