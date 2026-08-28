@@ -827,3 +827,79 @@ It argues the eight remaining findings should each be confirmed the way this
 one was disconfirmed: by reading the path, not by grepping for the mechanism I
 expected. Two have been (#8 and #9 are conflicts between documents, checked
 against both texts). Six have not.
+
+---
+
+## 14. Decision: message bodies are not compressed, 2026-08-28
+
+Recorded because the absence looked like an omission, was checked, and is a
+choice — and because the obvious-seeming fix does not work, which is worth
+writing down so it is not proposed again.
+
+### What the RFC actually requires
+
+RFC 1 §3's pipeline reads `→ [compress]  optional, BEFORE encryption`. The
+brackets mean what they mean for `[FEC]` and `[armor]` on the lines below:
+optional. The MUST that follows —
+
+> **Compression MUST precede encryption and padding.**
+
+— constrains the *ordering*, not the *doing*. Not compressing is conformant.
+An earlier note in this session called this an unmet MUST and was wrong; it
+would have put a requirement that does not exist onto the audit list.
+
+### What the code does
+
+Nothing compresses a body. No `flate2`, `miniz`, `zstd` or `lz4` in any
+crate; no compression in `krab-crypto`, `krab-core`, `krab-proto` or the send
+path; `seal_one` seals the plaintext as it stands. The only compression in
+the tree is PNG encoding in the picture pipeline, and the courier archive
+which documents itself as "flat length-prefixed records, uncompressed".
+
+### Why it stays that way
+
+**Padding makes the safe version pointless.** The proposal that looked best —
+compress only when the object stays in the same size bucket — captures no
+benefit at all. If the bucket is unchanged the object is padded to the same
+size either way, so the bytes on the wire, on disk and on a courier's stick
+are identical in count. It spends CPU at both ends to change nothing.
+
+Compression pays only when it **drops** a bucket. Dropping a bucket is
+precisely the observable that creates a CRIME-style oracle. The benefit and
+the leak are the same event, so there is no middle position:
+
+| | bandwidth win | leak |
+|---|---|---|
+| compress, bucket may change | real | a genuine, if slow, ratio oracle |
+| compress, bucket fixed | **none** | none |
+| don't compress | none | none |
+
+### The oracle, assessed rather than waved at
+
+Against this protocol a CRIME-style attack needs attacker-chosen bytes beside
+a secret — plausible, via a hostile group member or quoted text; an observable
+length — bucketed to six values, which *degrades* the attack without
+defeating it, because an attacker who pads their injected content can position
+a message one byte below a bucket edge and read the bucket as a reliable
+one-bit oracle; and many trials — which is where it fails, because the medium
+is human-speed store-and-forward rather than a browser emitting thousands of
+requests unattended. That last defence is a property of the medium, not of the
+cryptography, and it is the one worth being uneasy about.
+
+§8.2 already concedes bucketing "bounds that leak to bucket granularity but
+does not eliminate it". Compression would make that residue
+attacker-influenceable rather than merely content-dependent.
+
+### If it is ever built
+
+Only the bucket-changing version is worth building, and it needs an explicit
+threat-model decision plus a defence against boundary-positioning — which is
+not obviously possible while RFC 1 §8 fixes padding to buckets rather than
+allowing jitter.
+
+Two constraints hold whatever is decided. The compressed/not flag belongs in
+the **inner plaintext**, where §4.3's "unknown keys in the inner plaintext
+MUST be ignored" makes it forward-compatible and where it discloses nothing.
+It **MUST NOT** go in the routing header: there it is a per-message "this
+compressed well" bit that every relay can read, which is a cleaner oracle than
+the one the scheme was trying to avoid.
