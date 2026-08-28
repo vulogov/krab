@@ -11,6 +11,7 @@
 
 use krab_core::object::ObjectId;
 use krab_crypto::Fingerprint;
+use std::collections::BTreeMap;
 
 /// Bucket granularity: one day, matching the epoch (RFC 1 §2).
 ///
@@ -59,6 +60,21 @@ pub fn bucket_end(bucket: u32) -> u64 {
 pub struct Segment {
     bucket: u32,
     entries: Vec<(ObjectId, Vec<u8>)>,
+    /// `id` → its position in `entries`.
+    ///
+    /// **Append order is the file layout; it is not a lookup structure.**
+    /// `get` walked `entries` linearly, and `Store::get` walks every segment,
+    /// so fetching one object was linear in the corpus. That is on three paths
+    /// at once: `persist::write_corpus` fetches every object it packs, and a
+    /// save runs after every exchange that received anything; `get_truncated`
+    /// serves a peer's `Want`; and `contains` answers whether an object is
+    /// held. Saving a 50 000-object corpus cost 629 ms of nothing but these
+    /// lookups, growing as the square.
+    ///
+    /// Positions are stable because a segment is append-only and is removed
+    /// whole — `expire` and `evict_to` `unlink()` it rather than compacting —
+    /// so nothing ever shifts an index that this map holds.
+    by_id: BTreeMap<ObjectId, usize>,
     fingerprint: Fingerprint,
     bytes: u64,
 }
@@ -69,6 +85,7 @@ impl Segment {
         Segment {
             bucket,
             entries: Vec::new(),
+            by_id: BTreeMap::new(),
             fingerprint: Fingerprint::ZERO,
             bytes: 0,
         }
@@ -99,15 +116,17 @@ impl Segment {
     pub fn append(&mut self, id: ObjectId, bytes: Vec<u8>) {
         self.bytes += bytes.len() as u64;
         self.fingerprint = self.fingerprint.add(Fingerprint::of(&id));
+        self.by_id.insert(id, self.entries.len());
         self.entries.push((id, bytes));
     }
 
     /// Fetch by identifier.
     pub fn get(&self, id: &ObjectId) -> Option<&[u8]> {
-        self.entries
-            .iter()
-            .find(|e| &e.0 == id)
-            .map(|e| e.1.as_slice())
+        // `get` rather than indexing: a position that named nothing would be a
+        // panic on a path a peer can reach, and returning `None` is the same
+        // answer this gives for an object that was never here.
+        let &at = self.by_id.get(id)?;
+        self.entries.get(at).map(|e| e.1.as_slice())
     }
 
     /// Every identifier held, in append order.

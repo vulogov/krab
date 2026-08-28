@@ -34,6 +34,29 @@ fn corpus(n: u32) -> Store {
     s
 }
 
+/// What saving the corpus costs.
+///
+/// `persist::write_corpus` packs every object, and packing fetches each one by
+/// identifier. So this walk is the shape of a save, and a save runs after
+/// every exchange that received anything.
+#[test]
+#[ignore = "measurement, not an assertion"]
+fn what_fetching_every_object_costs() {
+    for n in [1_000u32, 10_000, 50_000] {
+        let s = corpus(n);
+        let ids: Vec<_> = s.entries_in_range(0, u32::MAX);
+        let t = std::time::Instant::now();
+        let mut bytes = 0u64;
+        for (_, id) in &ids {
+            bytes += s.get(id).map(|b| b.len() as u64).unwrap_or(0);
+        }
+        println!(
+            "corpus {n:>6}: fetching every object {:>10.3?}   ({bytes} bytes)",
+            t.elapsed()
+        );
+    }
+}
+
 #[test]
 #[ignore = "measurement, not an assertion"]
 fn what_one_batch_of_ranges_costs() {

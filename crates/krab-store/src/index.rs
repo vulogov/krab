@@ -652,6 +652,46 @@ mod tests {
         }
     }
 
+    /// **Fetching an object must not depend on where it sits.** A segment is
+    /// append-only, which is a file layout, not a lookup structure — `get`
+    /// walked its entries until it matched, so an object appended late cost
+    /// the whole segment to find. `persist::write_corpus` fetches every object
+    /// it packs and runs after every exchange that received anything, and
+    /// `get_truncated` does the same for each object a peer's `Want` asks for.
+    ///
+    /// A ratio rather than a wall-clock bound: it is the *shape* of the cost
+    /// that is being asserted, so the test says nothing about how fast the
+    /// machine is and is as valid in a debug build as a release one.
+    #[test]
+    fn fetching_an_object_does_not_depend_on_where_it_sits() {
+        // One bucket, so what is measured is the lookup inside a segment and
+        // not the walk across segments.
+        let objs: Vec<(u32, u8)> = (1..1_400u32).flat_map(|e| (0..8u8).map(move |s| (e, s))).collect();
+        let s = store_with(0, &objs);
+        assert!(s.len() > 10_000, "held {}", s.len());
+        let held = s.entries_in_range(0, u32::MAX);
+        let (first, last) = (held[0].1, held[held.len() - 1].1);
+
+        let time = |id: &ObjectId| {
+            let t = std::time::Instant::now();
+            for _ in 0..20_000 {
+                assert!(s.get(id).is_some());
+            }
+            t.elapsed()
+        };
+        // Warm, then measure. The first pass pays for page faults the second
+        // would otherwise be blamed for.
+        let _ = time(&first);
+        let (a, b) = (time(&first), time(&last));
+
+        let ratio = b.as_secs_f64() / a.as_secs_f64().max(f64::MIN_POSITIVE);
+        assert!(
+            ratio < 20.0,
+            "the last object took {ratio:.0}x the first ({a:?} against {b:?}) \
+             — the segment is being scanned rather than indexed"
+        );
+    }
+
     /// RFC 1 §11 check 2 — what stops a relay extending TTL to force
     /// indefinite storage.
     #[test]
