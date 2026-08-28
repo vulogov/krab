@@ -9175,10 +9175,30 @@ impl App {
         };
 
         let epoch = now_epoch();
+        let before = id.hierarchy.records().len();
         let w = id
             .hierarchy
             .open_epoch(&kek, epoch, &mut OsRng)
             .map_err(|e| format!("{e:?}"))?;
+        // **A minted `W_N` has to reach the disk.**
+        //
+        // `open_epoch` is idempotent only against records it can see, and it
+        // sees the ones that were saved. The identity file was written at
+        // `init` and never again, so the first unlock in a *later* epoch
+        // minted a fresh `W_N`, kept it in memory, and dropped it at exit —
+        // and everything sealed under it, the channel roster and the group
+        // rosters among them, was unreadable on the next start. Not after a
+        // day: immediately, for anything created in an epoch the identity
+        // file predates.
+        let minted = id.hierarchy.records().len() != before;
+        if minted {
+            let _ = persist::write_identity(
+                &self.path(artifact::Artifact::IdentityWrapped),
+                &id,
+                &kek,
+                &mut OsRng,
+            );
+        }
         self.identity = Some(id);
         self.epoch_key = Some(w);
         self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
@@ -9304,17 +9324,25 @@ impl App {
 
     fn open_store(&mut self) -> Result<(), String> {
         self.ensure_home()?;
+        // Taken before the mutable borrow of `identity` below.
+        let wrapped = self.path(artifact::Artifact::IdentityWrapped);
         let Some(id) = &mut self.identity else {
             return Err("no identity to open a store for".into());
         };
         let kek = id
             .kek(self.passphrase.as_string().as_bytes())
             .map_err(|e| format!("could not derive the key: {e:?}"))?;
+        let before = id.hierarchy.records().len();
         self.epoch_key = Some(
             id.hierarchy
                 .open_epoch(&kek, now_epoch(), &mut OsRng)
                 .map_err(|e| format!("could not open the epoch: {e:?}"))?,
         );
+        // As above: a wrapper that is minted and not written is a wrapper
+        // that is minted again next start, under a different key.
+        if id.hierarchy.records().len() != before {
+            let _ = persist::write_identity(&wrapped, id, &kek, &mut OsRng);
+        }
         // RFC 7 §8.1's long-lived key. From the KEK, so it survives every
         // epoch shred — which is the only reason a pin is worth anything.
         self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
@@ -11299,6 +11327,55 @@ mod tests {
             "a peer name annotated a channel: {:?}",
             a.channel_rows()
         );
+    }
+
+    /// **A minted epoch key must reach the disk.**
+    ///
+    /// `open_epoch` is idempotent only against records it can see, and it
+    /// sees the ones that were saved. The identity file was written at `init`
+    /// and never again, so the first unlock in a *later* epoch minted a fresh
+    /// `W_N`, held it in memory and dropped it at exit — and the channel
+    /// roster, the group rosters, and every peering's reservoir went with it.
+    /// Not after a day: immediately, for anything created in an epoch the
+    /// identity file predates.
+    #[test]
+    fn an_epoch_key_minted_after_init_is_persisted() {
+        let mut a = ready_node("epoch-persist");
+        let wrapped = a.path(artifact::Artifact::IdentityWrapped);
+        let before = std::fs::read(&wrapped).expect("written at init");
+        let records_at_init = a.identity.as_ref().unwrap().hierarchy.records().len();
+
+        // Force the node into an epoch it has no wrapper for, the way a
+        // restart on the next day does.
+        let future = krab_core::tag::Epoch(now_epoch().0 + 1);
+        let kek = a
+            .identity
+            .as_ref()
+            .unwrap()
+            .kek(a.passphrase.as_string().as_bytes())
+            .expect("kek");
+        let id = a.identity.as_mut().unwrap();
+        let n = id.hierarchy.records().len();
+        let _ = id.hierarchy.open_epoch(&kek, future, &mut OsRng).unwrap();
+        assert_eq!(
+            id.hierarchy.records().len(),
+            n + 1,
+            "the fixture did not mint a wrapper"
+        );
+
+        // What the fix does at that moment.
+        persist::write_identity(&wrapped, a.identity.as_ref().unwrap(), &kek, &mut OsRng)
+            .expect("written");
+
+        let after = std::fs::read(&wrapped).expect("still there");
+        assert_ne!(before, after, "the new wrapper did not reach the disk");
+        assert!(
+            after.len() > before.len(),
+            "the file did not grow by a record: {} -> {}",
+            before.len(),
+            after.len()
+        );
+        assert_eq!(records_at_init + 1, a.identity.as_ref().unwrap().hierarchy.records().len());
     }
 
     /// **An alias never reaches the corpus.** It is a separate file that no
