@@ -137,6 +137,54 @@ pub fn safe(text: &str) -> Rendered {
     }
 }
 
+/// The same sanitising, over a block of text that is allowed to have lines.
+///
+/// [`safe`] is for a row in a list: it removes every dangerous character —
+/// which includes `\n`, correctly, because a newline in a one-line row is a
+/// way to push text off the row — and stops at [`MAX_RENDERED`].
+///
+/// A body is neither of those things. Applying `safe` to one joined its lines
+/// into a single run and cut it at 64 characters, so a note typed over two
+/// lines came back as one and a long message came back short. This keeps the
+/// line structure and the far larger bound, and sanitises within each line
+/// exactly as `safe` does.
+pub fn safe_block(text: &str) -> Rendered {
+    let mut out = String::new();
+    let mut removed = 0;
+    let mut truncated = false;
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        for c in line.chars() {
+            if is_dangerous(c) {
+                removed += 1;
+                continue;
+            }
+            if out.chars().count() >= MAX_BLOCK {
+                truncated = true;
+                break;
+            }
+            out.push(c);
+        }
+        if truncated {
+            break;
+        }
+    }
+    Rendered {
+        text: out,
+        removed,
+        truncated,
+    }
+}
+
+/// Characters a body may render to.
+///
+/// Large enough that no message this protocol can carry hits it — the largest
+/// object is 256 KB — and finite so that a hostile body cannot make the
+/// renderer walk forever.
+pub const MAX_BLOCK: usize = 512 * 1024;
+
 /// Fold a string onto its confusable skeleton — Unicode TR39's idea.
 ///
 /// Case is folded and the confusables below are mapped onto ASCII, so two
@@ -232,6 +280,52 @@ pub fn confusable_with_known(text: &str, known: &[String]) -> Option<String> {
 /// Strip leading and trailing punctuation from a word.
 fn trim_punctuation(w: &str) -> String {
     w.trim_matches(|c: char| !c.is_alphanumeric()).to_string()
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    /// **A body keeps its lines.** `safe` removes `\n` — correctly, for a
+    /// row in a list, where a newline pushes text off the row. Used on a
+    /// body it joined a note typed over two lines into one.
+    #[test]
+    fn a_block_keeps_its_newlines() {
+        let r = safe_block("abc\nsdd");
+        assert_eq!(r.text, "abc\nsdd", "the newline was eaten");
+        assert_eq!(safe("abc\nsdd").text, "abcsdd", "safe still strips it");
+    }
+
+    /// And it still removes what `safe` removes, on every line.
+    #[test]
+    fn a_block_is_still_sanitised_on_every_line() {
+        let r = safe_block("one\ntwo\u{202e}three");
+        assert!(!r.text.contains('\u{202e}'), "an override survived: {:?}", r.text);
+        assert_eq!(r.removed, 1);
+        assert_eq!(r.text.lines().count(), 2, "{:?}", r.text);
+    }
+
+    /// **A body is not cut at 64 characters.** `safe`'s bound is a row's
+    /// width; applying it to a message truncated every line of it.
+    #[test]
+    fn a_block_is_not_truncated_at_a_rows_width() {
+        let long = "x".repeat(MAX_RENDERED * 4);
+        let r = safe_block(&long);
+        assert_eq!(r.text.chars().count(), long.chars().count());
+        assert!(!r.truncated);
+        // The row form still is, which is what it is for.
+        assert!(safe(&long).truncated);
+    }
+
+    /// But it is bounded: a hostile body must not make the renderer walk on
+    /// forever.
+    #[test]
+    fn a_block_is_still_bounded() {
+        let huge = "y".repeat(MAX_BLOCK + 1000);
+        let r = safe_block(&huge);
+        assert!(r.truncated);
+        assert_eq!(r.text.chars().count(), MAX_BLOCK);
+    }
 }
 
 #[cfg(test)]

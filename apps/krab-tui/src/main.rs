@@ -3284,7 +3284,7 @@ fn inbox_row(m: &receive::Message) -> String {
                  makes mail unreadable (RFC 7 §8), so it stays until `wipe` \
                  destroys it.",
                 k.epoch,
-                display::safe(&k.body).text
+                display::safe_block(&k.body).text
             ),
             None => "no note selected.\n\n`note <text>` keeps one; `note` \
                      alone opens a composer."
@@ -3335,7 +3335,7 @@ fn inbox_row(m: &receive::Message) -> String {
                 "\n{:>3}. [epoch {}] {}\n",
                 i + 1,
                 k.epoch,
-                display::safe(&k.body).text
+                display::safe_block(&k.body).text
             ));
         }
         if let Some(w) = archive.warning() {
@@ -5564,7 +5564,7 @@ impl App {
                              from {}  ·  post #{seq}\n\n{}",
                             channels::short(&id),
                             channels::short(&id),
-                            display::safe(text).text
+                            display::safe_block(text).text
                         ),
                         None => format!("channel {}\n\nno posts yet", channels::short(&id)),
                     };
@@ -5594,12 +5594,11 @@ impl App {
                 // The pane keeps the whole body rather than a first line, so
                 // it is sanitised line by line — a control character in the
                 // fortieth line is as good as one in the first.
-                let safe: String = m
-                    .body
-                    .lines()
-                    .map(|l| display::safe(l).text)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                // `safe` also stops at 64 characters, which is right for a
+                // row in a list and wrong here: it silently cut every line of
+                // a message at 64. `safe_block` sanitises the same way, keeps
+                // the lines, and bounds at a size no object can reach.
+                let safe: String = display::safe_block(&m.body).text;
                 self.body = format!("from {}\n\n{}", m.from, safe);
             }
             None => self.body.push_str("no message selected"),
