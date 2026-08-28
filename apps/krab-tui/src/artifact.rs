@@ -62,6 +62,17 @@ pub enum Artifact {
     /// is the request and the risk together: RFC 7 §8's erasure is what stops
     /// a seized disk being a transcript, and this file is exempt from it.
     Pinned,
+    /// Local names for identifiers — RFC 8 §7's fingerprint rule applies.
+    ///
+    /// **Never transmitted and never imported.** An alias is written by this
+    /// operator, for this operator, and nothing puts one on the wire or takes
+    /// one from a peer's card: a name a correspondent could choose is the
+    /// attacker-controlled display name §7 exists to defend against.
+    ///
+    /// Sealed under a KEK subkey like the pinned archive, and destroyed by
+    /// the same paths — an alias table is a plaintext social graph, and it is
+    /// the part of a seizure that turns pseudonymous identifiers into people.
+    Aliases,
     /// The last full nodelist fragment this node published — RFC 3 §8.2.
     ///
     /// The base a `NODEDIFF` references. One record for every peer, because a
@@ -78,7 +89,7 @@ pub enum Artifact {
 
 impl Artifact {
     /// Every artifact. Used by the test that keeps this file honest.
-    pub const ALL: [Artifact; 14] = [
+    pub const ALL: [Artifact; 15] = [
         Artifact::IdentityWrapped,
         Artifact::KekParams,
         Artifact::Corpus,
@@ -93,6 +104,7 @@ impl Artifact {
         Artifact::IntroductionsSpent,
         Artifact::Nodelist,
         Artifact::Pinned,
+        Artifact::Aliases,
     ];
 
     /// The name on disk.
@@ -112,6 +124,7 @@ impl Artifact {
             Artifact::IntroductionsSpent => "introductions.spent",
             Artifact::Nodelist => "nodelist.sent",
             Artifact::Pinned => "pinned.archive",
+            Artifact::Aliases => "aliases",
         }
     }
 
@@ -136,7 +149,8 @@ impl Artifact {
             | Artifact::DuressWrapped
             | Artifact::IntroductionsSpent
             | Artifact::Nodelist
-            | Artifact::Pinned => true,
+            | Artifact::Pinned
+            | Artifact::Aliases => true,
         }
     }
 }

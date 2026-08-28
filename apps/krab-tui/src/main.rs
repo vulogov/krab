@@ -39,6 +39,7 @@ mod display;
 mod entropy;
 mod fanout;
 mod filter;
+mod alias;
 mod fragment;
 mod markdown;
 mod groups;
@@ -369,6 +370,8 @@ struct App {
     needs_clear: bool,
     /// Show the body's bytes rather than its rendering — `Ctrl-Y`.
     raw_body: bool,
+    /// Key for the alias file. `None` while locked, like `pin_key`.
+    alias_key: Option<[u8; 32]>,
     /// Decrypted message plaintext. **Only** [`App::show_selected`] writes
     /// here, and RFC 7 §8 says it exists only while displayed.
     body: String,
@@ -609,6 +612,7 @@ impl Default for App {
             composer_at: 0,
             needs_clear: false,
             raw_body: false,
+            alias_key: None,
             // Not "no message selected": on a fresh node that is true and
             // useless. The first screen has to say what to type, because
             // nothing else on it does.
@@ -1563,10 +1567,12 @@ impl App {
 ///
 /// Separate from `refresh_inbox` so the format can be asserted directly. The
 /// pane renders exactly this, so a change to it has to break those tests.
-fn inbox_row(m: &receive::Message) -> String {
+fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
     format!(
         "{}  {} {}{}",
-        m.from,
+        // A local name beside the identifier, never instead of it — RFC 8 §7
+        // wants the fingerprint present wherever a name is.
+        names.show(alias::Kind::Message, &m.from),
         // **An attachment is visible in the list, not only once opened.**
         // One cell, always present so the body column does not shift between
         // rows — a ragged column is harder to scan than no marker at all.
@@ -1786,7 +1792,13 @@ fn inbox_row(m: &receive::Message) -> String {
                 scan.examined
             )]
         } else {
-            scan.messages.iter().map(Self::inbox_row).collect()
+            {
+                let names = self.aliases();
+                scan.messages
+                    .iter()
+                    .map(|m| Self::inbox_row(m, &names))
+                    .collect()
+            }
         };
         // Bases recorded now that the scan's borrow has ended. Deferred rather
         // than skipped: without them, a delta arriving next week has nothing
@@ -3233,6 +3245,166 @@ fn inbox_row(m: &receive::Message) -> String {
     ///
     /// Bare `pin` reports the archive; `pin <peer>` keeps their conversation;
     /// `pin release <peer>` gives it back to the erasure.
+    /// The alias table, or an empty one.
+    fn aliases(&self) -> alias::Aliases {
+        let Some(key) = self.alias_key else {
+            return alias::Aliases::default();
+        };
+        std::fs::read(self.path(artifact::Artifact::Aliases))
+            .ok()
+            .and_then(|b| krab_crypto::kek::open_under(&key, alias::DOMAIN, &b).ok())
+            .map(|b| alias::Aliases::decode(&b))
+            .unwrap_or_default()
+    }
+
+    fn save_aliases(&self, table: &alias::Aliases) -> bool {
+        let Some(key) = self.alias_key else {
+            return false;
+        };
+        let mut plain = table.encode();
+        let sealed =
+            match krab_crypto::kek::seal_under(&key, alias::DOMAIN, &plain, &mut OsRng) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+        // The encoded form is the names in the clear; it does not outlive
+        // this function (RFC 7 §9).
+        plain.iter_mut().for_each(|b| *b = 0);
+        atomic::write(&self.path(artifact::Artifact::Aliases), &sealed).is_ok()
+    }
+
+    /// `alias <id> <name>`, and the two sibling verbs.
+    ///
+    /// **Never sent and never imported.** The table is a separate file that
+    /// no send path reads; there is no verb that takes a name from a peer,
+    /// because a name a correspondent chose is the attacker-controlled
+    /// display name RFC 8 §7 exists to defend against.
+    fn alias_command(&mut self, kind: alias::Kind, line: &str) -> String {
+        let Ok(words) = words::split(line) else {
+            return "unbalanced quotes".into();
+        };
+        if self.alias_key.is_none() {
+            return "locked — unlock to reach your names".into();
+        }
+        let id = words.get(1).map(|w| w.text());
+        let name = words::rest(&words, 2);
+        let name = name.trim();
+        let mut table = self.aliases();
+
+        let Some(id) = id else {
+            // No arguments: list. Both columns, always — a list of bare names
+            // would be a list of things the operator cannot type at a verb.
+            let rows = table.all(kind);
+            if rows.is_empty() {
+                return format!(
+                    "no {} names.\n\n\
+                     `{} <id> <name>` adds one. Names are local: they are \
+                     never sent, never imported, and always shown beside the \
+                     identifier rather than instead of it (RFC 8 §7).",
+                    match kind {
+                        alias::Kind::Message => "message",
+                        alias::Kind::Channel => "channel",
+                        alias::Kind::Peer => "peer",
+                    },
+                    kind.verb()
+                );
+            }
+            let mut out = format!("{} name(s):\n", rows.len());
+            for (id, name) in rows {
+                out.push_str(&format!("\n\x20 {name}  ({id})"));
+            }
+            out.push_str(&format!(
+                "\n\n`no {} <name>` removes one.",
+                kind.verb()
+            ));
+            return out;
+        };
+        if name.is_empty() {
+            return format!(
+                "usage: {} <id> <name>\n\n\
+                 The name is local to this node.",
+                kind.verb()
+            );
+        }
+        match table.set(kind, &id, name) {
+            Err(alias::Refused::Empty) => "that name is empty once rendered".into(),
+            Err(alias::Refused::TooLong) => format!(
+                "too long — {} characters at most, so it cannot push the \
+                 identifier off a row.",
+                alias::MAX_ALIAS
+            ),
+            Err(alias::Refused::Full) => format!(
+                "no room — {} names at most in that table. Every one is \
+                 plaintext at rest, so the table is bounded.",
+                alias::MAX_ALIASES
+            ),
+            Err(alias::Refused::LooksLikeAnIdentifier) => {
+                "that name looks like a short id.\n\n\
+                 Names are shown as `name (id)`, and a name that is itself \
+                 eight hex characters makes that unreadable — or names \
+                 somebody else."
+                    .into()
+            }
+            Ok(()) => {
+                if !self.save_aliases(&table) {
+                    return "the name could not be written".into();
+                }
+                let shown = table.show(kind, &id);
+                self.refresh_inbox();
+                format!(
+                    "{shown}\n\n\
+                     Local only: it is never sent, never imported, and shown \
+                     beside the identifier rather than instead of it — the \
+                     fingerprint comparison is what says who this is (RFC 3 \
+                     §11), not the name. `wipe` destroys it."
+                )
+            }
+        }
+    }
+
+    /// `no alias <name>`, `no alias-channel <name>`, `no alias-peer <name>`.
+    fn alias_remove(&mut self, line: &str) -> String {
+        let Ok(words) = words::split(line) else {
+            return "unbalanced quotes".into();
+        };
+        let which = words.get(1).map(|w| w.text()).unwrap_or_default();
+        let kind = match which.as_str() {
+            "alias" => alias::Kind::Message,
+            "alias-channel" => alias::Kind::Channel,
+            "alias-peer" => alias::Kind::Peer,
+            _ => {
+                return "usage: no alias <name>\n\
+                        \x20      no alias-channel <name>\n\
+                        \x20      no alias-peer <name>"
+                    .into()
+            }
+        };
+        if self.alias_key.is_none() {
+            return "locked — unlock to reach your names".into();
+        }
+        let name = words::rest(&words, 2);
+        let name = name.trim();
+        if name.is_empty() {
+            return format!("usage: no {} <name>", kind.verb());
+        }
+        let mut table = self.aliases();
+        match table.clear_by_name(kind, name) {
+            None => format!(
+                "no {} name {name:?}.\n\n\
+                 `{}` lists them.",
+                kind.verb(),
+                kind.verb()
+            ),
+            Some(id) => {
+                if !self.save_aliases(&table) {
+                    return "the name could not be removed".into();
+                }
+                self.refresh_inbox();
+                format!("removed {name} — {id} is shown by its identifier again.")
+            }
+        }
+    }
+
     /// `note [text]` — something you write to yourself.
     ///
     /// # Why this is not a message addressed to your own node
@@ -6082,6 +6254,12 @@ impl App {
             Command::Keys => self.output = self.keys_report(),
             Command::Pin => self.output = self.pin_command(line),
             Command::Note => self.output = self.note_command(line),
+            Command::Alias => self.output = self.alias_command(alias::Kind::Message, line),
+            Command::AliasChannel => {
+                self.output = self.alias_command(alias::Kind::Channel, line)
+            }
+            Command::AliasPeer => self.output = self.alias_command(alias::Kind::Peer, line),
+            Command::No => self.output = self.alias_remove(line),
             Command::Status => self.output = self.status_report(),
             Command::ForceSend => self.output = self.force_send(line),
             Command::Rollcall => self.output = self.rollcall_command(line),
@@ -8991,6 +9169,7 @@ impl App {
         self.identity = Some(id);
         self.epoch_key = Some(w);
         self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
+        self.alias_key = Some(alias::Aliases::key_from_kek(&kek));
         self.locked = false;
 
         // The corpus goes through the same verification a stranger's archive
@@ -9126,6 +9305,7 @@ impl App {
         // RFC 7 §8.1's long-lived key. From the KEK, so it survives every
         // epoch shred — which is the only reason a pin is worth anything.
         self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
+        self.alias_key = Some(alias::Aliases::key_from_kek(&kek));
         self.save(&kek)?;
         // `kek` drops here. RFC 7 §4: it is memory-only and never written, and
         // the shorter it lives the better — it is re-derived on unlock.
@@ -9435,6 +9615,7 @@ impl App {
         self.pending_bases.clear();
         // Derived from the KEK, so it goes when the KEK does.
         self.pin_key = None;
+        self.alias_key = None;
         self.warned_shred_at = None;
         self.last_scan_fail = 0;
         // Per-link budgets. Sealed under W_N, which a locked node no longer
@@ -11062,6 +11243,92 @@ mod tests {
         }
         a.on_key(KeyCode::Char('w'), KeyModifiers::CONTROL);
         assert_eq!(a.composer, "alpha ");
+    }
+
+    /// **An alias never reaches the corpus.** It is a separate file that no
+    /// send path reads, so naming somebody cannot put that name on a wire.
+    #[test]
+    fn naming_someone_changes_nothing_that_leaves_the_node() {
+        let mut a = ready_node("alias-local");
+        let before = a.store.with(|s| s.entries_in_range(0, u32::MAX).len());
+        let card = std::fs::read(a.path(artifact::Artifact::PeerCard)).ok();
+
+        type_command(&mut a, "alias 0cf29190 alice");
+        assert!(a.output.contains("alice (0cf29190)"), "{}", a.output);
+
+        assert_eq!(
+            a.store.with(|s| s.entries_in_range(0, u32::MAX).len()),
+            before,
+            "an alias reached the corpus"
+        );
+        assert_eq!(
+            std::fs::read(a.path(artifact::Artifact::PeerCard)).ok(),
+            card,
+            "an alias reached the card handed to peers"
+        );
+    }
+
+    /// **It is ciphertext at rest, like the pinned archive.**
+    #[test]
+    fn the_alias_file_is_encrypted() {
+        let mut a = ready_node("alias-crypto");
+        type_command(&mut a, "alias 0cf29190 SECRETALIASMARKER");
+        let sealed = std::fs::read(a.path(artifact::Artifact::Aliases)).expect("written");
+        assert!(
+            !sealed
+                .windows(b"SECRETALIASMARKER".len())
+                .any(|w| w == b"SECRETALIASMARKER"),
+            "the name is on disk in the clear"
+        );
+    }
+
+    /// **A wipe destroys names.** An alias table is a plaintext social graph;
+    /// it is the part of a seizure that turns identifiers into people.
+    #[test]
+    fn a_wipe_destroys_aliases() {
+        let mut a = ready_node("alias-wipe");
+        type_command(&mut a, "alias 0cf29190 alice");
+        assert!(a.path(artifact::Artifact::Aliases).exists());
+        a.panic_wipe();
+        assert!(
+            !a.path(artifact::Artifact::Aliases).exists(),
+            "the alias file survived a wipe"
+        );
+    }
+
+    /// The three verbs write three tables, and removal is by name.
+    #[test]
+    fn the_three_verbs_and_their_removal() {
+        let mut a = ready_node("alias-verbs");
+        type_command(&mut a, "alias 0cf29190 alice");
+        type_command(&mut a, "alias-channel 672bc3bf weather");
+        type_command(&mut a, "alias-peer 7b4f469a bob");
+        let t = a.aliases();
+        assert_eq!(t.get(alias::Kind::Message, "0cf29190"), Some("alice"));
+        assert_eq!(t.get(alias::Kind::Channel, "672bc3bf"), Some("weather"));
+        assert_eq!(t.get(alias::Kind::Peer, "7b4f469a"), Some("bob"));
+
+        // Removal names what it freed, and only from the table asked for.
+        type_command(&mut a, "no alias-channel weather");
+        assert!(a.output.contains("672bc3bf"), "{}", a.output);
+        assert_eq!(a.aliases().get(alias::Kind::Channel, "672bc3bf"), None);
+        assert_eq!(a.aliases().get(alias::Kind::Message, "0cf29190"), Some("alice"));
+
+        // A name that is not there says so rather than silently succeeding.
+        type_command(&mut a, "no alias nobody");
+        assert!(a.output.contains("no alias name"), "{}", a.output);
+    }
+
+    /// A locked node has no key for the table and says so.
+    #[test]
+    fn aliases_are_unreachable_while_locked() {
+        let mut a = ready_node("alias-locked");
+        type_command(&mut a, "alias 0cf29190 alice");
+        a.lock();
+        type_command(&mut a, "alias 0cf29190 alice");
+        assert!(a.output.contains("locked"), "{}", a.output);
+        type_command(&mut a, "no alias alice");
+        assert!(a.output.contains("locked"), "{}", a.output);
     }
 
     /// **A note to self is kept, and is not an object.**
@@ -17998,8 +18265,9 @@ mod tests {
             post_quantum: true,
             nodelist: None,
         };
-        let with = App::inbox_row(&mk("[picture]", Some(a_png(2, 2))));
-        let without = App::inbox_row(&mk("plain", None));
+        let names = alias::Aliases::default();
+        let with = App::inbox_row(&mk("[picture]", Some(a_png(2, 2))), &names);
+        let without = App::inbox_row(&mk("plain", None), &names);
 
         assert!(with.contains(ATTACHMENT_GLYPH), "{with}");
         assert!(!without.contains(ATTACHMENT_GLYPH), "{without}");

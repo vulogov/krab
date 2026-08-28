@@ -55,6 +55,14 @@ pub enum Command {
     Pin,
     /// A note to yourself — never leaves this node.
     Note,
+    /// Name a correspondent, locally.
+    Alias,
+    /// Name a channel, locally.
+    AliasChannel,
+    /// Name a peer, locally.
+    AliasPeer,
+    /// Remove a local name: `no alias <name>`.
+    No,
     /// **Not in RFC 8 §5.** Write a received picture to a file — RFC 8 §6.
     ///
     /// Writes bytes and stops. RFC 8 §6 forbids passing received bytes to a
@@ -184,9 +192,13 @@ impl Command {
     /// to 19 of 26 without anything noticing. `every_variant_is_in_all` closes
     /// that: it matches on `Command` exhaustively, so a new variant does not
     /// compile until it appears here.
-    pub const ALL: [Command; 30] = [
+    pub const ALL: [Command; 34] = [
         Command::Pin,
         Command::Note,
+        Command::Alias,
+        Command::AliasChannel,
+        Command::AliasPeer,
+        Command::No,
         Command::Picture,
         Command::Group,
         Command::Channel,
@@ -246,6 +258,10 @@ impl Command {
             "group" => Command::Group,
             "pin" => Command::Pin,
             "note" | "notes" => Command::Note,
+            "alias" | "aliases" => Command::Alias,
+            "alias-channel" => Command::AliasChannel,
+            "alias-peer" => Command::AliasPeer,
+            "no" => Command::No,
             "picture" | "pic" => Command::Picture,
             "force-send" => Command::ForceSend,
             "status" => Command::Status,
@@ -259,6 +275,22 @@ impl Command {
     /// two that end things.
     pub const SYNOPSES: &'static [(&'static str, &'static str)] = &[
         ("init", "create this node's key hierarchy — run once, first"),
+        (
+            "alias <short id> <name>",
+            "name a correspondent, locally — never sent, never imported",
+        ),
+        (
+            "alias-channel <id> <name>",
+            "name a channel, locally",
+        ),
+        (
+            "alias-peer <id> <name>",
+            "name a peer, locally",
+        ),
+        (
+            "no alias <name>",
+            "remove a local name; also `no alias-channel`, `no alias-peer`",
+        ),
         (
             "note [text]",
             "a note to yourself — never leaves this node; no text opens a composer",
@@ -479,6 +511,10 @@ impl fmt::Display for Command {
             Command::Group => "group",
             Command::Pin => "pin",
             Command::Note => "note",
+            Command::Alias => "alias",
+            Command::AliasChannel => "alias-channel",
+            Command::AliasPeer => "alias-peer",
+            Command::No => "no",
             Command::Picture => "picture",
             Command::ForceSend => "force-send",
             Command::Status => "status",
@@ -709,6 +745,10 @@ mod tests {
             match c {
                 Command::Pin => {}
                 Command::Note => {}
+                Command::Alias => {}
+                Command::AliasChannel => {}
+                Command::AliasPeer => {}
+                Command::No => {}
                 Command::Picture => {}
                 Command::Group => {}
                 Command::Channel => {}
@@ -739,7 +779,7 @@ mod tests {
                 Command::Verify => {}
             }
         }
-        assert_eq!(Command::ALL.len(), 30);
+        assert_eq!(Command::ALL.len(), 34);
     }
 
     /// **Every verb round-trips.** RFC 8 §5's ten, and the sixteen it omits.
