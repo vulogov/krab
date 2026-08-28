@@ -27,6 +27,17 @@ pub const EPOCH_SECS: u64 = 86_400;
 /// — the object is accepted, stored, and undecryptable.
 pub const EPOCH_WINDOW: u32 = 45;
 
+/// `MAX_TTL` in minutes — RFC 1 §2, and the bound RFC 1 §11 I2 checks against.
+///
+/// **Defined once, here, because it is a protocol constant and not a policy.**
+/// It lived as a `const` inside two functions in the interface, and the one
+/// place that most needed it — the ingest that accepts objects off the
+/// network — passed `u32::MAX` instead, which made I2 dead code: an object
+/// claiming an expiry eight thousand years out was accepted, never expired,
+/// and sorted into a segment far above every real one, so eviction under
+/// pressure discarded the operator's mail and kept it.
+pub const MAX_TTL_MIN: u32 = EPOCH_WINDOW * 1440;
+
 /// `MAX_TTL` in days, RFC 1 §2.
 pub const MAX_TTL_DAYS: u32 = 45;
 

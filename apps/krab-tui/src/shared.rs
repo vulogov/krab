@@ -296,7 +296,24 @@ impl Corpus for ExchangeView {
         // of which thread calls it.
         let id = krab_crypto::object_id(&bytes);
         self.store.with(|s| {
-            let _ = s.ingest(id, bytes, self.now_min, u32::MAX);
+            // **RFC 1 §11 I2.** `u32::MAX` here meant no upper bound at all,
+            // on the one path that takes objects from a peer — so an object
+            // claiming an expiry centuries out was accepted, never expired,
+            // and sorted above every real one, where eviction under pressure
+            // discards the operator's mail and keeps it.
+            //
+            // The ceiling is `real now + MAX_TTL`, and reaching it takes
+            // arithmetic because `ingest` derives it from the lower bound it
+            // is given — while this view is deliberately handed `window.0`,
+            // which is `now - MAX_TTL`, as that lower bound. Passing
+            // `MAX_TTL_MIN` directly would put the ceiling at *now* and
+            // refuse every unexpired object. `retention_now_min` is the real
+            // clock, which is why it exists (RFC 3 §7).
+            let ceiling = self
+                .retention_now_min
+                .saturating_sub(self.now_min)
+                .saturating_add(krab_core::tag::MAX_TTL_MIN);
+            let _ = s.ingest(id, bytes, self.now_min, ceiling);
         });
     }
 }
@@ -349,6 +366,56 @@ mod tests {
             store.len(),
             1,
             "a scoped link refused an object inside its own retention window"
+        );
+    }
+
+    /// **RFC 1 §11 I2, on the path that takes objects from a peer.**
+    ///
+    /// `ingest` was called with `u32::MAX` as its TTL bound, so the check
+    /// `index.rs` documents as "what stops a relay extending TTL to force
+    /// indefinite storage" never fired. An object claiming an expiry
+    /// centuries out was accepted and never expired — and because segments
+    /// are keyed by expiry and eviction takes the lowest bucket first, it
+    /// outlived every real object and the operator's own mail was discarded
+    /// to make room for it.
+    #[test]
+    fn an_object_claiming_an_absurd_expiry_is_refused() {
+        let store = SharedStore::new(Store::new());
+        let real_now = NOW;
+        let window_lo = real_now - 45 * 1_440;
+        let mut view = ExchangeView::new(
+            store.clone(),
+            window_lo,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+            real_now,
+        );
+
+        // Ordinary mail still lands: the ceiling is real now + MAX_TTL, and
+        // reaching that needs the real clock rather than the window's lower
+        // edge, which is what this view is handed as its lower bound.
+        view.put(object(1));
+        assert_eq!(
+            store.with(|s| s.entries_in_range(0, u32::MAX).len()),
+            1,
+            "a live object was refused"
+        );
+
+        // Eight thousand years out is not mail.
+        let far = RoutingHeader {
+            version: 1,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: u32::MAX - 10_000,
+            tag: Tag(7u64.to_le_bytes()),
+        };
+        let bytes = canonical_bytes(&far, &[9u8; 40]).unwrap();
+        view.put(bytes);
+        assert_eq!(
+            store.with(|s| s.entries_in_range(0, u32::MAX).len()),
+            1,
+            "an object claiming an expiry beyond MAX_TTL was stored"
         );
     }
 

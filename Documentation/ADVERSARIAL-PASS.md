@@ -1111,3 +1111,434 @@ them together gives the wrong one.
 The question that finds it is not "what does this touch" but "what does this
 *default to*, and is that the safe direction **for each thing it defaults**".
 A struct's `Default` is a set of decisions wearing one name.
+
+---
+
+## Pass 13 — 2026-08-28 · axis: **the bounds themselves**
+
+Run against the question the previous twelve passes kept answering by
+accident: *this value is bounded — by what, and is the bound reachable from
+the code that is actually compiled?* Not "is there a check" but "does the
+check run".
+
+**Twelve findings, four severe.** Recorded before the work rather than after
+it, because three of the four severe ones compose into one attack and fixing
+them piecemeal would lose the chain. Finding 1's network path was fixed while
+this was being written; everything else here is open.
+
+### 1. SEVERE — RFC 1 §11's I2 is dead code · **partly fixed**
+
+`Store::ingest` takes a TTL ceiling:
+
+```rust
+pub fn ingest(&mut self, id: ObjectId, bytes: Vec<u8>, now_min: u32, max_ttl_min: u32)
+```
+
+and enforces it at `index.rs:182`, under a comment that states the whole
+purpose of the check:
+
+```rust
+// RFC 1 §11 check 2 — this is what stops a relay extending TTL to
+// force indefinite storage.
+if expiry > now_min.saturating_add(max_ttl_min) {
+    return Err(Reject::TooFarFuture);
+}
+```
+
+Every call site outside a test passes `u32::MAX`:
+
+```text
+apps/krab-tui/src/shared.rs:299     ← the network path
+apps/krab-tui/src/persist.rs:415,444
+apps/krab-tui/src/receive.rs:705,888
+```
+
+`MAX_TTL` exists only as a constant in `index.rs`'s own test module. So the
+saturating add always reaches `u32::MAX`, the comparison is always false, and
+`Reject::TooFarFuture` has never fired in a running node.
+
+Measured. An object declaring `expiry_min = u32::MAX - 10_000` — about eight
+thousand years out — ingests, and `expire(now)` returns zero for it forever.
+
+**The storage cost is the small half.** `evict_to` is oldest-first, and it
+finds the oldest by `self.segments.keys().next()`:
+
+```rust
+let Some(&oldest) = self.segments.keys().next() else { break };
+```
+
+Buckets are days. The operator's mail sits near bucket 29 000; an object with
+a far-future expiry sits near bucket 2 982 616. Under capacity pressure the
+node therefore evicts **every real object first** and keeps the injected ones,
+and each eviction raises `min_expiry_min`, so `Reject::BelowWatermark`
+permanently blocks re-fetching what was dropped. RFC 5 §8's resurrection
+defence, applied to the wrong objects, makes the loss unrecoverable by
+reconnecting — which is exactly what `enforce_retention`'s own log line warns
+the operator about.
+
+The bound that was missing is not missing. `enforce_retention` declared
+`const MAX_TTL_MIN: u32 = 45 * 1440` and passed it to `prune_tombstones` on
+the next line. Five lines away, the same tick, the same function.
+
+**A fix for the network path landed in the working tree while this was being
+written, and is not committed.** `MAX_TTL_MIN` now lives in `krab_core::tag`
+beside `MAX_TTL_DAYS`, the two function-local copies are gone, and
+`ExchangeView::put` passes it. That is the right shape: it closes the
+reachable attack, and it closes finding 2 with it by making the top bucket
+unreachable. It is recorded here as reported rather than as verified — this
+pass measured the defect, not the repair.
+
+Three call sites still pass `u32::MAX`, and they are not all the same
+question:
+
+- `courier.rs:161` — **untrusted.** A courier archive is input from a medium
+  a stranger may have written; it takes the same ceiling as the socket.
+- `main.rs` and `receive.rs` — this node's own objects, composed locally.
+  Harmless today, and each is one edit away from not being, because nothing
+  distinguishes them from the two above at the call site.
+- `node.rs:81` — **worse than `u32::MAX`, and the reason to look at these one
+  by one.** `StoreView::put` is `krab-node`'s reference `Corpus`
+  implementation, and it derives *now* from the object being ingested:
+
+  ```rust
+  self.0.ingest(id, bytes, h.expiry_min.saturating_sub(1), u32::MAX);
+  ```
+
+  With `now_min` taken from the expiry, `expiry <= now_min` is false for every
+  object and `expiry > now_min + max_ttl` is false for every object. Both of
+  I2's time checks are vacuous by construction, so an already-expired object
+  ingests as readily as a far-future one. Nothing in the interface uses
+  `StoreView` — the TUI has its own `ExchangeView` — so this is a trap rather
+  than a live path, sitting in the implementation a second client would copy.
+
+### 2. SEVERE — the top bucket overflows the expiry arithmetic · **latent**
+
+Reachable only through finding 1, which is why it survived six passes, and
+closed by finding 1's fix rather than by anything here. The arithmetic is
+still wrong; what changed is that nothing can reach a bucket high enough to
+overflow it. Recorded because the next caller to pass a wider ceiling reopens
+it, and because the release-mode symptom is the one worth recognising.
+
+`bucket_of(u32::MAX)` is 2 982 616, and both `expire` and `evict_to` compute a
+bucket's upper edge the same way:
+
+```rust
+(b + 1) * crate::segment::BUCKET_MINUTES        // index.rs:340, 349, 383, 389
+```
+
+`2_982_617 × 1_440` is 4 294 968 480. `u32::MAX` is 4 294 967 295.
+
+Measured, both profiles, from one ingested object:
+
+```text
+debug   — panicked at index.rs:340: attempt to multiply with overflow
+release — wraps to 1185
+```
+
+The debug case is a remote peer crashing the node with one object in one
+frame. The release case is worse, because it is quiet. 1 185 is less than
+`now_min`, so the far-future segment is unlinked as if it had already expired
+— and the next line keeps its index entry, because the comparison there is
+against the expiry rather than the bucket:
+
+```rust
+self.index.retain(|(e, _), _| *e > now_min);    // u32::MAX > now_min
+```
+
+`index` and `segments` now disagree, and the two halves of the reconciliation
+interface read different ones:
+
+| method | reads | sees the phantom |
+|---|---|---|
+| `count_in_range`, `entries_in_range`, `len` | `self.index` | yes |
+| `range_fingerprint` | `self.segments` | no |
+
+So the node's own count and fingerprint disagree about the same range, and its
+manifest advertises an identifier `get()` cannot serve. The peer `Want`s it,
+receives nothing, and asks again next session. Every session. `rebuild_index`
+repairs it, which means the symptom is a node that reconciles correctly until
+it has been up long enough to hit `expire`, and then never converges again
+until it is restarted.
+
+### 3. SEVERE — control messages are free, and answering them is not · **open**
+
+RFC 3 §6 is "the central mechanism of this document", and `ExchangeView::put`
+implements it faithfully — for objects. `Range` is not an object. It is never
+charged, and `MAX_MESSAGES` permits 65 536 of them in one session.
+
+Measured against a 100 000-object corpus, for the 1 600 rows that fit in one
+64 KB frame:
+
+```text
+stored 100000
+1600 count_in_range   over 100000 objects: 210.678708ms
+1600 range_fingerprint over 100000 objects:  7.920745042s
+```
+
+`recon::respond` calls `describe` — which is one of each — once per offered
+range, and up to `RBSR_BRANCH` times more in the descend arm. Eight seconds of
+a core for 64 KB of upload, on a session bounded only at 65 536 messages.
+
+Two avoidable scans produce it. `count_in_range` and `entries_in_range` filter
+`self.index.keys()` although `index` is a `BTreeMap<(u32, ObjectId), _>` whose
+ordering is exactly the one being filtered on — `.range()` is available and
+unused. And `range_fingerprint` computes
+
+```rust
+let whole = b > lo_b && b < hi_b;
+```
+
+which is never true when `lo_b == hi_b`, so a range narrower than a day always
+takes the per-identifier edge-bucket scan with a `locate()` lookup for each.
+The attacker chooses the range width, so the attacker chooses which branch.
+
+The pattern is the one Pass 6 named and did not finish: a property that holds
+for five objects and fails for a hundred thousand. Pass 6 measured the corpus
+against convergence. Nothing had measured it against a peer choosing the
+question.
+
+### 4. SEVERE — both link bounds default to "unlimited" · **open**
+
+```rust
+fn scope_for(&self, peer: &str) -> filter::Filter {
+    self.credential_with(peer)
+        .map(|c| filter::Filter::from_credential(&c))
+        .unwrap_or_else(filter::Filter::unscoped)
+}
+
+fn budget_for(&mut self, peer: &str) -> Option<shared::Budget> {
+    let terms = self.inbound_terms(peer)?;      // None without a credential
+    …
+}
+```
+
+`Filter::admits` returns `true` on its first line for an unscoped filter, and
+`put` skips the quota block entirely when `budget` is `None`. So a peering
+whose credential ceremony was never completed reconciles with no retention
+horizon, no class mask, no shard, and no byte or object budget.
+
+That is the configuration finding 1 needs. The two mechanisms RFC 3 builds to
+bound a link both degrade to *unlimited* in the absence of the artifact that
+configures them, when the whole argument of §6 is that you peer with a
+stranger at 1% trust.
+
+**And a credential does not reliably restore the horizon either.**
+`Filter::admits` skips the retention check entirely when `retention_days` is
+zero:
+
+```rust
+if self.retention_days > 0 {
+    let horizon = now_min.saturating_add(self.retention_days.saturating_mul(1_440));
+    if header.expiry_min > horizon { return false; }
+}
+```
+
+while `Filter::between` derives the field as `a.min(b)`, on the stated
+reasoning that a floor commitment is the narrower of the two. Zero is the
+narrowest number and the widest policy. One reader treats it as "the tightest
+commitment either side offered"; the other treats it as "no commitment at
+all", and no code anywhere reconciles them. A negotiated credential naming
+zero days is a filter that admits every expiry there is.
+
+Pass 12's closing question, applied one level up from a struct field:
+**what does this default to, and is that the safe direction.** Pass 12 asked
+it of `Flags::default()`. Nobody had asked it of `Option::None`, and nobody
+had asked it of a zero that two functions read in opposite directions.
+
+### 5. `display::safe_block` is quadratic · **open**
+
+`out.chars().count()` is evaluated once per appended character, against a
+bound of `MAX_BLOCK = 512 * 1024`:
+
+```rust
+if out.chars().count() >= MAX_BLOCK {      // display.rs:164
+```
+
+Measured, release build:
+
+```text
+   1000 chars ->  94.791µs
+  10000 chars ->   3.776ms
+  50000 chars ->  55.317ms
+ 100000 chars -> 148.499ms
+ 262144 chars ->   1.0027s      ← the largest body an object can carry
+```
+
+`show_selected` runs it on the interface thread, so arrow-keying onto a
+hostile message freezes the interface for a second — and Pass 4 established
+what that costs: a frozen interface takes the lock chord with it, which is the
+one keystroke an operator might need urgently. The module's own bound is the
+attack surface: 512 KiB was chosen so that "no message this protocol can
+carry hits it", and the cost of walking to it was never priced.
+
+`a_block_is_still_bounded` accounts for about four seconds of the test suite
+and has been paying for this in every run since it was written.
+
+### 6. Invisible characters walk past both halves of RFC 8 §7 · **open**
+
+`is_dangerous` removes the C0 controls, U+202A–202E, U+2066–2069,
+U+200B–200F, U+FEFF and U+2061–2064. `skeleton` filters on the same predicate,
+so anything `is_dangerous` misses is carried into the confusable comparison
+intact.
+
+Measured — for each of these, `safe()` reports `removed == 0` and
+`confusable_with_known` returns `None` against a known short id of
+`0797c2c1`:
+
+```text
+SOFT HYPHEN          U+00AD
+ARABIC LETTER MARK   U+061C     ← a bidi control, and not in the two ranges above
+HANGUL FILLER        U+3164
+TAG LATIN SMALL A    U+E0041
+VARIATION SELECTOR-1 U+FE00
+```
+
+The control holds: `pay 0797с2c1 now` with a Cyrillic `с` *is* flagged. So the
+mechanism works and is walked around, which is the worse of the two outcomes.
+
+No homoglyph is needed. A soft hyphen inside an otherwise exact short id
+renders as nothing — ratatui drops U+00AD, U+061C and U+3164 before they reach
+the terminal — and changes the skeleton, so the note reads as the identifier
+and is not marked. The module states its **confusables table** is a subset and
+says what that costs. It does not state that its **removal set** is one, and
+the removal set is what the skeleton depends on.
+
+The fix is not a longer list. `char::is_control` is category Cc; what this
+wants is Cc, Cf, Cn, Zl and Zp — a predicate rather than an enumeration, with
+the enumeration kept only for the ranges a predicate would miss.
+
+### 7. One body path skips the sanitiser · **open**
+
+In `show_selected`, the post-detail branch sanitises:
+
+```rust
+display::safe_block(text).text                  // main.rs:5808
+```
+
+and the channel-overview branch, twenty lines below, does not:
+
+```rust
+posts.join("\n")                                // main.rs:5825
+```
+
+`channel_posts` builds those from `String::from_utf8_lossy(&p.payload)` —
+signed, but written by somebody else. Not escape injection: ratatui 0.29 drops
+Cc characters before the backend prints, which I verified rather than assumed.
+But U+200D and U+2028 survive into the buffer, and everything in finding 6
+survives everywhere.
+
+Found while reading for something else: `channel_posts` scans the entire
+corpus and decodes every object in it on **every keystroke** that moves the
+list cursor.
+
+### 8. The picture decoder's parent trusts one number it says it does not · **open**
+
+`cells_isolated` checks the child's framing, under a comment that is exactly
+right about why:
+
+```rust
+// The parent checks the child's arithmetic. A compromised child is not
+// bound by anything inside it, so its framing is input like any other.
+if n.saturating_mul(w).saturating_mul(6) != out.len() - 8 {
+    return Err(Error::Corrupt);
+}
+let mut grid = Vec::with_capacity(n);
+```
+
+`n = u32::MAX, w = 0` satisfies it — `0 == 0` — for an eight-byte reply. The
+`with_capacity` that follows is over a 24-byte element and asks for about
+100 GB. The saturating multiplications were added so the check could not
+overflow; nothing bounds `n` when the product is zero for the other reason.
+
+### 9. A truncated length prefix reads as a clean close · **open**
+
+`frame::read` and `read_bytes` map `UnexpectedEof` on the four-byte length to
+`Ok(None)`, which is the value that means "the peer finished". One to three
+bytes then a cut connection is indistinguishable from a polite goodbye. RFC 0
+I-4 makes an unreachable peer normal, which is the argument for not escalating
+— it is not an argument for the two being the same value.
+
+### 10. `Control::parse` is malleable · **open**
+
+The outer array length is read and never reconciled against what the opcode
+consumed, and `Reader::is_done` is never checked, so trailing bytes inside a
+frame parse cleanly. Control messages are never hashed, stored or relayed, so
+nothing rests on their canonicity today — but `write(parse(x)) != x` is a
+property RFC 4 §5.5 will need the moment an archive is signed.
+
+Separately, `u32::try_from(v)? as u16` truncates for both fields that use it:
+a `Hello` declaring version 65 536 parses as version 1's, and a `Bye` with
+reason 65 536 reads as reason 0.
+
+### 11. The workspace's only `unsafe` is UB, and it is in a test · **open**
+
+`apps/krab-tui/src/line.rs:294` reads `Vec::spare_capacity_mut()` as
+initialised `char` to assert that `take()` overwrote the passphrase. Reading
+uninitialised memory is UB, and an arbitrary bit pattern is not a valid
+`char`, so the assertion is not sound evidence for the thing it is checking —
+a compiler entitled to assume validity is entitled to fold the check away.
+The property is worth testing; the observation has to be made through
+initialised memory.
+
+`apps/krab-tui` is also the only crate in the workspace without
+`#![forbid(unsafe_code)]`, which is why this compiles at all.
+
+### 12. A file that cannot exist on Windows is tracked · **open**
+
+A zero-byte file named `` .num()).unwrap_or(0);|X| `` — a shell redirection
+that got away — has been in the tree since ce22d72. `|` is not a legal
+filename character on Windows, so `git clone` fails there outright. RFC 0 §9's
+argument is that a user must be able to verify the binary without trusting the
+author; a checkout that fails on a major platform is the first step of that
+failing.
+
+### What did not fail
+
+- **The CBOR reader.** It borrows throughout, allocates nothing, checks every
+  declared length against the input rather than trusting it, and enforces all
+  five of RFC 1 §4.3's rules including the ones a general library would not.
+  I tried to find a length it would trust and could not.
+- **`frame::read`'s bound.** `MAX_FRAME` is checked before the allocation, in
+  both the control and the raw path, which is the rule finding 9 in Pass 3 was
+  about. It held.
+- **The picture decoder's isolation.** A separate process, a 20-second kill,
+  a 64 MB output cap, and a fallback that is reported rather than silent.
+  Finding 8 is one arithmetic gap in an otherwise complete boundary.
+- **`transcode`'s pixel cap.** Taken from the header before any decoder
+  allocates, then re-checked against what the decoder actually produced, which
+  is the check that closes the gap the first one leaves.
+- **Constant-time comparison where it is load-bearing.** `noise.rs` uses
+  `subtle::ConstantTimeEq` for the key check. The one non-constant comparison
+  I found, `rekey_run.rs:200`, is over a value both ends derive from the same
+  root inside an already-authenticated session.
+- **`chunks_exact` everywhere**, with a `% 32 != 0` rejection in front of each
+  of the three sites, so a trailing partial chunk is refused rather than
+  silently dropped.
+- **The build.** Clean `clippy` across the workspace with `--all-targets`,
+  clean `cargo test --workspace --release`, and `#![forbid(unsafe_code)]` on
+  all six library crates.
+
+### The pattern
+
+Passes 7 through 12 found new work not reaching what older work owned. This
+one is a different shape, and it is the one a reader is least likely to catch:
+**every finding here is a bound that exists, is documented, is correct, and
+does not run.**
+
+I2's ceiling is implemented and every caller disables it. The quota is
+implemented and does not cover the message class that costs the most to
+answer. The filter is implemented and returns `true` on its first line for the
+configuration an attacker would choose. The sanitiser is implemented and its
+removal set is narrower than the check that depends on it. In every case the
+code that would have to be read to see the defect is not the code the comment
+is attached to.
+
+That is why grepping for the check finds nothing. The question that finds
+these is not "is this bounded" — the answer is always yes, in writing, next to
+the bound. It is **"who supplies the bound, and what do they actually pass"**,
+which is a call-site question rather than a definition question, and none of
+the twelve previous passes had asked one.
+
+Two of the four severe findings compose: 1 makes 2 reachable, and 4 makes 1
+reachable from the network. A pass that had found any one of them alone would
+have priced it as a nuisance.

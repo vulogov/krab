@@ -1235,7 +1235,7 @@ impl App {
     /// beyond which no honest peer still offers the object (RFC 5 §8).
     fn enforce_retention(&mut self) {
         let now_min = now_epoch().0 * 1440;
-        const MAX_TTL_MIN: u32 = 45 * 1440;
+        use krab_core::tag::MAX_TTL_MIN;
         let cap = peering::Policy::default().retention_bytes;
 
         let (expired, evicted) = self.store.with(|s| {
@@ -8239,7 +8239,7 @@ impl App {
         // expires at exactly `now + MAX_TTL` — the upper edge. A window that
         // stopped there would omit everything written today, every time.
         let now = now_epoch().0 * 1440;
-        const MAX_TTL_MIN: u32 = 45 * 1440;
+        use krab_core::tag::MAX_TTL_MIN;
         let window = (
             now.saturating_sub(MAX_TTL_MIN),
             now.saturating_add(MAX_TTL_MIN) + 1,
