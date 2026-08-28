@@ -188,20 +188,93 @@ pub fn transcode(bytes: &[u8]) -> Result<Vec<u8>, Error> {
         return Err(Error::Corrupt);
     }
 
-    // 3. Re-encode. Nothing from the input reaches the output but pixels:
-    //    no EXIF, no ICC, no trailing bytes, no ancillary chunks.
+    // 3. Re-encode, shrinking until it fits. Nothing from the input reaches
+    //    the output but pixels: no EXIF, no ICC, no trailing bytes, no
+    //    ancillary chunks.
+    //
+    //    **A picture is resized rather than fragmented.** Splitting one across
+    //    objects would give an observer a set that travels together, expires
+    //    together and shares a bucket — and object independence is what the
+    //    padding in RFC 1 §8 buys. So the object stays one object and the
+    //    picture is made to fit it, which is a loss of detail rather than a
+    //    loss of unlinkability.
+    let (mut rgba, mut w, mut h) = (rgba, w, h);
+    for _ in 0..MAX_SHRINK_STEPS {
+        let out = encode_rgba(&rgba, w, h)?;
+        if out.len() <= MAX_OBJECT {
+            return Ok(out);
+        }
+        // Each step is a linear 3/4, so area falls to about half — enough to
+        // converge quickly, small enough not to overshoot into mush.
+        let (nw, nh) = (w * 3 / 4, h * 3 / 4);
+        if nw < MIN_SIDE || nh < MIN_SIDE {
+            return Err(Error::TooLarge { bytes: out.len() });
+        }
+        rgba = downscale(&rgba, w, h, nw, nh);
+        w = nw;
+        h = nh;
+    }
+    Err(Error::TooLarge {
+        bytes: MAX_OBJECT + 1,
+    })
+}
+
+/// Steps the shrink loop may take before giving up. Each removes about half
+/// the area, so this covers a picture roughly 250x the cap.
+const MAX_SHRINK_STEPS: usize = 8;
+
+/// Below this on either side a picture has stopped being one.
+const MIN_SIDE: u32 = 16;
+
+/// One PNG, at the best compression the encoder offers.
+///
+/// Compression is free size: it costs the sender CPU once and every carrier
+/// bandwidth for the life of the object, which on a courier or a radio link
+/// is the scarce thing (RFC 4 §5.4).
+fn encode_rgba(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut out, w, h);
         enc.set_color(ColorType::Rgba);
         enc.set_depth(BitDepth::Eight);
+        enc.set_compression(png::Compression::High);
         let mut writer = enc.write_header().map_err(|_| Error::Corrupt)?;
-        writer.write_image_data(&rgba).map_err(|_| Error::Corrupt)?;
-    }
-    if out.len() > MAX_OBJECT {
-        return Err(Error::TooLarge { bytes: out.len() });
+        writer.write_image_data(rgba).map_err(|_| Error::Corrupt)?;
     }
     Ok(out)
+}
+
+/// Box-average `src` down to `nw` x `nh`.
+///
+/// Averaging rather than dropping pixels: nearest-neighbour on a photograph
+/// produces the aliasing that makes a downscale look like damage, and the
+/// arithmetic here is a few adds per output pixel.
+fn downscale(src: &[u8], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (nw as usize) * (nh as usize) * 4];
+    for y in 0..nh {
+        let y0 = (y as u64 * h as u64 / nh as u64) as u32;
+        let y1 = (((y + 1) as u64 * h as u64 / nh as u64) as u32).max(y0 + 1).min(h);
+        for x in 0..nw {
+            let x0 = (x as u64 * w as u64 / nw as u64) as u32;
+            let x1 = (((x + 1) as u64 * w as u64 / nw as u64) as u32).max(x0 + 1).min(w);
+            let mut acc = [0u64; 4];
+            let mut n = 0u64;
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let i = ((sy as usize) * (w as usize) + sx as usize) * 4;
+                    for c in 0..4 {
+                        acc[c] += src[i + c] as u64;
+                    }
+                    n += 1;
+                }
+            }
+            let o = ((y as usize) * (nw as usize) + x as usize) * 4;
+            for c in 0..4 {
+                out[o + c] = if n == 0 { 0 } else { (acc[c] / n) as u8 };
+            }
+        }
+    }
+    out
 }
 
 fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), Error> {
@@ -724,10 +797,15 @@ mod tests {
         assert!(transcode(&[0xFF, 0xD8, 0x00, 0x00]).is_err());
     }
 
-    /// A picture that will not fit in one object is refused with the reason,
-    /// rather than being sent as something that cannot be reassembled.
+    /// **A picture too large for one object is resized to fit it.**
+    ///
+    /// It used to be refused. Fragmenting it instead would hand an observer a
+    /// set of objects that travel together, expire together and share a
+    /// bucket — and object independence is what RFC 1 §8's padding buys. So
+    /// the object stays one object and the picture is made to fit: a loss of
+    /// detail rather than a loss of unlinkability.
     #[test]
-    fn a_picture_too_large_for_one_object_is_refused() {
+    fn a_picture_too_large_for_one_object_is_resized_to_fit() {
         // Random pixels do not compress, so this exceeds the bucket while
         // staying well inside the pixel cap.
         let (w, h) = (512u32, 512u32);
@@ -745,10 +823,43 @@ mod tests {
             let mut wr = enc.write_header().unwrap();
             wr.write_image_data(&noise).unwrap();
         }
-        match transcode(&src) {
-            Err(Error::TooLarge { bytes }) => assert!(bytes > MAX_OBJECT),
-            other => panic!("expected a size refusal, got {other:?}"),
-        }
+        // The source does not fit; what comes back does, and is still a
+        // picture rather than a stub.
+        assert!(src.len() > MAX_OBJECT, "the fixture already fits");
+        let out = transcode(&src).expect("resized rather than refused");
+        assert!(
+            out.len() <= MAX_OBJECT,
+            "still too large: {} > {MAX_OBJECT}",
+            out.len()
+        );
+        let (ow, oh) = dimensions(&out).expect("a readable PNG");
+        assert!(ow < w && oh < h, "it was not actually resized: {ow}x{oh}");
+        assert!(ow >= MIN_SIDE && oh >= MIN_SIDE, "shrunk past being a picture");
+    }
+
+    /// A picture that already fits is not touched — no needless resampling.
+    #[test]
+    fn a_picture_that_fits_keeps_its_dimensions() {
+        let src = png_of(64, 48);
+        let out = transcode(&src).expect("transcodes");
+        assert!(out.len() <= MAX_OBJECT);
+        assert_eq!(dimensions(&out).unwrap(), (64, 48));
+    }
+
+    /// Averaging, not dropping: a downscale of a flat colour stays that
+    /// colour, which nearest-neighbour also manages but blurring would not.
+    #[test]
+    fn a_downscale_preserves_a_flat_colour() {
+        let (w, h) = (16u32, 16u32);
+        let src: Vec<u8> = (0..(w * h))
+            .flat_map(|_| [10u8, 200, 30, 255])
+            .collect();
+        let out = downscale(&src, w, h, 8, 8);
+        assert_eq!(out.len(), 8 * 8 * 4);
+        assert!(
+            out.chunks(4).all(|p| p == [10, 200, 30, 255]),
+            "the colour moved under the resample"
+        );
     }
 
     /// **RFC 4 §5.4** — and RFC 8 §6 requires saying so *before* sending,
