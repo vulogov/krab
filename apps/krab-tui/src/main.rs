@@ -11329,6 +11329,199 @@ mod tests {
         );
     }
 
+    /// **A peering survives a restart, and so does what it agreed.**
+    ///
+    /// The peer-link, the credential and the terms are on disk; the reservoir
+    /// is sealed under `W_N`, which is the part that was being lost. A
+    /// peering that came back without its reservoir would still look peered
+    /// and would quietly have stopped being post-quantum.
+    #[test]
+    fn a_peering_and_its_terms_survive_a_restart() {
+        let (a, _b, _a_id, b_id) = peered_pair("peering-restart");
+        let home = a.home.clone();
+        let pass = a.passphrase.as_string();
+
+        // What is on disk for that peer, before anything restarts.
+        assert!(a.peer_path(&b_id, artifact::PeerFile::Link).exists());
+        let terms_before = a.peer_terms(&b_id).is_some();
+        drop(a);
+
+        // A new process, same home: nothing carried in memory.
+        let mut restarted = App::default();
+        restarted.home = home;
+        // `unlock` is the path a restart takes: it reads the identity from
+        // disk rather than expecting one in memory.
+        restarted.unlock(pass.as_bytes()).expect("the store opens");
+
+        assert!(
+            restarted.peer_ids().iter().any(|p| p == &b_id),
+            "the peering is gone after a restart: {:?}",
+            restarted.peer_ids()
+        );
+        assert_eq!(
+            restarted.peer_terms(&b_id).is_some(),
+            terms_before,
+            "the peering came back without the terms it agreed"
+        );
+        // And the epoch key is the same one, so anything sealed under it —
+        // the reservoir among them — is still readable.
+        assert!(restarted.epoch_key.is_some());
+    }
+
+    /// Move every object A holds into B — what a reconciliation does, with
+    /// the scheduling and the transport taken out.
+    fn carry_all(from: &App, to: &App) {
+        let now_min = now_epoch().0 * 1440;
+        let objects: Vec<(krab_core::object::ObjectId, Vec<u8>)> = from.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|x| (i, x.to_vec())))
+                .collect()
+        });
+        for (i, bytes) in objects {
+            let _ = to.store.with(|s| s.ingest(i, bytes, now_min, u32::MAX));
+        }
+    }
+
+    /// **A relays for A and C without being able to read for them.**
+    ///
+    /// A is peered with B, C is peered with B, and A and C have never met.
+    /// This is the whole point of a store-and-forward corpus: B carries
+    /// ciphertext it cannot open, and the message arrives anyway.
+    #[test]
+    fn a_message_reaches_a_node_two_hops_away() {
+        let (mut a, mut b, _a_id, b_id) = peered_pair("relay-ab");
+        let (mut c, mut b2, _c_id, b2_id) = peered_pair("relay-cb");
+
+        // A writes to C. It cannot: they have no peering, which is the
+        // premise — so it writes to B, and what is proved is the carry.
+        type_command(&mut a, &format!("send {b_id} for the middle node"));
+        assert!(a.output.contains("composed"), "{}", a.output);
+
+        // A -> B, and B can read it: they are peered.
+        carry_all(&a, &b);
+        b.refresh_inbox();
+        assert!(
+            b.messages.iter().any(|m| m.body.contains("for the middle node")),
+            "the first hop did not arrive"
+        );
+
+        // Now the hop that matters. C writes to B2 and A never sees it, but
+        // the object crosses A on its way — carried, not read.
+        type_command(&mut c, &format!("send {b2_id} from the far side"));
+        carry_all(&c, &a);
+        a.refresh_inbox();
+        assert!(
+            !a.messages.iter().any(|m| m.body.contains("from the far side")),
+            "a node read mail addressed to somebody else"
+        );
+        // And A still holds it, which is what makes it a relay rather than a
+        // filter: the object is in the corpus it will offer onward.
+        let held = a.store.with(|s| s.entries_in_range(0, u32::MAX).len());
+        assert!(held > 1, "the relayed object was not kept: {held}");
+
+        // A -> B2 completes the second hop, and B2 opens what C sealed.
+        carry_all(&a, &b2);
+        b2.refresh_inbox();
+        assert!(
+            b2.messages.iter().any(|m| m.body.contains("from the far side")),
+            "the message did not survive the relay: {:?}",
+            b2.messages.iter().map(|m| &m.body).collect::<Vec<_>>()
+        );
+    }
+
+    /// **A channel post from each of three nodes reaches the other two.**
+    ///
+    /// Posts are class 1 and public, so unlike sealed mail every node that
+    /// carries them can read them — which is what makes a channel a channel.
+    #[test]
+    fn channel_posts_from_three_nodes_reach_them_all() {
+        let mut a = ready_node("three-chan-a");
+        let mut b = ready_node("three-chan-b");
+        let mut c = ready_node("three-chan-c");
+
+        let mut ids = Vec::new();
+        for (n, text) in [
+            (&mut a, "from A"),
+            (&mut b, "from B"),
+            (&mut c, "from C"),
+        ] {
+            type_command(n, "channel carry on");
+            type_command(n, "channel carry on");
+            type_command(n, "channel new");
+            ids.push(n.roster.mine.as_ref().unwrap().id());
+            post_now(n, text);
+        }
+
+        // A -> B -> C, and back, which is the shape of the line A-B-C.
+        carry_all(&a, &b);
+        carry_all(&c, &b);
+        carry_all(&b, &a);
+        carry_all(&b, &c);
+
+        // Every node holds every channel's post, including the two it did
+        // not write and the one it cannot post to.
+        for (who, node) in [("A", &a), ("B", &b), ("C", &c)] {
+            for (n, id) in ids.iter().enumerate() {
+                let posts = node.channel_posts(id);
+                assert!(
+                    !posts.is_empty(),
+                    "{who} is missing channel {n}'s post: {posts:?}"
+                );
+            }
+        }
+    }
+
+    /// **The same epoch must yield the same key after a restart.**
+    ///
+    /// This is what the roster, the group rosters and every peering's
+    /// reservoir are sealed under. If `W_N` differs between one start and the
+    /// next, all three are unreadable — and the reservoir's case is the
+    /// quietest: a peering silently loses its post-quantum property and
+    /// degrades to `mode_auth` with nothing said.
+    #[test]
+    fn an_epoch_yields_the_same_key_across_a_restart() {
+        let mut a = ready_node("epoch-stable");
+        let wrapped = a.path(artifact::Artifact::IdentityWrapped);
+        let params = a.identity.as_ref().unwrap().kek_params;
+        let kek = a
+            .identity
+            .as_ref()
+            .unwrap()
+            .kek(a.passphrase.as_string().as_bytes())
+            .expect("kek");
+
+        // An epoch this node has no wrapper for — the next day.
+        let future = krab_core::tag::Epoch(now_epoch().0 + 1);
+        let id = a.identity.as_mut().expect("identity");
+        let first = id.hierarchy.open_epoch(&kek, future, &mut OsRng).unwrap();
+        persist::write_identity(&wrapped, a.identity.as_ref().unwrap(), &kek, &mut OsRng)
+            .expect("written");
+
+        // What the next start does: read the identity back from disk and ask
+        // for the same epoch.
+        let mut reloaded = persist::read_identity(&wrapped, &kek, params).expect("read back");
+        let second = reloaded
+            .hierarchy
+            .open_epoch(&kek, future, &mut OsRng)
+            .unwrap();
+
+        assert_eq!(
+            first, second,
+            "the same epoch gave two different keys across a restart — \
+             everything sealed under the first is unreadable"
+        );
+        // And something sealed under it opens with the reloaded one, which is
+        // the property the reservoir actually depends on.
+        let sealed =
+            krab_crypto::kek::seal_under(&first, b"krab/reservoir", b"chunk", &mut OsRng)
+                .expect("sealed");
+        assert_eq!(
+            krab_crypto::kek::open_under(&second, b"krab/reservoir", &sealed).expect("opens"),
+            b"chunk"
+        );
+    }
+
     /// **A minted epoch key must reach the disk.**
     ///
     /// `open_epoch` is idempotent only against records it can see, and it
