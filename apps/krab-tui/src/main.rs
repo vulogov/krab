@@ -2995,7 +2995,13 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
     /// judgement, which is exactly what §6 is written against — and it is
     /// visible rather than silent, because `peers` reports it.
     fn budget_for(&mut self, peer: &str) -> Option<shared::Budget> {
-        let terms = self.inbound_terms(peer)?;
+        // A link with no credential gets the default terms rather than no
+        // budget: `put` skips the quota block entirely when this is `None`,
+        // so returning `None` meant an unfinished ceremony bought unmetered
+        // ingress — the same defect as the filter above, on the other bound.
+        let terms = self
+            .inbound_terms(peer)
+            .unwrap_or_default();
         let day = quota::day_of(self.now_s());
         let cell = self.spends.entry(peer.to_string()).or_insert_with(|| {
             std::sync::Arc::new(std::sync::Mutex::new(
@@ -3088,7 +3094,21 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
     fn scope_for(&self, peer: &str) -> filter::Filter {
         self.credential_with(peer)
             .map(|c| filter::Filter::from_credential(&c))
-            .unwrap_or_else(filter::Filter::unscoped)
+            // **Not `unscoped`.** A peering whose ceremony was never
+            // completed used to get no retention horizon, no class mask and
+            // no shard — strictly *more* than a peering that finished one,
+            // because `admits` returns true on its first line for an
+            // unscoped filter. An unfinished agreement is not an agreement to
+            // everything.
+            //
+            // The fallback is the terms the ceremony itself defaults to, so
+            // an incomplete peering behaves like a completed one at defaults
+            // rather than like no limits at all. RFC 3 §5's defaults are
+            // deliberately generous, so this throttles nobody honest.
+            .unwrap_or_else(|| {
+                let d = credential::LinkTerms::default();
+                filter::Filter::between(&d, &d, credential::Flags::default().class_mask)
+            })
     }
 
     /// `peer counter <n> <MB/day> <objects> <days>` — RFC 3 §5.2.
@@ -13882,11 +13902,22 @@ mod tests {
     /// a budget nobody signed is the unilateral judgement §6 is written
     /// against.
     #[test]
-    fn a_link_with_no_credential_has_no_budget() {
+    fn a_link_with_no_credential_is_metered_at_the_defaults() {
         let mut x = ready_node("nob-x");
         let mut y = ready_node("nob-y");
         let short_y = peer_up(&mut x, &mut y);
-        assert!(x.budget_for(&short_y).is_none());
+
+        // It used to be `None`, and `put` skips the quota block entirely on
+        // `None` — so a ceremony that was never completed bought unmetered
+        // ingress, which is strictly more than completing one grants.
+        let b = x
+            .budget_for(&short_y)
+            .expect("an uncredentialled link is unmetered");
+        let d = credential::LinkTerms::default();
+        assert!(
+            b.bytes_per_day <= d.bytes_per_day,
+            "the default budget is looser than the default terms"
+        );
     }
 
     /// **The budget survives a restart**, or it is not a budget: a peer that
@@ -13929,10 +13960,21 @@ mod tests {
         let short_y = peer_up(&mut x, &mut y);
         let short_x = peer_up(&mut y, &mut x);
 
-        // No credential yet: unscoped, and *not* the old zero.
+        // No credential yet: the *defaults*, not unscoped. An unfinished
+        // agreement used to admit everything, which is more than finishing
+        // one grants — `admits` returns true on its first line for an
+        // unscoped filter.
         let before = x.scope_for(&short_y);
-        assert!(before.is_unscoped());
+        assert!(
+            !before.is_unscoped(),
+            "an uncredentialled link admits everything"
+        );
         assert_ne!(before.digest(), [0u8; 32], "the vacuous digest is back");
+        let d = credential::LinkTerms::default();
+        assert_eq!(
+            before.retention_days, d.retention_days,
+            "the fallback is not the ceremony's own defaults"
+        );
 
         // Complete a credential on both ends.
         let proposal = x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default()));
@@ -13953,9 +13995,15 @@ mod tests {
             sy.digest(),
             "the two ends disagree about the scope of their own link"
         );
+        // Was `assert_ne!` against the pre-credential scope. That comparison
+        // stopped meaning anything once the fallback became the ceremony's
+        // own defaults: a credential agreeing those terms yields the same
+        // filter, correctly. What still has to hold is that the scope is a
+        // real one rather than the admit-everything filter it used to be.
+        assert!(!sx.is_unscoped());
         assert_ne!(
             sx.digest(),
-            before.digest(),
+            filter::Filter::unscoped().digest(),
             "a credentialled link is indistinguishable from an uncredentialled one"
         );
     }
