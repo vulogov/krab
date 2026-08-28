@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="Documentation/assets/krabnet-color.png" alt="Krab" width="240">
+</p>
+
 # Krab
 
 Friend-to-friend, store-and-forward messaging over any transport.
