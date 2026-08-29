@@ -533,7 +533,15 @@ pub fn cells_isolated(bytes: &[u8], cols: u32, rows: u32) -> Result<Vec<Vec<Cell
     req.extend_from_slice(&cols.to_le_bytes());
     req.extend_from_slice(&rows.to_le_bytes());
     req.extend_from_slice(bytes);
-    let out = run_isolated(&req)?;
+    decode_cells_reply(&run_isolated(&req)?, cols, rows)
+}
+
+/// Read the child's answer to [`cells_isolated`].
+///
+/// Separate from the spawn so it can be tested against a reply no honest child
+/// would send — which is the only kind that matters here, since the point of
+/// the check is that a compromised child is not bound by anything inside it.
+fn decode_cells_reply(out: &[u8], cols: u32, rows: u32) -> Result<Vec<Vec<Cell>>, Error> {
     if out.len() < 8 {
         return Err(Error::Corrupt);
     }
@@ -541,6 +549,22 @@ pub fn cells_isolated(bytes: &[u8], cols: u32, rows: u32) -> Result<Vec<Vec<Cell
     let w = u32::from_le_bytes(out[4..8].try_into().expect("4 bytes")) as usize;
     // The parent checks the child's arithmetic. A compromised child is not
     // bound by anything inside it, so its framing is input like any other.
+    //
+    // **The bounds come first, and the product is not a bound.** `n * w * 6`
+    // is zero whenever `w` is zero, whatever `n` says — so a reply of
+    // `n = u32::MAX, w = 0` with no payload satisfied the equality and then
+    // reached `Vec::with_capacity(n)`, which asks for about 103 GB and aborts
+    // the process. RFC 7 §9 sets `panic = "abort"`, so that is the node dying,
+    // not an error anyone catches.
+    //
+    // This process chose `cols` and `rows`, and a truthful answer cannot
+    // exceed them: `cells` clamps its output to exactly those. So they are the
+    // bound, they are known before a byte of the reply is read, and checking
+    // them makes the equality below a consistency check rather than a
+    // gatekeeper.
+    if n > rows as usize || w > cols as usize {
+        return Err(Error::Corrupt);
+    }
     if n.saturating_mul(w).saturating_mul(6) != out.len() - 8 {
         return Err(Error::Corrupt);
     }
@@ -989,5 +1013,43 @@ mod tests {
     fn the_child_wait_is_bounded() {
         assert!(CHILD_TIMEOUT <= std::time::Duration::from_secs(60));
         assert!(CHILD_TIMEOUT >= std::time::Duration::from_secs(5));
+    }
+
+    /// **A product is not a bound.** `n * w * 6` is zero whenever `w` is zero,
+    /// whatever `n` claims, so a reply of `n = u32::MAX, w = 0` with no
+    /// payload satisfied the equality and reached `Vec::with_capacity(n)` —
+    /// about 103 GB, and `panic = "abort"` makes that the node dying rather
+    /// than an error anyone catches.
+    #[test]
+    fn a_reply_cannot_ask_the_parent_for_an_absurd_allocation() {
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&u32::MAX.to_le_bytes()); // rows
+        reply.extend_from_slice(&0u32.to_le_bytes()); // columns
+        assert_eq!(decode_cells_reply(&reply, 80, 24), Err(Error::Corrupt));
+
+        // The mirror, and every other way past the equality.
+        for (n, w) in [(0u32, u32::MAX), (u32::MAX, u32::MAX), (25, 0), (0, 81)] {
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&n.to_le_bytes());
+            reply.extend_from_slice(&w.to_le_bytes());
+            assert_eq!(
+                decode_cells_reply(&reply, 80, 24),
+                Err(Error::Corrupt),
+                "n={n} w={w} was accepted"
+            );
+        }
+    }
+
+    /// And an honest reply still decodes.
+    #[test]
+    fn a_well_formed_reply_decodes() {
+        let (n, w) = (2usize, 3usize);
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&(n as u32).to_le_bytes());
+        reply.extend_from_slice(&(w as u32).to_le_bytes());
+        reply.extend(std::iter::repeat_n(7u8, n * w * 6));
+        let grid = decode_cells_reply(&reply, 80, 24).expect("honest reply");
+        assert_eq!(grid.len(), n);
+        assert!(grid.iter().all(|r| r.len() == w));
     }
 }

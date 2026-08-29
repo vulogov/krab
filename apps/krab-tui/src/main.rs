@@ -23,6 +23,16 @@
 //! requirements and it is easy to miss, because it works fine in a debug build
 //! where unwinding is enabled.
 
+// Every library crate in the workspace forbids this; the binary did not, and
+// so it was the one place an `unsafe` block could appear unremarked. One had:
+// a test that read `Vec::spare_capacity_mut()` back as initialised `char`,
+// which is undefined behaviour in the test for the code that wipes a
+// passphrase — see `line::tests::taking_the_line_overwrites_it`.
+//
+// `forbid` rather than `deny`: `deny` can be turned off by an `allow` on the
+// item that wants it, which is exactly the edit nobody reviews.
+#![forbid(unsafe_code)]
+
 mod activity;
 mod activity_log;
 mod artifact;

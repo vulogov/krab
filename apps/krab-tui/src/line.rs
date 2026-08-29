@@ -280,21 +280,46 @@ mod tests {
     }
 
     /// Taking the line overwrites it. The passphrase goes through here.
+    ///
+    /// # Why this stops where it does
+    ///
+    /// An earlier version reached into `spare_capacity_mut()` after `take` and
+    /// read it back as `char` through `assume_init`. That is undefined
+    /// behaviour and not a technicality: `clear` ends the elements' lifetimes,
+    /// so the memory is uninitialised as far as the language is concerned, and
+    /// `char` has a validity invariant a raw read can violate outright. A test
+    /// whose own soundness depends on the optimiser leaving it alone proves
+    /// nothing about the code it is testing — and it was the only `unsafe` in
+    /// this crate, which is why the crate now forbids it and this is safe.
+    ///
+    /// So the two halves are checked separately, and between them they are the
+    /// whole claim. `overwrite` zeroes every live character; `clear` calls
+    /// `overwrite` before dropping the length and keeps the allocation. What
+    /// is *not* checked is the bytes past the length after the fact, because
+    /// no safe read of them exists — and that is where the earlier version was
+    /// reaching.
     #[test]
     fn taking_the_line_overwrites_it() {
+        let mut l = Line::from("correct horse battery staple");
+        let cap = l.chars.capacity();
+
+        // Half one: the overwrite reaches every character that is there.
+        l.overwrite();
+        assert_eq!(l.chars.len(), 28, "the length must not change");
+        assert!(
+            l.chars.iter().all(|&c| c == '\0'),
+            "the buffer still holds the passphrase: {:?}",
+            l.chars
+        );
+
+        // Half two: `take` runs it, and reuses the same allocation — so what
+        // was zeroed above is the memory the passphrase was actually in, not
+        // a copy that a reallocation left behind.
         let mut l = Line::from("correct horse battery staple");
         let got = l.take();
         assert_eq!(got, "correct horse battery staple");
         assert!(l.is_empty());
         assert_eq!(l.cursor(), 0);
-        // The allocation is reused, and every character in it was overwritten
-        // before the length was dropped.
-        assert!(l.chars.capacity() >= 28);
-        let raw = l.chars.spare_capacity_mut();
-        let seen: Vec<char> = unsafe { raw[..28].iter().map(|c| c.assume_init()) }.collect();
-        assert!(
-            seen.iter().all(|&c| c == '\0'),
-            "the buffer still holds the passphrase: {seen:?}"
-        );
+        assert_eq!(l.chars.capacity(), cap, "the allocation was replaced");
     }
 }

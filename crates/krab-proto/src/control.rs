@@ -253,6 +253,29 @@ impl Control {
         w.finish()
     }
 
+    /// How many elements the outer array holds, for each opcode.
+    ///
+    /// The mirror of [`Control::write`], and the only place the two tables
+    /// meet — `every_opcode_round_trips` walks both, so a new opcode written
+    /// without an arity fails to parse rather than parsing loosely.
+    fn arity(op: u64) -> Option<usize> {
+        Some(match op {
+            0 => 5,  // Hello: version, node, watermark, filter digest
+            1 => 3,  // Manifest: filter digest, rows
+            2 => 2,  // Want: identifiers
+            3 => 2,  // Obj: bytes
+            4 => 1,  // Done
+            5 => 2,  // Range: descriptions
+            6 => 1,  // RangeDone
+            7 => 2,  // Bye: reason
+            8 => 4,  // Rekey: index, sealed, ephemeral
+            9 => 3,  // RekeyAck: index, confirmation
+            10 => 2, // Card: bytes
+            11 => 2, // Contribution: bytes
+            _ => return None,
+        })
+    }
+
     /// Decode. Never panics: this is pre-authentication input (RFC 0 §9).
     /// Decode one control message.
     ///
@@ -289,6 +312,15 @@ impl Control {
             cbor::Item::Uint(v) => v,
             _ => return Err(Error::Malformed),
         };
+        // **The outer length is part of the message, not decoration.** It was
+        // read, checked against zero, and then ignored — so every opcode
+        // accepted an array of any length, and the same logical message had
+        // unboundedly many encodings. RFC 1 §4.3 requires deterministic CBOR
+        // precisely so that it does not: a canonical encoding is what lets a
+        // signature or a digest over a message mean anything.
+        if Control::arity(op).ok_or(Error::UnknownOpcode)? != n {
+            return Err(Error::Malformed);
+        }
         let uint = |r: &mut cbor::Reader| -> Result<u64, Error> {
             match r.item().map_err(|_| Error::Malformed)? {
                 cbor::Item::Uint(v) => Ok(v),
@@ -308,19 +340,24 @@ impl Control {
             }
         };
         let u32f = |v: u64| -> Result<u32, Error> { u32::try_from(v).map_err(|_| Error::BadField) };
+        // **Narrowing is a check, not a cast.** `u32f(..)? as u16` silently
+        // truncated: a `version` of 65 536 parsed as 0, which is the value
+        // that means "the version this node speaks". A field whose out-of-
+        // range values fold onto a meaningful one is not a version field.
+        let u16f = |v: u64| -> Result<u16, Error> { u16::try_from(v).map_err(|_| Error::BadField) };
 
-        match op {
+        let msg = match op {
             0 => {
-                let version = u32f(uint(&mut r)?)? as u16;
+                let version = u16f(uint(&mut r)?)?;
                 let node = bytes32(&bstr(&mut r)?)?;
                 let watermark = u32f(uint(&mut r)?)?;
                 let filter_digest = bytes32(&bstr(&mut r)?)?;
-                Ok(Control::Hello {
+                Control::Hello {
                     version,
                     node,
                     watermark,
                     filter_digest,
-                })
+                }
             }
             1 => {
                 let filter_digest = bytes32(&bstr(&mut r)?)?;
@@ -337,10 +374,10 @@ impl Control {
                         .map_err(|_| Error::BadField)?;
                     entries.push(Entry { expiry_min, id });
                 }
-                Ok(Control::Manifest {
+                Control::Manifest {
                     filter_digest,
                     entries,
-                })
+                }
             }
             2 => {
                 let n = arr(&mut r)?;
@@ -353,10 +390,10 @@ impl Control {
                             .map_err(|_| Error::BadField)?,
                     );
                 }
-                Ok(Control::Want(ids))
+                Control::Want(ids)
             }
-            3 => Ok(Control::Obj(bstr(&mut r)?)),
-            4 => Ok(Control::Done),
+            3 => Control::Obj(bstr(&mut r)?),
+            4 => Control::Done,
             5 => {
                 let n = arr(&mut r)?;
                 if n % 4 != 0 {
@@ -375,12 +412,12 @@ impl Control {
                         count,
                     });
                 }
-                Ok(Control::Range(rs))
+                Control::Range(rs)
             }
-            6 => Ok(Control::RangeDone),
-            7 => Ok(Control::Bye {
-                reason: u32f(uint(&mut r)?)? as u16,
-            }),
+            6 => Control::RangeDone,
+            7 => Control::Bye {
+                reason: u16f(uint(&mut r)?)?,
+            },
             8 => {
                 let index = u32f(uint(&mut r)?)?;
                 // No `with_capacity` on a declared length anywhere near this:
@@ -389,22 +426,35 @@ impl Control {
                 // what actually arrived.
                 let sealed = bstr(&mut r)?.to_vec();
                 let ephemeral = bytes32(&bstr(&mut r)?)?;
-                Ok(Control::Rekey {
+                Control::Rekey {
                     index,
                     sealed,
                     ephemeral,
-                })
+                }
             }
-            10 => Ok(Control::Card(bstr(&mut r)?.to_vec())),
-            11 => Ok(Control::Contribution(bstr(&mut r)?.to_vec())),
+            10 => Control::Card(bstr(&mut r)?.to_vec()),
+            11 => Control::Contribution(bstr(&mut r)?.to_vec()),
             9 => {
                 let index = u32f(uint(&mut r)?)?;
                 let raw = bstr(&mut r)?;
                 let confirm: [u8; 8] = raw.try_into().map_err(|_| Error::BadField)?;
-                Ok(Control::RekeyAck { index, confirm })
+                Control::RekeyAck { index, confirm }
             }
-            _ => Err(Error::UnknownOpcode),
+            // `arity` already refused anything not listed there, so this is
+            // unreachable rather than a second gate — kept so the two tables
+            // cannot drift apart silently.
+            _ => return Err(Error::UnknownOpcode),
+        };
+
+        // **Nothing may follow the message.** The reader stopped where the
+        // message ended and never asked whether the buffer did, so any number
+        // of trailing bytes rode along inside the frame and parsed to exactly
+        // the same value. That is the same malleability the outer length
+        // check above closes, one layer out.
+        if !r.is_done() {
+            return Err(Error::Malformed);
         }
+        Ok(msg)
     }
 }
 
@@ -600,5 +650,91 @@ mod tests {
         raw.push(0x5a);
         raw.extend_from_slice(&u32::MAX.to_be_bytes());
         assert!(Control::parse(&raw).is_err());
+    }
+
+    /// **The outer array length is part of the message.** It was read, checked
+    /// against zero, and then ignored, so every opcode accepted an array of
+    /// any length and the same logical message had unboundedly many
+    /// encodings. RFC 1 §4.3 requires deterministic CBOR precisely so it does
+    /// not.
+    #[test]
+    fn the_outer_array_length_must_match_the_opcode() {
+        for msg in all() {
+            let bytes = msg.write();
+            assert_eq!(Control::parse(&bytes), Ok(msg.clone()), "the fixture");
+            // The head is `array(n)`, a single byte for n < 24. Rewriting it
+            // changes nothing else about the encoding.
+            let head = bytes[0];
+            assert_eq!(head & 0xE0, 0x80, "array head expected");
+            for wrong in [1u8, 2, 3, 4, 5, 6] {
+                if wrong == head & 0x1F {
+                    continue;
+                }
+                let mut bad = bytes.clone();
+                bad[0] = 0x80 | wrong;
+                assert!(
+                    Control::parse(&bad).is_err(),
+                    "opcode {} accepted an array of {wrong}",
+                    msg.opcode()
+                );
+            }
+        }
+    }
+
+    /// **Nothing may follow the message.** The reader stopped where the
+    /// message ended and never asked whether the buffer did, so any number of
+    /// trailing bytes rode along inside the frame and parsed to the same
+    /// value — the same malleability, one layer out.
+    #[test]
+    fn trailing_bytes_are_refused() {
+        for msg in all() {
+            let mut bytes = msg.write();
+            bytes.extend_from_slice(&[0xFF, 0x00, 0x42]);
+            assert!(
+                Control::parse(&bytes).is_err(),
+                "opcode {} accepted trailing bytes",
+                msg.opcode()
+            );
+        }
+    }
+
+    /// **Narrowing is a check, not a cast.** `u32f(..)? as u16` truncated, so
+    /// a version of 65 536 parsed as 0 — the value that means "the version
+    /// this node speaks". A field whose out-of-range values fold onto a
+    /// meaningful one is not a version field.
+    #[test]
+    fn an_out_of_range_version_is_refused_not_truncated() {
+        let mut w = cbor::Writer::new();
+        w.array(5)
+            .uint(0)
+            .uint(65_536)
+            .bstr(&[3u8; 32])
+            .uint(4_200)
+            .bstr(&[9u8; 32]);
+        let bytes = w.finish();
+        assert_eq!(Control::parse(&bytes), Err(Error::BadField));
+
+        // And the same for a close reason.
+        let mut w = cbor::Writer::new();
+        w.array(2).uint(7).uint(65_536 + 7);
+        assert_eq!(Control::parse(&w.finish()), Err(Error::BadField));
+
+        // The largest value that does fit still round-trips.
+        let mut w = cbor::Writer::new();
+        w.array(2).uint(7).uint(65_535);
+        assert_eq!(
+            Control::parse(&w.finish()),
+            Ok(Control::Bye { reason: 65_535 })
+        );
+    }
+
+    /// `arity` and `write` must not drift: a new opcode written without an
+    /// entry there would parse loosely, which is the state this replaced.
+    #[test]
+    fn every_written_opcode_has_an_arity() {
+        for op in 0..=11u64 {
+            assert!(Control::arity(op).is_some(), "opcode {op} has no arity");
+        }
+        assert_eq!(Control::arity(12), None);
     }
 }
