@@ -229,7 +229,7 @@ mod tests {
             expiry_min: NOW_MIN + 40_000 + salt as u32,
             tag: Tag([salt; 8]),
         };
-        let b = canonical_bytes(&h, &[salt; 40]).unwrap();
+        let b = canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).unwrap();
         (krab_crypto::object_id(&b), b)
     }
 
@@ -397,7 +397,7 @@ mod tests {
             expiry_min: NOW_MIN + 40_000,
             tag: Tag([9; 8]),
         };
-        let big = canonical_bytes(&big_header, &[7u8; 40]).unwrap();
+        let big = canonical_bytes(&big_header, &krab_core::object::example_sealed_body(7)).unwrap();
         source
             .ingest(krab_crypto::object_id(&big), big, NOW_MIN, u32::MAX)
             .unwrap();

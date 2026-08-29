@@ -87,8 +87,19 @@ fn object(salt: u32) -> (ObjectId, Vec<u8>) {
         expiry_min: NOW_MIN + 1_000 + (salt % (45 * DAY)),
         tag: Tag((salt as u64).to_le_bytes()),
     };
-    let mut body = [0u8; 40];
-    body[..4].copy_from_slice(&salt.to_le_bytes());
+    // A real §4.2 envelope: since RFC 1 §11 I4 is enforced at ingest, forty
+    // arbitrary bytes are not a body, and SIM-2 must measure objects a node
+    // would actually accept. Written out rather than using
+    // `example_sealed_body`, because the salt has to vary beyond one byte —
+    // 300 objects must be 300 objects, not 256 and 44 duplicates.
+    let body = krab_core::object::Envelope {
+        epoch: salt as u64,
+        tag_mode: 0,
+        suite: 1,
+        enc: &[salt as u8; 32],
+        ciphertext: &[(salt >> 8) as u8; 16],
+    }
+    .write();
     let b = canonical_bytes(&h, &body).expect("canonical");
     (krab_crypto::object_id(&b), b)
 }

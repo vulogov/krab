@@ -268,6 +268,167 @@ pub fn verify_padding(bytes: &[u8], body_len: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// A minimal well-formed `sealed` body, distinct per `salt`.
+///
+/// For callers that need an object whose body is *valid* and whose content
+/// does not matter — every fixture that used to write forty arbitrary bytes.
+/// Until RFC 1 §11 I4 was enforced those bytes were ingestible; now they are
+/// not, correctly, and a dozen hand-rolled replacements would be a dozen
+/// chances to write a body that is almost canonical and to blame the check
+/// for the rejection.
+///
+/// Nothing in it is secret and nothing is encrypted: it is a shape, not a
+/// message. It exists here rather than in each test module because the shape
+/// is RFC 1 §4.2's and this is where §4.2 lives.
+pub fn example_sealed_body(salt: u8) -> Vec<u8> {
+    Envelope {
+        epoch: 1,
+        tag_mode: 0,
+        suite: 1,
+        enc: &[salt; 32],
+        ciphertext: &[salt; 16],
+    }
+    .write()
+}
+
+/// The most nesting a v1 body may contain.
+///
+/// **Derived, and slack.** Every body RFC 1 §4.2 and RFC 6 define is a flat
+/// map of scalars, so one level is what is used. The bound exists because
+/// [`validate_body`] runs on pre-authentication input: a body of `[[[[…`
+/// nests as deep as it is long, and an object may be 262 128 bytes.
+const MAX_BODY_DEPTH: usize = 8;
+
+/// Validate a body and report how many bytes it occupies — RFC 1 §11 **I4**,
+/// and the length **I1** needs.
+///
+/// # Why these two checks are one function
+///
+/// I1 requires the padding after the body to be zero, and nothing knows where
+/// the body ends without decoding it — which is I4. So neither could be done
+/// without the other, and for a long time neither was done at all: `ingest`
+/// checked that an object's *length* equalled its declared bucket and stopped
+/// there, with a comment explaining that `body_len` was not available. Both
+/// were missing together because they are one check wearing two numbers.
+///
+/// §11's own note is what this costs when it is skipped: *"the identifier
+/// covers the padding, so a non-zero pad is a covert channel that every relay
+/// carries until expiry, believing it ordinary."* The same is true of a body
+/// with an unknown key, or one encoded non-canonically — bytes inside the
+/// identifier that the receiver did not understand and relayed anyway.
+///
+/// # What each class gets
+///
+/// `sealed` and `cover` bodies are §4.2's five-key envelope, so
+/// [`decode_envelope`] checks the key set exactly: unknown keys are refused
+/// and key 3 is refused *because* it is reserved. That is all of I4.
+///
+/// A `bulletin` body's key set is RFC 6's, not RFC 1's, and this layer does
+/// not know it — RFC 1 §3 makes the store handle opaque objects on purpose.
+/// What is checked here is I4's first clause in full: the body is exactly one
+/// deterministic CBOR map, every rule of §4.3 enforced, and nothing after it
+/// but padding. Its key *set* is checked where the format is known, in
+/// `bulletin::from_object` and `channels::from_object`, both of which refuse a
+/// map whose keys are not the ones they expect. That split is stated rather
+/// than implied, and it is the residue of the check, not a waiver of it.
+///
+/// `short` is refused outright: RFC 1 §5 makes it link-local and framed by
+/// RFC 4 §8, so it is not a corpus object and there is no ingest path for one.
+pub fn validate_body(bytes: &[u8]) -> Result<usize, Error> {
+    let header = RoutingHeader::parse(bytes)?;
+    let class = Class::from_byte(header.class).ok_or(Error::Malformed)?;
+    let body = bytes.get(ROUTING_HEADER_LEN..).ok_or(Error::Malformed)?;
+    match class {
+        Class::Sealed | Class::ReservedCover => decode_envelope(body).map(|(_, n)| n),
+        Class::Bulletin => walk_body(body),
+        Class::Short => Err(Error::Malformed),
+    }
+}
+
+/// One frame of [`walk_body`]'s explicit stack.
+enum Frame {
+    /// Items still owed by an open array.
+    Array(usize),
+    /// Items still owed by an open map — two per pair — and the last key seen.
+    ///
+    /// An even count means a key comes next, which is how §4.3 rule 3's
+    /// ascending-key requirement is enforced without a second reader.
+    Map { owed: usize, last: Option<u64> },
+}
+
+/// Walk exactly one deterministic CBOR map and return the bytes it spans.
+///
+/// Iterative rather than recursive: this is pre-authentication input, and a
+/// deeply nested body would otherwise choose this program's stack depth.
+/// Nothing is allocated against a declared count either — the counts are only
+/// counted down, so a truncated body fails on the first item that is not
+/// there, exactly as `Control::parse` does one layer up.
+fn walk_body(body: &[u8]) -> Result<usize, Error> {
+    let mut r = cbor::Reader::new(body);
+    let Ok(cbor::Item::Map(n)) = r.item() else {
+        // Every v1 body is a map. Requiring it makes the body's extent one
+        // item rather than "as many items as happen to fit before the
+        // padding", which is what makes the padding check below meaningful.
+        return Err(Error::Malformed);
+    };
+    let mut stack = alloc::vec![Frame::Map {
+        owed: n.checked_mul(2).ok_or(Error::Malformed)?,
+        last: None,
+    }];
+
+    while let Some(frame) = stack.last_mut() {
+        let expect_key = match frame {
+            Frame::Array(0) | Frame::Map { owed: 0, .. } => {
+                stack.pop();
+                continue;
+            }
+            Frame::Array(left) => {
+                *left -= 1;
+                false
+            }
+            Frame::Map { owed, .. } => {
+                *owed -= 1;
+                // Decremented already, so an *odd* remainder means the item
+                // just claimed was the key of its pair.
+                *owed % 2 == 1
+            }
+        };
+        // Every §4.3 rule the reader already owns — shortest form, definite
+        // lengths, no floats, no tags — is enforced here by asking it.
+        let item = r.item().map_err(|_| Error::Malformed)?;
+        if expect_key {
+            let cbor::Item::Uint(k) = item else {
+                // §4.3 rule 3: map keys are unsigned integers.
+                return Err(Error::Malformed);
+            };
+            let Some(Frame::Map { last, .. }) = stack.last_mut() else {
+                unreachable!("the frame was a map a line ago")
+            };
+            // Ascending, no duplicates — `<=` catches both.
+            if last.is_some_and(|p| k <= p) {
+                return Err(Error::Malformed);
+            }
+            *last = Some(k);
+            continue;
+        }
+        let child = match item {
+            cbor::Item::Array(n) => Some(Frame::Array(n)),
+            cbor::Item::Map(n) => Some(Frame::Map {
+                owed: n.checked_mul(2).ok_or(Error::Malformed)?,
+                last: None,
+            }),
+            _ => None,
+        };
+        if let Some(child) = child {
+            if stack.len() >= MAX_BODY_DEPTH {
+                return Err(Error::Malformed);
+            }
+            stack.push(child);
+        }
+    }
+    Ok(body.len() - r.remaining())
+}
+
 /// A decoded `sealed` envelope body, RFC 1 §4.2.
 ///
 /// Key 3 (`admission`) is absent by construction: RFC 1 §4.2 requires a v1

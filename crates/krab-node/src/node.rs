@@ -235,7 +235,7 @@ mod tests {
             expiry_min: 29_766_240 + salt as u32,
             tag: Tag([salt; 8]),
         };
-        let b = canonical_bytes(&h, &[salt; 40]).unwrap();
+        let b = canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).unwrap();
         (krab_crypto::object_id(&b), b)
     }
 

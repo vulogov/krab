@@ -410,7 +410,7 @@ mod tests {
                 expiry_min: 29_806_000 + salt as u32,
                 tag: krab_core::object::Tag([salt; 8]),
             };
-            let b = krab_core::object::canonical_bytes(&h, &[salt; 40]).unwrap();
+            let b = krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).unwrap();
             store
                 .ingest(krab_crypto::object_id(&b), b, 29_766_000, u32::MAX)
                 .unwrap();
@@ -439,7 +439,7 @@ mod tests {
             expiry_min: 29_806_000,
             tag: krab_core::object::Tag([7; 8]),
         };
-        let b = krab_core::object::canonical_bytes(&h, &[7u8; 40]).unwrap();
+        let b = krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(7)).unwrap();
         let id = krab_crypto::object_id(&b);
         store.ingest(id, b, 29_766_000, u32::MAX).unwrap();
         write_corpus(&path, &store).unwrap();

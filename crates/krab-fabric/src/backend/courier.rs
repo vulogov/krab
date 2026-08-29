@@ -186,7 +186,7 @@ mod tests {
             expiry_min: 29_766_240,
             tag: Tag([salt; 8]),
         };
-        canonical_bytes(&h, &[salt; 40]).unwrap()
+        canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).unwrap()
     }
 
     /// The whole point of building this backend early: a session is the same

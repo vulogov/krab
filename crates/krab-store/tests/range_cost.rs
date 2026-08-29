@@ -20,7 +20,7 @@ fn object(expiry_min: u32, salt: u32) -> (krab_core::object::ObjectId, Vec<u8>) 
         expiry_min,
         tag: Tag(salt.to_le_bytes().repeat(2).try_into().unwrap()),
     };
-    let bytes = canonical_bytes(&h, &salt.to_le_bytes().repeat(10)).unwrap();
+    let bytes = canonical_bytes(&h, &krab_core::object::example_sealed_body(salt as u8)).unwrap();
     (krab_crypto::object_id(&bytes), bytes)
 }
 

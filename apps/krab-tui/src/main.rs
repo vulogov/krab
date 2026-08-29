@@ -13755,7 +13755,7 @@ mod tests {
             expiry_min: now_epoch().0 * 1440 + 10_000,
             tag: krab_core::object::Tag((salt as u64).to_le_bytes()),
         };
-        krab_core::object::canonical_bytes(&h, &[salt as u8; 40]).unwrap()
+        krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(salt as u8)).unwrap()
     }
 
     /// Complete a credential between two ready nodes, both ends.
@@ -14831,7 +14831,7 @@ mod tests {
                 expiry_min: now_epoch().0 * 1440 + 40_000,
                 tag: krab_core::object::Tag([3; 8]),
             };
-            let b = krab_core::object::canonical_bytes(&h, &[3u8; 40]).unwrap();
+            let b = krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(3)).unwrap();
             (krab_crypto::object_id(&b), b)
         };
         a.store
@@ -15819,7 +15819,7 @@ mod tests {
                     expiry_min: now + 1_000 + (salt % 60_000),
                     tag: krab_core::object::Tag((salt as u64).to_le_bytes()),
                 };
-                let b = krab_core::object::canonical_bytes(&h, &[7u8; 40]).unwrap();
+                let b = krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(7)).unwrap();
                 let _ = s.ingest(krab_crypto::object_id(&b), b, now, u32::MAX);
                 salt += 1;
                 if salt > 20_000 {
@@ -15863,7 +15863,7 @@ mod tests {
                 expiry_min: now + 40_000,
                 tag: krab_core::object::Tag([3; 8]),
             };
-            let b = krab_core::object::canonical_bytes(&h, &[3u8; 40]).unwrap();
+            let b = krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(3)).unwrap();
             s.ingest(krab_crypto::object_id(&b), b, now, u32::MAX)
                 .unwrap();
         });

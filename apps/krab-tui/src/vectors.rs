@@ -505,6 +505,7 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
             Err(Reject::BelowWatermark) => "BelowWatermark",
             Err(Reject::Malformed) => "Malformed",
             Err(Reject::BadPadding) => "BadPadding",
+            Err(Reject::BadBody) => "BadBody",
             Err(Reject::IdMismatch) => "IdMismatch",
             Err(Reject::Unrecognised) => "Unrecognised",
             // No catch-all: a new `Reject` variant should fail to compile here
@@ -521,7 +522,12 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
             expiry_min: expiry,
             tag: Tag([7; 8]),
         };
-        let b = canonical_bytes(&h, &[7u8; 40]).unwrap();
+        // A real §4.2 envelope, not forty arbitrary bytes. Every case below
+        // is meant to fail one named check, and a body that is not
+        // deterministic CBOR fails I4 first — so a fixture that could not be
+        // ingested for an unrelated reason would make the whole table say
+        // `BadBody` and prove nothing.
+        let b = canonical_bytes(&h, &envelope_body(7)).unwrap();
         (krab_crypto::object_id(&b), b)
     };
 
@@ -566,7 +572,73 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
     let id = krab_crypto::object_id(&junk);
     out.push(("bad_class", name_of(s.ingest(id, junk, NOW, u32::MAX))));
 
+    // I3 — and the reserved flag bits are zero. §4.1 defines bits 0 and 1;
+    // 2..7 are MBZ, and they are inside the identifier, so anything put there
+    // is carried by every relay until expiry. The refusal is `Malformed`
+    // because the frozen header is where this is checked: for those sixteen
+    // bytes, a reserved bit set is a header that does not parse.
+    let mut junk = bytes.clone();
+    junk[3] = 0b0000_0100;
+    let id = krab_crypto::object_id(&junk);
+    out.push(("reserved_flag_set", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+
+    // I1 — the padding after the body is zero. The identifier covers it, so a
+    // non-zero pad is a covert channel every relay carries believing it
+    // ordinary.
+    let mut junk = bytes.clone();
+    let last = junk.len() - 1;
+    junk[last] = 0xFF;
+    let id = krab_crypto::object_id(&junk);
+    out.push(("nonzero_padding", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+
+    // I4 — the body parses as deterministic CBOR.
+    let h = RoutingHeader {
+        version: 1,
+        class: 0,
+        size_bucket: 0,
+        flags: 0,
+        expiry_min: NOW + 40_000,
+        tag: Tag([7; 8]),
+    };
+    let junk = canonical_bytes(&h, &[0xFFu8; 40]).unwrap();
+    let id = krab_crypto::object_id(&junk);
+    out.push(("body_not_cbor", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+
+    // I4 — and carries no key that is not defined for this version. Key 3 is
+    // `admission`, reserved: §4.2 says reserved means absent, not
+    // present-and-empty.
+    let mut w = krab_core::cbor::Writer::new();
+    w.map(6)
+        .uint(0)
+        .uint(1)
+        .uint(1)
+        .uint(0)
+        .uint(2)
+        .uint(1)
+        .uint(3)
+        .bstr(&[])
+        .uint(4)
+        .bstr(&[7u8; 32])
+        .uint(5)
+        .bstr(&[7u8; 16]);
+    let junk = canonical_bytes(&h, &w.finish()).unwrap();
+    let id = krab_crypto::object_id(&junk);
+    out.push(("reserved_body_key", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+
     out
+}
+
+/// A minimal but real §4.2 envelope body, for fixtures that are meant to fail
+/// some *other* check.
+fn envelope_body(salt: u8) -> Vec<u8> {
+    krab_core::object::Envelope {
+        epoch: 1,
+        tag_mode: 0,
+        suite: 1,
+        enc: &[salt; 32],
+        ciphertext: &[salt; 16],
+    }
+    .write()
 }
 
 #[cfg(test)]

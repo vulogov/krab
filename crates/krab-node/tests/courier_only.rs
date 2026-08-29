@@ -72,7 +72,7 @@ fn object(salt: u8) -> (ObjectId, Vec<u8>) {
         expiry_min: NOW_MIN + 40_000 + salt as u32,
         tag: Tag([salt; 8]),
     };
-    let b = canonical_bytes(&h, &[salt; 40]).expect("canonical");
+    let b = canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).expect("canonical");
     (krab_crypto::object_id(&b), b)
 }
 
@@ -217,7 +217,8 @@ fn a_sealed_message_crosses_by_courier() {
     use krab_crypto::dh::SecretKey;
     use krab_crypto::reservoir::Reservoir;
     use krab_crypto::rng::NotRandom;
-    use krab_crypto::seal::{info_for, open, seal, Mode, Sealed, ENC_LEN};
+    use krab_core::object::{decode_envelope, Envelope};
+    use krab_crypto::seal::{info_for, open, Mode, Sealed, ENC_LEN};
 
     let post = temp_dir("sealed");
     let archive = post.join("out.krab");
@@ -243,10 +244,21 @@ fn a_sealed_message_crosses_by_courier() {
     };
     // RFC 1 §6.1: the AAD binds the routing header, so a relay that edits the
     // expiry to force indefinite storage produces something undecryptable.
-    let aad = header.write();
+    //
+    // The header alone is not the whole AAD in production — `compose::seal_to`
+    // appends `Envelope::aad_prefix`, which is what binds the epoch and suite
+    // as well. This test predates I4 being enforced and was building its own
+    // object shape: `enc ‖ ct` as raw bytes, which is not a §4.2 body and is
+    // not what any node sends. It went unnoticed because nothing checked, and
+    // an end-to-end test that constructs an object no encoder produces is
+    // testing a format that does not exist.
+    let mut aad = header.write().to_vec();
     let info = info_for(header.class);
+    let suite = 1u64;
 
-    let sealed = seal(
+    // Two phases, because `aad_prefix` needs the encapsulated key and
+    // `Encap` does not take the AAD — the same ordering `compose` resolves.
+    let (enc_key, mut ctx) = krab_crypto::seal::begin_seal(
         &Mode::AuthPsk {
             chunk: &chunk_s,
             epoch,
@@ -254,16 +266,30 @@ fn a_sealed_message_crosses_by_courier() {
         &sender,
         &recipient.public(),
         &info,
-        &aad,
-        plaintext,
         &mut NotRandom::seeded(3),
     )
-    .expect("sealed");
+    .expect("encapsulated");
+    aad.extend_from_slice(&Envelope::aad_prefix(
+        epoch.0 as u64,
+        0,
+        suite,
+        &enc_key,
+    ));
+    let ct = ctx.seal(plaintext, &aad).expect("sealed");
+    let sealed = Sealed {
+        enc: enc_key,
+        ct: ct.clone(),
+    };
 
-    // The object body is the encapsulated key followed by the ciphertext.
-    let mut body = Vec::with_capacity(ENC_LEN + sealed.ct.len());
-    body.extend_from_slice(&sealed.enc);
-    body.extend_from_slice(&sealed.ct);
+    // The object body is RFC 1 §4.2's envelope, as `compose` writes it.
+    let body = Envelope {
+        epoch: epoch.0 as u64,
+        tag_mode: 0,
+        suite,
+        enc: &sealed.enc,
+        ciphertext: &sealed.ct,
+    }
+    .write();
     let object_bytes = canonical_bytes(&header, &body).expect("canonical");
     let id = krab_crypto::object_id(&object_bytes);
 
@@ -299,15 +325,20 @@ fn a_sealed_message_crosses_by_courier() {
     let held = store.get(&id).expect("the object arrived");
 
     // Reconstruct and open, using only what the ceremony established.
+    //
+    // The body is decoded rather than sliced at fixed offsets. That is the
+    // point of §4.2 carrying lengths: the object was padded to its bucket and
+    // the identifier covers the padding (RFC 1 §8.1), so a reader that took
+    // the ciphertext length from the *sender's* framing — as this test used to
+    // — was reading a length no receiver has.
     let recovered = RoutingHeader::parse(held).expect("header parses");
-    let payload = &held[ROUTING_HEADER_LEN..];
+    let (env, _) = decode_envelope(&held[ROUTING_HEADER_LEN..]).expect("a §4.2 body");
+    assert_eq!(env.enc.len(), ENC_LEN);
     let mut enc = [0u8; ENC_LEN];
-    enc.copy_from_slice(&payload[..ENC_LEN]);
-    // The body was padded to its size bucket, and the identifier covers the
-    // padding (RFC 1 §8.1), so the ciphertext length has to come from the
-    // sender's framing rather than from what is on disk.
-    let ct = payload[ENC_LEN..ENC_LEN + sealed.ct.len()].to_vec();
+    enc.copy_from_slice(env.enc);
 
+    let mut aad = recovered.write().to_vec();
+    aad.extend_from_slice(&env.aad());
     let opened = open(
         &Mode::AuthPsk {
             chunk: &chunk_r,
@@ -315,9 +346,12 @@ fn a_sealed_message_crosses_by_courier() {
         },
         &recipient,
         &sender.public(),
-        &Sealed { enc, ct },
+        &Sealed {
+            enc,
+            ct: env.ciphertext.to_vec(),
+        },
         &info_for(recovered.class),
-        &recovered.write(),
+        &aad,
     )
     .expect("opens with what the ceremony established, and nothing else");
 

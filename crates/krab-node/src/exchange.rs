@@ -608,7 +608,7 @@ mod tests {
             expiry_min: NOW + 40_000 + salt,
             tag: Tag((salt as u64).to_le_bytes()),
         };
-        let b = canonical_bytes(&h, &[(salt % 251) as u8; 40]).unwrap();
+        let b = canonical_bytes(&h, &krab_core::object::example_sealed_body((salt % 251) as u8)).unwrap();
         (krab_crypto::object_id(&b), b)
     }
 

@@ -70,6 +70,14 @@ pub enum Reject {
     /// covers the padding, so a node relaying it carries whatever was put
     /// there, indefinitely, believing it to be an ordinary object.
     BadPadding,
+    /// I4 — the body is not deterministic CBOR, or carries a key that is not
+    /// defined for this version.
+    ///
+    /// Distinct from [`Reject::BadPadding`] although the two are checked
+    /// together: RFC 1 §11 gives every check a stable identifier so that "a
+    /// reviewer can ask which one a given line implements", and a shared
+    /// rejection would undo that at the only place it can be observed.
+    BadBody,
     /// I3 — the version or class is not one this implementation knows.
     ///
     /// RFC 1 §4.3: "unknown keys in a body of a known version MUST be
@@ -189,19 +197,36 @@ impl Store {
         if krab_core::object::Class::from_byte(header.class).is_none() {
             return Err(Reject::Unrecognised);
         }
+        // I3's second half — "reserved flag bits zero" — is already done, in
+        // `RoutingHeader::parse` above, whose contract says so: it "validates
+        // only what is frozen for all versions". Adding it here again would be
+        // dead code that reads like the only check.
 
-        // RFC 1 §11 I1 — length equals the declared bucket, and padding
-        // is zero (RFC 1 §8.1).
-        //
-        // `body_len` is not known here without decoding the body, which the
-        // store deliberately does not do — it handles opaque objects. What can
-        // be checked without decoding is the length, and that every byte after
-        // the largest possible body is zero. `verify_padding` with a body of
-        // the full remaining length degenerates to the length check alone, so
-        // the zero-padding scan is done directly below.
+        // RFC 1 §11 I1 — length equals the declared bucket.
         if bytes.len() != header.bucket_size() as usize {
             return Err(Reject::BadPadding);
         }
+
+        // RFC 1 §11 I4 — the body parses as deterministic CBOR, with no
+        // unknown keys for a known version — and I1's other half, that every
+        // byte after it is zero.
+        //
+        // **These two arrive together because neither can be done alone.**
+        // Nothing knows where the padding starts without decoding the body,
+        // and this check stopped at the length above for exactly that reason:
+        // the store handles opaque objects (RFC 1 §3) and giving it a body
+        // decoder would make every future body format a storage concern. So
+        // it does not have one — `krab_core::object` owns the body formats
+        // already, and answers the one question the store needs.
+        //
+        // §11 is explicit that this is not optional: "an implementation MUST
+        // apply every check before an object enters the store, and MUST NOT
+        // accept an object on which any check was skipped." Two of the six
+        // were skipped, and §11's own aside had already predicted it — "in a
+        // reference implementation of this document, three of these six were
+        // absent and nothing failed."
+        let body_len = krab_core::object::validate_body(&bytes).map_err(|_| Reject::BadBody)?;
+        krab_core::object::verify_padding(&bytes, body_len).map_err(|_| Reject::BadPadding)?;
 
         // RFC 1 §11 check 2 — this is what stops a relay extending TTL to
         // force indefinite storage.
@@ -239,19 +264,6 @@ impl Store {
             },
         );
         Ok(())
-    }
-
-    /// Verify zero padding after a decoded body — RFC 1 §11 I1.
-    ///
-    /// Separate from [`Store::ingest`] because it needs the body length, which
-    /// only a decoder knows. `ingest` enforces the length rule, which needs no
-    /// decode; a caller that decodes the body SHOULD call this as well.
-    ///
-    /// Split rather than merged because the store handles opaque objects by
-    /// design (RFC 1 §3), and giving it a body decoder would make every future
-    /// body format a storage-layer concern.
-    pub fn verify_body_padding(bytes: &[u8], body_len: usize) -> Result<(), Reject> {
-        krab_core::object::verify_padding(bytes, body_len).map_err(|_| Reject::BadPadding)
     }
 
     /// Drop tombstones no peer can still offer — RFC 5 §8.
@@ -544,8 +556,13 @@ mod tests {
             expiry_min,
             tag: Tag([salt; 8]),
         };
-        let bytes = canonical_bytes(&h, &[salt; 40]).unwrap();
+        let bytes = canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).unwrap();
         (krab_crypto::object_id(&bytes), bytes)
+    }
+
+    /// A body that is whatever bytes are given, valid or not.
+    fn alloc_body(raw: &[u8]) -> Vec<u8> {
+        raw.to_vec()
     }
 
     fn store_with(now: u32, objs: &[(u32, u8)]) -> Store {
@@ -974,20 +991,176 @@ mod tests {
     }
 
     /// **Non-zero padding is a covert channel that replicates.** The
-    /// identifier covers it, so a relay carries whatever was put there.
+    /// identifier covers it, so a relay carries whatever was put there,
+    /// indefinitely, believing it ordinary.
+    ///
+    /// Checked through `ingest` rather than through a helper. There used to be
+    /// a `Store::verify_body_padding` for exactly this, documented as
+    /// something a caller who decoded the body *SHOULD* call — and no caller
+    /// did. RFC 1 §11 does not have a SHOULD here: "an implementation MUST
+    /// apply every check before an object enters the store". A check reachable
+    /// only by a caller who remembers it is the shape of a check that is not
+    /// applied, so the helper is gone and the check is inline.
     #[test]
-    fn non_zero_padding_is_refused_when_the_body_length_is_known() {
-        let (_, bytes) = object(DAY, 5);
-        // A body of 40 bytes, as `object` builds.
-        assert!(Store::verify_body_padding(&bytes, 40).is_ok());
+    fn non_zero_padding_is_refused() {
+        let mut s = Store::new();
+        let (id, bytes) = object(DAY, 5);
+        assert_eq!(s.ingest(id, bytes.clone(), 0, MAX_TTL), Ok(()));
 
         let mut smuggled = bytes.clone();
         let last = smuggled.len() - 1;
+        assert_eq!(smuggled[last], 0, "the fixture must have padding to smuggle in");
         smuggled[last] = 0x41;
+        let id = krab_crypto::object_id(&smuggled);
         assert_eq!(
-            Store::verify_body_padding(&smuggled, 40),
+            s.ingest(id, smuggled, 0, MAX_TTL),
             Err(Reject::BadPadding),
             "a byte hidden in the padding must not pass"
         );
+    }
+
+    /// **RFC 1 §11 I4**, the check that could not exist until something knew
+    /// where the body ended.
+    #[test]
+    fn a_body_that_is_not_deterministic_cbor_is_refused() {
+        let mut s = Store::new();
+        let h = RoutingHeader {
+            version: 1,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: DAY,
+            tag: Tag([3; 8]),
+        };
+        for (why, body) in [
+            ("not CBOR at all", alloc_body(&[0xFF; 40])),
+            // Indefinite-length map: §4.3 rule 2.
+            ("indefinite length", alloc_body(&[0xBF, 0x00, 0x00, 0xFF])),
+            // {1: 0, 0: 0} — descending keys, §4.3 rule 3.
+            ("descending keys", alloc_body(&[0xA2, 0x01, 0x00, 0x00, 0x00])),
+            // {0: 0, 0: 0} — duplicate keys, same rule.
+            ("duplicate keys", alloc_body(&[0xA2, 0x00, 0x00, 0x00, 0x00])),
+            // A bare uint: a body is a map.
+            ("not a map", alloc_body(&[0x01])),
+            // A map whose declared pairs are not there.
+            ("truncated", alloc_body(&[0xA4, 0x00, 0x00])),
+        ] {
+            let bytes = canonical_bytes(&h, &body).unwrap();
+            let id = krab_crypto::object_id(&bytes);
+            assert_eq!(
+                s.ingest(id, bytes, 0, MAX_TTL),
+                Err(Reject::BadBody),
+                "{why} was accepted as a body"
+            );
+        }
+        assert!(s.is_empty());
+    }
+
+    /// The reserved envelope key, and any key §4.2 does not define. "Reserved
+    /// means absent, not present-and-empty" — and the identifier covers it, so
+    /// an accepted one is relayed by every node that takes it.
+    #[test]
+    fn an_undefined_envelope_key_is_refused() {
+        let mut s = Store::new();
+        let h = RoutingHeader {
+            version: 1,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: DAY,
+            tag: Tag([4; 8]),
+        };
+        for extra in [3u64, 6, 99] {
+            let mut w = krab_core::cbor::Writer::new();
+            w.map(6)
+                .uint(0)
+                .uint(1)
+                .uint(1)
+                .uint(0)
+                .uint(2)
+                .uint(1)
+                .uint(4)
+                .bstr(&[1u8; 32])
+                .uint(5)
+                .bstr(&[1u8; 16]);
+            // Appended so the keys stay ascending; `extra` is above 5 or is 3,
+            // and 3 is written in place below.
+            let body = if extra == 3 {
+                let mut w = krab_core::cbor::Writer::new();
+                w.map(6)
+                    .uint(0)
+                    .uint(1)
+                    .uint(1)
+                    .uint(0)
+                    .uint(2)
+                    .uint(1)
+                    .uint(3)
+                    .bstr(&[])
+                    .uint(4)
+                    .bstr(&[1u8; 32])
+                    .uint(5)
+                    .bstr(&[1u8; 16]);
+                w.finish()
+            } else {
+                w.uint(extra).uint(0);
+                w.finish()
+            };
+            let bytes = canonical_bytes(&h, &body).unwrap();
+            let id = krab_crypto::object_id(&bytes);
+            assert_eq!(
+                s.ingest(id, bytes, 0, MAX_TTL),
+                Err(Reject::BadBody),
+                "envelope key {extra} was accepted"
+            );
+        }
+    }
+
+    /// **I3's other half**, and where it actually lives.
+    ///
+    /// §4.1 defines flag bits 0 and 1; 2–7 are MBZ, and they are inside the
+    /// identifier, so anything put there is carried by every relay until
+    /// expiry — the covert channel §11 describes for padding, in a different
+    /// field. Enforced by `RoutingHeader::parse`, which is why the refusal is
+    /// `Malformed` and not `Unrecognised`: for the frozen sixteen bytes, a
+    /// reserved bit set *is* a header that does not parse.
+    ///
+    /// The test exists because I looked for this check in `ingest`, did not
+    /// find it, and concluded it was missing — over a set that was not the
+    /// whole set. It is here now so the next reader is told where it is
+    /// instead of adding a second copy.
+    #[test]
+    fn a_reserved_flag_bit_is_refused() {
+        let mut s = Store::new();
+        for bit in 2..8u8 {
+            let h = RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags: 1 << bit,
+                expiry_min: DAY,
+                tag: Tag([bit; 8]),
+            };
+            let bytes = canonical_bytes(&h, &krab_core::object::example_sealed_body(bit)).unwrap();
+            let id = krab_crypto::object_id(&bytes);
+            assert_eq!(
+                s.ingest(id, bytes, 0, MAX_TTL),
+                Err(Reject::Malformed),
+                "reserved flag bit {bit} was accepted"
+            );
+        }
+        // The two that are defined still pass.
+        for flags in [0u8, 0b01, 0b10, 0b11] {
+            let h = RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags,
+                expiry_min: DAY,
+                tag: Tag([flags; 8]),
+            };
+            let bytes = canonical_bytes(&h, &krab_core::object::example_sealed_body(flags)).unwrap();
+            let id = krab_crypto::object_id(&bytes);
+            assert_eq!(s.ingest(id, bytes, 0, MAX_TTL), Ok(()), "flags {flags}");
+        }
     }
 }
