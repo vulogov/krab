@@ -47,6 +47,9 @@ fuzz/target/
 # Every Artifact variant, by name.
 identity.wrapped
 kek.params
+# A directory now, one file per expiry bucket. The old single-file name is
+# kept below because a node upgraded in place still has one until it starts.
+corpus
 corpus.krab
 ceremony.cbor
 peer.card

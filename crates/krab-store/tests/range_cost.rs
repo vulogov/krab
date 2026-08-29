@@ -57,6 +57,45 @@ fn what_fetching_every_object_costs() {
     }
 }
 
+/// What a save costs, before and after the per-bucket layout.
+///
+/// `persist::write_corpus` packs the buckets the store reports dirty. A save
+/// runs after every exchange that received anything, so what matters is the
+/// cost of recording *one* new object, not the cost of the corpus.
+#[test]
+#[ignore = "measurement, not an assertion"]
+fn what_recording_one_object_costs() {
+    for n in [1_000u32, 10_000, 50_000] {
+        let mut s = corpus(n);
+        s.mark_saved();
+
+        // One object arrives, as it does from an exchange.
+        let (id, b) = object(1 + (n + 7) % MAX_TTL, n + 7);
+        s.ingest(id, b, 0, MAX_TTL).unwrap();
+
+        // The bytes a save would write: every dirty bucket, whole.
+        let dirty: Vec<u32> = s.dirty_buckets().collect();
+        let bytes: u64 = dirty
+            .iter()
+            .map(|&b| {
+                let lo = b * DAY;
+                let hi = lo.saturating_add(DAY);
+                s.entries_in_range(lo, hi)
+                    .iter()
+                    .filter_map(|(_, id)| s.get(id).map(|x| x.len() as u64))
+                    .sum::<u64>()
+            })
+            .sum();
+        println!(
+            "corpus {n:>6}: one object arrives → {} of {} buckets written, \
+             {bytes} bytes (whole corpus is {})",
+            dirty.len(),
+            s.buckets().count(),
+            s.bytes()
+        );
+    }
+}
+
 #[test]
 #[ignore = "measurement, not an assertion"]
 fn what_one_batch_of_ranges_costs() {

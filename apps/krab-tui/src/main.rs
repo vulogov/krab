@@ -346,7 +346,6 @@ fn main() -> io::Result<()> {
     let interrupted = [
         "identity.wrapped",
         "kek.params",
-        "corpus.krab",
         "ceremony.cbor",
     ]
     .iter()
@@ -1264,7 +1263,20 @@ impl App {
                 why: "corpus at capacity — oldest objects evicted",
             });
         }
-        let _ = expired;
+
+        // **What left memory has to leave the disk.** Removing objects from
+        // the store used to change nothing on disk until the next save, and a
+        // save only happens when something arrives — so a node that expired
+        // its corpus and then went quiet kept every expired segment, readable,
+        // indefinitely. Saving here sweeps them: `write_corpus` shreds the
+        // file of any bucket the store no longer holds.
+        //
+        // It costs the buckets that changed and nothing else, which is the
+        // point of the layout — this would have been a whole-corpus rewrite
+        // on every retention tick before it.
+        if expired > 0 || evicted > 0 {
+            self.save_corpus();
+        }
     }
 
     /// Destroy epoch wrapper keys past the retention window — RFC 7 §4.
@@ -9005,10 +9017,11 @@ impl App {
             )
             .map_err(|e| at("identity.wrapped", e))?;
         }
+        let dir = self.path(artifact::Artifact::Corpus);
         self.store
-            .with(|s| persist::write_corpus(&self.path(artifact::Artifact::Corpus), s))
+            .with(|s| persist::write_corpus(&dir, s, &mut OsRng))
             .map(|_| ())
-            .map_err(|e| at("corpus.krab", e))
+            .map_err(|e| at("corpus", e))
     }
 
     /// Start accepting calls, if `--listen` was given.
@@ -9142,10 +9155,15 @@ impl App {
     }
 
     /// Persist just the corpus. Cheap, and needs no key.
+    ///
+    /// Cheap now in a way it was not: this writes the segments that changed,
+    /// which after an exchange is usually one, rather than rewriting every
+    /// object the node holds. See `persist::write_corpus`.
     fn save_corpus(&self) {
+        let dir = self.path(artifact::Artifact::Corpus);
         let _ = self
             .store
-            .with(|s| persist::write_corpus(&self.path(artifact::Artifact::Corpus), s));
+            .with(|s| persist::write_corpus(&dir, s, &mut OsRng));
     }
 
     fn identity_params(&self) -> krab_crypto::kek::KekParams {
@@ -9278,8 +9296,20 @@ impl App {
 
         // The corpus goes through the same verification a stranger's archive
         // does. The disk is not trusted (RFC 7 §4).
+        //
+        // A node written by an earlier build has one `corpus.krab` instead of
+        // a directory of segments. It is migrated here, once, through the same
+        // import path — an upgrade that silently started with an empty corpus
+        // would look exactly like the data loss this series keeps finding.
+        let dir = self.path(artifact::Artifact::Corpus);
+        let old = self.home.join("corpus.krab");
+        let now_min = epoch.0 * 1440;
         let _ = self.store.with(|s| {
-            persist::read_corpus(&self.path(artifact::Artifact::Corpus), s, epoch.0 * 1440)
+            if !dir.exists() && old.exists() {
+                persist::migrate_corpus(&old, &dir, s, now_min, &mut OsRng)
+            } else {
+                persist::read_corpus(&dir, s, now_min)
+            }
         });
         // Both are sealed under the epoch key, so this is the first moment
         // either can be read — and a restarted node that could not find its
@@ -15144,7 +15174,11 @@ mod tests {
             "peer.card",
             "ceremony.cbor",
             "identity.wrapped",
-            "corpus.krab",
+            // The corpus is a directory of segments now. `remove_matching`
+            // recurses, shreds each `<bucket>.krab`, and removes the directory
+            // once it is empty — a directory that survived would name the
+            // expiry buckets this node held, which is a shape of its traffic.
+            "corpus",
         ] {
             assert!(!a.at(name).exists(), "{name} survived wipe");
         }
@@ -15284,11 +15318,27 @@ mod tests {
         let allowed = [
             "identity.wrapped", // sealed under the KEK
             "kek.params",       // plaintext, self-defeating to tamper with
-            "corpus.krab",      // content-addressed
+            "corpus",           // a directory of content-addressed segments
             "ceremony.cbor",    // signed cards, wrapped contribution
             "peer.card",        // signed
             "peer.pad",         // destroyed at seal; see the pad-life test
         ];
+        // The corpus directory holds one segment per expiry bucket, and a
+        // bucket number is the expiry — which every relay already reads from
+        // the frozen header. So the names disclose nothing the objects do not,
+        // and they are checked here rather than exempted.
+        let corpus = home.join("corpus");
+        if corpus.is_dir() {
+            for entry in std::fs::read_dir(&corpus).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                assert!(
+                    name.strip_suffix(".krab").is_some_and(|b| b
+                        .parse::<u32>()
+                        .is_ok()),
+                    "unexpected file in the corpus: {name}"
+                );
+            }
+        }
         for entry in std::fs::read_dir(&home).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let ok = allowed.contains(&name.as_str())
@@ -16441,6 +16491,69 @@ mod tests {
         );
     }
 
+    /// **A node upgraded in place must not start empty.**
+    ///
+    /// Every earlier build wrote one `corpus.krab`. An upgrade that silently
+    /// began with nothing would look exactly like the data loss this series
+    /// keeps finding — and it would be irreversible, because the first save
+    /// would then have nothing to write and the old file would sit beside a
+    /// live node that ignored it.
+    #[test]
+    fn a_corpus_written_by_an_earlier_build_is_migrated_on_open() {
+        let a = ready_node("migrate-open");
+        let home = a.home.clone();
+
+        // A node with something in it.
+        let h = krab_core::object::RoutingHeader {
+            version: 1,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: now_epoch().0 * 1440 + 10_000,
+            tag: krab_core::object::Tag([5; 8]),
+        };
+        let bytes =
+            krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(5))
+                .unwrap();
+        let id = krab_crypto::object_id(&bytes);
+        a.store
+            .with(|s| s.ingest(id, bytes, now_epoch().0 * 1440, u32::MAX))
+            .expect("ingested");
+        a.save_corpus();
+        assert!(home.join("corpus").is_dir(), "the new layout was not written");
+
+        // Now put the home back into the old layout, by hand: one archive over
+        // the whole window, and no directory.
+        let old = home.join("corpus.krab");
+        a.store.with(|s| {
+            crate::courier::pack(
+                s,
+                &old,
+                (0, u32::MAX),
+                &krab_fabric::profile::LinkProfile::courier(),
+            )
+            .expect("packed")
+        });
+        std::fs::remove_dir_all(home.join("corpus")).unwrap();
+
+        // A fresh node on that home migrates it. The identity is read back
+        // from `identity.wrapped`, exactly as a restart does — `Identity` does
+        // not implement `Clone`, and it should not: a second copy of the
+        // private keys is a second thing to zeroize.
+        let mut b = App {
+            home: home.clone(),
+            ..App::default()
+        };
+        b.unlock(b"a passphrase").expect("unlocks");
+
+        assert!(
+            b.store.with(|s| s.contains(&id)),
+            "the object did not survive the migration"
+        );
+        assert!(home.join("corpus").is_dir(), "the segments were not written");
+        assert!(!old.exists(), "the old file was left behind");
+    }
+
     /// `Ctrl-Q` and `quit` must do the same thing. They did not: one wrote the
     /// corpus out and the other did not.
     #[test]
@@ -16457,7 +16570,9 @@ mod tests {
             a.identity = Some(id);
             a.passphrase = line::Line::from("a passphrase");
             a.open_store().expect("the store opens");
-            std::fs::remove_file(a.path(artifact::Artifact::Corpus)).expect("start without one");
+            // The corpus is a directory of segments now, so starting without
+            // one means removing the directory.
+            let _ = std::fs::remove_dir_all(a.path(artifact::Artifact::Corpus));
             a
         };
 
@@ -16465,7 +16580,7 @@ mod tests {
         chord.on_key(KeyCode::Char('q'), KeyModifiers::CONTROL);
         assert!(chord.quit);
         assert!(
-            chord.at("corpus.krab").exists(),
+            chord.at("corpus").exists(),
             "Ctrl-Q left the corpus unwritten"
         );
 

@@ -112,7 +112,7 @@ impl Artifact {
         match self {
             Artifact::IdentityWrapped => "identity.wrapped",
             Artifact::KekParams => "kek.params",
-            Artifact::Corpus => "corpus.krab",
+            Artifact::Corpus => "corpus",
             Artifact::Ceremony => "ceremony.cbor",
             Artifact::PeerCard => "peer.card",
             Artifact::PeerPad => "peer.pad",
@@ -270,6 +270,11 @@ pub fn wiped(name: &str) -> bool {
         || name.ends_with(".link")
         || name.ends_with(".reservoir")
         || name.ends_with(".krab")
+        // The corpus directory itself. `remove_matching` removes a directory
+        // once it has emptied it, and every segment inside is a `.krab`, so
+        // the contents are covered above — this is here so that a *file* of
+        // that name, written by an earlier build, is destroyed too.
+        || name == "corpus"
         // `<peer>.credential`, the half-signed proposal written into the home
         // directory for handover. Operator-named in the sense that the peer
         // decides the prefix, so it cannot be an `Artifact` variant — and it

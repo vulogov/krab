@@ -8,7 +8,7 @@ use crate::segment::{bucket_of, Segment};
 use crate::Error;
 use krab_core::object::{ObjectId, RoutingHeader, TRUNC_LEN};
 use krab_crypto::Fingerprint;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The index keys covering the expiry range `[lo, hi)`.
 ///
@@ -117,6 +117,25 @@ pub struct Store {
     /// when the expiry was added to permit pruning at all.
     tombstones: BTreeMap<ObjectId, u32>,
     min_expiry_min: u32,
+    /// Buckets whose live contents changed since [`Store::mark_saved`].
+    ///
+    /// **The corpus is one file per bucket, and a save that rewrote all of
+    /// them rewrote the whole corpus.** At the 1 GiB retention cap that is a
+    /// gigabyte of I/O after every exchange that received anything, for a
+    /// change of one object — which is what RFC 5 §7's segment layout exists
+    /// to avoid: "eviction is `unlink()` of a whole segment: no compaction,
+    /// no tombstone sweep, no fragmentation, no write amplification."
+    ///
+    /// A set of bucket numbers, not of objects. Which bucket changed is
+    /// already public — it is the expiry, which every relay reads from the
+    /// frozen header — so this discloses nothing that eviction order does not
+    /// (RFC 5 §9).
+    ///
+    /// Buckets that *disappear* are not tracked here. Expiry and eviction
+    /// remove whole segments, and a saver comparing the files on disk against
+    /// [`Store::buckets`] sees a removal without being told about it — one
+    /// less thing that can be forgotten on a path that adds a segment.
+    dirty: BTreeSet<u32>,
 }
 
 impl Store {
@@ -251,6 +270,7 @@ impl Store {
         }
 
         let bucket = bucket_of(expiry);
+        self.dirty.insert(bucket);
         self.segments
             .entry(bucket)
             .or_insert_with(|| Segment::new(bucket))
@@ -469,9 +489,47 @@ impl Store {
                 }
             }
         }
+        // Every bucket at or below `now_min` may have lost index entries even
+        // though its segment survives — `expire` prunes an object at its own
+        // expiry, and unlinks a segment only once the whole bucket is past.
+        // A saver writes what the index holds, so those buckets are dirty.
+        let cut: Vec<u32> = self
+            .segments
+            .range(..=bucket_of(now_min))
+            .map(|(&b, _)| b)
+            .collect();
+        self.dirty.extend(cut);
         self.index.retain(|(e, _), _| *e > now_min);
         self.min_expiry_min = self.min_expiry_min.max(now_min);
         n
+    }
+
+    /// Buckets currently held, in order — the segments a saver should find.
+    pub fn buckets(&self) -> impl Iterator<Item = u32> + '_ {
+        self.segments.keys().copied()
+    }
+
+    /// Buckets whose contents changed since [`Store::mark_saved`].
+    pub fn dirty_buckets(&self) -> impl Iterator<Item = u32> + '_ {
+        self.dirty.iter().copied()
+    }
+
+    /// Declare the disk to match: nothing is owed.
+    ///
+    /// Called by the saver after a successful write, and by the loader after
+    /// reading — a store built by ingesting the files that are already there
+    /// owes nothing, and without this the first save after a restart rewrites
+    /// every segment it has just read.
+    pub fn mark_saved(&mut self) {
+        self.dirty.clear();
+    }
+
+    /// Declare every held bucket dirty.
+    ///
+    /// For a saver that cannot trust what is on disk: a migration from an
+    /// older layout, or a home directory emptied underneath a running node.
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty = self.segments.keys().copied().collect();
     }
 
     /// Evict under storage pressure until at or below `cap_bytes`.

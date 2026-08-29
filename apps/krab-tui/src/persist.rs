@@ -256,37 +256,165 @@ pub fn kek_for(passphrase: &[u8], params: &KekParams) -> Result<Kek, Error> {
     Kek::derive(passphrase, params).map_err(|_| Error::Locked)
 }
 
-/// Write the corpus, in the courier archive format.
+/// The name a bucket's segment file has inside the corpus directory.
 ///
-/// Packed to a temporary and renamed, so a crash cannot truncate the corpus.
-/// Objects are recoverable from peers, but a node that lost half its store on a
-/// power cut then spends its next reconciliations re-fetching what it already
-/// had — and on a serial or courier link that is hours or weeks.
-pub fn write_corpus(path: &Path, store: &Store) -> Result<usize, Error> {
+/// `.krab` because `artifact::wiped` already destroys every name with that
+/// suffix and `shred::remove_matching` recurses — so a segment is covered by
+/// `wipe` without a new rule, and a rule that has to be remembered is how both
+/// of the failures `artifact` exists for happened.
+fn segment_name(bucket: u32) -> String {
+    format!("{bucket}.krab")
+}
+
+/// The bucket a segment file names, if it names one.
+fn bucket_of_name(name: &str) -> Option<u32> {
+    name.strip_suffix(".krab")?.parse().ok()
+}
+
+/// The half-open expiry window a bucket covers.
+///
+/// The top bucket's true edge is past `u32::MAX`, and clamping there excludes
+/// the minute `u32::MAX` itself — which RFC 1 §11 I2 refuses at ingest, so no
+/// object can be in it.
+fn bucket_window(bucket: u32) -> (u32, u32) {
+    let start = krab_store::segment::bucket_start(bucket);
+    let end = krab_store::segment::bucket_end(bucket).min(u32::MAX as u64) as u32;
+    (start, end)
+}
+
+/// Write the segments that changed, and remove the ones that are gone.
+///
+/// # One file per bucket, not one file for the corpus
+///
+/// This wrote the whole corpus into `corpus.krab` on every call, and it is
+/// called after every exchange that received anything. At RFC 3 §5's default
+/// retention — a gigabyte — that is a gigabyte of I/O to record one new
+/// object, and it grows with the corpus rather than with the change.
+///
+/// RFC 5 §7 already said what the layout should be. Objects are grouped into
+/// TTL buckets so that "eviction is `unlink()` of a whole segment: no
+/// compaction, no tombstone sweep, no fragmentation, no write amplification.
+/// Courier export is a copy of whole segment files." The store had the
+/// buckets; only the writer did not use them.
+///
+/// So a save now touches the buckets that changed — usually one, since an
+/// object's bucket is its expiry day.
+///
+/// # Removal is a sweep, not a notification
+///
+/// Expiry and eviction drop whole segments, and nothing tells this function
+/// which. It compares the files on disk against [`Store::buckets`] instead, so
+/// a segment that disappears is noticed without the store having to remember
+/// to say so — one less thing a future edit can forget on the path that adds a
+/// segment.
+///
+/// The files are **shredded**, not unlinked. A segment holds sealed objects,
+/// so this is defence in depth and not the erasure — `shred`'s own module
+/// documentation is careful about the difference — but an expired segment is
+/// an artifact leaving the disk, and those are overwritten first.
+///
+/// Each segment is packed to a temporary and renamed, so a crash cannot
+/// truncate one. Objects are recoverable from peers, but a node that lost half
+/// its store on a power cut then spends its next reconciliations re-fetching
+/// what it already had — and on a serial or courier link that is hours or
+/// weeks.
+pub fn write_corpus(dir: &Path, store: &mut Store, rng: &mut dyn Rng) -> Result<usize, Error> {
+    std::fs::create_dir_all(dir).map_err(|_| Error::Io)?;
     let profile = krab_fabric::profile::LinkProfile::courier();
-    let tmp = crate::atomic::temp_for(path);
-    let n = crate::courier::pack(store, &tmp, (0, u32::MAX), &profile)
-        .map(|p| p.objects)
-        .map_err(|_| Error::Io)?;
-    std::fs::rename(&tmp, path).map_err(|_| Error::Io)?;
-    if let Some(dir) = path.parent() {
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
+
+    let mut written = 0;
+    for bucket in store.dirty_buckets().collect::<Vec<_>>() {
+        let path = dir.join(segment_name(bucket));
+        let tmp = crate::atomic::temp_for(&path);
+        let (lo, hi) = bucket_window(bucket);
+        let n = crate::courier::pack(store, &tmp, (lo, hi), &profile)
+            .map(|p| p.objects)
+            .map_err(|_| Error::Io)?;
+        std::fs::rename(&tmp, &path).map_err(|_| Error::Io)?;
+        written += n;
+    }
+
+    let held: std::collections::BTreeSet<u32> = store.buckets().collect();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(bucket) = bucket_of_name(&name) else {
+                continue;
+            };
+            if !held.contains(&bucket) {
+                crate::shred::remove(&entry.path(), rng);
+            }
         }
     }
-    Ok(n)
+
+    // The renames are only durable once the directory entry is.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    store.mark_saved();
+    Ok(written)
 }
 
 /// Read the corpus back, verifying every object.
 ///
 /// Uses the same path a stranger's archive takes. The disk is not trusted.
-pub fn read_corpus(path: &Path, store: &mut Store, now_min: u32) -> Result<usize, Error> {
-    if !path.exists() {
+///
+/// Every segment file in the directory is imported. A file that fails
+/// verification contributes nothing and does not stop the others: the corpus
+/// is content-addressed, so a damaged segment is a gap, and refusing to start
+/// because one bucket is corrupt would turn a recoverable loss into a total
+/// one.
+pub fn read_corpus(dir: &Path, store: &mut Store, now_min: u32) -> Result<usize, Error> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Err(Error::Absent);
+    };
+    let (mut accepted, mut files) = (0, 0);
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if bucket_of_name(&name).is_none() {
+            continue;
+        }
+        files += 1;
+        if let Ok(i) = crate::courier::import(store, &entry.path(), now_min) {
+            accepted += i.accepted;
+        }
+    }
+    // What was just read is what is on disk, so nothing is owed. Without this
+    // the first save after a restart rewrites every segment it has just read —
+    // the whole-corpus write this layout replaced, once per start.
+    store.mark_saved();
+    if files == 0 {
         return Err(Error::Absent);
     }
-    crate::courier::import(store, path, now_min)
+    Ok(accepted)
+}
+
+/// Move a single-file `corpus.krab` into the per-bucket layout.
+///
+/// A node written by an earlier build has one file. This reads it through the
+/// same verification path, writes the segments, and shreds the original. It
+/// runs once, because afterwards the directory exists.
+///
+/// An upgrade that silently started with an empty corpus would look exactly
+/// like the data loss this series keeps finding, so the migration is a step
+/// rather than a fallback.
+pub fn migrate_corpus(
+    old: &Path,
+    dir: &Path,
+    store: &mut Store,
+    now_min: u32,
+    rng: &mut dyn Rng,
+) -> Result<usize, Error> {
+    if !old.exists() {
+        return Err(Error::Absent);
+    }
+    let accepted = crate::courier::import(store, old, now_min)
         .map(|i| i.accepted)
-        .map_err(|_| Error::Malformed)
+        .map_err(|_| Error::Malformed)?;
+    store.mark_all_dirty();
+    write_corpus(dir, store, rng)?;
+    crate::shred::remove(old, rng);
+    Ok(accepted)
 }
 
 #[cfg(test)]
@@ -398,7 +526,7 @@ mod tests {
     #[test]
     fn the_corpus_survives_and_is_verified_on_the_way_back() {
         let dir = temp("corpus");
-        let path = dir.join("corpus.krab");
+        let path = dir.join("corpus");
 
         let mut store = Store::new();
         for salt in 0..5u8 {
@@ -415,7 +543,8 @@ mod tests {
                 .ingest(krab_crypto::object_id(&b), b, 29_766_000, u32::MAX)
                 .unwrap();
         }
-        assert_eq!(write_corpus(&path, &store).unwrap(), 5);
+        let mut rng = NotRandom::seeded(4);
+        assert_eq!(write_corpus(&path, &mut store, &mut rng).unwrap(), 5);
 
         let mut back = Store::new();
         assert_eq!(read_corpus(&path, &mut back, 29_766_000).unwrap(), 5);
@@ -424,12 +553,131 @@ mod tests {
         }
     }
 
+    /// **A save writes the buckets that changed, and only those.**
+    ///
+    /// The whole point of the layout: one file per expiry bucket, so recording
+    /// one new object costs one segment rather than the corpus. This used to
+    /// rewrite everything on every call, after every exchange that received
+    /// anything.
+    #[test]
+    fn a_save_touches_only_the_buckets_that_changed() {
+        let dir = temp("corpus-incremental");
+        let path = dir.join("corpus");
+        let day = 1_440u32;
+        let object = |bucket: u32, salt: u8| {
+            let h = krab_core::object::RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags: 0,
+                expiry_min: bucket * day + 1 + salt as u32,
+                tag: krab_core::object::Tag([salt; 8]),
+            };
+            let b = krab_core::object::canonical_bytes(
+                &h,
+                &krab_core::object::example_sealed_body(salt),
+            )
+            .unwrap();
+            (krab_crypto::object_id(&b), b)
+        };
+
+        let mut store = Store::new();
+        let mut rng = NotRandom::seeded(9);
+        for bucket in 20_000..20_004u32 {
+            let (id, b) = object(bucket, bucket as u8);
+            store.ingest(id, b, 0, u32::MAX).unwrap();
+        }
+        assert_eq!(write_corpus(&path, &mut store, &mut rng).unwrap(), 4);
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 4, "one per bucket");
+
+        // Nothing changed: nothing is written.
+        assert_eq!(write_corpus(&path, &mut store, &mut rng).unwrap(), 0);
+
+        // Note the modification times, add one object, and check that exactly
+        // one file moved. Times rather than contents, because "was rewritten
+        // with identical bytes" is the failure being ruled out.
+        let stamp = |b: u32| {
+            std::fs::metadata(path.join(format!("{b}.krab")))
+                .and_then(|m| m.modified())
+                .unwrap()
+        };
+        let before: Vec<_> = (20_000..20_004).map(stamp).collect();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let (id, b) = object(20_002, 200);
+        store.ingest(id, b, 0, u32::MAX).unwrap();
+        assert_eq!(write_corpus(&path, &mut store, &mut rng).unwrap(), 2);
+        let after: Vec<_> = (20_000..20_004).map(stamp).collect();
+        for (i, (a, b)) in before.iter().zip(after.iter()).enumerate() {
+            if i == 2 {
+                assert_ne!(a, b, "the changed bucket was not rewritten");
+            } else {
+                assert_eq!(a, b, "bucket {} was rewritten for nothing", 20_000 + i);
+            }
+        }
+
+        // And a bucket that goes away takes its file with it.
+        store.expire(20_001 * day);
+        write_corpus(&path, &mut store, &mut rng).unwrap();
+        assert!(!path.join("20000.krab").exists(), "an expired segment stayed");
+        assert!(path.join("20003.krab").exists(), "a live segment was removed");
+    }
+
+    /// A node written by an earlier build has one file. It must not start
+    /// empty — an upgrade that silently discards the corpus looks exactly like
+    /// the data loss this series keeps finding.
+    #[test]
+    fn a_single_file_corpus_is_migrated_and_shredded() {
+        let dir = temp("corpus-migrate");
+        let old = dir.join("corpus.krab");
+        let new = dir.join("corpus");
+
+        // Write the old layout by hand: one archive over the whole window.
+        let mut store = Store::new();
+        for salt in 0..3u8 {
+            let h = krab_core::object::RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags: 0,
+                expiry_min: 29_806_000 + salt as u32,
+                tag: krab_core::object::Tag([salt; 8]),
+            };
+            let b = krab_core::object::canonical_bytes(
+                &h,
+                &krab_core::object::example_sealed_body(salt),
+            )
+            .unwrap();
+            store
+                .ingest(krab_crypto::object_id(&b), b, 29_766_000, u32::MAX)
+                .unwrap();
+        }
+        let profile = krab_fabric::profile::LinkProfile::courier();
+        crate::courier::pack(&store, &old, (0, u32::MAX), &profile).unwrap();
+
+        let mut back = Store::new();
+        let mut rng = NotRandom::seeded(11);
+        assert_eq!(
+            migrate_corpus(&old, &new, &mut back, 29_766_000, &mut rng).unwrap(),
+            3
+        );
+        assert!(!old.exists(), "the old file survived the migration");
+        assert_eq!(back.len(), 3);
+
+        // And the migrated node reads back exactly what it had.
+        let mut again = Store::new();
+        assert_eq!(read_corpus(&new, &mut again, 29_766_000).unwrap(), 3);
+        for id in store.ids_in_order() {
+            assert_eq!(again.get(id), store.get(id));
+        }
+    }
+
     /// A corrupted corpus file does not put anything invalid into the store —
     /// the disk is not trusted, so the same checks apply as to a courier stick.
     #[test]
     fn a_corrupted_corpus_file_is_not_trusted() {
         let dir = temp("corpus-bad");
-        let path = dir.join("corpus.krab");
+        let path = dir.join("corpus");
         let mut store = Store::new();
         let h = krab_core::object::RoutingHeader {
             version: 1,
@@ -442,14 +690,23 @@ mod tests {
         let b = krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(7)).unwrap();
         let id = krab_crypto::object_id(&b);
         store.ingest(id, b, 29_766_000, u32::MAX).unwrap();
-        write_corpus(&path, &store).unwrap();
+        let mut rng = NotRandom::seeded(5);
+        write_corpus(&path, &mut store, &mut rng).unwrap();
 
-        let intact = std::fs::read(&path).unwrap();
+        // One bucket, so one segment file — and every byte of it is flipped in
+        // turn, exactly as before the layout changed.
+        let seg = std::fs::read_dir(&path)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
+        let intact = std::fs::read(&seg).unwrap();
         let mut back = Store::new();
         for i in 0..intact.len() {
             let mut raw = intact.clone();
             raw[i] ^= 0xFF;
-            std::fs::write(&path, &raw).unwrap();
+            std::fs::write(&seg, &raw).unwrap();
             let _ = read_corpus(&path, &mut back, 29_766_000);
         }
         for oid in back.ids_in_order() {
