@@ -70,6 +70,7 @@ when there is no status to report.
 | `Ctrl-Q` | quit — writes the corpus out first |
 | `Ctrl-O` | full-screen the focused pane; the command line and output pane go together |
 | `Ctrl-L` | lock immediately |
+| `Ctrl-Alt-Shift-W` | **PANIC** — destroys every key on this node, on one press, from any pane. No confirmation and no undo. |
 | `Ctrl-1` / `Ctrl-2` | private messages / channels |
 | `Esc` | back to the default screen, in one keystroke |
 | `Tab` | move between panes |

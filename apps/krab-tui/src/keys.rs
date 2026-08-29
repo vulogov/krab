@@ -103,12 +103,27 @@ pub enum Binding {
     Quit,
     /// **Lock immediately.** Reachable from every mode.
     Lock,
-    /// **Destroy the key hierarchy.** `Ctrl-Alt-Shift-W`, twice.
+    /// **Destroy the key hierarchy.** `Ctrl-Alt-Shift-W`, once.
     ///
     /// RFC 7 §10's wipe without the typing. The `wipe` verb asks for
     /// confirmation and that is right for a deliberate decision; it is wrong
     /// when the operator has seconds. `duress` covers being watched. This
     /// covers not having time.
+    ///
+    /// # Why there is no confirmation
+    ///
+    /// There was: the chord armed on the first press and fired on a second
+    /// within three seconds. That is one second of protection against a
+    /// mis-strike, bought with one second of delay at the only moment this
+    /// key exists for — and the trade is the wrong way round. An operator
+    /// reaching for a panic wipe has already decided; the cost of it not
+    /// firing is the whole threat model, and the cost of it firing by accident
+    /// is a node that has to be re-peered.
+    ///
+    /// The protection against a mis-strike is the chord itself. Four
+    /// simultaneous keys is a deliberate hand position, not a slip, and
+    /// `no_lesser_chord_reaches_the_panic_wipe` holds every subset of the
+    /// modifiers to something else — so the near misses are not near.
     PanicWipe,
     /// Redraw. Displaced from `Ctrl-L`.
     Redraw,
@@ -185,8 +200,9 @@ impl Binding {
     pub fn of(key: KeyPress, mode: Mode) -> Binding {
         // The panic chord, before everything — including lock, since locking
         // is recoverable and this is not, and an operator reaching for it has
-        // already decided. Four modifiers so it cannot be struck by accident;
-        // the caller requires it twice, so a single misfire destroys nothing.
+        // already decided. Four simultaneous keys are what stops it being
+        // struck by accident, and they are the whole of the protection: it
+        // fires on one press.
         if key.ctrl && key.alt && key.shift && key.code == Key::Char('W') {
             return Binding::PanicWipe;
         }

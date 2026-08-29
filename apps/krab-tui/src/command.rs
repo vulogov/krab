@@ -422,8 +422,9 @@ impl Command {
         ("Ctrl-Q", "quit"),
         ("Ctrl-L", "lock immediately"),
         (
-            "Ctrl-Alt-Shift-W ×2",
-            "PANIC — destroy every key on this node, no confirmation",
+            "Ctrl-Alt-Shift-W",
+            "PANIC — destroys every key on this node at once. No confirmation, \
+             no second press, no undo.",
         ),
         (
             "Ctrl-M / Ctrl-T",

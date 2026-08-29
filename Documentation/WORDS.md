@@ -107,11 +107,19 @@ This is the part that is not a trade-off.
 A concatenative language makes `peers each wipe` expressible. So is a loop
 over `duress`, over `peer seal`, over the panic chord's effect.
 
-The value of `wipe` asking twice, of the panic chord needing two presses
-within three seconds, of the fingerprint comparison being a voice call — is
-**friction**. Every one of those steps exists because a human should do it
-once, deliberately, having thought about it. A loop is a friction remover.
-That is what loops are for.
+The value of `wipe` asking twice, of the panic chord needing four fingers at
+once, of the fingerprint comparison being a voice call — is **friction**.
+Every one of those steps exists because a human should do it once,
+deliberately, having thought about it. A loop is a friction remover. That is
+what loops are for.
+
+The panic chord is the instructive one, because its friction moved. It used to
+arm on one press and fire on a second within three seconds, and that was the
+wrong shape: the delay fell at the only moment the key exists for, while the
+protection it bought — one second of second thoughts — is protection against a
+mis-strike rather than against a mistake. The chord itself is the friction now.
+Four simultaneous keys is a deliberate hand position; a loop cannot strike it,
+and neither can a sleeve.
 
 So a language here would need a rule its designer never intended, and the rule
 is the interesting part:

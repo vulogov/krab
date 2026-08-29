@@ -1542,3 +1542,225 @@ the twelve previous passes had asked one.
 Two of the four severe findings compose: 1 makes 2 reachable, and 4 makes 1
 reachable from the network. A pass that had found any one of them alone would
 have priced it as a nuisance.
+
+---
+
+## Pass 14 — 2026-08-29 · axis: **the frame ceiling**
+
+RFC 4 §4.2 gives every link one hard number: a frame is at most 65 535 bytes.
+`frame::write` enforces it, and its doc comment is emphatic about validating
+before allocating. This pass asked the mirror-image question, which no previous
+pass had: **not "is the input bounded" but "is the output".**
+
+Every finding below is a message this node builds and cannot send.
+
+Baseline before starting: `cargo test --workspace` 780 passing, `cargo clippy
+--workspace --all-targets --all-features` clean, `#![forbid(unsafe_code)]`
+intact on all six library crates.
+
+### 1. CRITICAL — two of the six size buckets cannot be put on a link · **open**
+
+RFC 1 §8.1's bucket ladder and RFC 4 §4.2's frame ceiling were never compared.
+
+```text
+bucket 0 (    256 B object) -> Control::Obj =     261 B  frame::write = ok
+bucket 1 (   1024 B object) -> Control::Obj =    1029 B  frame::write = ok
+bucket 2 (   4096 B object) -> Control::Obj =    4101 B  frame::write = ok
+bucket 3 (  16384 B object) -> Control::Obj =   16389 B  frame::write = ok
+bucket 4 (  65536 B object) -> Control::Obj =   65543 B  frame::write = REFUSED
+bucket 5 ( 262144 B object) -> Control::Obj =  262151 B  frame::write = REFUSED
+```
+
+Bucket 4 misses by **eight bytes** — the CBOR array head, the opcode and the
+byte-string head. `MAX_OBJECT` is 262 144 and equals the largest bucket, so a
+third of the defined object sizes are unreachable over any live link. The same
+ceiling binds twice: `StreamSession::send` hands the plaintext to
+`noise.write_message`, and a Noise transport message has the identical 65 535
+ceiling, so removing the check in `frame.rs` would not help.
+
+**These objects are routinely created.** `picture.rs` shrinks an image until it
+fits `MAX_OBJECT` — bucket 5, by construction — and `compose::bucket_for`
+searches all six buckets. Any picture over roughly 16 KiB lands in a bucket that
+cannot be transferred.
+
+The runtime consequence is not a dropped object. `serve_wants` is
+
+```rust
+session.send(&Control::Obj(bytes))?;        // exchange.rs:584
+```
+
+so the `Err(Error::Frame)` propagates out of the exchange and **ends the
+session**. The peer asked for the object, gets nothing, and asks again next
+session — every session, for as long as the object is held. One legal picture
+in the corpus permanently breaks reconciliation with every peer on every live
+link, and RFC 0 §6 guarantees nobody is told.
+
+A hostile peer does not need to compose one: it needs to get one object into
+the corpus, which is what the protocol is for.
+
+The courier path is the exception, and by accident rather than design —
+`courier.rs:117` writes `if session.send(...).is_ok()`, so an archive skips the
+object instead of dying. The two paths disagree about whether an unsendable
+object is fatal, and neither chose.
+
+### 2. SEVERE — the RBSR arm's manifest has no cap · **open**
+
+Pass 6 finding 13 was "a corpus above one manifest never converged", and the fix
+was `.take(MAX_PER_EXCHANGE)`. It was applied to the two manifest-mode sends,
+at `exchange.rs:215` and `exchange.rs:297`. **The RBSR arm has a third send and
+did not get one:**
+
+```rust
+if !answer.list.is_empty() {
+    session.send(&Control::Manifest {
+        filter_digest,
+        entries: answer.list,          // exchange.rs:487 — no `.take`
+    })?;
+}
+```
+
+`respond` fills `answer.list` from `local.entries(r.lo, r.hi)` for every range
+it resolves as a leaf, and nothing bounds the total across ranges. Measured, two
+peers holding disjoint halves of the same window:
+
+```text
+n= 10000  round 4: Manifest frame =   110 039 B   <-- over
+n= 20000  round 4: Manifest frame =   220 039 B   <-- over
+n= 50000  round 4: Manifest frame =   550 039 B   <-- over
+n=100000  round 4: Manifest frame = 1 100 041 B   <-- over
+```
+
+It breaks at about **10 000 objects** — below the smallest corpus RFC 1 §9.3's
+own table sizes, and the same threshold class Pass 6 already paid for once.
+
+### 3. SEVERE — the RBSR descent list has no cap either · **open**
+
+The other send in the same arm:
+
+```rust
+session.send(&Control::Range(out))?;   // exchange.rs:505 — no cap
+```
+
+Each offered range that differs and is not a leaf contributes `RBSR_BRANCH` = 16
+described sub-ranges, and `respond` iterates every offered range. Same two
+peers:
+
+```text
+n= 10000  round 3:   801 ranges, Range frame =  36 051 B
+n= 20000  round 3:  1376 ranges, Range frame =  61 925 B
+n= 30000  round 3:  1760 ranges, Range frame =  79 205 B   <-- over
+n=100000  round 3:  2928 ranges, Range frame = 131 765 B   <-- over
+```
+
+Breaks between 20 000 and 30 000 objects. `RBSR_MAX_ROUNDS` bounds the number of
+rounds and says nothing about the size of one.
+
+Note what findings 2 and 3 mean together: for any corpus over ~10 000 objects,
+**RBSR mode cannot complete a descent** — and `LatencyClass::Interactive` and
+`Batch` both select it, which is every TCP and Tor link.
+
+### 4. Why 780 tests and thirteen passes did not see any of this · **root cause**
+
+`SimSession::send` never serialises the message:
+
+```rust
+w.a_to_b.push_back(msg.clone());       // backend/sim.rs:119
+```
+
+It moves a `Control` between two `VecDeque`s. There is no encoding step, so
+there is no length, so **`MAX_FRAME` does not exist on the simulated
+transport.** SIM-2, the convergence measurements, and every test that drives
+the real reconciliation state machine run over this backend. The state machine
+has never once been exercised against the one constraint every real link has.
+
+Demonstrated directly:
+
+```text
+Obj(bucket 4)          65543 B on the wire | sim backend: accepts | real framing: REFUSES
+Manifest(5000 rows)   110039 B on the wire | sim backend: accepts | real framing: REFUSES
+```
+
+`CourierSession::send` and `StreamSession::send` both go through the framing
+and would have caught all three. Neither is what the tests drive at scale.
+
+This is the first finding in fourteen passes that is a property of the *test
+harness* rather than of the code under test, and it is why the three above
+could survive a suite that is otherwise thorough enough to have caught them
+individually.
+
+### 5. SEVERE — one silent socket denies all inbound peering · **open**
+
+`Listener::accept` completes the Noise handshake inline, and the comment says
+so deliberately:
+
+```rust
+// **RFC 4 §12's concurrency cap, satisfied at one.** This loop is the only
+// caller of `accept`, and `accept` completes the handshake before returning
+// — so there is never more than one in-progress handshake, against the SHOULD
+// of four. That is a structural property, not a counter.
+```
+
+It satisfies a cap of four by never exceeding one, which also means a single
+handshake is the only handshake. An earlier fix added `HANDSHAKE_TIMEOUT_S` =
+10 to stop a silent caller holding the loop "for good" — but bounding it at ten
+seconds does not close the attack, it prices it.
+
+An unauthenticated attacker connects and sends nothing. The accept loop spends
+ten seconds on that socket; every real peer waits in the TCP backlog and gives
+up at its own end. Keeping one connection in flight — about **one connection
+every ten seconds, from one socket, with no data sent** — denies inbound
+peering completely and indefinitely. There is no cost to the attacker and
+nothing in the activity log, because a failed handshake is deliberately
+reported as `Ok(None)`.
+
+The cap RFC 4 §12 asks for is a *bound* on concurrency, not the absence of it.
+Satisfying it structurally at one is what makes the loop a single point of
+serialisation.
+
+### What did not fail
+
+- **`krab-core::cbor`.** Non-allocating, non-recursive, borrows throughout. A
+  declared length can only fail to fit the input. All five §4.3 rules enforced
+  where they are claimed.
+- **`walk_body`.** Iterative with `MAX_BODY_DEPTH` = 8 and `checked_mul` on
+  every map count — pre-authentication nesting cannot choose the stack depth.
+- **`Store::ingest`.** All six of RFC 1 §11's checks present and in the order
+  §11 requires, I5 first and unconditional.
+- **`frame::read_len`.** Pass 13 finding 9 fixed: a partial header is now
+  `Err(Frame)` rather than a clean close.
+- **`Control::parse`.** Pass 13 finding 10 fixed: the outer array length is
+  checked against `Control::arity`, so the encoding is no longer malleable.
+- **`fold_range`.** Pass 13 finding 3's two scans fixed — `BTreeMap::range`
+  and maintained segment aggregates, with the `intact` test corrected. The
+  early return makes the `hi_min - 1` underflow unreachable.
+- **`bucket_end`.** Pass 13 finding 2 fixed: returns `u64`, and `bucket_start`
+  saturates. The top-bucket overflow is gone.
+- **The workspace's `unsafe`.** Pass 13 finding 11 fixed; nothing outside
+  `lock.rs`'s deliberately-named overwrite remains.
+- **`NotRandom`.** Reachable only from test modules. `OsRng` fails closed
+  rather than degrading.
+- **`RoutingHeader::parse`.** Validates `size_bucket` against `BUCKETS.len()`
+  before anything indexes it.
+
+### The pattern
+
+Pass 13 ended on "who supplies the bound, and what do they actually pass" — a
+call-site question. This pass is the same question asked in the other
+direction, and it turns out nobody had asked it at all: **every bound in the
+system is written as a check on what arrives.** `frame::read` validates before
+allocating. `Control::parse` pushes rather than pre-sizing. `ingest` runs six
+checks. The receive path is genuinely hardened.
+
+The send path has one check, in `frame::write`, and it is the last thing that
+happens. Nothing upstream of it knows the number exists. `respond` builds a
+response of whatever size the corpus implies; `serve_wants` sends whatever
+`get` returned; `compose` picks whatever bucket the plaintext needs. Each is
+correct in isolation and none is reconciled with 65 535.
+
+Findings 1, 2 and 3 are one defect wearing three hats, and finding 4 is why it
+was invisible: **the simulator models a transport with no frame.** A test
+harness that omits the single constraint the layer exists to impose will
+validate a state machine that cannot run anywhere.
+
+Finding 5 is separate and is the older shape — a bound satisfied so
+structurally that the structure became the vulnerability.

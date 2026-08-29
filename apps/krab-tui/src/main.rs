@@ -202,13 +202,6 @@ fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// How long the panic chord stays armed.
-///
-/// Long enough to press twice under stress, short enough that an armed node
-/// left alone disarms itself rather than waiting to be triggered by whoever
-/// is at the keyboard next.
-const PANIC_WINDOW: Duration = Duration::from_secs(3);
-
 /// How long a first-contact socket stays open before closing itself.
 ///
 /// Long enough to arrange with somebody — thirty seconds was not, which is why
@@ -620,9 +613,6 @@ struct App {
     init_step: Option<InitStep>,
     /// Whether the passphrase prompt is unlocking rather than initialising.
     unlocking: bool,
-    /// When the panic chord was first pressed, if it is armed. See
-    /// [`Binding::PanicWipe`].
-    panic_armed: Option<Instant>,
 }
 
 impl Default for App {
@@ -702,7 +692,6 @@ impl Default for App {
             confirmed: false,
             init_step: None,
             unlocking: false,
-            panic_armed: None,
         }
     }
 }
@@ -874,10 +863,6 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        // Anything that is not the second half of the chord disarms it. An
-        // armed node that stays armed while the operator does something else
-        // is a node that destroys itself on an unrelated keystroke later.
-        let was_armed = self.panic_armed.take();
         let press = KeyPress {
             code: match code {
                 KeyCode::Tab | KeyCode::BackTab => Key::Tab,
@@ -920,21 +905,7 @@ impl App {
             // misfire on an irreversible action is not acceptable and a second
             // deliberate press costs about a second — which an operator
             // reaching for this has, or they would already have lost the node.
-            Binding::PanicWipe => {
-                let now = Instant::now();
-                let armed = was_armed.is_some_and(|t| now.duration_since(t) < PANIC_WINDOW);
-                if armed {
-                    self.panic_armed = None;
-                    self.output = self.panic_wipe();
-                } else {
-                    self.panic_armed = Some(now);
-                    self.output = format!(
-                        "ARMED — press again within {}s to destroy every key on this node. \
-                         Anything else cancels.",
-                        PANIC_WINDOW.as_secs()
-                    );
-                }
-            }
+            Binding::PanicWipe => self.output = self.panic_wipe(),
             Binding::Quit => self.leave(),
             Binding::Lock => self.lock(),
             Binding::CycleFocus => self.ui.cycle_focus(),
@@ -16768,54 +16739,53 @@ mod tests {
     /// **The panic chord.** RFC 7 §10's wipe for an operator who does not have
     /// time to type. `duress` covers being watched; this covers having
     /// seconds.
+    ///
+    /// **One press.** It armed on the first and fired on a second within three
+    /// seconds, which bought one second of protection against a mis-strike at
+    /// the price of one second of delay at the only moment this key exists
+    /// for. The chord itself is the protection — see [`keys::Binding::PanicWipe`].
     #[test]
-    fn the_panic_chord_needs_two_presses_and_destroys_everything() {
+    fn one_press_of_the_panic_chord_destroys_everything() {
         let mut a = ready_node("panic-chord");
         assert!(a.identity.is_some() && a.epoch_key.is_some());
+        assert!(a.path(artifact::Artifact::IdentityWrapped).exists());
 
-        let chord = |a: &mut App| {
-            a.on_key(
-                KeyCode::Char('W'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
-            )
-        };
+        a.on_key(
+            KeyCode::Char('W'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
 
-        // One press arms and destroys nothing.
-        chord(&mut a);
-        assert!(a.identity.is_some(), "one press must not destroy anything");
-        assert!(a.output.contains("ARMED"), "{}", a.output);
-
-        // The second finishes it.
-        chord(&mut a);
-        assert!(a.identity.is_none(), "the hierarchy survived");
+        assert!(a.identity.is_none(), "the hierarchy survived one press");
         assert!(a.epoch_key.is_none());
         assert!(
             !a.path(artifact::Artifact::IdentityWrapped).exists(),
             "the store survived"
         );
+        assert!(a.output.contains("overwritten and removed"), "{}", a.output);
     }
 
-    /// An armed node that stays armed destroys itself on an unrelated
-    /// keystroke later. Anything else disarms it.
+    /// **It fires from wherever the operator is**, including mid-command with
+    /// the command line focused.
+    ///
+    /// The chord resolves ahead of every mode in `Binding::of`, and a panic
+    /// wipe that needed the right pane focused would be one that failed at the
+    /// moment it was reached for. `W` is also a letter, and a letter typed on
+    /// the command line is a character — so this is where a mode-dependent
+    /// binding would go wrong.
     #[test]
-    fn any_other_key_disarms_the_panic_chord() {
-        let mut a = ready_node("panic-disarm");
+    fn the_panic_chord_fires_while_typing_a_command() {
+        let mut a = ready_node("panic-typing");
+        a.ui.focus_command();
+        for c in "conn".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(a.command.as_string(), "conn", "the fixture must be typing");
+
         a.on_key(
             KeyCode::Char('W'),
             KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
         );
-        assert!(a.panic_armed.is_some());
-
-        a.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
-        assert!(a.panic_armed.is_none(), "still armed after another key");
-
-        // So a later press only arms again, it does not fire.
-        a.on_key(
-            KeyCode::Char('W'),
-            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
-        );
-        assert!(a.identity.is_some(), "it fired without a second press");
-        assert!(a.output.contains("ARMED"));
+        assert!(a.identity.is_none(), "the chord did not reach the wipe");
     }
 
     /// Four modifiers, and every subset of them is something else. A chord an

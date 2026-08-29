@@ -129,10 +129,17 @@ post-quantum until `peer reseal`.
 ### When someone is at the door
 
     Ctrl-L                   lock, from any mode, including mid-composition
-    wipe                     RFC 7 §10's panic destruction
+    Ctrl-Alt-Shift-W         PANIC — destroys every key, at once, no confirmation
+    wipe                     the same destruction, typed and confirmed
 
-Lock is one keystroke and asks nothing. `wipe` destroys every key this node
+Lock is one keystroke and asks nothing. Both wipes destroy every key this node
 holds, overwriting before unlinking, and cannot be undone.
+
+The difference is who they are for. `wipe` is a deliberate decision and asks
+twice. The chord is for an operator who has seconds: it fires on the first
+press, from any pane, including mid-command. Four simultaneous keys is what
+stops it being struck by accident — there is nothing else between the press
+and the destruction, by design.
 
 ## What this release is, and is not
 
