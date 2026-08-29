@@ -15144,6 +15144,71 @@ mod tests {
         assert_eq!(written.r, a.load_ceremony().unwrap().my_contribution.r);
     }
 
+    /// **A corpus of many segments is wiped, all of it.**
+    ///
+    /// The corpus stopped being one file and became a directory of them, and
+    /// "the existing rule already covers it" is exactly the reasoning that
+    /// left `wipe` stale twice before — see `artifact`. So this builds a
+    /// corpus spanning several expiry buckets, asserts that there really are
+    /// several files (a wipe test over an empty directory passes and proves
+    /// nothing), and then asserts that every one of them is gone along with
+    /// the directory that named them.
+    ///
+    /// The directory matters on its own. A surviving `corpus/` holding nothing
+    /// but names still lists the expiry days this node held, which is the
+    /// shape of its traffic over the retention window.
+    #[test]
+    fn wipe_removes_every_segment_and_the_directory_naming_them() {
+        let mut a = ready_node("wipe-segments");
+        let now_min = now_epoch().0 * 1440;
+        for day in 1..6u32 {
+            let h = krab_core::object::RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags: 0,
+                expiry_min: now_min + day * 1_440,
+                tag: krab_core::object::Tag([day as u8; 8]),
+            };
+            let bytes = krab_core::object::canonical_bytes(
+                &h,
+                &krab_core::object::example_sealed_body(day as u8),
+            )
+            .unwrap();
+            let id = krab_crypto::object_id(&bytes);
+            a.store
+                .with(|s| s.ingest(id, bytes, now_min, u32::MAX))
+                .expect("ingested");
+        }
+        a.save_corpus();
+
+        let corpus = a.path(artifact::Artifact::Corpus);
+        let segments: Vec<_> = std::fs::read_dir(&corpus)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            segments.len() >= 5,
+            "the fixture must span several buckets, or this proves nothing: {segments:?}"
+        );
+
+        type_command(&mut a, "wipe");
+        type_command(&mut a, "wipe");
+
+        for path in &segments {
+            assert!(!path.exists(), "{} survived the wipe", path.display());
+        }
+        assert!(
+            !corpus.exists(),
+            "the corpus directory survived, and its entries name the expiry \
+             days this node held"
+        );
+        // And they were counted as overwritten, not merely unlinked — the
+        // report is what an operator reads to know the hedge ran.
+        assert!(a.output.contains("overwritten and removed"), "{}", a.output);
+    }
+
     /// **`wipe` overwrites everything it removes**, ciphertext included.
     ///
     /// The erasure is the key destruction; the overwrite is what a
