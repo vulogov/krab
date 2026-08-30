@@ -161,6 +161,9 @@ struct Meeting {
     mine: peering::Contribution,
     /// When it closes itself.
     until: Instant,
+    /// How long that was, so the message on closing names the window the
+    /// operator asked for rather than the default they did not.
+    window: Duration,
 }
 
 /// An action waiting for one line that is not a command.
@@ -210,6 +213,14 @@ fn now_seconds() -> u64 {
 /// check them against, and a door left open past the arrangement to use it is
 /// one nobody is watching.
 const MEET_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// The longest `peer meet listen --timeout` will accept.
+///
+/// A first-contact socket accepts whoever calls — there is no peering yet, so
+/// there is no key to check anyone against. Its safety is that it is open for
+/// as long as the arrangement to use it and no longer, so the operator may
+/// shorten the window and may not turn it into a service.
+const MEET_WINDOW_MAX: Duration = Duration::from_secs(60 * 60);
 
 /// Lines PgUp/PgDn move the output pane.
 ///
@@ -6083,9 +6094,7 @@ impl App {
                     }
                     Some(Peering::Pad) => self.peer_pad(arg(rest, 1).as_deref()),
                     Some(Peering::Wrap) => self.peer_wrap(arg(rest, 1).as_deref()),
-                    Some(Peering::Meet) => {
-                        self.peer_meet(arg(rest, 1).as_deref(), arg(rest, 2).as_deref())
-                    }
+                    Some(Peering::Meet) => self.peer_meet(rest),
                     Some(Peering::Verified) => self.peer_verified(arg(rest, 1).as_deref()),
                     Some(Peering::Reseal) => {
                         let tail = rest.trim().strip_prefix("reseal").unwrap_or("").to_string();
@@ -6578,12 +6587,40 @@ impl App {
     /// authenticated**, and the output says so at length. `peer reseal`
     /// repairs the first; `peer verified` records the second once a human has
     /// done it.
-    fn peer_meet(&mut self, a: Option<&str>, b: Option<&str>) -> String {
+    fn peer_meet(&mut self, line: &str) -> String {
+        // `--timeout <minutes>` may sit anywhere after the verb, so an
+        // operator who set `--listen` can shorten the window without
+        // repeating the address. Removed from the word list before the
+        // positional arguments are read, or `listen` would find the flag
+        // where it expects an address.
+        let mut words: Vec<String> = words::split(line)
+            .map(|w| w.iter().map(|x| x.text()).collect())
+            .unwrap_or_default();
+        let mut window = MEET_WINDOW;
+        if let Some(i) = words.iter().position(|w| w == "--timeout") {
+            let Some(n) = words.get(i + 1).and_then(|v| v.parse::<u64>().ok()) else {
+                return "usage: peer meet listen [<addr>] --timeout <minutes>".into();
+            };
+            if n == 0 || n > MEET_WINDOW_MAX.as_secs() / 60 {
+                return format!(
+                    "a first-contact window is 1 to {} minutes. A door held open \
+                     longer than the arrangement to use it is a door nobody is \
+                     watching.",
+                    MEET_WINDOW_MAX.as_secs() / 60
+                );
+            }
+            window = Duration::from_secs(n * 60);
+            words.drain(i..=i + 1);
+        }
+        let a = words.get(1).map(|s| s.as_str());
+        let b = words.get(2).map(|s| s.as_str());
+
         match (a, b) {
             (Some("cancel"), _) | (Some("stop"), _) => return self.meet_cancel(),
             (Some("status"), _) => return self.meet_status(),
             _ => {}
         }
+
         let (listening, addr) = match (a, b) {
             (Some("listen"), Some(addr)) => (true, addr.to_string()),
             (Some("listen"), None) => match self.listen.clone() {
@@ -6597,6 +6634,8 @@ impl App {
                         \x20 peer meet <addr>          call them\n\
                         \x20 peer meet status          is a door open?\n\
                         \x20 peer meet cancel          close it\n\n\
+                        \x20 --timeout <minutes>       how long to wait, \
+                        default 15\n\n\
                         First contact over a link, for two people who can reach \
                         each other on a network and nowhere else. The result is \
                         NOT post-quantum and NOT authenticated until you compare \
@@ -6620,7 +6659,7 @@ impl App {
         let (my_card, my_contribution) = bootstrap::offer(my_card, &mut OsRng);
 
         if listening {
-            return self.meet_listen(&addr, my_card, my_contribution, noise);
+            return self.meet_listen(&addr, my_card, my_contribution, noise, window);
         }
 
         // Dialling has somebody to call and is one attempt, not an open door,
@@ -6650,6 +6689,7 @@ impl App {
         my_card: peering::Card,
         mine: peering::Contribution,
         noise: [u8; 32],
+        window: Duration,
     ) -> String {
         if let Some(m) = &self.meeting {
             return format!(
@@ -6691,18 +6731,20 @@ impl App {
             running,
             done,
             mine,
-            until: Instant::now() + MEET_WINDOW,
+            until: Instant::now() + window,
+            window,
         });
         format!(
             "waiting on {addr} (port {port}) for {} minutes.\n\n\
              **This accepts whoever calls.** There is no peering yet, so there \
              is no key to check them against — that is what the fingerprint \
              comparison afterwards is for.\n\n\
-             It closes itself when the time is up. `peer meet cancel` closes it \
-             now; `peer meet status` says whether it is still open.\n\n\
+             **It closes itself the moment the exchange finishes**, and when \
+             the time is up if nobody calls. `peer meet cancel` closes it now; \
+             `peer meet status` says whether it is still open.\n\n\
              Do not leave this running. A door left open for somebody who has \
              already arrived is a door nobody is watching.",
-            MEET_WINDOW.as_secs() / 60
+            window.as_secs() / 60
         )
     }
 
@@ -6762,7 +6804,7 @@ impl App {
                 "closed {} — nobody called within {} minutes.\n\n\
                  `peer meet listen {}` opens it again.",
                 m.addr,
-                MEET_WINDOW.as_secs() / 60,
+                m.window.as_secs() / 60,
                 m.addr
             );
         }
@@ -16750,6 +16792,47 @@ mod tests {
         assert_eq!(a.peer_ids(), vec!["aaaa1111", "bbbb2222"]);
     }
 
+    /// **A first-contact door closes when the arrangement is over**, and the
+    /// operator may say how long that is.
+    ///
+    /// The default is fifteen minutes and it was the only choice. Two people
+    /// arranging a call for a known minute do not want a quarter-hour window,
+    /// and one waiting on a slow correspondent may want longer — but not
+    /// unboundedly longer, because a socket that accepts whoever calls is safe
+    /// only for as long as somebody is watching it.
+    #[test]
+    fn a_meet_window_can_be_shortened_and_is_bounded() {
+        let mut a = ready_node("meet-timeout");
+
+        type_command(&mut a, "peer meet listen 127.0.0.1:0 --timeout 2");
+        assert!(a.output.contains("for 2 minutes"), "{}", a.output);
+        let m = a.meeting.as_ref().expect("a door is open");
+        assert_eq!(m.window, Duration::from_secs(120));
+        assert!(m.until <= Instant::now() + Duration::from_secs(121));
+        type_command(&mut a, "peer meet cancel");
+
+        // Bounded above: this is a door, not a service.
+        type_command(&mut a, "peer meet listen 127.0.0.1:0 --timeout 601");
+        assert!(a.output.contains("1 to 60 minutes"), "{}", a.output);
+        assert!(a.meeting.is_none(), "an over-long window opened a door");
+
+        // And zero is not a window.
+        type_command(&mut a, "peer meet listen 127.0.0.1:0 --timeout 0");
+        assert!(a.meeting.is_none(), "{}", a.output);
+
+        // A missing or unparseable number says so rather than defaulting —
+        // silently using fifteen minutes when the operator asked for two is
+        // the failure this option exists to prevent.
+        type_command(&mut a, "peer meet listen 127.0.0.1:0 --timeout");
+        assert!(a.output.contains("usage:"), "{}", a.output);
+        assert!(a.meeting.is_none());
+
+        // The default still applies when nothing is asked for.
+        type_command(&mut a, "peer meet listen 127.0.0.1:0");
+        assert_eq!(a.meeting.as_ref().unwrap().window, MEET_WINDOW);
+        type_command(&mut a, "peer meet cancel");
+    }
+
     /// **The panic chord.** RFC 7 §10's wipe for an operator who does not have
     /// time to type. `duress` covers being watched; this covers having
     /// seconds.
@@ -19750,7 +19833,7 @@ mod tests {
         assert!(b.meeting.is_some(), "{}", b.output);
         std::thread::sleep(Duration::from_millis(200));
 
-        let out_a = a.peer_meet(Some("127.0.0.1:45591"), None);
+        let out_a = a.peer_meet("meet 127.0.0.1:45591");
         assert!(out_a.starts_with("peer-link signed"), "A: {out_a}");
 
         // B picks it up on a tick, without anyone typing.

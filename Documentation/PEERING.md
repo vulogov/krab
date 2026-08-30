@@ -267,6 +267,9 @@ exchange, and you have a working peering.
 # Bob waits
 > peer meet listen 127.0.0.1:40000
 
+# ...or, for a call arranged at a known minute
+> peer meet listen 127.0.0.1:40000 --timeout 2
+
 # Alice calls
 > peer meet 127.0.0.1:40000
 peer-link signed with <fingerprint>
@@ -399,7 +402,7 @@ They bind the same kind of socket and are otherwise opposites.
 
 | | `--listen <addr>` | `peer meet listen <addr>` |
 |---|---|---|
-| Runs | for the life of the process | once, for 30 seconds |
+| Runs | for the life of the process | once — until the exchange finishes, or the window closes |
 | Accepts | **only nodes you have peered with** | **anyone who calls** |
 | Handshake | Noise IK, against a stored key | Noise XX, no prior key |
 | Result | a link, for reconciliation | a *new peering* |
@@ -412,8 +415,18 @@ that refusal is the point — RFC 4 §4.1 makes a mismatch a hard failure and
 never a prompt.
 
 `peer meet listen` is the ceremony, and it is deliberately the opposite: there
-is no stored key yet, so it accepts whoever calls in the next thirty seconds
-and the authentication is the voice call afterwards.
+is no stored key yet, so it accepts whoever calls while it is open and the
+authentication is the voice call afterwards.
+
+Because it accepts anyone, **it closes itself the moment the exchange
+finishes** — the door is not left open for somebody who has already arrived.
+If nobody calls, it closes when the window is up: fifteen minutes by default,
+and `--timeout <minutes>` sets it, from one to sixty. Two people arranging a
+call for a known minute should say `--timeout 2`; nobody should say sixty
+without a reason, and there is no value that means "leave it open".
+
+`peer meet status` says whether it is still open, and `peer meet cancel`
+closes it now.
 
 So they can use the same port and generally should not be running at once. In
 practice:

@@ -47,11 +47,43 @@ impl Allowed {
     }
 }
 
+/// In-progress handshakes this listener holds at once.
+///
+/// RFC 4 §9 requires the cap and suggests four *per peer*. Before a handshake
+/// completes there is no peer to attribute it to — that is the whole of the
+/// attack — so this is a cap on the total, set at four times §9's figure so
+/// that several honest peers reconnecting together are never turned away.
+///
+/// Reaching it drops the newest connection without a word. RFC 4 §9 calls
+/// handshake slowloris "the cheapest attack against a reachable node", and an
+/// operator log entry for it would be the attacker writing to the log.
+pub const MAX_PENDING_HANDSHAKES: usize = 16;
+
 /// A bound socket accepting calls from any known peer.
 pub struct Listener {
     inner: TcpListener,
     local_static: [u8; 32],
     allowed: Allowed,
+    /// Handshakes running on their own threads, and the completed sessions
+    /// they hand back.
+    ///
+    /// # Why the handshake is not done here
+    ///
+    /// It was, inline, on the one thread that accepts. The comment beside it
+    /// argued that the timeout made this safe, and the timeout is what made it
+    /// unsafe: **a caller that connects and says nothing holds the accept loop
+    /// for the full [`HANDSHAKE_TIMEOUT_S`]**, so one connection every ten
+    /// seconds — from anywhere, with no credential, sending no data — denies
+    /// every real peer entry, and failed handshakes are `Ok(None)` by design
+    /// so nothing is logged. The cost to the attacker is one socket.
+    ///
+    /// Accepting is cheap and handshaking is not, so they are separated: this
+    /// end takes the connection immediately and completes it elsewhere. A
+    /// silent caller now occupies one slot of [`MAX_PENDING_HANDSHAKES`] for
+    /// ten seconds and blocks nobody.
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    done_tx: std::sync::mpsc::Sender<Accepted>,
+    done_rx: std::sync::mpsc::Receiver<Accepted>,
 }
 
 impl Listener {
@@ -68,11 +100,15 @@ impl Listener {
         // asked. A blocking accept on a background thread cannot be told to
         // stop without connecting to it.
         inner.set_nonblocking(true)?;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         Ok((
             Listener {
                 inner,
                 local_static,
                 allowed,
+                pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                done_tx,
+                done_rx,
             },
             port,
         ))
@@ -85,33 +121,70 @@ impl Listener {
     /// `Ok(None)`: an unknown dialler is not an event the operator needs, and
     /// making it one would let anyone fill the activity log from outside.
     pub fn accept(&self) -> Result<Option<Accepted>, Error> {
-        let mut stream = match self.inner.accept() {
+        use std::sync::atomic::Ordering;
+
+        // A handshake that finished since the last call, before taking a new
+        // connection: a session that is ready outranks one that is not.
+        if let Ok(session) = self.done_rx.try_recv() {
+            return Ok(Some(session));
+        }
+
+        let stream = match self.inner.accept() {
             Ok((s, _)) => s,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        // The handshake blocks; the listen socket does not. Without this the
-        // first read returns WouldBlock and the handshake fails against a
-        // peer that is doing nothing wrong.
-        stream.set_nonblocking(false)?;
-        // And it must not block forever: a caller that opens a connection and
-        // says nothing would otherwise hold the accept loop for good, which is
-        // a denial of service costing the attacker one socket.
-        let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
-        stream.set_read_timeout(t)?;
-        stream.set_write_timeout(t)?;
 
+        // RFC 4 §9's cap. Dropping the stream closes it; a caller that finds
+        // the node busy retries, and an attacker holding every slot has bought
+        // ten seconds rather than the loop.
+        if self.pending.load(Ordering::Relaxed) >= MAX_PENDING_HANDSHAKES {
+            return Ok(None);
+        }
+        self.pending.fetch_add(1, Ordering::Relaxed);
+
+        let local_static = self.local_static;
         let allowed = self.allowed.snapshot();
-        match handshake_responder_any(&mut stream, &self.local_static, &allowed) {
-            Ok((noise, peer)) => {
+        let tx = self.done_tx.clone();
+        let pending = self.pending.clone();
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let finish = || -> Result<Accepted, Error> {
+                // The handshake blocks; the listen socket does not. Without
+                // this the first read returns WouldBlock and the handshake
+                // fails against a peer that is doing nothing wrong.
+                stream.set_nonblocking(false)?;
+                // And it must not block forever. It no longer blocks the
+                // accept loop either, but a thread that never returns is a
+                // thread leak, and the slot it holds is the resource RFC 4 §9
+                // caps.
+                let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
+                stream.set_read_timeout(t)?;
+                stream.set_write_timeout(t)?;
+                let (noise, peer) =
+                    handshake_responder_any(&mut stream, &local_static, &allowed)?;
                 // Clear the timeouts: a session is long-lived and legitimately
                 // silent between reconciliations.
                 stream.set_read_timeout(None)?;
                 stream.set_write_timeout(None)?;
-                Ok(Some((Box::new(StreamSession::new(stream, noise)), peer)))
+                Ok((
+                    Box::new(StreamSession::new(stream, noise)) as Box<dyn Session>,
+                    peer,
+                ))
+            };
+            if let Ok(session) = finish() {
+                let _ = tx.send(session);
             }
-            Err(_) => Ok(None),
-        }
+            pending.fetch_sub(1, Ordering::Relaxed);
+        });
+
+        // Nothing to hand back yet. The caller polls, which it already does.
+        Ok(None)
+    }
+
+    /// Handshakes in progress. For tests and for RFC 3 §12's metrics.
+    pub fn pending_handshakes(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
