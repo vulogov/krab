@@ -8626,7 +8626,7 @@ impl App {
             ingress_bytes: spend.bytes,
             objects_received: spend.offered,
             objects_new: spend.objects,
-            rejected: spend.refused,
+            rejected: spend.rejected,
             unique_source: None,
             ..Default::default()
         }
@@ -17013,6 +17013,7 @@ mod tests {
             objects: 5,
             offered: 10,
             refused: 0,
+            rejected: 0,
         });
         assert_eq!(m.novelty_ratio(), Some(0.5), "novelty is measured");
         assert_eq!(

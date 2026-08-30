@@ -77,6 +77,20 @@ pub struct Spend {
     /// which is the other violation signal. Distinct from a duplicate: this is
     /// volume the link agreed not to carry.
     pub refused: u64,
+    /// Objects RFC 1 §11 refused — malformed, expired, mis-identified.
+    ///
+    /// **§11 requires this and it was not kept.** "Rejection MUST be silent to
+    /// the peer beyond ordinary flow control, and MUST be counted per peer as
+    /// a quota signal (RFC 3)." The silence was implemented — nothing is sent
+    /// back — and the counting was not: `ExchangeView::put` discarded
+    /// `ingest`'s result, so a peer sending nothing but rubbish looked
+    /// identical to a peer with nothing to send.
+    ///
+    /// Separate from [`Spend::refused`] deliberately. Over-budget is a peer
+    /// exceeding what it agreed; malformed is a peer sending what no honest
+    /// encoder produces. RFC 3 §6.2 adjusts standing on the first; conflating
+    /// them would make the dial respond to the wrong evidence.
+    pub rejected: u64,
 }
 
 impl Spend {
@@ -118,7 +132,7 @@ impl Spend {
     /// Deterministic CBOR, for sealed storage.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        w.map(5)
+        w.map(6)
             .uint(1)
             .uint(self.day as u64)
             .uint(2)
@@ -128,7 +142,9 @@ impl Spend {
             .uint(4)
             .uint(self.offered)
             .uint(5)
-            .uint(self.refused);
+            .uint(self.refused)
+            .uint(6)
+            .uint(self.rejected);
         w.finish()
     }
 
@@ -139,7 +155,7 @@ impl Spend {
     pub fn decode(bytes: &[u8]) -> Option<Spend> {
         let mut r = Reader::new(bytes);
         let mut m = r.map().ok()?;
-        if m.left() != 5 {
+        if m.left() != 6 {
             return None;
         }
         let day = match (m.key().ok()??, m.value().ok()?) {
@@ -162,12 +178,17 @@ impl Spend {
             (5, Item::Uint(v)) => v,
             _ => return None,
         };
+        let rej = match (m.key().ok()??, m.value().ok()?) {
+            (6, Item::Uint(v)) => v,
+            _ => return None,
+        };
         Some(Spend {
             day,
             bytes: b,
             objects: o,
             offered: off,
             refused: ref_,
+            rejected: rej,
         })
     }
 
@@ -650,6 +671,7 @@ mod adjust_tests {
             objects: 100,
             offered: 200,
             refused: 1,
+            rejected: 0,
         };
         assert_eq!(Standing::judge(&spend), Conduct::Overspent);
     }
@@ -663,6 +685,7 @@ mod adjust_tests {
             objects: 1,
             offered: 1_000,
             refused: 0,
+            rejected: 0,
         };
         assert_eq!(Standing::judge(&spend), Conduct::Unproductive);
     }
@@ -678,6 +701,7 @@ mod adjust_tests {
             objects: 0,
             offered: NOVELTY_FLOOR_VOLUME - 1,
             refused: 0,
+            rejected: 0,
         };
         assert_eq!(Standing::judge(&spend), Conduct::Good);
     }
@@ -710,6 +734,7 @@ mod adjust_tests {
                 objects: 10,
                 offered: 10,
                 refused: 0,
+            rejected: 0,
             },
             standing: Standing::default(),
         };
@@ -736,6 +761,7 @@ mod adjust_tests {
                 objects: 2,
                 offered: 3,
                 refused: 4,
+            rejected: 0,
             },
             standing: Standing { age: 5 },
         };

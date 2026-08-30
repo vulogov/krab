@@ -1043,3 +1043,104 @@ not what they declined to.
 
 That number is the next thing worth having, and getting it means classifying
 168 lines by hand rather than quoting a figure derived from nothing.
+
+---
+
+## 17. RFC 1, requirement by requirement — 2026-08-30
+
+The first document classified line by line rather than by keyword. Method:
+resolve every `MUST` occurrence into a requirement, then for each, find the
+enforcement or establish there is none, and find the test or record that there
+is none.
+
+**The unit was wrong in every previous count.** RFC 1 has 36 lines containing
+`MUST`; they carry 41 occurrences, of which 8 are `MUST NOT`; one line is RFC
+2119 boilerplate and one is a heading using the word rhetorically; several
+requirements span two or three lines and several lines carry two requirements.
+What follows is **31 requirements**, which is the number that was never
+available by counting anything.
+
+| § | requirement | verdict | enforced at |
+|---|---|---|---|
+| 3 | FEC and armor MUST NOT participate in the identifier | met | `object_id` covers header ‖ body only; neither is applied below the identifier |
+| 3 | compression MUST precede encryption and padding | vacuous | no compression — §14 |
+| 4.1 | every version MUST parse the 16 bytes | met | `RoutingHeader::parse` is version-independent |
+| 4.2 | a v1 encoder MUST NOT emit key 3 | met | `Envelope::write` writes five keys, none of them 3 |
+| 4.2 | a v1 decoder MUST reject key 3 | met + tested | `decode_envelope`, `reserved_body_key` vector |
+| 4.3 | indefinite-length items MUST be rejected | met + tested | `cbor::Reader::head`, `rejects_indefinite_lengths` |
+| 4.3 | unknown body keys MUST be rejected | met + tested | `decode_envelope`; ingest I4 |
+| 4.3 | unknown *inner plaintext* keys MUST be ignored | vacuous | the inner plaintext is a marker and bytes, not a keyed map |
+| 5.2 | nodes MUST support excluding class 1 via `class_mask` | met | `filter::Filter`, `Policy::class_mask` |
+| 5.3 | cover objects MUST be indistinguishable from `sealed` | vacuous | nothing emits cover in v1 |
+| 5.3 | cover MUST use class 0, not class 2 | vacuous | as above; `ReservedCover` exists only to reserve the value |
+| 5.4 | the size/timing caveat MUST be restated in security considerations | met | documentation obligation, met by RFC 1 §8.2 and this tree's `SECURE-DELETE.md` |
+| 6.2 | `EPOCH_WINDOW` MUST be ≥ `MAX_TTL / EPOCH` | met | `MAX_TTL_MIN = EPOCH_WINDOW * 1440` derives the other way; conflict #10 |
+| 6.2 | a deployment MUST NOT narrow it | met | not configurable |
+| 6.3 | the envelope MUST NOT indicate which recipient key was used | met | §4.2's five keys carry no index |
+| 6.3 | implementations MUST attempt the full set | met + tested | `receive.rs`, "every private key, and no early exit" |
+| 6.3 | and MUST NOT stop at first success | met + tested | same |
+| 6.4 | MUST cache failed `(id, epoch)` pairs | met + tested | `receive::Attempts` |
+| 7 | suite `0x0002` MUST be selectable per message | met | per-recipient mode in `compose::seal_to` |
+| 7 | MUST NOT be a deployment-wide default | met | no setting expresses one |
+| 8.1 | padding MUST be zero | met + tested | `canonical_bytes` |
+| 8.1 | a receiver MUST reject non-zero padding | met + tested | ingest I1, `non_zero_padding_is_refused` |
+| 8.2 | cover MUST match the bucket distribution of real traffic | vacuous | nothing emits cover |
+| 9.2 | MUST show a fingerprint alongside any display name | met + tested | `alias::Aliases::show` renders both, always |
+| 9.3 | truncated identifiers MUST NOT appear in a routing header, a `WANT` outside a session, or any stored structure | met | the header has no such field; `by_trunc` is derived and unpersisted |
+| 10 | a relay MUST route, filter and expire an unknown `ver` from the header alone, and MUST store and forward it opaquely | **UNMET** | see below |
+| 10 | reserved header bits MUST be zero on emission | met | `RoutingHeader::write` |
+| 10 | and MUST be ignored on receipt | **conflict #12** | `parse` rejects; §11 I3 requires rejecting |
+| 11 | a receiver MUST reject unless I1–I6 hold | met + tested | `Store::ingest`; vectors name each |
+| 11 | every check MUST be applied before an object enters the store | met | I1 and I4 closed 2026-08-29 |
+| 11 | I5 MUST run before anything consulting the identifier | met | first check in `ingest` |
+| 11 | rejection MUST be silent to the peer | met | nothing is written back |
+| 11 | and MUST be counted per peer as a quota signal | **was unmet, now met** | `Spend::rejected` |
+| 12 | RFC 1 MUST NOT reach Final without machine-checkable vectors | met | `Documentation/vectors/rfc-1.txt` |
+| 12 | two independent implementations MUST agree on every vector | **unmet, by design** | there is one implementation; recorded in README |
+
+### The one that matters: §10's opaque relay
+
+> "A relay encountering `ver` it does not know MUST route, filter, and expire
+> from the 16-byte routing header alone, and MUST store and forward the
+> remaining bytes opaquely."
+
+`Store::ingest` refuses `version != 1`, and there is no other path into the
+corpus. So this node does not relay a v2 object at all.
+
+The deviation is deliberate and the reasoning is in the code: "an object this
+node cannot fully validate must not enter the store, because the identifier
+covers bytes it did not understand — which is a malleability surface." That
+argument is not wrong. But §10 answers it directly — "this is safe because the
+identifier covers the whole object; an unparsed object cannot be tampered with
+undetected" — and states the cost of getting it wrong:
+
+> "Without opaque relay of unknown versions, the first protocol revision
+> partitions the network along version lines and the partition is permanent,
+> because the nodes that would bridge it are the ones offline for a month."
+
+**This is the eleventh unmet requirement and the most consequential found so
+far**, because it is invisible until there is a v2 and unrepairable afterwards
+by the nodes that matter. It is not fixed here: admitting unvalidatable objects
+touches I3, I4, eviction accounting and the quota model at once, and it wants
+its own change rather than a line in an audit.
+
+### Conflict #12: reserved header bits
+
+§10 says reserved bits "MUST be **ignored** on receipt". §11's I3 requires
+"reserved flag bits zero" and §11's preamble says a receiver MUST **reject** an
+object unless every check holds. For the same field, one section says ignore
+and the other says refuse.
+
+`RoutingHeader::parse` refuses, implementing §11. Under §10's reading a v2
+object setting bit 2 is refused by every v1 relay, which is the partition §10
+exists to prevent — so the two sections disagree about the same bytes, and the
+implementation cannot satisfy both. Third conflict between frozen documents,
+after #10 and #11.
+
+### Counts
+
+31 requirements. **25 met** (17 with a test that names them), **4 vacuous**
+(cover traffic and inner-plaintext keys, both unimplemented in v1), **1 unmet**
+(§10 opaque relay), **1 unmet by design** (§12's second implementation), and
+**1 conflict**. One requirement — §11's per-peer rejection counter — was unmet
+when this pass began and was fixed during it.

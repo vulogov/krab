@@ -320,7 +320,7 @@ impl Corpus for ExchangeView {
         // `ingest` is the only path that admits data and it checks regardless
         // of which thread calls it.
         let id = krab_crypto::object_id(&bytes);
-        self.store.with(|s| {
+        let admitted = self.store.with(|s| {
             // **RFC 1 §11 I2.** `u32::MAX` here meant no upper bound at all,
             // on the one path that takes objects from a peer — so an object
             // claiming an expiry centuries out was accepted, never expired,
@@ -338,8 +338,20 @@ impl Corpus for ExchangeView {
                 .retention_now_min
                 .saturating_sub(self.now_min)
                 .saturating_add(krab_core::tag::MAX_TTL_MIN);
-            let _ = s.ingest(id, bytes, self.now_min, ceiling);
+            s.ingest(id, bytes, self.now_min, ceiling)
         });
+        // **RFC 1 §11's other half.** "Rejection MUST be silent to the peer
+        // beyond ordinary flow control, and MUST be counted per peer as a
+        // quota signal (RFC 3)." The silence was implemented and the counting
+        // was not — `ingest`'s result went to `let _`, so a peer sending
+        // nothing but rubbish was indistinguishable from a peer with nothing
+        // to send, on the one panel an operator uses to decide about them.
+        if admitted.is_err() {
+            if let Some(b) = &self.budget {
+                let mut acct = b.spend.lock().unwrap_or_else(|e| e.into_inner());
+                acct.spend.rejected = acct.spend.rejected.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -349,6 +361,63 @@ mod tests {
     use krab_core::object::{canonical_bytes, RoutingHeader, Tag};
 
     const NOW: u32 = 29_766_000;
+
+    /// **RFC 1 §11 — "rejection MUST be silent to the peer beyond ordinary
+    /// flow control, and MUST be counted per peer as a quota signal."**
+    ///
+    /// The silence was implemented; the counting was not. `ingest`'s result
+    /// went to `let _`, so a peer sending nothing but objects RFC 1 §11
+    /// refuses looked, on the panel an operator uses to decide about them,
+    /// exactly like a peer with nothing to send.
+    ///
+    /// Counted separately from an over-budget refusal. Over-budget is a peer
+    /// exceeding what it agreed to; malformed is a peer sending what no honest
+    /// encoder produces, and RFC 3 §6.2 adjusts standing on the first.
+    #[test]
+    fn an_object_refused_on_ingest_is_counted_against_the_peer() {
+        let store = SharedStore::new(Store::new());
+        let account = std::sync::Arc::new(Mutex::new(crate::quota::Account::default()));
+        let mut view = ExchangeView::new(
+            store,
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+            NOW,
+            krab_fabric::profile::MaxBucket(5),
+        )
+        .with_budget(Budget {
+            spend: account.clone(),
+            bytes_per_day: u64::MAX,
+            objects_per_day: u64::MAX,
+        });
+
+        // Well-formed, and admitted.
+        let h = RoutingHeader {
+            version: 1,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: NOW + 40_000,
+            tag: Tag([1; 8]),
+        };
+        view.put(canonical_bytes(&h, &krab_core::object::example_sealed_body(1)).unwrap());
+        assert_eq!(account.lock().unwrap().spend.rejected, 0);
+
+        // A body RFC 1 §11 I4 refuses. The bytes crossed the link, so they are
+        // charged; the object did not enter the corpus, so it is counted.
+        let bad = canonical_bytes(&h, &[0xFFu8; 40]).unwrap();
+        view.put(bad);
+        assert_eq!(
+            account.lock().unwrap().spend.rejected,
+            1,
+            "a refused object left no trace against the peer that sent it"
+        );
+        assert_eq!(
+            account.lock().unwrap().spend.refused,
+            0,
+            "a malformed object was counted as an over-budget one"
+        );
+    }
 
     /// **RFC 4 §5.4 — the ceiling is enforced at the sender.**
     ///
