@@ -115,6 +115,23 @@ pub const MAX_PER_EXCHANGE: usize = (frame::MAX_FRAME - MANIFEST_OVERHEAD) / MAN
 /// collect collects it then.
 pub const MAX_SERVED: usize = MAX_PER_EXCHANGE * RBSR_MAX_ROUNDS;
 
+/// Range descriptions that fit one frame — RFC 5 §4.4.
+///
+/// **Derived the same way [`MAX_PER_EXCHANGE`] is, and missing for the same
+/// reason it once was.** Pass 6 capped the two manifest-mode sends and did not
+/// cap the RBSR arm's, so `Control::Range` and the leaf `Control::Manifest`
+/// inside [`descend`] grew with the disagreement until the write failed and
+/// took the session with it — measured at about 30 000 objects against a
+/// disjoint corpus, on the mode every TCP and Tor link selects.
+///
+/// A `Range` is two `u32` bounds, a `u32` count and a 32-byte fingerprint:
+/// five bytes each for the first three at realistic magnitudes, and 34 for the
+/// byte string.
+pub const MAX_RANGES_PER_MESSAGE: usize = (frame::MAX_FRAME - MANIFEST_OVERHEAD) / RANGE_ROW;
+
+/// Bytes a range costs on the wire, as CBOR.
+const RANGE_ROW: usize = 49;
+
 /// Bytes a manifest row costs on the wire, as CBOR.
 const MANIFEST_ROW: usize = 22;
 
@@ -389,18 +406,50 @@ enum Half {
     Responder,
 }
 
+/// Take at most `n` items, starting from an offset that varies with `salt`.
+///
+/// **Truncating to the first `n` does not work and looks as though it does.**
+/// `advertised_range` says why for the manifest arm and the reasoning is the
+/// same here: a descent begins from the whole window every session, so a batch
+/// cut to its first `n` entries is cut identically every session, and whatever
+/// falls past the cut is never descended into. The corpus converges on a
+/// prefix and stops — silently, and permanently.
+///
+/// Rotating by a salt that varies per session covers the whole batch over
+/// several sessions instead. Poisson scheduling (RFC 5 §6.1) already supplies
+/// the variation, and RFC 5 §6.2 requires reconciliation be "randomised in
+/// order and interval".
+fn rotated<T: Clone>(items: &[T], n: usize, salt: u64) -> Vec<T> {
+    if items.len() <= n {
+        return items.to_vec();
+    }
+    let start = (salt % items.len() as u64) as usize;
+    items
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(n)
+        .cloned()
+        .collect()
+}
+
 /// Drive an RBSR descent as the initiator — RFC 5 §4.4.
 ///
 /// Opens by describing the whole window; everything after that is [`descend`].
+///
+/// `salt` chooses which part of an over-large batch to descend into, exactly
+/// as it chooses a sub-range in [`initiate`]. It must vary between sessions or
+/// a descent too wide for one frame never covers its tail — see [`rotated`].
 pub fn initiate_rbsr<C: Corpus + ?Sized>(
     session: &mut dyn Session,
     corpus: &mut C,
     filter_digest: [u8; 32],
     lo: u32,
     hi: u32,
+    salt: u64,
 ) -> Result<Moved, Error> {
     session.send(&Control::Range(vec![describe(corpus, lo, hi)]))?;
-    descend(session, corpus, filter_digest, Half::Initiator)
+    descend(session, corpus, filter_digest, Half::Initiator, salt)
 }
 
 /// Drive an RBSR descent as the responder — RFC 5 §4.4.
@@ -408,8 +457,9 @@ pub fn respond_rbsr<C: Corpus + ?Sized>(
     session: &mut dyn Session,
     corpus: &mut C,
     filter_digest: [u8; 32],
+    salt: u64,
 ) -> Result<Moved, Error> {
-    descend(session, corpus, filter_digest, Half::Responder)
+    descend(session, corpus, filter_digest, Half::Responder, salt)
 }
 
 /// The descent loop, shared by both ends.
@@ -456,6 +506,7 @@ fn descend<C: Corpus + ?Sized>(
     corpus: &mut C,
     filter_digest: [u8; 32],
     half: Half,
+    salt: u64,
 ) -> Result<Moved, Error> {
     let mut moved = Moved::default();
     let mut budget = MAX_SERVED;
@@ -483,10 +534,16 @@ fn descend<C: Corpus + ?Sized>(
                     respond(corpus, &fresh)
                 };
 
+                // **Both of these are bounded, and neither used to be.** Pass 6
+                // capped the manifest arm's two sends and left this arm's,
+                // where a wide enough disagreement produced a message no frame
+                // could carry — and a failed write ends the session rather
+                // than degrading. The salt rotates what is dropped, so the
+                // part that does not fit this session is covered by another.
                 if !answer.list.is_empty() {
                     session.send(&Control::Manifest {
                         filter_digest,
-                        entries: answer.list,
+                        entries: rotated(&answer.list, MAX_PER_EXCHANGE, salt ^ rounds as u64),
                     })?;
                 }
 
@@ -502,7 +559,8 @@ fn descend<C: Corpus + ?Sized>(
                         said_done = true;
                     }
                 } else {
-                    session.send(&Control::Range(out))?;
+                    let batch = rotated(&out, MAX_RANGES_PER_MESSAGE, salt ^ rounds as u64);
+                    session.send(&Control::Range(batch))?;
                 }
             }
             Some(Control::Manifest {
@@ -515,9 +573,16 @@ fn descend<C: Corpus + ?Sized>(
                 if theirs != filter_digest {
                     return Err(Error::Frame);
                 }
+                // Bounded for the same reason: a peer may now send a manifest
+                // larger than one frame, and asking for all of it in one
+                // message would put this end's write past what it can carry.
                 let want = wanted(corpus, &entries);
                 if !want.is_empty() {
-                    session.send(&Control::Want(want))?;
+                    session.send(&Control::Want(rotated(
+                        &want,
+                        MAX_PER_EXCHANGE,
+                        salt ^ rounds as u64,
+                    )))?;
                 }
             }
             Some(Control::Want(ids)) => moved.sent += serve_wants(session, corpus, &ids, &mut budget)?,
@@ -822,6 +887,10 @@ mod tests {
     /// before the initiator has said anything, which passes and proves
     /// nothing.
     fn exchange_rbsr(a: &mut Store, b: &mut Store) -> (Moved, Moved) {
+        exchange_rbsr_salted(a, b, 0)
+    }
+
+    fn exchange_rbsr_salted(a: &mut Store, b: &mut Store, salt: u64) -> (Moved, Moved) {
         use krab_fabric::backend::sim::SimFabric;
         let fabric = SimFabric::new(LinkProfile::tcp());
         let mut end_a = fabric.end_a();
@@ -831,14 +900,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let m = {
                 let mut vb = StoreView(&mut b_owned);
-                respond_rbsr(&mut end_b, &mut vb, [0; 32]).unwrap_or_default()
+                respond_rbsr(&mut end_b, &mut vb, [0; 32], salt).unwrap_or_default()
             };
             (b_owned, m)
         });
 
         let ma = {
             let mut va = StoreView(a);
-            initiate_rbsr(&mut end_a, &mut va, [0; 32], 0, u32::MAX).unwrap_or_default()
+            initiate_rbsr(&mut end_a, &mut va, [0; 32], 0, u32::MAX, salt).unwrap_or_default()
         };
         let _ = end_a.close();
 
@@ -1000,6 +1069,88 @@ mod tests {
         assert_eq!(ma.received, 0);
         assert_eq!(mb.received, 0);
         assert_eq!(a.len(), 10);
+    }
+
+    /// **Every message this driver builds must fit a frame.** The two RBSR
+    /// sends were uncapped, and a write that fails ends the session — so a
+    /// wide enough disagreement stopped reconciling with that peer entirely.
+    #[test]
+    fn a_full_batch_of_ranges_and_rows_still_frames() {
+        let range = Range {
+            lo: 4_000_000_000,
+            hi: 4_294_967_295,
+            fingerprint: krab_crypto::Fingerprint::over([object(1).0].iter()),
+            count: 4_000_000_000,
+        };
+        let msg = Control::Range(alloc_ranges(range, MAX_RANGES_PER_MESSAGE));
+        assert!(
+            msg.write().len() <= frame::MAX_FRAME,
+            "a full batch of {MAX_RANGES_PER_MESSAGE} ranges is {} bytes",
+            msg.write().len()
+        );
+
+        let rows: Vec<Entry> = (0..MAX_PER_EXCHANGE)
+            .map(|i| Entry {
+                expiry_min: 4_000_000_000 + i as u32,
+                id: [0xAB; TRUNC],
+            })
+            .collect();
+        let msg = Control::Manifest {
+            filter_digest: [7; 32],
+            entries: rows,
+        };
+        assert!(msg.write().len() <= frame::MAX_FRAME, "a full manifest");
+
+        let ids: Vec<[u8; TRUNC]> = (0..MAX_PER_EXCHANGE).map(|_| [0xCD; TRUNC]).collect();
+        assert!(Control::Want(ids).write().len() <= frame::MAX_FRAME, "a full want");
+    }
+
+    fn alloc_ranges(r: Range, n: usize) -> Vec<Range> {
+        (0..n)
+            .map(|i| Range {
+                lo: r.lo.wrapping_add(i as u32),
+                ..r
+            })
+            .collect()
+    }
+
+    /// **Truncating a batch to its first `n` never covers the tail.** A
+    /// descent begins from the whole window every session, so a cut made the
+    /// same way every session drops the same entries for ever.
+    #[test]
+    fn a_capped_batch_rotates_so_the_tail_is_covered() {
+        let items: Vec<u32> = (0..100).collect();
+        assert_eq!(rotated(&items, 100, 7), items, "nothing to drop");
+        assert_eq!(rotated(&items, 200, 7), items, "room to spare");
+
+        let mut seen = std::collections::BTreeSet::new();
+        for salt in 0..100u64 {
+            let taken = rotated(&items, 10, salt);
+            assert_eq!(taken.len(), 10, "salt {salt} took the wrong number");
+            seen.extend(taken);
+        }
+        assert_eq!(seen.len(), items.len(), "some entries were never chosen");
+    }
+
+    /// And two corpora that disagree everywhere still converge over RBSR, over
+    /// a wire that now serialises — which is where a message too large to
+    /// frame would show up as a session that ended rather than a slow one.
+    #[test]
+    fn disjoint_corpora_converge_over_rbsr_without_the_session_dying() {
+        let mut a = store_with(0..600);
+        let mut b = store_with(600..1_200);
+        for round in 0..12u64 {
+            let (ma, mb) = exchange_rbsr_salted(&mut a, &mut b, round);
+            if ma.received + mb.received == 0 {
+                break;
+            }
+        }
+        assert_eq!(a.len(), b.len(), "corpora did not converge");
+        assert_eq!(
+            a.range_fingerprint(0, u32::MAX),
+            b.range_fingerprint(0, u32::MAX),
+            "counts agree but contents do not"
+        );
     }
 
     /// A peer asking for something we do not hold is skipped, not fatal — it

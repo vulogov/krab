@@ -43,8 +43,8 @@ use std::sync::Mutex;
 /// A shared in-memory wire between two ends.
 #[derive(Debug, Default)]
 struct Wire {
-    a_to_b: VecDeque<Control>,
-    b_to_a: VecDeque<Control>,
+    a_to_b: VecDeque<Vec<u8>>,
+    b_to_a: VecDeque<Vec<u8>>,
     partitioned: bool,
     /// Messages silently dropped, for asserting what a partition cost.
     dropped: usize,
@@ -105,10 +105,36 @@ impl Drop for SimSession {
 }
 
 impl Session for SimSession {
+    /// Encode, then queue the bytes.
+    ///
+    /// # Why this serialises when it could just clone
+    ///
+    /// It did just clone — `push_back(msg.clone())` — and that made this
+    /// backend a different transport from every other one. A `Control` that
+    /// could not be encoded, or could not be framed, crossed the simulated
+    /// wire anyway, so `MAX_FRAME` did not exist here and neither did
+    /// `Control::parse`.
+    ///
+    /// SIM-2 and every test that drives the real state machine run over this.
+    /// So a whole class of defect — a message this node builds and cannot put
+    /// on a link — was invisible to the suite by construction, and Pass 14
+    /// found three of them at once: two of RFC 1 §8.1's six size buckets
+    /// unsendable, and both of the RBSR arm's sends uncapped. A harness that
+    /// is more permissive than production does not fail to catch bugs; it
+    /// certifies them.
+    ///
+    /// The module header calls this "not a test double — a first-class
+    /// backend", which is exactly right and is why the gap mattered. A
+    /// first-class backend has the transport's limits.
     fn send(&mut self, msg: &Control) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Closed);
         }
+        // The same encode-and-frame a real session performs, and the same
+        // refusal if the result cannot be carried.
+        let mut framed = Vec::new();
+        crate::frame::write(&mut framed, msg)?;
+
         let mut w = self.wire.lock().expect("sim wire poisoned");
         if w.partitioned {
             // I-4: unreachable is normal, not an escalation. The message is
@@ -117,9 +143,9 @@ impl Session for SimSession {
             return Ok(());
         }
         if self.is_a {
-            w.a_to_b.push_back(msg.clone());
+            w.a_to_b.push_back(framed);
         } else {
-            w.b_to_a.push_back(msg.clone());
+            w.b_to_a.push_back(framed);
         }
         drop(w);
         self.arrived.notify_all();
@@ -152,8 +178,11 @@ impl Session for SimSession {
             } else {
                 w.a_to_b.pop_front()
             };
-            if let Some(msg) = queued {
-                return Ok(Some(msg));
+            if let Some(bytes) = queued {
+                // Decoded through the same reader a socket uses, so a message
+                // that would not survive the round trip does not survive it
+                // here either.
+                return crate::frame::read(&mut bytes.as_slice());
             }
             // Nothing queued. If no session holds the other end, nothing ever
             // will — that is the contract's `None`.

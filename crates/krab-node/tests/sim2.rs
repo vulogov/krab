@@ -155,7 +155,7 @@ fn reconcile(a: &mut Store, b: &mut Store, mode: Mode, salt: u64) -> usize {
         let moved = {
             let mut vb = StoreView(&mut b_owned);
             match mode {
-                Mode::Rbsr => exchange::respond_rbsr(&mut end_b, &mut vb, [0; 32]),
+                Mode::Rbsr => exchange::respond_rbsr(&mut end_b, &mut vb, [0; 32], 0),
                 Mode::Manifest => exchange::respond_to(&mut end_b, &mut vb, [0; 32], 0, u32::MAX),
             }
             .unwrap_or_default()
@@ -166,7 +166,7 @@ fn reconcile(a: &mut Store, b: &mut Store, mode: Mode, salt: u64) -> usize {
     let from_a = {
         let mut va = StoreView(a);
         match mode {
-            Mode::Rbsr => exchange::initiate_rbsr(&mut end_a, &mut va, [0; 32], 0, u32::MAX),
+            Mode::Rbsr => exchange::initiate_rbsr(&mut end_a, &mut va, [0; 32], 0, u32::MAX, 0),
             Mode::Manifest => exchange::initiate(&mut end_a, &mut va, [0; 32], 0, u32::MAX, salt),
         }
         .unwrap_or_default()

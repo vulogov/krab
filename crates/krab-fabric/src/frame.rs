@@ -11,12 +11,50 @@ use krab_proto::control::Control;
 use std::io::{Read, Write};
 
 /// Noise's transport-message ceiling, RFC 4 §4.2.
+///
+/// **A property of Noise, not a policy.** It is the largest transport message
+/// the construction defines, tag included, so it bounds one `write_message`
+/// and nothing else. A *control message* larger than this is carried across
+/// several of them — RFC 4 §4.2's own table says so, listing 2 frames for the
+/// 65 536 bucket and 5 for 262 144 — which is what [`MAX_CONTROL`] is for.
 pub const MAX_FRAME: usize = 65_535;
 
+/// The largest control message this protocol can produce.
+///
+/// # Why this is not `MAX_FRAME`
+///
+/// The two were the same number, and that made two of RFC 1 §8.1's six size
+/// buckets impossible to send. A `Control::Obj` carrying a bucket-4 object is
+/// 65 536 bytes of payload plus a seven-byte CBOR head: **65 543 against a
+/// 65 535 ceiling, over by eight.** Bucket 5 is four times over. Since
+/// `picture` sizes every image to fit `MAX_OBJECT`, which is bucket 5, a
+/// picture was unsendable by construction — and `serve_wants` propagated the
+/// write error rather than skipping the object, so one legal picture in the
+/// corpus ended every exchange with every peer, on every link, for as long as
+/// it was held.
+///
+/// Nothing in the object layer was wrong. RFC 4 §4.2 had always said a large
+/// object spans frames; the transport simply never did it, and the frame
+/// writer refused what it should have split.
+///
+/// **Derived, not chosen.** The largest object RFC 1 §8.1 defines, plus the
+/// CBOR that wraps it: a two-element array head, the opcode, and a byte-string
+/// head for a length that needs four bytes. Nothing else comes close — a
+/// manifest is deliberately held to one Noise message by
+/// `exchange::MAX_PER_EXCHANGE`, which stays derived from [`MAX_FRAME`].
+pub const MAX_CONTROL: usize = krab_core::object::MAX_OBJECT as usize + CONTROL_OVERHEAD;
+
+/// `array(2) | uint | bstr head` around the largest payload.
+const CONTROL_OVERHEAD: usize = 1 + 1 + 5;
+
 /// Write one framed control message.
+///
+/// Bounded by [`MAX_CONTROL`], because this is the plaintext framing a courier
+/// archive uses (RFC 4 §5.5) — there is no Noise transport message here to be
+/// bounded by. The encrypted path chunks instead; see `noise::StreamSession`.
 pub fn write(out: &mut impl Write, msg: &Control) -> Result<usize, Error> {
     let body = msg.write();
-    if body.len() > MAX_FRAME {
+    if body.len() > MAX_CONTROL {
         return Err(Error::Frame);
     }
     out.write_all(&(body.len() as u32).to_le_bytes())?;
@@ -90,8 +128,10 @@ pub fn read(input: &mut impl Read) -> Result<Option<Control>, Error> {
     let Some(n) = read_len(input)? else {
         return Ok(None);
     };
-    // Checked before allocating, never after.
-    if n > MAX_FRAME {
+    // Checked before allocating, never after — RFC 4 §9. The bound is the
+    // largest message this protocol can produce, so it still refuses a length
+    // no honest sender has.
+    if n > MAX_CONTROL {
         return Err(Error::Frame);
     }
     let mut body = vec![0u8; n];

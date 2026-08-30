@@ -1421,7 +1421,20 @@ impl App {
             }
             let outcome = match mode {
                 krab_proto::recon::Mode::Rbsr => {
-                    krab_node::exchange::respond_rbsr(&mut *session, &mut view, scope.digest())
+                    // Its own salt, drawn here. A descent too wide for one
+                    // frame drops part of each batch, and which part must vary
+                    // between sessions or the tail never converges — see
+                    // `exchange::rotated`. The responder's batches are its own,
+                    // so it needs its own variation rather than the
+                    // initiator's.
+                    let mut salt = [0u8; 8];
+                    OsRng.fill(&mut salt);
+                    krab_node::exchange::respond_rbsr(
+                        &mut *session,
+                        &mut view,
+                        scope.digest(),
+                        u64::from_le_bytes(salt),
+                    )
                 }
                 krab_proto::recon::Mode::Manifest => krab_node::exchange::respond_to(
                     &mut *session,
@@ -1528,6 +1541,7 @@ impl App {
                     scope.digest(),
                     window.0,
                     window.1,
+                    salt,
                 ),
                 krab_proto::recon::Mode::Manifest => krab_node::exchange::initiate(
                     &mut *session,

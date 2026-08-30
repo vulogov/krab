@@ -278,28 +278,109 @@ impl<S: Read + Write> StreamSession<S> {
     }
 }
 
+/// Plaintext a single Noise transport message can carry.
+///
+/// [`crate::frame::MAX_FRAME`] less the 16-byte AEAD tag, less the one-byte
+/// continuation marker below.
+const MAX_CHUNK: usize = crate::frame::MAX_FRAME - 16 - 1;
+
+/// First byte of every chunk: whether another follows.
+///
+/// # Why an explicit byte rather than an implicit rule
+///
+/// "A chunk shorter than the maximum is the last one" needs no byte and is
+/// wrong twice: a message that is an exact multiple of [`MAX_CHUNK`] has no
+/// short chunk to end on, and a reader that infers the end from a length can
+/// be made to infer it early by anyone who controls one. Framing that is
+/// derived rather than stated is the kind of cleverness this codebase has
+/// already paid for once, in `range_fingerprint`'s whole-bucket test.
+const MORE: u8 = 1;
+const LAST: u8 = 0;
+
 impl<S: Read + Write + Send> crate::Session for StreamSession<S> {
+    /// Encrypt and write one control message, across as many Noise transport
+    /// messages as it needs.
+    ///
+    /// # Why this chunks
+    ///
+    /// It did not, and two of RFC 1 §8.1's six size buckets were therefore
+    /// unsendable: `Control::Obj` of a bucket-4 object is 65 543 bytes against
+    /// Noise's 65 535 ceiling. RFC 4 §4.2 had always expected this — its table
+    /// lists 2 frames for the 65 536 bucket and 5 for 262 144 — so the framing
+    /// on the wire is unchanged and this is the table being implemented rather
+    /// than an extension of it.
+    ///
+    /// Chunking here rather than at the object layer is the whole point.
+    /// `picture`'s refusal to split a payload across several *objects* is
+    /// about unlinkability: separate objects have separate identifiers,
+    /// separate expiries and separate delivery, and a reassembling recipient
+    /// links them. None of that applies inside one Noise session, where the
+    /// peer already sees every byte in order. The object keeps one identifier
+    /// and one bucket; only the ciphertext is divided.
     fn send(&mut self, msg: &krab_proto::control::Control) -> Result<(), Error> {
         let plain = msg.write();
-        self.buf.resize(plain.len() + 16, 0);
-        let n = self
-            .noise
-            .write_message(&plain, &mut self.buf)
-            .map_err(|_| Error::Frame)?;
-        crate::frame::write_bytes(&mut self.stream, &self.buf[..n])?;
+        if plain.len() > crate::frame::MAX_CONTROL {
+            return Err(Error::Frame);
+        }
+        // `chunks` yields nothing for an empty slice, and `Control::Done`
+        // encodes to two bytes, so this cannot be empty — but an opcode that
+        // encoded to nothing would otherwise send nothing at all and hang the
+        // far end waiting for a message that was never framed.
+        let mut chunks = plain.chunks(MAX_CHUNK).peekable();
+        while let Some(part) = chunks.next() {
+            let marker = if chunks.peek().is_some() { MORE } else { LAST };
+            let mut framed = Vec::with_capacity(part.len() + 1);
+            framed.push(marker);
+            framed.extend_from_slice(part);
+
+            self.buf.resize(framed.len() + 16, 0);
+            let n = self
+                .noise
+                .write_message(&framed, &mut self.buf)
+                .map_err(|_| Error::Frame)?;
+            crate::frame::write_bytes(&mut self.stream, &self.buf[..n])?;
+        }
         Ok(())
     }
 
+    /// Read one control message, reassembling it across transport messages.
+    ///
+    /// The accumulation is bounded by [`crate::frame::MAX_CONTROL`] — the same
+    /// number the writer is bounded by — so a peer cannot hold this end open
+    /// by sending `MORE` for ever. A message that reaches the bound without a
+    /// `LAST` is a peer exceeding what the protocol can express, which is a
+    /// closed session rather than a larger buffer.
     fn recv(&mut self) -> Result<Option<krab_proto::control::Control>, Error> {
-        let Some(ct) = crate::frame::read_bytes(&mut self.stream)? else {
-            return Ok(None);
-        };
-        self.buf.resize(ct.len(), 0);
-        let n = self
-            .noise
-            .read_message(&ct, &mut self.buf)
-            .map_err(|_| Error::Frame)?;
-        krab_proto::control::Control::parse(&self.buf[..n])
+        let mut plain: Vec<u8> = Vec::new();
+        loop {
+            let Some(ct) = crate::frame::read_bytes(&mut self.stream)? else {
+                // Mid-message is not a clean end. A peer that stops between
+                // chunks has truncated something, and reporting it as "the
+                // peer said nothing more" would hand the drivers a successful
+                // finish for a conversation that was cut.
+                return if plain.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(Error::Frame)
+                };
+            };
+            self.buf.resize(ct.len(), 0);
+            let n = self
+                .noise
+                .read_message(&ct, &mut self.buf)
+                .map_err(|_| Error::Frame)?;
+            let (&marker, body) = self.buf[..n].split_first().ok_or(Error::Frame)?;
+            if plain.len() + body.len() > crate::frame::MAX_CONTROL {
+                return Err(Error::Frame);
+            }
+            plain.extend_from_slice(body);
+            match marker {
+                LAST => break,
+                MORE => continue,
+                _ => return Err(Error::Frame),
+            }
+        }
+        krab_proto::control::Control::parse(&plain)
             .map(Some)
             .map_err(|_| Error::Frame)
     }
