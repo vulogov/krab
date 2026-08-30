@@ -1418,6 +1418,12 @@ impl App {
         // code happened to implement would be the divergence RFC 0's editorial
         // rule exists to prevent. Read before `take_session`, which removes it.
         let mode = self.links.get(peer)?.profile.sync_mode();
+        // **RFC 4 §5.4's ceiling, on the sending side.** "Objects above the
+        // link's `max_object_size` are filtered at the sender." A LoRa profile
+        // declaring `MaxBucket(1)` must not have a 4 KB object written to it —
+        // over an hour of airtime for something the far end already said it
+        // cannot take.
+        let max_bucket = self.links.get(peer)?.profile.max_bucket;
         // **The agreed scope** — RFC 3 §7.3, derived from the signed
         // credential. A peering with no completed credential has no agreed
         // scope, and says so with a digest of its own rather than the zero one
@@ -1445,7 +1451,14 @@ impl App {
         std::thread::spawn(move || {
             let mut session = session;
             let mut view =
-                shared::ExchangeView::new(view_store, window.0, carriage, scope, retention_now);
+                shared::ExchangeView::new(
+                    view_store,
+                    window.0,
+                    carriage,
+                    scope,
+                    retention_now,
+                    max_bucket,
+                );
             // Cloned, so the totals can be folded back after the drivers
             // return: the view sees only objects it accepted, and RFC 3 §12's
             // novelty ratio needs the ones it declined as duplicates too.
@@ -1505,6 +1518,8 @@ impl App {
     /// §5.1's guarantee is that a keypress never causes a transfer, and the
     /// separation is that the two paths do not share a function.
     fn reconcile_with(&mut self, peer: &str) -> Option<activity_log::Event> {
+        // RFC 4 §5.4's ceiling, as on the answering side.
+        let max_bucket = self.links.get(peer)?.profile.max_bucket;
         let window = {
             let now = now_epoch().0 * 1440;
             (
@@ -1560,7 +1575,14 @@ impl App {
         std::thread::spawn(move || {
             let mut session = session;
             let mut view =
-                shared::ExchangeView::new(view_store, window.0, carriage, scope, retention_now);
+                shared::ExchangeView::new(
+                    view_store,
+                    window.0,
+                    carriage,
+                    scope,
+                    retention_now,
+                    max_bucket,
+                );
             // Cloned, so the totals can be folded back after the drivers
             // return: the view sees only objects it accepted, and RFC 3 §12's
             // novelty ratio needs the ones it declined as duplicates too.
@@ -13998,6 +14020,7 @@ mod tests {
             krab_crypto::CarriagePolicy::default(),
             filter::Filter::unscoped(),
             now_epoch().0 * 1440,
+            krab_fabric::profile::MaxBucket(5),
         )
         .with_budget(tight);
 

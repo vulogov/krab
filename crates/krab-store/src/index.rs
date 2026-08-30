@@ -574,8 +574,21 @@ impl Store {
     /// Rebuild the index from the segments, RFC 5 §7.
     ///
     /// Corruption is then a delay rather than data loss.
+    /// # "Fully rebuildable" means every derived map, not one of them
+    ///
+    /// This rebuilt `index` and left `by_trunc` alone, which passed every test
+    /// because nothing had cleared `by_trunc` either — the rebuild worked on a
+    /// store that had never lost anything. RFC 5 §7's requirement is about the
+    /// case where it *has*: a node whose index is gone or corrupt must be able
+    /// to reconstruct it from the segments, and `by_trunc` is what
+    /// `get_truncated` and `has_truncated` answer from. Without it a rebuilt
+    /// node would serve reconciliation and find nothing it holds.
+    ///
+    /// Both maps are cleared first, so the rebuild is tested against an empty
+    /// one rather than against itself.
     pub fn rebuild_index(&mut self) -> Result<(), Error> {
         self.index.clear();
+        self.by_trunc.clear();
         for (&bucket, seg) in &self.segments {
             for (id, bytes) in seg.entries() {
                 let h = RoutingHeader::parse(bytes).map_err(|_| Error::Corrupt)?;
@@ -586,6 +599,7 @@ impl Store {
                         expiry_min: h.expiry_min,
                     },
                 );
+                self.by_trunc.insert(id.truncated(), *id);
             }
         }
         Ok(())
@@ -1171,6 +1185,74 @@ mod tests {
                 "envelope key {extra} was accepted"
             );
         }
+    }
+
+    /// **RFC 5 §7: "the index MUST be fully rebuildable from the segments by
+    /// one scan."**
+    ///
+    /// Listed as unchecked in `PLAN.md` §12 — "asserted by the store's design
+    /// and not exercised by deleting an index and rebuilding". Exercising it
+    /// found `by_trunc` was not rebuilt: the map `get_truncated` and
+    /// `has_truncated` answer from, which is every object a peer asks for by
+    /// its manifest row. A node that lost its index would have served
+    /// reconciliation and found nothing it held.
+    ///
+    /// **What this test can and cannot reach.** Nothing outside the store can
+    /// empty a derived map, so this cannot stage "the index is gone" —
+    /// `rebuild_index` clearing both maps is what makes the assertion mean
+    /// anything, and with the clear removed the test passes against a map it
+    /// never lost. So it discriminates the pair: a map that is cleared and not
+    /// repopulated fails here, which is the mistake that is actually available
+    /// to somebody adding a third one.
+    #[test]
+    fn the_index_rebuilds_from_the_segments_alone() {
+        let objs: Vec<(u32, u8)> = (0..20).map(|i| (DAY + i as u32, i)).collect();
+        let mut s = store_with(0, &objs);
+        let before: Vec<_> = s.entries_in_range(0, u32::MAX);
+        let fingerprint = s.range_fingerprint(0, u32::MAX);
+        let trunc: Vec<_> = before.iter().map(|(_, id)| id.truncated()).collect();
+        assert!(trunc.iter().all(|t| s.has_truncated(t)));
+
+        s.rebuild_index().expect("rebuilds");
+
+        assert_eq!(s.entries_in_range(0, u32::MAX), before, "ordering");
+        assert_eq!(s.range_fingerprint(0, u32::MAX), fingerprint, "fingerprint");
+        // The half that was not rebuilt. Reconciliation asks by truncated
+        // identifier and by nothing else.
+        for t in &trunc {
+            assert!(
+                s.has_truncated(t),
+                "a rebuilt index cannot answer what a manifest asks"
+            );
+            assert!(s.get_truncated(t).is_some());
+        }
+    }
+
+    /// **RFC 1 §5: a `short` object is not a corpus object.**
+    ///
+    /// Also listed unchecked in `PLAN.md` §12 — "nothing emits one, so the
+    /// MUST NOTs about forwarding and storing it are satisfied vacuously, but
+    /// that an *incoming* class 3 object is refused before the store was not
+    /// verified". It is refused, in `validate_body`; this is the verification.
+    #[test]
+    fn a_link_local_short_object_is_not_stored() {
+        let mut s = Store::new();
+        let h = RoutingHeader {
+            version: 1,
+            class: krab_core::object::Class::Short as u8,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: DAY,
+            tag: Tag([9; 8]),
+        };
+        let bytes = canonical_bytes(&h, &krab_core::object::example_sealed_body(9)).unwrap();
+        let id = krab_crypto::object_id(&bytes);
+        assert_eq!(
+            s.ingest(id, bytes, 0, MAX_TTL),
+            Err(Reject::BadBody),
+            "a link-local object entered the corpus"
+        );
+        assert!(s.is_empty());
     }
 
     /// **I3's other half**, and where it actually lives.

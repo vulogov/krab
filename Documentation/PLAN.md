@@ -700,7 +700,9 @@ now had its MUSTs enumerated and its checkable ones checked.
 
 ### Unmet
 
-**RFC 4 §12 — concurrent in-progress handshakes per peer are not capped.**
+**RFC 4 §9 — concurrent in-progress handshakes per peer are not capped.**
+*(Closed 2026-08-30. The citation was also wrong: this block is §9,
+"Denial of service", not §12. See the correction below.)*
 
 > Handshake timeout MUST be enforced (SHOULD be 30 s on interactive links).
 > Concurrent in-progress handshakes per peer MUST be capped (SHOULD be 4).
@@ -972,3 +974,72 @@ effect.
 
 Revisit when a node measurably cannot hold its retention window in memory. The
 harness for that measurement exists: `crates/krab-store/tests/range_cost.rs`.
+
+---
+
+## 16. The audit's own status, corrected — 2026-08-30
+
+§12 above declared the RFCs 1–7 audit complete on 2026-08-27 and has been
+quoted as current ever since. It was not, in three ways, and the shape of each
+is the one the adversarial passes keep finding: **a statement that was true
+when written and was never re-read against the code that moved under it.**
+
+### Corrections to §12
+
+**RFC 4's handshake cap is met.** §12 lists it unmet. `MAX_PENDING_HANDSHAKES`
+caps in-progress handshakes and `Listener::accept` completes them off the
+accept loop — Pass 14 §5 and Pass 15 §5. The cap is on the total rather than
+per peer, because before a handshake completes there is no peer to attribute
+one to; that is stated where it is enforced.
+
+**The citation was wrong.** §12 quotes RFC 4's denial-of-service block and
+attributes it to §12 of that document. It is **§9**. The quoted text was
+correct, which is why nobody noticed — a wrong pointer to the right words.
+
+**Two of the three "not checked" items are now checked**, and checking them
+was not a formality:
+
+- *RFC 5 §7, "the index MUST be fully rebuildable from the segments by one
+  scan."* Exercising it found `rebuild_index` rebuilt `index` and not
+  `by_trunc` — the map `get_truncated` and `has_truncated` answer from, which
+  is every object a peer asks for by its manifest row. A node that had lost
+  its index would have rebuilt, served reconciliation, and found nothing it
+  held. The test passed before the fix, because nothing had cleared
+  `by_trunc` either: the rebuild was being exercised against a map that had
+  never lost anything.
+- *RFC 4 §8's `short` class, incoming.* Refused since RFC 1 §11 I4 was
+  enforced — `validate_body` has no branch that admits class 3 — and now
+  tested rather than inferred.
+
+### And one that was unmet rather than unchecked
+
+*RFC 4 §5.4: "Objects above the link's `max_object_size` are filtered **at the
+sender**. Receiver-side rejection wastes the scarcest resource in the system
+and creates invisible partitions."*
+
+`courier::pack` honoured this. Nothing else did. A LoRa link declaring
+`MaxBucket(1)` would still have a 4 KB object written to it by `serve_wants` —
+over an hour of airtime at SF10, for something the far end had already said it
+could not take. §12 had this listed under "not checked" as a constant with no
+end-to-end exercise; writing the exercise found the requirement unmet.
+
+`ExchangeView` now carries the link's ceiling and withholds an object above it,
+which makes ten unmet requirements found by this audit rather than nine.
+
+Filtered at `get` and not at `entries`, deliberately: withholding the manifest
+row would leave this end's rows disagreeing with its own range fingerprint,
+and RBSR reads that as a divergence no exchange can close. One wasted 22-byte
+row is the cheaper error.
+
+### What is still not checked
+
+The prose MUSTs with no distinctive noun. §12's own method note is the honest
+statement of the limit — "the requirements this pass could verify are the ones
+with a distinctive noun in them, and requirements without one were skipped and
+are listed as skipped" — and 168 lines across RFCs 1–7 contain `MUST`, most of
+them in prose rather than in the fenced normative blocks. How many of those
+were skipped is not known, because the passes recorded what they checked and
+not what they declined to.
+
+That number is the next thing worth having, and getting it means classifying
+168 lines by hand rather than quoting a figure derived from nothing.

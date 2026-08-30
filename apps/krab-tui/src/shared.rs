@@ -142,6 +142,8 @@ pub struct ExchangeView {
     /// peer is held to what it signed rather than trusted to honour it, so the
     /// agreement and the enforcement are separate and both are here.
     filter: crate::filter::Filter,
+    /// The largest object this link carries — RFC 4 §5.4.
+    max_bucket: krab_fabric::profile::MaxBucket,
 }
 
 /// A link's budget, shared between the exchange thread and the interface.
@@ -166,6 +168,7 @@ impl ExchangeView {
         carriage: krab_crypto::CarriagePolicy,
         filter: crate::filter::Filter,
         retention_now_min: u32,
+        max_bucket: krab_fabric::profile::MaxBucket,
     ) -> ExchangeView {
         ExchangeView {
             store,
@@ -173,6 +176,7 @@ impl ExchangeView {
             carriage,
             filter,
             retention_now_min,
+            max_bucket,
             budget: None,
         }
     }
@@ -196,6 +200,7 @@ impl ExchangeView {
             carriage,
             crate::filter::Filter::unscoped(),
             now_min,
+            krab_fabric::profile::MaxBucket(5),
         )
     }
 
@@ -247,8 +252,28 @@ impl Corpus for ExchangeView {
     fn count(&self, lo: u32, hi: u32) -> u32 {
         self.store.with(|s| s.count_in_range(lo, hi))
     }
+    /// Fetch an object a peer asked for — unless this link cannot carry it.
+    ///
+    /// # RFC 4 §5.4, on the sending side
+    ///
+    /// > "Objects above the link's `max_object_size` are filtered **at the
+    /// > sender**. Receiver-side rejection wastes the scarcest resource in the
+    /// > system and creates invisible partitions."
+    ///
+    /// The ceiling was enforced on the courier path — `courier::pack` skips an
+    /// object the archive's profile cannot carry — and on no other. A LoRa link
+    /// declaring `MaxBucket(1)` would still have a 4 KB object written to it by
+    /// `serve_wants`: over an hour of airtime, for something the far end had
+    /// already said it could not take.
+    ///
+    /// Filtered here rather than in `entries`, deliberately. Withholding the
+    /// row would leave this end's manifest disagreeing with its own range
+    /// fingerprint, and RBSR reads that as a divergence no exchange can close —
+    /// permanent, and far worse than one wasted 22-byte row.
     fn get(&self, id: &[u8; TRUNC]) -> Option<Vec<u8>> {
-        self.store.with(|s| s.get_truncated(id).map(|b| b.to_vec()))
+        let bytes = self.store.with(|s| s.get_truncated(id).map(|b| b.to_vec()))?;
+        let header = RoutingHeader::parse(&bytes).ok()?;
+        self.max_bucket.admits(header.size_bucket).then_some(bytes)
     }
     fn has(&self, id: &[u8; TRUNC]) -> bool {
         self.store.with(|s| s.has_truncated(id))
@@ -325,6 +350,83 @@ mod tests {
 
     const NOW: u32 = 29_766_000;
 
+    /// **RFC 4 §5.4 — the ceiling is enforced at the sender.**
+    ///
+    /// > "Objects above the link's `max_object_size` are filtered at the
+    /// > sender. Receiver-side rejection wastes the scarcest resource in the
+    /// > system and creates invisible partitions."
+    ///
+    /// `courier::pack` honoured this and the live path did not, so a LoRa link
+    /// declaring `MaxBucket(1)` could have a 4 KB object written to it — over
+    /// an hour of airtime at SF10, for something the far end had already said
+    /// it could not take. `PLAN.md` §12 listed the LoRa ceiling as a MUST that
+    /// existed as a constant with no end-to-end exercise; this is the
+    /// exercise, and it found it unmet.
+    #[test]
+    fn a_link_is_not_asked_to_carry_more_than_it_admits() {
+        use krab_proto::recon::Corpus;
+
+        let store = SharedStore::new(Store::new());
+        let object = |bucket: u8, salt: u8| {
+            let h = RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: bucket,
+                flags: 0,
+                expiry_min: NOW + 40_000 + salt as u32,
+                tag: Tag([salt; 8]),
+            };
+            let bytes =
+                canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).unwrap();
+            (krab_crypto::object_id(&bytes), bytes)
+        };
+        // One object LoRa can carry and one it cannot.
+        let (small, small_bytes) = object(1, 1);
+        let (big, big_bytes) = object(3, 2);
+        store.with(|s| {
+            s.ingest(small, small_bytes, NOW, u32::MAX).unwrap();
+            s.ingest(big, big_bytes, NOW, u32::MAX).unwrap();
+        });
+
+        let lora = krab_fabric::profile::LinkProfile::lora_sf10();
+        assert!(lora.max_bucket.admits(1) && !lora.max_bucket.admits(3));
+        let view = ExchangeView::new(
+            store.clone(),
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+            NOW,
+            lora.max_bucket,
+        );
+
+        assert!(
+            view.get(&small.truncated()).is_some(),
+            "an object this link carries was withheld"
+        );
+        assert!(
+            view.get(&big.truncated()).is_none(),
+            "a 4 KB object was handed to a link that admits 1 KB"
+        );
+
+        // **The row still crosses.** Withholding it would leave the manifest
+        // disagreeing with this end's own range fingerprint, and RBSR reads
+        // that as a divergence no exchange can close.
+        let rows = view.entries(0, u32::MAX);
+        assert_eq!(rows.len(), 2, "the manifest must still describe the corpus");
+
+        // And a link with no ceiling carries both.
+        let tcp = krab_fabric::profile::LinkProfile::tcp();
+        let wide = ExchangeView::new(
+            store,
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+            NOW,
+            tcp.max_bucket,
+        );
+        assert!(wide.get(&big.truncated()).is_some());
+    }
+
     /// Carriage that hosts everything, for the tests that are about locking
     /// rather than about what a node is willing to host.
     fn carry_all() -> krab_crypto::CarriagePolicy {
@@ -360,6 +462,7 @@ mod tests {
             scope,
             // The real now, not the window's lower bound.
             real_now,
+            krab_fabric::profile::MaxBucket(5),
         );
         view.put(object(1));
         assert_eq!(
@@ -389,6 +492,7 @@ mod tests {
             carry_all(),
             crate::filter::Filter::unscoped(),
             real_now,
+            krab_fabric::profile::MaxBucket(5),
         );
 
         // Ordinary mail still lands: the ceiling is real now + MAX_TTL, and
@@ -444,6 +548,7 @@ mod tests {
             carry_all(),
             crate::filter::Filter::unscoped(),
             NOW,
+            krab_fabric::profile::MaxBucket(5),
         );
 
         let reader = shared.clone();
@@ -481,6 +586,7 @@ mod tests {
                         carry_all(),
                         crate::filter::Filter::unscoped(),
                         NOW,
+                        krab_fabric::profile::MaxBucket(5),
                     );
                     for salt in 0..40 {
                         v.put(object(salt));
@@ -510,6 +616,7 @@ mod tests {
                         carry_all(),
                         crate::filter::Filter::unscoped(),
                         NOW,
+                        krab_fabric::profile::MaxBucket(5),
                     );
                     v.put(vec![0xFFu8; 256]); // not a valid object
                     v.put(object(i));
@@ -539,6 +646,7 @@ mod tests {
             carry_all(),
             crate::filter::Filter::unscoped(),
             NOW,
+            krab_fabric::profile::MaxBucket(5),
         );
         view.put(object(1));
 
@@ -556,6 +664,7 @@ mod tests {
             carry_all(),
             crate::filter::Filter::unscoped(),
             NOW,
+            krab_fabric::profile::MaxBucket(5),
         );
         v2.put(object(2));
         assert_eq!(shared.len(), 2);
@@ -575,7 +684,14 @@ mod tests {
             let s = shared.clone();
             std::thread::spawn(move || {
                 let mut v =
-                    ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped(), NOW);
+                    ExchangeView::new(
+                        s,
+                        NOW,
+                        carry_all(),
+                        crate::filter::Filter::unscoped(),
+                        NOW,
+                        krab_fabric::profile::MaxBucket(5),
+                    );
                 for salt in 0..300 {
                     v.put(object(salt));
                 }
@@ -607,7 +723,14 @@ mod tests {
             let s = shared.clone();
             std::thread::spawn(move || {
                 let mut v =
-                    ExchangeView::new(s, NOW, carry_all(), crate::filter::Filter::unscoped(), NOW);
+                    ExchangeView::new(
+                        s,
+                        NOW,
+                        carry_all(),
+                        crate::filter::Filter::unscoped(),
+                        NOW,
+                        krab_fabric::profile::MaxBucket(5),
+                    );
                 for salt in 0..300 {
                     v.put(object(salt));
                 }
@@ -623,6 +746,7 @@ mod tests {
                         carry_all(),
                         crate::filter::Filter::unscoped(),
                         NOW,
+                        krab_fabric::profile::MaxBucket(5),
                     );
                     // Each call is internally consistent: entries never
                     // contains a duplicate or a torn row, whatever is landing.
@@ -661,6 +785,7 @@ mod tests {
             krab_crypto::CarriagePolicy::default(),
             crate::filter::Filter::unscoped(),
             NOW,
+            krab_fabric::profile::MaxBucket(5),
         );
         assert!(!view.carriage.enabled, "carriage must default to off");
         view.put(bytes.clone());
@@ -696,6 +821,7 @@ mod tests {
             krab_crypto::CarriagePolicy::default(),
             crate::filter::Filter::unscoped(),
             NOW,
+            krab_fabric::profile::MaxBucket(5),
         );
         view.put(object(1));
         assert_eq!(store.len(), 1, "a sealed object was refused");
@@ -722,6 +848,7 @@ mod tests {
                 krab_crypto::CarriagePolicy::default(),
                 crate::filter::Filter::unscoped(),
                 0,
+                krab_fabric::profile::MaxBucket(5),
             );
             view.put(bytes);
             assert_eq!(store.len(), 1, "{kind:?} was refused with carriage off");
