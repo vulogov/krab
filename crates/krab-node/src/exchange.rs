@@ -236,7 +236,13 @@ pub fn initiate<C: Corpus + ?Sized>(
         entries: mine,
     })?;
 
-    loop {
+    // **Bounded, and it was not.** `MAX_MESSAGES` says this loop is capped and
+    // §2 of `ADVERSARIAL-PASS.md` records it as fixed; the commit added the
+    // bound to the inner drain and left both main loops as `loop {`. Every arm
+    // ends in `Some(_) => continue`, so a two-byte `RangeDone` costs the peer
+    // nothing and spins this thread for ever — measured at a million messages
+    // against a documented ceiling of 65 536.
+    for _ in 0..MAX_MESSAGES {
         match session.recv()? {
             Some(Control::Want(ids)) => moved.sent += serve_wants(session, corpus, &ids, &mut budget)?,
             Some(Control::Manifest {
@@ -284,7 +290,9 @@ pub fn respond_to<C: Corpus + ?Sized>(
     let mut budget = MAX_SERVED;
     let (mut offered, mut served) = (false, false);
 
-    loop {
+    // Bounded for the reason `initiate`'s loop is — this is the half a
+    // stranger reaches without dialling.
+    for _ in 0..MAX_MESSAGES {
         match session.recv()? {
             Some(Control::Manifest {
                 filter_digest: theirs,
@@ -1069,6 +1077,63 @@ mod tests {
         assert_eq!(ma.received, 0);
         assert_eq!(mb.received, 0);
         assert_eq!(a.len(), 10);
+    }
+
+    /// **Both main loops end.** `MAX_MESSAGES` documents a cap on this and
+    /// `ADVERSARIAL-PASS.md` §2 records it as applied to `initiate` and
+    /// `respond_to`; the commit put it on the inner drain loops and left both
+    /// main loops as `loop {`. Every arm ends in `Some(_) => continue`, so a
+    /// two-byte message a peer can send for ever costs it nothing and spins
+    /// the thread — a documented bound with no caller, which is the pattern
+    /// this pass was looking for.
+    #[test]
+    fn a_peer_that_never_finishes_does_not_run_a_driver_for_ever() {
+        /// A peer that answers everything with a message the driver ignores.
+        struct Chatter {
+            sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Session for Chatter {
+            fn send(&mut self, _: &Control) -> Result<(), Error> {
+                Ok(())
+            }
+            fn recv(&mut self) -> Result<Option<Control>, Error> {
+                self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Deliberately an opcode neither manifest-mode driver acts on,
+                // so it falls to `Some(_) => continue` and never advances the
+                // conversation. Two bytes on the wire.
+                Ok(Some(Control::RangeDone))
+            }
+            fn close(&mut self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        // `Session` is `Send`, so the counter has to be too.
+        use std::sync::atomic::Ordering;
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut store = store_with(0..4);
+        let mut view = StoreView(&mut store);
+        let mut peer = Chatter {
+            sent: count.clone(),
+        };
+        let _ = initiate(&mut peer, &mut view, [0; 32], 0, u32::MAX, 0);
+        assert!(
+            count.load(Ordering::Relaxed) <= MAX_MESSAGES + 1,
+            "initiate handled {} messages against a documented cap of {MAX_MESSAGES}",
+            count.load(Ordering::Relaxed)
+        );
+
+        count.store(0, Ordering::Relaxed);
+        let mut view = StoreView(&mut store);
+        let mut peer = Chatter {
+            sent: count.clone(),
+        };
+        let _ = respond_to(&mut peer, &mut view, [0; 32], 0, u32::MAX);
+        assert!(
+            count.load(Ordering::Relaxed) <= MAX_MESSAGES + 1,
+            "respond_to handled {} messages against a documented cap of {MAX_MESSAGES}",
+            count.load(Ordering::Relaxed)
+        );
     }
 
     /// **Every message this driver builds must fit a frame.** The two RBSR

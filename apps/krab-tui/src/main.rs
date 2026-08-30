@@ -9090,13 +9090,17 @@ impl App {
             // Ends when the receiver is dropped, which happens when the App
             // does. Nothing else needs to signal it.
             //
-            // **RFC 4 §12's concurrency cap, satisfied at one.** This loop is
-            // the only caller of `accept`, and `accept` completes the
-            // handshake before returning — so there is never more than one
-            // in-progress handshake, against the SHOULD of four. That is a
-            // structural property, not a counter, and it stops being true the
-            // moment someone spawns a thread per connection here. Whoever
-            // does that owes the cap the requirement asks for.
+            // **RFC 4 §9's concurrency cap is a counter now, not a
+            // structure.** This said the cap was "satisfied at one" because
+            // `accept` completed the handshake before returning, and warned
+            // that it would stop being true the moment someone spawned a
+            // thread per connection. Someone did — that is exactly how a
+            // silent caller was stopped from holding the accept loop — so the
+            // structural argument is gone and the comment described the
+            // opposite of the code.
+            //
+            // The cap it owed is `listener::MAX_PENDING_HANDSHAKES`, enforced
+            // inside `accept`. This loop is still its only caller.
             loop {
                 match l.accept() {
                     Ok(Some(pair)) => {

@@ -1764,3 +1764,342 @@ validate a state machine that cannot run anywhere.
 
 Finding 5 is separate and is the older shape — a bound satisfied so
 structurally that the structure became the vulnerability.
+
+---
+
+## Pass 15 — 2026-08-29 · axis: **the clock inside a session**
+
+Pass 14 asked what this node can put on a link. This one asks the question one
+step further along: **once two nodes are talking, what ends the conversation?**
+
+Every bound in the network path is a count. `MAX_FRAME` bounds a frame,
+`MAX_CONTROL` a message, `MAX_PER_EXCHANGE` a manifest, `MAX_SERVED` the
+objects one session gives away, `MAX_PENDING_HANDSHAKES` the handshakes in
+flight, `RBSR_MAX_ROUNDS` a descent. Not one of them is a deadline, and the
+only two clocks in the whole stack — `HANDSHAKE_TIMEOUT_S` and serial's
+`ANSWER_TIMEOUT` — are both spent before the session exists.
+
+The consequence is that **the hardening stops at the door.** Pass 14 §5 evicted
+the silent caller from the accept loop; it is still in the building.
+
+**Seven findings. Three are proved by a probe rather than by reading, and the
+first re-opens something this document records as fixed.**
+
+Baseline: 1 132 tests pass, `clippy --all-targets` is clean, and the workspace
+builds without a warning. None of what follows is visible from any of that.
+
+### 1. CRITICAL — the exchange loop is still unbounded · **open**
+
+Finding 2 of the first pass, above, is headed *"The exchange loop was
+unbounded · **FIXED**"* and says:
+
+> `initiate` and `respond_to` looped until the peer said `Done`. […]
+> **Fix.** `MAX_MESSAGES` bounds a session at 64k messages.
+
+That is not what the fix did. `git show 17b4524 -- crates/krab-node/src/exchange.rs`
+adds exactly one `for _ in 0..MAX_MESSAGES`, and it is the **inner drain loop**
+inside `respond_to` — the short read that waits for the initiator's closing
+`Done`. The two main loops the finding names were never touched, and are
+`loop {` today, at `exchange.rs:239` and `exchange.rs:287`.
+
+Both drivers end their match with
+
+```rust
+// Anything else belongs to a mode this driver does not speak.
+Some(_) => continue,
+```
+
+so a `Control::RangeDone` — opcode 6, two bytes on the wire — is read,
+discarded, and the loop goes round again. It charges nothing against
+`MAX_SERVED`, nothing against RFC 3 §6's quota, and nothing against any
+counter that exists.
+
+Measured, not argued. A `Session` that answers every `recv` with `RangeDone`,
+stopping itself at a million so the probe terminates:
+
+```text
+initiate handled 1000001 messages; MAX_MESSAGES = 65536
+respond_to handled 1000001 messages
+```
+
+Fifteen times the bound the document says is in force, and the only reason it
+stopped is that the mock stopped. Against a real socket nothing stops: the
+thread `reconcile_with` and `answer_reconciliation` spawn never returns.
+
+**This also invalidates Pass 13 finding 3.** That finding prices a peer's
+chosen `Range` at "eight seconds of a core for 64 KB of upload, on a session
+bounded only at 65 536 messages". The session is not bounded at 65 536
+messages. It is not bounded.
+
+And the amplification figure needs restating for the same reason. `MAX_SERVED`
+is derived as `MAX_PER_EXCHANGE * RBSR_MAX_ROUNDS`:
+
+```text
+MAX_PER_EXCHANGE = 2 973
+MAX_SERVED       = 23 784 objects
+at bucket 5      = 6 234 832 896 bytes = 6.23 GB
+```
+
+6.23 GB served in one session, for a peer that sent a handful of 35 KB `Want`
+frames. `MAX_SERVED` does hold — it is a local, decremented in `serve_wants`,
+and it is the one bound in this file that works. But it bounds the *bytes*, and
+the finding above is that nothing bounds the *conversation*, so the session
+that has spent its budget stays open anyway, forever, doing nothing.
+
+### 2. CRITICAL — a dial has no deadline, on the interface thread · **open**
+
+Pass 4 finding 10 is *"reconciliation froze the interface, taking the lock
+chord with it"*, and it was fixed by moving exchanges onto threads. The freeze
+is back through a different door, and this one has no timeout at all rather
+than a long one.
+
+`connect bob tcp 10.0.0.5:40000` runs `Command::Connect` → `dispatch_connect`
+→ `establish` → `TcpFabric::connect`, all of it on the thread that owns
+`event::poll`. `TcpFabric::connect` is three lines:
+
+```rust
+fn connect(&self) -> Result<Box<dyn Session>, Error> {
+    let mut stream = TcpStream::connect(&self.addr)?;
+    let noise = handshake_initiator(&mut stream, &self.local_static, &self.expected_peer)?;
+    Ok(Box::new(StreamSession::new(stream, noise)))
+}
+```
+
+`TcpStream::connect`, not `connect_timeout`. No `set_read_timeout`. So against
+a host that completes the TCP handshake and then says nothing, `read_len`
+blocks in `input.read` and never comes out. Probed:
+
+```text
+connect() still blocked after 20s against a silent socket
+```
+
+Twenty seconds is only where the probe gave up; there is no value it would have
+returned at.
+
+While it blocks, `run()` never reaches `event::poll`, so **`Binding::PanicWipe`
+and `Binding::Lock` are unreachable.** The panic chord is the one keystroke this
+codebase treats as unconditional — the previous commit is called *"The panic
+chord fires on one press"* — and a hostile or merely broken address takes it
+away entirely, from the terminal, with no way back but SIGKILL.
+
+Three things make this worse than a hang:
+
+- **It needs no credential.** The block happens inside `handshake_initiator`,
+  before `check_peer`. Anyone who can answer TCP at the address in the stored
+  peer-link — an on-path attacker, a reassigned address, a tarpit, a firewall
+  that ACKs and drops — reaches it. The static-key check that is meant to be
+  the first thing that matters is never evaluated.
+- **The operator was invited to do it.** `connect` prints the address to type
+  and `listen` prints the line to hand the other end.
+- **The sibling paths all got this right.** `bootstrap_connect` sets a 10 s read
+  and write timeout. `Listener` sets one. `SerialFabric` opens the port with a
+  30 s timeout. `establish`'s own `answer` branch is bounded by `ANSWER_WAIT_S`
+  and says why: "a bounded wait rather than a hang: the operator gets the
+  prompt back […] which a blocked UI would not allow." One branch of one
+  function is the exception, and it is the one an operator uses most.
+
+### 3. SEVERE — an established session has no deadline at all · **open**
+
+`Listener::accept` completes a handshake under `HANDSHAKE_TIMEOUT_S` and then
+does this, deliberately and with a reason:
+
+```rust
+// Clear the timeouts: a session is long-lived and legitimately silent
+// between reconciliations.
+stream.set_read_timeout(None)?;
+stream.set_write_timeout(None)?;
+```
+
+The reasoning is sound about the *link* and wrong about the *drivers*, because
+nothing keeps a session idle between reconciliations — `answer_reconciliation`
+takes the session and calls `respond_to`, which calls `recv` immediately. A
+session that is "legitimately silent" is a driver blocked in `read`.
+
+`grep -n 'set_read_timeout' crates/krab-fabric crates/krab-node` returns six
+lines, all in `listener.rs`, all before a session exists. There is no deadline
+anywhere in `initiate`, `respond_to`, `descend`, `serve_wants`, or
+`StreamSession::recv`.
+
+So Pass 14 finding 5's attacker — connect, send nothing — still works. It has
+moved past the handshake, which now costs it one static key from a completed
+peering rather than nothing, but the effect is larger:
+
+- The spawned exchange thread never returns, holding a socket, a
+  `TransportState` and an `ExchangeView`. One per silent session, permanently.
+- `take_session(peer)` has already **removed** the session from `LinkTable`, so
+  the peering has no transport until something re-establishes one.
+- No `activity_log::Event` is ever sent, because the event is constructed from
+  the driver's return value. The operator sees the hang as nothing at all. On
+  the next scheduled cycle they see `Failed { why: "no session — nothing
+  exchanged" }`, which points at the link rather than at a stuck thread.
+- Outbound links are re-established only by an operator typing `connect`, which
+  is finding 2.
+
+`MAX_MESSAGES` would not fix this even where it is applied: a bound on *how
+many* messages a peer may send is not a bound on *how long* this end will wait
+for the next one. `descend` is correctly bounded at `MAX_MESSAGES` and hangs
+exactly as readily.
+
+The serial backend is the counter-example that shows the gap is not inherent:
+`SerialFabric` opens the port with `.timeout(ANSWER_TIMEOUT)` and never clears
+it, so a serial session inherits a 30 s read deadline for its whole life and a
+silent peer ends it. TCP and serial were extracted into one handshake so the
+cryptography could not diverge. Their liveness did.
+
+### 4. SEVERE — the corpus has no size cap in the running node · **open**
+
+`Store::evict_to` is documented as the answer to storage pressure, and
+`MAX_SERVED`'s own doc-comment leans on it:
+
+> the bytes behind those objects are bounded by the corpus, which
+> `krab_store::index::Store::evict_to` already caps.
+
+It does not, because nothing calls it:
+
+```text
+$ grep -rn 'evict_to' --include='*.rs' crates apps | grep -v 'fn evict_to'
+crates/krab-store/src/index.rs:677:   assert_eq!(s.evict_to(0), 1);
+crates/krab-store/src/index.rs:723:   s.evict_to(s.bytes() / 2);
+crates/krab-store/src/index.rs:814:   s.evict_to(before / 2);
+crates/krab-store/src/index.rs:830:   s.evict_to(1);
+crates/krab-store/src/index.rs:919:   s.evict_to(0);
+crates/krab-node/tests/sim2.rs:446:   let evicted = full.evict_to(cap);
+crates/krab-node/tests/sim2.rs:487:   s.evict_to(s.bytes() / divisor);
+```
+
+Seven call sites, all of them tests. `main.rs:1233` ticks `expire` and
+`prune_tombstones`; nothing ticks `evict_to`, and there is no cap constant to
+pass it.
+
+The corpus is resident: `Segment.entries` is a `Vec<(ObjectId, Vec<u8>)>` and
+`Store` holds every segment. So the only ceiling on a node's memory is
+`MAX_TTL` — 45 days of everything every peer offers — combined with RFC 3 §6's
+per-peer daily quota, which Pass 13 finding 4 established defaults to
+*unlimited* whenever the credential ceremony was not completed. RFC 1 §9.3
+sizes corpora at 500 000 objects; at bucket 5 that is 131 GB of RAM.
+
+**The simulator has the cap the implementation does not.** `apps/krab-sim` takes
+`--cap`, and `sim.rs:374` enforces it:
+
+```rust
+if cap_bytes > 0 && b > cap_bytes {
+    while b > cap_bytes && oi < hi { … }
+}
+```
+
+That is the exact inverse of Pass 14 finding 4, and worth naming as its own
+shape: there, the simulator omitted a constraint the transport imposes and
+validated a state machine that could not run. Here it *adds* a constraint the
+node does not have, and validates a storage model the node does not implement.
+A harness that differs from the thing in either direction certifies the harness.
+
+### 5. `Bootstrap::accept_once` handshakes inline · **open**
+
+Pass 14 finding 5 was fixed for `Listener` in commit 1625653 by moving the
+handshake to a thread behind `MAX_PENDING_HANDSHAKES`. Its sibling forty lines
+below in the same file was not:
+
+```rust
+pub fn accept_once(&self) -> Result<Option<Accepted>, Error> {
+    let mut stream = match self.inner.accept() { … };
+    stream.set_nonblocking(false)?;
+    …
+    match crate::noise::handshake_responder_xx(&mut stream, &self.local_static) {
+```
+
+`bootstrap_accept` loops on it until its deadline, so one stranger who connects
+and stays silent consumes 10 s of a first-contact window in which the operator
+is on the phone reading a fingerprint aloud. It is the weaker case — the window
+is short, operator-initiated, and announced out of band — but it is the same
+defect, in the same file, in the function that is *by design* reachable by
+someone with no credential at all.
+
+### 6. Serial's timeout mapping documents behaviour that no longer exists · **open**
+
+```rust
+/// `serialport` reports a timeout as `TimedOut`; the framing layer needs the
+/// distinction between "nothing yet" and "the peer is gone", so a timeout is
+/// mapped to `UnexpectedEof` — which `frame::read_bytes` already treats as a
+/// clean end of input rather than as corruption.
+```
+
+Pass 13 finding 9 changed that. `read_len` now matches `Ok(0) => break` and
+sends every `Err` that is not `Interrupted` to `Err(Error::Io(e))`, so an
+`UnexpectedEof` from `Port::read` is an error, not a clean end.
+
+The behaviour is the safer of the two — a silent line ends the exchange as a
+failure rather than as a success — and it is the reverse of what the comment
+promises to a reader deciding whether the mapping is safe. It also makes
+`ANSWER_TIMEOUT` a hard 30-second liveness deadline on every serial exchange,
+on links RFC 4 §5.3 measures in minutes, against a peer that Pass 13 finding 3
+measured spending eight seconds on a single `range_fingerprint`. Nobody chose
+that number for that job.
+
+### 7. `start_listener`'s cap comment now says the opposite of the code · **open**
+
+```rust
+// **RFC 4 §12's concurrency cap, satisfied at one.** This loop is the only
+// caller of `accept`, and `accept` completes the handshake before returning
+// — so there is never more than one in-progress handshake […] and it stops
+// being true the moment someone spawns a thread per connection here.
+// Whoever does that owes the cap the requirement asks for.
+```
+
+Commit 1625653 spawned the thread per connection and paid the debt — that is
+what `MAX_PENDING_HANDSHAKES` is. The comment describing the old structure
+survived in the caller, and it is the kind that gets believed: it tells a future
+reader that a counter is unnecessary, in the file where the counter is not.
+
+### What did not fail
+
+- **`krab-core::cbor`.** Re-read against `snow`'s buffer contract as well as
+  its own. Non-allocating, non-recursive, `take` checked against the actual
+  input; `usize::try_from` on every declared length.
+- **`snow`'s handshake buffers.** The 1 KB `buf` in every `handshake_*` is fed
+  messages of up to `MAX_FRAME`. `decrypt_and_mix_hash` and `decrypt_ad` both
+  compare `out.len()` against the ciphertext before writing, so an oversized
+  handshake message is `Error::Decrypt`, not a panic.
+- **`Control::parse`.** Arity checked, every collection arm pushes, `u16f`/`u32f`
+  narrow by check rather than by cast.
+- **`Store::ingest`.** I5 first and unconditional; I1's two halves and I4
+  together; expiry floor, ceiling, watermark, tombstone and duplicate in order.
+- **`RoutingHeader::parse`.** `size_bucket` validated against `BUCKETS.len()`
+  before anything indexes it. Every direct struct literal in the workspace uses
+  `size_bucket: 0` and is a fixture, so `bucket_size`'s index cannot panic —
+  though the invariant lives in `parse` rather than in the type, and a `pub`
+  field is one construction away from it.
+- **`Post::signed_bytes`.** Length-prefixes `content_type` before the payload,
+  so the split between them is not malleable under a valid signature. This is
+  the shape that is usually wrong and is not.
+- **`handshake_responder_any`.** The static is read from inside message 1 and
+  checked against `allowed` before a byte of the caller's is acted on, and a
+  refusal is indistinguishable from a framing error.
+- **`advertised_range`.** The salt is spent only where both halves are
+  populated, so the forced descent through empty expiry space does not exhaust
+  it. Correct, and subtle enough to be worth re-confirming.
+
+### The pattern
+
+Pass 14 closed on the send path having one check and nothing upstream knowing
+the number exists. This pass is the same sentence about a different dimension:
+**every bound in Krab is a quantity, and the system's real resource is time.**
+
+A count bounds an attacker who wants to consume something. It does nothing to
+an attacker who wants to consume *nothing*, which is the cheaper attack and the
+one this threat model should expect — a friend-to-friend network has no volume
+to hide in, so the adversary who matters is the one who does not move.
+Findings 1, 2, 3 and 5 are all the same attacker, sending zero or two bytes,
+against four different layers, and each layer was hardened against the
+attacker who sends too much.
+
+Findings 1 and 4 add a second, worse shape: **a bound that is documented as
+existing and does not.** `ADVERSARIAL-PASS.md` §2 says `MAX_MESSAGES` bounds
+the session; `MAX_SERVED`'s doc-comment says `evict_to` caps the corpus;
+Pass 13 §3 prices an attack against a session limit that is not there. Three
+later arguments were built on two bounds that were never wired, and each
+argument is correct given its premise. A missing check fails a test. A missing
+check with a paragraph explaining it fails the next three reviews as well.
+
+The method note at the top of this document says to ask what would have to be
+true for a sentence to be false. Findings 1 and 4 suggest the cheaper version
+first: **for every sentence naming a mechanism, grep for its caller.**

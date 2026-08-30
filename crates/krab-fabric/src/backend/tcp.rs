@@ -55,6 +55,7 @@
 
 pub use crate::noise::{generate_static, NOISE_PARAMS};
 
+use crate::backend::listener;
 use crate::noise::{handshake_initiator, handshake_responder, StreamSession};
 use crate::profile::LinkProfile;
 use crate::{Error, Fabric, Session};
@@ -108,9 +109,42 @@ impl Fabric for TcpFabric {
         &self.profile
     }
 
+    /// Dial, handshake, and hand back a session.
+    ///
+    /// # Every step has a deadline, and none of them did
+    ///
+    /// `TcpStream::connect` blocks for the operating system's connect
+    /// timeout — on Linux about two minutes — and the handshake that follows
+    /// had no read timeout at all, so a socket that accepts and says nothing
+    /// blocked here indefinitely. **This runs on the interface thread**:
+    /// `connect <peer> tcp <addr>` is typed at the command line, and while it
+    /// blocks, `event::poll` is not being called. Nothing reaches the key
+    /// handler — including `Binding::Lock` and `Binding::PanicWipe`, which had
+    /// just been made to fire on one press and could not be pressed at all.
+    ///
+    /// It needs no credential either: the block is inside
+    /// `handshake_initiator`, before `check_peer` has anything to check.
+    ///
+    /// Every sibling path in this crate already did this — `bootstrap_connect`,
+    /// `Listener::accept`, the serial backend — which is what made the gap
+    /// hard to see by reading.
     fn connect(&self) -> Result<Box<dyn Session>, Error> {
-        let mut stream = TcpStream::connect(&self.addr)?;
+        // `connect_timeout` needs a resolved address; `connect` does its own
+        // resolution. Resolving first also bounds the DNS step, which is the
+        // other half of "the operator typed a hostname and the interface
+        // stopped".
+        let addr = self
+            .addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))?;
+        let mut stream = TcpStream::connect_timeout(
+            &addr,
+            std::time::Duration::from_secs(listener::CONNECT_TIMEOUT_S),
+        )?;
+        listener::arm_handshake(&stream)?;
         let noise = handshake_initiator(&mut stream, &self.local_static, &self.expected_peer)?;
+        listener::arm_session(&stream)?;
         Ok(Box::new(StreamSession::new(stream, noise)))
     }
 
@@ -125,7 +159,9 @@ impl Fabric for TcpFabric {
             Err(e) => return Err(e.into()),
         };
         stream.set_nonblocking(false)?;
+        listener::arm_handshake(&stream)?;
         let noise = handshake_responder(&mut stream, &self.local_static, &self.expected_peer)?;
+        listener::arm_session(&stream)?;
         Ok(Some(Box::new(StreamSession::new(stream, noise))))
     }
 }

@@ -153,20 +153,13 @@ impl Listener {
                 // The handshake blocks; the listen socket does not. Without
                 // this the first read returns WouldBlock and the handshake
                 // fails against a peer that is doing nothing wrong.
-                stream.set_nonblocking(false)?;
-                // And it must not block forever. It no longer blocks the
-                // accept loop either, but a thread that never returns is a
-                // thread leak, and the slot it holds is the resource RFC 4 §9
-                // caps.
-                let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
-                stream.set_read_timeout(t)?;
-                stream.set_write_timeout(t)?;
+                // It no longer blocks the accept loop, but a thread that
+                // never returns is a thread leak, and the slot it holds is
+                // the resource RFC 4 §9 caps.
+                arm_handshake(&stream)?;
                 let (noise, peer) =
                     handshake_responder_any(&mut stream, &local_static, &allowed)?;
-                // Clear the timeouts: a session is long-lived and legitimately
-                // silent between reconciliations.
-                stream.set_read_timeout(None)?;
-                stream.set_write_timeout(None)?;
+                arm_session(&stream)?;
                 Ok((
                     Box::new(StreamSession::new(stream, noise)) as Box<dyn Session>,
                     peer,
@@ -196,13 +189,17 @@ impl Listener {
 /// far end presented is returned so the caller can bind it to the card that
 /// arrives inside.
 pub fn bootstrap_connect(addr: &str, local_static: [u8; 32]) -> Result<Accepted, Error> {
-    let mut stream = TcpStream::connect(addr)?;
-    let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
-    stream.set_read_timeout(t)?;
-    stream.set_write_timeout(t)?;
+    let resolved = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))?;
+    let mut stream = TcpStream::connect_timeout(
+        &resolved,
+        std::time::Duration::from_secs(CONNECT_TIMEOUT_S),
+    )?;
+    arm_handshake(&stream)?;
     let (noise, peer) = crate::noise::handshake_initiator_xx(&mut stream, &local_static)?;
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
+    arm_session(&stream)?;
     Ok((Box::new(StreamSession::new(stream, noise)), peer))
 }
 
@@ -216,6 +213,9 @@ pub fn bootstrap_connect(addr: &str, local_static: [u8; 32]) -> Result<Accepted,
 pub struct Bootstrap {
     inner: TcpListener,
     local_static: [u8; 32],
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    done_tx: std::sync::mpsc::Sender<Accepted>,
+    done_rx: std::sync::mpsc::Receiver<Accepted>,
 }
 
 impl Bootstrap {
@@ -224,10 +224,14 @@ impl Bootstrap {
         let inner = TcpListener::bind(addr)?;
         let port = inner.local_addr()?.port();
         inner.set_nonblocking(true)?;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         Ok((
             Bootstrap {
                 inner,
                 local_static,
+                pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                done_tx,
+                done_rx,
             },
             port,
         ))
@@ -239,24 +243,55 @@ impl Bootstrap {
     /// the handshake is dropped and also reported as `Ok(None)`: this socket
     /// accepts strangers by design, so a failed one is not an event, and
     /// making it one would let anyone fill the operator's log from outside.
+    /// # The same fix as [`Listener::accept`], which this did not get
+    ///
+    /// The handshake was inline here too. It is a smaller hole — the poll
+    /// loop is on its own thread and this door is open for minutes, not for
+    /// the life of the process — but the shape is identical: a caller that
+    /// connects and says nothing owns the door for [`HANDSHAKE_TIMEOUT_S`],
+    /// and repeating that costs one socket and shuts out the person the
+    /// operator is actually waiting for. First contact is arranged for a
+    /// particular minute, so blocking it is enough.
+    ///
+    /// Two siblings in one file, one fixed and one not, is the shape of every
+    /// omission this series has found.
     pub fn accept_once(&self) -> Result<Option<Accepted>, Error> {
-        let mut stream = match self.inner.accept() {
+        use std::sync::atomic::Ordering;
+
+        if let Ok(session) = self.done_rx.try_recv() {
+            return Ok(Some(session));
+        }
+        let stream = match self.inner.accept() {
             Ok((s, _)) => s,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        stream.set_nonblocking(false)?;
-        let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
-        stream.set_read_timeout(t)?;
-        stream.set_write_timeout(t)?;
-        match crate::noise::handshake_responder_xx(&mut stream, &self.local_static) {
-            Ok((noise, peer)) => {
-                stream.set_read_timeout(None)?;
-                stream.set_write_timeout(None)?;
-                Ok(Some((Box::new(StreamSession::new(stream, noise)), peer)))
-            }
-            Err(_) => Ok(None),
+        if self.pending.load(Ordering::Relaxed) >= MAX_PENDING_HANDSHAKES {
+            return Ok(None);
         }
+        self.pending.fetch_add(1, Ordering::Relaxed);
+
+        let local_static = self.local_static;
+        let tx = self.done_tx.clone();
+        let pending = self.pending.clone();
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let finish = || -> Result<Accepted, Error> {
+                arm_handshake(&stream)?;
+                let (noise, peer) =
+                    crate::noise::handshake_responder_xx(&mut stream, &local_static)?;
+                arm_session(&stream)?;
+                Ok((
+                    Box::new(StreamSession::new(stream, noise)) as Box<dyn Session>,
+                    peer,
+                ))
+            };
+            if let Ok(session) = finish() {
+                let _ = tx.send(session);
+            }
+            pending.fetch_sub(1, Ordering::Relaxed);
+        });
+        Ok(None)
     }
 }
 
@@ -286,6 +321,58 @@ pub fn bootstrap_accept(
 /// stays silent would otherwise stop every other peer from ever getting in,
 /// at a cost to the attacker of one open socket.
 pub const HANDSHAKE_TIMEOUT_S: u64 = 10;
+
+/// How long a dial may take before it is abandoned.
+///
+/// `TcpStream::connect` waits for the operating system's own timeout, which
+/// is about two minutes on Linux and is not a number this program chose.
+/// `connect <peer> tcp <addr>` runs on the interface thread, so that is two
+/// minutes in which no key is read — including the panic chord.
+pub const CONNECT_TIMEOUT_S: u64 = 10;
+
+/// How long a driver waits for the next message inside an exchange.
+///
+/// # Why an established session has a deadline
+///
+/// It did not, and the reasoning for that was right about the link and wrong
+/// about the drivers: a session is long-lived and legitimately silent
+/// *between* reconciliations, so the timeouts were cleared once the handshake
+/// finished. But nothing reads a socket between reconciliations. Every read
+/// happens inside `krab_node::exchange`, where the driver is waiting for the
+/// peer's next message and a peer that never sends one is not idle — it is
+/// holding a thread that will never return, on a session `take_session` has
+/// already removed, so no event is ever logged and the operator is told
+/// nothing.
+///
+/// Generous rather than tight: an honest peer on a slow link may take a while
+/// to answer a manifest, and cutting it off would turn a slow exchange into a
+/// failed one. It bounds a stall, not a delay.
+pub const SESSION_TIMEOUT_S: u64 = 120;
+
+/// Put the handshake's deadline on a stream.
+///
+/// The handshake blocks and the listen socket does not, so blocking mode is
+/// restored here too — without it the first read returns `WouldBlock` and the
+/// handshake fails against a peer doing nothing wrong.
+pub fn arm_handshake(stream: &TcpStream) -> Result<(), Error> {
+    stream.set_nonblocking(false)?;
+    let t = Some(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_S));
+    stream.set_read_timeout(t)?;
+    stream.set_write_timeout(t)?;
+    Ok(())
+}
+
+/// Put the session's deadline on a stream, once the handshake has completed.
+///
+/// One function rather than four copies of `set_read_timeout(None)`, which is
+/// what the four sites had — and each one was independently correct about the
+/// link and independently wrong about the drivers.
+pub fn arm_session(stream: &TcpStream) -> Result<(), Error> {
+    let t = Some(std::time::Duration::from_secs(SESSION_TIMEOUT_S));
+    stream.set_read_timeout(t)?;
+    stream.set_write_timeout(t)?;
+    Ok(())
+}
 
 /// A session, and the static key of the peer it belongs to.
 pub type Accepted = (Box<dyn Session>, [u8; 32]);

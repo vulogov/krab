@@ -178,11 +178,40 @@ impl SerialFabric {
 
 /// A serial port as a plain byte stream.
 ///
-/// `serialport` reports a timeout as `TimedOut`; the framing layer needs the
-/// distinction between "nothing yet" and "the peer is gone", so a timeout is
-/// mapped to `UnexpectedEof` — which `frame::read_bytes` already treats as a
-/// clean end of input rather than as corruption.
+/// `serialport` reports a timeout as `TimedOut`, which no other backend
+/// produces, so it is mapped to `UnexpectedEof` — the one every stream
+/// transport already reaches at the end of input.
+///
+/// # What that means now, which is not what it used to
+///
+/// This said `frame::read_bytes` treats `UnexpectedEof` as "a clean end of
+/// input rather than corruption". It did, and Pass 13 §9 removed that: a
+/// stream that ends part-way through a length prefix is a truncated frame,
+/// not a finished peer, and reporting the two identically let a cut
+/// connection be recorded as a completed exchange. `read_len` now answers
+/// "clean end" only for zero bytes read, so a timeout **mid-frame** is an
+/// error and a timeout **between** frames still ends the session.
+///
+/// That is the behaviour a serial line should have, and the comment had
+/// simply outlived the code it described.
 struct Port(Box<dyn serialport::SerialPort>);
+
+impl Port {
+    /// Swap the handshake's deadline for the session's.
+    ///
+    /// [`ANSWER_TIMEOUT`] is how long to wait for somebody to connect a cable.
+    /// Leaving it in place made it the exchange's deadline too, which nothing
+    /// said and nobody chose — thirty seconds for a peer to answer a manifest
+    /// on the slowest link this program supports. The session deadline is the
+    /// one every other backend uses.
+    fn arm_session(&mut self) -> Result<(), Error> {
+        self.0
+            .set_timeout(Duration::from_secs(
+                crate::backend::listener::SESSION_TIMEOUT_S,
+            ))
+            .map_err(|_| Error::Unreachable)
+    }
+}
 
 impl Read for Port {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
@@ -219,6 +248,7 @@ impl Fabric for SerialFabric {
         }
         let mut port = Port(self.open(ANSWER_TIMEOUT)?);
         let noise = handshake_initiator(&mut port, &self.local_static, &self.expected_peer)?;
+        port.arm_session()?;
         Ok(Box::new(StreamSession::new(port, noise)))
     }
 
@@ -232,7 +262,10 @@ impl Fabric for SerialFabric {
         }
         let mut port = Port(self.open(ANSWER_TIMEOUT)?);
         match handshake_responder(&mut port, &self.local_static, &self.expected_peer) {
-            Ok(noise) => Ok(Some(Box::new(StreamSession::new(port, noise)))),
+            Ok(noise) => {
+                port.arm_session()?;
+                Ok(Some(Box::new(StreamSession::new(port, noise))))
+            }
             // Nothing arrived, or what arrived was not a handshake. Neither is
             // fatal on a line an operator may still be connecting.
             Err(_) => Ok(None),
