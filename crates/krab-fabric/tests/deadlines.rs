@@ -52,6 +52,30 @@ fn a_dial_to_a_silent_socket_gives_up() {
     drop(held);
 }
 
+/// **The deadline is the carrier's, not one number for all of them.**
+///
+/// Two minutes bounds a stall on TCP and guarantees a failed exchange on a
+/// link moving 0.85 bytes a second, where the largest control message takes
+/// days. The floor is chosen; everything above it is arithmetic.
+#[test]
+fn a_constrained_carrier_gets_the_time_its_physics_need() {
+    use krab_fabric::profile::SESSION_TIMEOUT_FLOOR_S;
+
+    let floor = Duration::from_secs(SESSION_TIMEOUT_FLOOR_S);
+    assert_eq!(LinkProfile::tcp().session_timeout(), floor, "tcp");
+    assert_eq!(LinkProfile::serial().session_timeout(), floor, "serial");
+
+    let lora = LinkProfile::lora_sf10();
+    let got = lora.session_timeout();
+    assert!(
+        got > Duration::from_secs(60 * 60),
+        "LoRa was given {got:?} to carry a message that takes far longer"
+    );
+    // And it is the carriage time, not a second magic number.
+    let want = (krab_fabric::frame::MAX_CONTROL as f64 / lora.sustained_bps).ceil() as u64;
+    assert_eq!(got, Duration::from_secs(want));
+}
+
 /// **An established session has a deadline too.**
 ///
 /// The timeouts were cleared once the handshake completed, and the reasoning

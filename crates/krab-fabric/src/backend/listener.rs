@@ -330,7 +330,14 @@ pub const HANDSHAKE_TIMEOUT_S: u64 = 10;
 /// minutes in which no key is read — including the panic chord.
 pub const CONNECT_TIMEOUT_S: u64 = 10;
 
-/// How long a driver waits for the next message inside an exchange.
+/// How long a driver waits for the next message inside an exchange, when the
+/// caller has no [`crate::profile::LinkProfile`] to ask.
+///
+/// Carriers derive their own from throughput —
+/// [`crate::profile::LinkProfile::session_timeout`] — because two minutes
+/// bounds a stall on TCP and guarantees a failed exchange on LoRa. The
+/// listener has no profile: it is one socket for every peer, and TCP's derived
+/// figure is this floor anyway.
 ///
 /// # Why an established session has a deadline
 ///
@@ -347,7 +354,7 @@ pub const CONNECT_TIMEOUT_S: u64 = 10;
 /// Generous rather than tight: an honest peer on a slow link may take a while
 /// to answer a manifest, and cutting it off would turn a slow exchange into a
 /// failed one. It bounds a stall, not a delay.
-pub const SESSION_TIMEOUT_S: u64 = 120;
+pub const SESSION_TIMEOUT_S: u64 = crate::profile::SESSION_TIMEOUT_FLOOR_S;
 
 /// Put the handshake's deadline on a stream.
 ///
@@ -368,7 +375,12 @@ pub fn arm_handshake(stream: &TcpStream) -> Result<(), Error> {
 /// what the four sites had — and each one was independently correct about the
 /// link and independently wrong about the drivers.
 pub fn arm_session(stream: &TcpStream) -> Result<(), Error> {
-    let t = Some(std::time::Duration::from_secs(SESSION_TIMEOUT_S));
+    arm_session_for(stream, std::time::Duration::from_secs(SESSION_TIMEOUT_S))
+}
+
+/// The same, for a caller that knows its carrier's own deadline.
+pub fn arm_session_for(stream: &TcpStream, deadline: std::time::Duration) -> Result<(), Error> {
+    let t = Some(deadline);
     stream.set_read_timeout(t)?;
     stream.set_write_timeout(t)?;
     Ok(())

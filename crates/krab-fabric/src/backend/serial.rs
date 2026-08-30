@@ -204,12 +204,8 @@ impl Port {
     /// said and nobody chose — thirty seconds for a peer to answer a manifest
     /// on the slowest link this program supports. The session deadline is the
     /// one every other backend uses.
-    fn arm_session(&mut self) -> Result<(), Error> {
-        self.0
-            .set_timeout(Duration::from_secs(
-                crate::backend::listener::SESSION_TIMEOUT_S,
-            ))
-            .map_err(|_| Error::Unreachable)
+    fn arm_session(&mut self, deadline: Duration) -> Result<(), Error> {
+        self.0.set_timeout(deadline).map_err(|_| Error::Unreachable)
     }
 }
 
@@ -248,7 +244,7 @@ impl Fabric for SerialFabric {
         }
         let mut port = Port(self.open(ANSWER_TIMEOUT)?);
         let noise = handshake_initiator(&mut port, &self.local_static, &self.expected_peer)?;
-        port.arm_session()?;
+        port.arm_session(self.profile.session_timeout())?;
         Ok(Box::new(StreamSession::new(port, noise)))
     }
 
@@ -263,7 +259,7 @@ impl Fabric for SerialFabric {
         let mut port = Port(self.open(ANSWER_TIMEOUT)?);
         match handshake_responder(&mut port, &self.local_static, &self.expected_peer) {
             Ok(noise) => {
-                port.arm_session()?;
+                port.arm_session(self.profile.session_timeout())?;
                 Ok(Some(Box::new(StreamSession::new(port, noise))))
             }
             // Nothing arrived, or what arrived was not a handshake. Neither is

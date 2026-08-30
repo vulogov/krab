@@ -153,7 +153,7 @@ fn reconcile(a: &mut Store, b: &mut Store, mode: Mode, salt: u64) -> usize {
     let mut b_owned = core::mem::replace(b, Store::new());
     let responder = std::thread::spawn(move || {
         let moved = {
-            let mut vb = StoreView(&mut b_owned);
+            let mut vb = StoreView::new(&mut b_owned, NOW_MIN);
             match mode {
                 Mode::Rbsr => exchange::respond_rbsr(&mut end_b, &mut vb, [0; 32], 0),
                 Mode::Manifest => exchange::respond_to(&mut end_b, &mut vb, [0; 32], 0, u32::MAX),
@@ -164,7 +164,7 @@ fn reconcile(a: &mut Store, b: &mut Store, mode: Mode, salt: u64) -> usize {
     });
 
     let from_a = {
-        let mut va = StoreView(a);
+        let mut va = StoreView::new(a, NOW_MIN);
         match mode {
             Mode::Rbsr => exchange::initiate_rbsr(&mut end_a, &mut va, [0; 32], 0, u32::MAX, 0),
             Mode::Manifest => exchange::initiate(&mut end_a, &mut va, [0; 32], 0, u32::MAX, salt),

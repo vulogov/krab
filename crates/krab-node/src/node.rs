@@ -47,11 +47,44 @@ use std::collections::BTreeMap;
 /// `MILESTONE-0.1.md` §2 phase F requires the measurements run "against the
 /// implementations ... not against a third model", and a second adapter
 /// written for the simulator would be exactly that third model.
-pub struct StoreView<'a>(pub &'a mut Store);
+pub struct StoreView<'a> {
+    store: &'a mut Store,
+    /// Now, in minutes, as the caller understands it.
+    ///
+    /// # Why this is a field and not a constant
+    ///
+    /// [`Corpus::put`] derived it from the object's own header —
+    /// `expiry_min.saturating_sub(1)` as `now_min` and `u32::MAX` as the
+    /// ceiling — so RFC 1 §11's **I2 could not reject anything.** An expiry in
+    /// the past passed, because it was one minute after the "now" it supplied;
+    /// an expiry centuries out passed, because the ceiling was the largest
+    /// number there is. Both bounds came from the value they were meant to
+    /// bound.
+    ///
+    /// That is the same defect the TUI's `ExchangeView` had and closed, and it
+    /// mattered more here than it looks: every user of this adapter is a test,
+    /// SIM-2, or the courier gate. The simulated *wire* was made to carry the
+    /// transport's limits in Pass 14; the simulated *corpus* still did not
+    /// carry ingest's, so every convergence measurement in the suite ran
+    /// through an adapter that accepted objects a real node refuses.
+    now_min: u32,
+}
+
+impl<'a> StoreView<'a> {
+    /// A view of `store` as it stands at `now_min`.
+    pub fn new(store: &'a mut Store, now_min: u32) -> StoreView<'a> {
+        StoreView { store, now_min }
+    }
+
+    /// The store behind the view.
+    pub fn store(&mut self) -> &mut Store {
+        self.store
+    }
+}
 
 impl Corpus for StoreView<'_> {
     fn entries(&self, lo: u32, hi: u32) -> Vec<Entry> {
-        self.0
+        self.store
             .entries_in_range(lo, hi)
             .into_iter()
             .map(|(expiry_min, id)| Entry {
@@ -61,25 +94,25 @@ impl Corpus for StoreView<'_> {
             .collect()
     }
     fn fingerprint(&self, lo: u32, hi: u32) -> krab_crypto::Fingerprint {
-        self.0.range_fingerprint(lo, hi)
+        self.store.range_fingerprint(lo, hi)
     }
     fn count(&self, lo: u32, hi: u32) -> u32 {
-        self.0.count_in_range(lo, hi)
+        self.store.count_in_range(lo, hi)
     }
     fn get(&self, id: &[u8; TRUNC]) -> Option<Vec<u8>> {
-        self.0.get_truncated(id).map(|b| b.to_vec())
+        self.store.get_truncated(id).map(|b| b.to_vec())
     }
     fn has(&self, id: &[u8; TRUNC]) -> bool {
-        self.0.has_truncated(id)
+        self.store.has_truncated(id)
     }
     fn put(&mut self, bytes: Vec<u8>) {
-        if let Ok(h) = krab_core::object::RoutingHeader::parse(&bytes) {
-            let id = krab_crypto::object_id(&bytes);
-            // RFC 1 §11's checks live in the store; a refusal here is normal.
-            let _ = self
-                .0
-                .ingest(id, bytes, h.expiry_min.saturating_sub(1), u32::MAX);
-        }
+        let id = krab_crypto::object_id(&bytes);
+        // RFC 1 §11's checks live in the store; a refusal here is normal, and
+        // the two bounds come from this node's clock rather than from the
+        // object being admitted.
+        let _ = self
+            .store
+            .ingest(id, bytes, self.now_min, krab_core::tag::MAX_TTL_MIN);
     }
 }
 
@@ -183,10 +216,17 @@ impl Node {
     /// Exposed separately so a test — or the sim fabric — can drive both ends.
     /// The mode comes from the link profile, which RFC 5 §4.1 makes a function
     /// of `latency_class` rather than a setting.
-    pub fn reconcile_with(&mut self, other: &mut Node, mode: Mode) -> usize {
+    pub fn reconcile_with(&mut self, other: &mut Node, mode: Mode, now_min: u32) -> usize {
         let (lo, hi) = self.window;
-        let mut a = StoreView(&mut self.store);
-        let mut b = StoreView(&mut other.store);
+        // **`now_min` is a parameter and not inferred from the window.** The
+        // first version of this derived it as `lo + MAX_TTL`, which is right
+        // for the interface's window — `(now - MAX_TTL, now + MAX_TTL)` — and
+        // wrong for this one, which a caller may set to anything. A bound
+        // computed from a value that was never promised to have that shape is
+        // the defect `StoreView::put` had; deriving a second one here would
+        // have replaced it with the same mistake spelled differently.
+        let mut a = StoreView::new(&mut self.store, now_min);
+        let mut b = StoreView::new(&mut other.store, now_min);
         recon::reconcile(&mut a, &mut b, mode, lo, hi).transferred
     }
 }
@@ -316,6 +356,45 @@ mod tests {
         assert!(initiated > 0, "and still reaches out");
     }
 
+    /// **The harness refuses what a node refuses.**
+    ///
+    /// `Corpus::put` took both of I2's bounds from the object being admitted —
+    /// `expiry_min - 1` as now, `u32::MAX` as the ceiling — so nothing could
+    /// fail either. Every user of this adapter is a test, SIM-2 or the courier
+    /// gate, which is what made it matter: Pass 14 gave the simulated *wire*
+    /// the transport's limits, and the simulated *corpus* still did not have
+    /// ingest's.
+    #[test]
+    fn the_adapter_applies_the_same_expiry_check_a_node_does() {
+        let mut store = Store::new();
+        let mut view = StoreView::new(&mut store, NOW_MIN);
+
+        let ok = |expiry: u32, salt: u8| {
+            let h = RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags: 0,
+                expiry_min: expiry,
+                tag: Tag([salt; 8]),
+            };
+            canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).unwrap()
+        };
+
+        // Already expired — I2's lower bound. Under the old adapter this was
+        // admitted, because the "now" it was checked against was derived from
+        // its own expiry.
+        view.put(ok(NOW_MIN - 10, 1));
+        // Centuries out — I2's upper bound, against a ceiling that was
+        // `u32::MAX`.
+        view.put(ok(u32::MAX - 10_000, 2));
+        assert_eq!(view.store().len(), 0, "the adapter admitted what I2 refuses");
+
+        // And an ordinary object still crosses.
+        view.put(ok(NOW_MIN + 1_000, 3));
+        assert_eq!(view.store().len(), 1);
+    }
+
     /// The integration test: a message crosses from one node to another with
     /// **nobody touching anything**.
     #[test]
@@ -326,14 +405,14 @@ mod tests {
         assert_eq!(a.store.len(), 3);
         assert_eq!(b.store.len(), 2);
 
-        let moved = a.reconcile_with(&mut b, Mode::Rbsr);
+        let moved = a.reconcile_with(&mut b, Mode::Rbsr, NOW_MIN);
 
         assert_eq!(moved, 5, "every object each side lacked");
         assert_eq!(a.store.len(), 5, "A reached the union");
         assert_eq!(b.store.len(), 5, "B reached the union");
 
         // Idempotent: a second pass moves nothing.
-        assert_eq!(a.reconcile_with(&mut b, Mode::Rbsr), 0);
+        assert_eq!(a.reconcile_with(&mut b, Mode::Rbsr, NOW_MIN), 0);
     }
 
     /// And it happens while both ends are locked, because reconciliation needs
@@ -348,7 +427,7 @@ mod tests {
         assert!(!a.session.can_decrypt() && !b.session.can_decrypt());
         assert!(a.session.can_reconcile() && b.session.can_reconcile());
 
-        assert_eq!(a.reconcile_with(&mut b, Mode::Manifest), 5);
+        assert_eq!(a.reconcile_with(&mut b, Mode::Manifest, NOW_MIN), 5);
         assert_eq!(a.store.len(), 5);
         assert_eq!(b.store.len(), 5);
     }

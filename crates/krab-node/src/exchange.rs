@@ -721,7 +721,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for _ in 0..400 {
                 if let Ok(Some(mut s)) = responder.accept() {
-                    let mut vb = StoreView(&mut b_owned);
+                    let mut vb = StoreView::new(&mut b_owned, NOW);
                     let m = respond_to(&mut *s, &mut vb, [0; 32], 0, u32::MAX).unwrap_or_default();
                     return (b_owned, m);
                 }
@@ -732,7 +732,7 @@ mod tests {
 
         let initiator = TcpFabric::new(LinkProfile::tcp(), format!("127.0.0.1:{port}"), a_sk, b_pk);
         let mut session = initiator.connect().expect("handshake");
-        let mut va = StoreView(a);
+        let mut va = StoreView::new(a, NOW);
         let ma = initiate(&mut *session, &mut va, [0; 32], 0, u32::MAX, salt).unwrap_or_default();
         let _ = session.close();
 
@@ -780,7 +780,7 @@ mod tests {
     #[test]
     fn objects_from_the_wire_go_through_ingest() {
         let mut dest = Store::new();
-        let mut view = StoreView(&mut dest);
+        let mut view = StoreView::new(&mut dest, NOW);
         let (_, good) = object(1);
 
         assert_eq!(take(&mut view, good.clone()), 1);
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn a_filter_digest_mismatch_is_refused() {
         let mut store = store_with(0..5);
-        let mut view = StoreView(&mut store);
+        let mut view = StoreView::new(&mut store, NOW);
         let entries = vec![Entry {
             expiry_min: 1,
             id: [1u8; TRUNC],
@@ -852,8 +852,8 @@ mod tests {
     /// advertised range must vary.
     #[test]
     fn the_advertised_range_varies_with_the_salt() {
-        let store = store_with(0..(MAX_PER_EXCHANGE as u32 * 3));
-        let view = StoreView(&mut { store });
+        let mut store = store_with(0..(MAX_PER_EXCHANGE as u32 * 3));
+        let view = StoreView::new(&mut store, NOW);
         let mut seen = std::collections::BTreeSet::new();
         for salt in 0..8u64 {
             let r = advertised_range(&view, 0, u32::MAX, salt);
@@ -907,14 +907,14 @@ mod tests {
         let mut b_owned = core::mem::replace(b, Store::new());
         let handle = std::thread::spawn(move || {
             let m = {
-                let mut vb = StoreView(&mut b_owned);
+                let mut vb = StoreView::new(&mut b_owned, NOW);
                 respond_rbsr(&mut end_b, &mut vb, [0; 32], salt).unwrap_or_default()
             };
             (b_owned, m)
         });
 
         let ma = {
-            let mut va = StoreView(a);
+            let mut va = StoreView::new(a, NOW);
             initiate_rbsr(&mut end_a, &mut va, [0; 32], 0, u32::MAX, salt).unwrap_or_default()
         };
         let _ = end_a.close();
@@ -1061,7 +1061,7 @@ mod tests {
         let fabric = SimFabric::new(LinkProfile::tcp());
         let mut end = fabric.end_a();
         let mut store = Store::new();
-        let mut view = StoreView(&mut store);
+        let mut view = StoreView::new(&mut store, NOW);
         // An empty pipe returns None immediately, which is the other exit.
         let m = respond_to(&mut end, &mut view, [0; 32], 0, u32::MAX);
         assert!(m.is_ok());
@@ -1112,7 +1112,7 @@ mod tests {
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let mut store = store_with(0..4);
-        let mut view = StoreView(&mut store);
+        let mut view = StoreView::new(&mut store, NOW);
         let mut peer = Chatter {
             sent: count.clone(),
         };
@@ -1124,7 +1124,7 @@ mod tests {
         );
 
         count.store(0, Ordering::Relaxed);
-        let mut view = StoreView(&mut store);
+        let mut view = StoreView::new(&mut store, NOW);
         let mut peer = Chatter {
             sent: count.clone(),
         };
@@ -1226,7 +1226,7 @@ mod tests {
         let mut store = Store::new();
         let fabric = SimFabric::new(LinkProfile::tcp());
         let mut end = fabric.end_a();
-        let view = StoreView(&mut store);
+        let view = StoreView::new(&mut store, NOW);
         let absent = [[9u8; TRUNC]; 3];
         let mut budget = MAX_SERVED;
         assert_eq!(serve_wants(&mut end, &view, &absent, &mut budget).unwrap(), 0);
@@ -1251,7 +1251,7 @@ mod tests {
 
         let fabric = SimFabric::new(LinkProfile::tcp());
         let mut end = fabric.end_a();
-        let view = StoreView(&mut store);
+        let view = StoreView::new(&mut store, NOW);
 
         // A peer that keeps asking for the four objects it already has.
         let mut budget = MAX_SERVED;

@@ -144,7 +144,7 @@ impl Fabric for TcpFabric {
         )?;
         listener::arm_handshake(&stream)?;
         let noise = handshake_initiator(&mut stream, &self.local_static, &self.expected_peer)?;
-        listener::arm_session(&stream)?;
+        listener::arm_session_for(&stream, self.profile.session_timeout())?;
         Ok(Box::new(StreamSession::new(stream, noise)))
     }
 
@@ -161,7 +161,7 @@ impl Fabric for TcpFabric {
         stream.set_nonblocking(false)?;
         listener::arm_handshake(&stream)?;
         let noise = handshake_responder(&mut stream, &self.local_static, &self.expected_peer)?;
-        listener::arm_session(&stream)?;
+        listener::arm_session_for(&stream, self.profile.session_timeout())?;
         Ok(Some(Box::new(StreamSession::new(stream, noise))))
     }
 }

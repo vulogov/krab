@@ -85,10 +85,43 @@ pub struct LinkProfile {
     pub fec: bool,
 }
 
+/// The shortest a session's read deadline may be, in seconds.
+///
+/// A driver waiting for a peer's next message needs longer than the message
+/// takes to arrive, and on a fast link that is milliseconds — so the floor is
+/// not derived from throughput but from what a peer might reasonably be doing
+/// between messages: reading a manifest against a large corpus, waiting on a
+/// disk. Two minutes.
+pub const SESSION_TIMEOUT_FLOOR_S: u64 = 120;
+
 impl LinkProfile {
     /// The strategy this link must use.
     pub fn sync_mode(&self) -> Mode {
         self.latency_class.sync_mode()
+    }
+
+    /// How long a driver waits for this link's next message.
+    ///
+    /// # Derived, because 120 seconds is not a fact about LoRa
+    ///
+    /// This was one constant for every carrier. Two minutes is generous on
+    /// TCP and absurd on a link moving 0.85 bytes a second, where the largest
+    /// control message takes **three and a half days** — so a single number
+    /// bounds a stall on one carrier and guarantees a failed exchange on
+    /// another.
+    ///
+    /// The floor is the choice and the rest is arithmetic: the time this link
+    /// needs to carry one largest message, at its own sustained rate, or
+    /// [`SESSION_TIMEOUT_FLOOR_S`], whichever is longer. So TCP and serial get
+    /// the floor, and a constrained carrier gets what its physics require
+    /// without anybody editing a table.
+    pub fn session_timeout(&self) -> core::time::Duration {
+        let carry = if self.sustained_bps > 0.0 {
+            (crate::frame::MAX_CONTROL as f64 / self.sustained_bps).ceil() as u64
+        } else {
+            SESSION_TIMEOUT_FLOOR_S
+        };
+        core::time::Duration::from_secs(carry.max(SESSION_TIMEOUT_FLOOR_S))
     }
 
     /// Sustained bytes per day.

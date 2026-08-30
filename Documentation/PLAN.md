@@ -903,3 +903,72 @@ MUST be ignored" makes it forward-compatible and where it discloses nothing.
 It **MUST NOT** go in the routing header: there it is a per-message "this
 compressed well" bit that every relay can read, which is a cleaner oracle than
 the one the scheme was trying to avoid.
+
+---
+
+## 15. Decision: no embedded database before 0.1, 2026-08-30
+
+**The corpus stays as segment files, and `graphitesql` is deferred until
+there is a measured scalability problem rather than an anticipated one.**
+
+### What prompted the question
+
+Saving the corpus rewrote every object the node held, on every exchange that
+received anything — at RFC 3 §5's gigabyte retention, a gigabyte of I/O to
+record one object. That is a real liability on a busy node and it is what an
+embedded store would have removed for free.
+
+It was not what the layout required. RFC 5 §7 had already specified TTL
+buckets so that "eviction is `unlink()` of a whole segment: no compaction, no
+tombstone sweep, no fragmentation, no write amplification"; the store had the
+buckets and only the writer did not use them. One file per bucket brought a
+save down to the bucket that changed — measured at 267 KB against 12.8 MB for
+a 50 000-object corpus — which removes the pressure that made a database look
+necessary.
+
+### Why not adopt one anyway
+
+Two candidates were considered. `graphitesql` is the better fit of the pair —
+`no_std` + `alloc`, `#![forbid(unsafe_code)]`, public domain, core-and-alloc
+dependencies only — and `minigraf` is a Datalog graph store with eleven
+dependencies and a query language, for a workload that is "give me the bytes
+for this 32-byte key".
+
+Against either, four arguments hold:
+
+1. **RFC 5 §7's own analysis.** Reconciliation needs a maintained per-bucket
+   `(count, fingerprint)`; §7 says "neither a plain key-value store nor a
+   relational index provides this without a scan, and it is the single storage
+   property the algorithm depends on". The aggregates stay ours regardless, so
+   a database adds a second structure to keep in step with them — the failure
+   mode Pass 14 found in `range_fingerprint` and Pass 15 found in
+   `StoreView::put`.
+2. **The rebuild requirement.** §7 requires the index be fully rebuildable from
+   the segments in one scan, so corruption is a delay rather than data loss. A
+   database conflates the two.
+3. **Encrypted values are not sufficient.** The objects are already ciphertext,
+   and that protects the values, not the container: a storage engine parses its
+   own page headers, free lists and B-tree pointers, and RFC 7 §4's premise is
+   that the disk may have been tampered with while the node was off. Those
+   bytes are covered by no key the operator holds. `corpus.krab` is loaded
+   through the same content-address verification as a stranger's courier stick,
+   deliberately; a database file cannot be. This project already made the same
+   call once, in `krab-fabric/src/backend/courier.rs`, rejecting SQLite for the
+   archive because it means parsing an attacker-supplied database.
+4. **Maturity.** `graphitesql` is 0.1.6 at roughly 80 downloads a month, and
+   its goal — byte-for-byte SQLite file-format compatibility — means
+   implementing the parts of that format an attacker controls. Vendoring and
+   auditing it is a larger security review than the whole of `krab-store`, and
+   it recurs on every upgrade.
+
+### What is deferred, not solved
+
+**The corpus is still fully resident in RAM**, bounded by
+`peering::Policy::default().retention_bytes` — one gigabyte. That is the real
+remaining limit, and it is a read-through or memory-mapped segment file, which
+is a file-layout change to code this project already owns. It is not a reason
+to adopt a storage engine; it is the work an engine would have done as a side
+effect.
+
+Revisit when a node measurably cannot hold its retention window in memory. The
+harness for that measurement exists: `crates/krab-store/tests/range_cost.rs`.

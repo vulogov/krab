@@ -864,13 +864,36 @@ impl App {
                     }
                 }
             }
-            if last.elapsed() >= TICK {
-                self.spinner.tick();
-                self.tick_schedule();
+            if self.tick_if_due(&mut last) {
                 last = Instant::now();
             }
         }
         Ok(())
+    }
+
+    /// Advance the background half if the tick is due, and say whether it was.
+    ///
+    /// # Why this is a function and not four lines in `run`
+    ///
+    /// It was four lines in `run`, and `run` cannot be called from a test — it
+    /// blocks on `event::poll` against a real terminal. So the edge from the
+    /// render loop to everything the node does in the background had no test
+    /// at all: expiry, eviction, the retention cap, prekey republication, the
+    /// meeting window and the reconciliation schedule are all downstream of
+    /// this one `if`, and every test reaches them by calling `tick_schedule`
+    /// directly.
+    ///
+    /// An audit read that as `Store::evict_to` having no caller outside the
+    /// tests. It was wrong — the chain is `run` → here → `enforce_retention` →
+    /// `evict_to` — but it was wrong about a chain nothing exercised, which is
+    /// a distinction with no defence. Pulling the condition out gives it one.
+    fn tick_if_due(&mut self, last: &mut Instant) -> bool {
+        if last.elapsed() < TICK {
+            return false;
+        }
+        self.spinner.tick();
+        self.tick_schedule();
+        true
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -16794,6 +16817,53 @@ mod tests {
         // not be reported as peered.
         a.ensure_peer_dir("cccc3333").unwrap();
         assert_eq!(a.peer_ids(), vec!["aaaa1111", "bbbb2222"]);
+    }
+
+    /// **The render loop reaches the retention cap.**
+    ///
+    /// Every background guarantee this node makes — expiry, eviction, prekey
+    /// republication, the meeting window, the reconciliation schedule — hangs
+    /// off one `if` in `run`, and `run` cannot be called from a test because it
+    /// blocks on a real terminal. So the chain was asserted by reading, and an
+    /// audit that read it differently concluded `evict_to` had no caller
+    /// outside the tests. The chain was there; nothing exercised it.
+    ///
+    /// This drives the loop's own condition, so what is asserted is the edge
+    /// rather than any one destination. The observable is the meeting window,
+    /// because it is the only thing downstream of `tick_schedule` that a test
+    /// can make due on demand — the rest are governed by the wall clock. What
+    /// this proves is the edge; what it does not prove is that any particular
+    /// item on `tick_schedule`'s list does its job, which is what each of
+    /// those items' own tests are for.
+    #[test]
+    fn the_render_loops_tick_reaches_the_background_half() {
+        let mut a = ready_node("tick-edge");
+        type_command(&mut a, "peer meet listen 127.0.0.1:0 --timeout 1");
+        assert!(a.meeting.is_some(), "{}", a.output);
+
+        // Not due yet: the loop must not run the background half every frame.
+        let mut last = Instant::now();
+        assert!(!a.tick_if_due(&mut last), "ticked before it was due");
+        assert!(a.meeting.is_some(), "the door closed without a tick");
+
+        // The window expires. Nothing else changes.
+        if let Some(m) = a.meeting.as_mut() {
+            m.until = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(
+            a.meeting.is_some(),
+            "an expired window closes itself only on a tick"
+        );
+
+        // Due. This is the edge `run` takes, and the only one it has.
+        let mut last = Instant::now() - TICK - Duration::from_millis(1);
+        assert!(a.tick_if_due(&mut last), "the tick did not fire when due");
+        assert!(
+            a.meeting.is_none(),
+            "the tick did not reach `tick_schedule` — and `enforce_retention`, \
+             `shred_expired_epochs` and the reconciliation schedule are on the \
+             same list"
+        );
     }
 
     /// **A first-contact door closes when the arrangement is over**, and the
