@@ -93,8 +93,14 @@ pub struct Row<'a> {
     pub peer: &'a str,
     /// Counters. **No per-object history exists to pass here.**
     pub metrics: &'a PeerMetrics,
-    /// Corpus coverage by age.
-    pub coverage: &'a Coverage,
+    /// Corpus coverage by age, where it is known.
+    ///
+    /// **`None` means unmeasured.** `Coverage::default()` is all zeros, and a
+    /// panel rendering that as "coverage 0%" tells an operator they hold none
+    /// of the corpus — which is RFC 0 §7.4's alarm condition reported as fact
+    /// on the strength of nothing having measured it. There is no production
+    /// constructor for `Coverage` yet; until there is, the column says so.
+    pub coverage: Option<&'a Coverage>,
     /// Transport state, or `None` if there is no link.
     pub link: Option<&'a LinkState>,
     /// Ingress quota in bytes, for the against-quota figure.
@@ -157,14 +163,14 @@ impl Row<'_> {
 
         let mut s = format!(
             "{:<8} {:<20} quota {:>5.1}%  novelty {:>4}  unique {:>4}  \
-             overhead {:>4}  coverage {:>4.0}%",
+             overhead {:>4}  coverage {:>4}",
             self.peer,
             link,
             self.quota_used(),
             f(self.metrics.novelty_ratio()),
             f(self.metrics.unique_source_ratio()),
             f(self.metrics.overhead_share()),
-            self.coverage.mean() * 100.0,
+            f(self.coverage.map(|c| c.mean())),
         );
         for h in self.highlights() {
             s.push_str(&format!("\n         ! {h}"));
@@ -199,7 +205,7 @@ mod tests {
             ingress_bytes: 5_000_000,
             objects_received: 1_000,
             objects_new: 400,
-            unique_source: 100,
+            unique_source: Some(100),
             control_bytes: 10_000,
             payload_bytes: 990_000,
             tag_match_decrypt_ok: 100,
@@ -230,7 +236,7 @@ mod tests {
         let rows = [Row {
             peer: "q3m9",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: t.get("q3m9"),
             quota_bytes: 10_000_000,
         }];
@@ -246,14 +252,14 @@ mod tests {
     #[test]
     fn a_peer_supplying_most_of_your_corpus_alone_is_flagged() {
         let mut m = metrics();
-        m.unique_source = 900;
+        m.unique_source = Some(900);
         m.objects_received = 1_000;
         let c = coverage();
         let t = table();
         let row = Row {
             peer: "q3m9",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: t.get("q3m9"),
             quota_bytes: 10_000_000,
         };
@@ -280,7 +286,7 @@ mod tests {
         let row = Row {
             peer: "q3m9",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: t.get("q3m9"),
             quota_bytes: 10_000_000,
         };
@@ -302,7 +308,7 @@ mod tests {
         let flagged = Row {
             peer: "q3m9",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: fast.get("q3m9"),
             quota_bytes: 10_000_000,
         };
@@ -320,7 +326,7 @@ mod tests {
         let quiet = Row {
             peer: "m4k2",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: slow.get("m4k2"),
             quota_bytes: 10_000_000,
         };
@@ -345,7 +351,7 @@ mod tests {
         let row = Row {
             peer: "q3m9",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: t.get("q3m9"),
             quota_bytes: 10_000_000,
         };
@@ -367,7 +373,7 @@ mod tests {
         let row = Row {
             peer: "q3m9",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: t.get("q3m9"),
             quota_bytes: 10_000_000,
         };
@@ -384,7 +390,7 @@ mod tests {
         let row = Row {
             peer: "x",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: None,
             quota_bytes: 10_000_000,
         };
@@ -413,7 +419,7 @@ mod tests {
         let row = Row {
             peer: "gone",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: None,
             quota_bytes: 1_000,
         };
@@ -429,7 +435,7 @@ mod tests {
         let row = Row {
             peer: "q3m9",
             metrics: &m,
-            coverage: &c,
+            coverage: Some(&c),
             link: t.get("q3m9"),
             quota_bytes: 1_000,
         };

@@ -25,8 +25,20 @@ pub struct PeerMetrics {
     pub objects_received: u64,
     /// Of those, how many were new.
     pub objects_new: u64,
-    /// Objects that arrived from this peer and no other.
-    pub unique_source: u64,
+    /// Objects that arrived from this peer and no other, where that is known.
+    ///
+    /// **`None` means unmeasured, and it must not be spelled `0`.** This is
+    /// RFC 3 §12's eclipse indicator — "high means cutting them partitions
+    /// you" — so a zero reads as *cutting this peer is safe*, which is the
+    /// most dangerous thing an unfed counter could say. Every other ratio here
+    /// is already `None` until its denominator moves; this one had a
+    /// denominator it did not own.
+    ///
+    /// Measuring it needs to know that an object arrived *only* via this peer,
+    /// and §12 forbids the per-object provenance that would answer directly.
+    /// The aggregate form — new-from-this-peer, minus those a later exchange
+    /// also offered — is derivable but is not derived yet.
+    pub unique_source: Option<u64>,
     /// Control-message bytes, for the overhead share.
     pub control_bytes: u64,
     /// Payload bytes.
@@ -56,8 +68,8 @@ impl PeerMetrics {
     /// value means cutting this peer partitions you, which is exactly what an
     /// eclipse attempt engineers.
     pub fn unique_source_ratio(&self) -> Option<f64> {
-        (self.objects_received > 0)
-            .then(|| self.unique_source as f64 / self.objects_received as f64)
+        let unique = self.unique_source?;
+        (self.objects_received > 0).then(|| unique as f64 / self.objects_received as f64)
     }
 
     /// Reconciliation bytes as a share of all bytes on this link.
@@ -130,6 +142,28 @@ impl Coverage {
 mod tests {
     use super::*;
 
+    /// **An unmeasured eclipse indicator must not read as a safe one.**
+    /// `unique_source: None` is "nobody has measured this"; `Some(0)` is
+    /// "measured, and nothing arrived only via this peer". Rendering the first
+    /// as the second says cutting the peer is safe on the strength of no
+    /// evidence at all.
+    #[test]
+    fn an_unmeasured_eclipse_indicator_is_unknown_not_zero() {
+        let unmeasured = PeerMetrics {
+            objects_received: 500,
+            unique_source: None,
+            ..Default::default()
+        };
+        assert_eq!(unmeasured.unique_source_ratio(), None);
+
+        let measured = PeerMetrics {
+            objects_received: 500,
+            unique_source: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(measured.unique_source_ratio(), Some(0.0));
+    }
+
     #[test]
     fn ratios_are_none_before_any_traffic() {
         let m = PeerMetrics::default();
@@ -155,7 +189,7 @@ mod tests {
     fn unique_source_ratio_exposes_an_eclipse() {
         let m = PeerMetrics {
             objects_received: 500,
-            unique_source: 480,
+            unique_source: Some(480),
             ..Default::default()
         };
         assert!(

@@ -8573,16 +8573,88 @@ impl App {
         }
     }
 
+    /// RFC 3 §12's per-peer aggregates, from the day's quota counters.
+    ///
+    /// # What each one is, and which are not measured
+    ///
+    /// `Spend` counts what a peer delivered (`offered`), what was charged
+    /// against its budget (`objects`, `bytes`), and what was refused past the
+    /// ceiling. That gives §12's ingress figures and its **novelty ratio** —
+    /// the one §12 calls key, "high volume at low novelty is misconfiguration
+    /// or attack".
+    ///
+    /// It does not give the rest, and the fields left at their defaults are
+    /// left there deliberately rather than approximated:
+    ///
+    /// - **unique-source contribution** needs to know an object arrived *only*
+    ///   via this peer, and §12 forbids the per-object provenance that would
+    ///   answer it directly. `None`, so the panel says so.
+    /// - **control vs payload bytes** are not separated on the link; the
+    ///   ratio is `None` while both are zero, which is already honest.
+    /// - **tag-match / decrypt-success** is measured in `receive`, on the
+    ///   inbox scan, and is not attributed to a peer — nor could it be
+    ///   without recording which peer supplied each object.
+    ///
+    /// `objects` is charged before `ingest` runs, so novelty's numerator is
+    /// "passed the filter and the budget" rather than "entered the corpus".
+    /// The two differ only for an object RFC 1 §11 refuses, which is a peer
+    /// sending malformed data — and that already shows up as a refusal.
+    fn metrics_from(spend: &quota::Spend) -> krab_node::metrics::PeerMetrics {
+        krab_node::metrics::PeerMetrics {
+            ingress_bytes: spend.bytes,
+            objects_received: spend.offered,
+            objects_new: spend.objects,
+            rejected: spend.refused,
+            unique_source: None,
+            ..Default::default()
+        }
+    }
+
     /// RFC 8 §5.3's panel.
     fn peers_panel(&self) -> String {
         // Activity provenance belongs beside the per-peer aggregates: the log
         // says what just happened, `PeerMetrics` says what has been happening.
         let recent = self.log.recent(6);
-        // No metrics source is wired yet, so the panel is honest about being
-        // empty rather than inventing rows. `PeerMetrics` is counters-only by
-        // construction (RFC 3 §12), which is the part that had to be right
-        // before anything populated it.
-        let rows: Vec<peers::Row> = Vec::new();
+        // **RFC 3 §12's aggregates, from the counters that exist.**
+        //
+        // This was `Vec::new()` — the panel, its thresholds and its
+        // highlights were written, tested, and shown to nobody, because
+        // nothing built a row. §12's own closing sentence is the reason that
+        // mattered: "a disconnect decision should be one keystroke from the
+        // evidence justifying it. If it is not, operators will not make it,
+        // and the accountability model degrades to nothing."
+        //
+        // What feeds a row is `quota::Spend`, which is already per-peer,
+        // already persisted, and already counters-only. What does not feed one
+        // reads as `—` rather than as a number: see `PeerMetrics.unique_source`
+        // and `Row.coverage`, both of which would otherwise report an
+        // unmeasured quantity as zero, and zero is the reassuring answer for
+        // both.
+        let spend_rows: Vec<(String, krab_node::metrics::PeerMetrics)> = self
+            .peer_ids()
+            .into_iter()
+            .map(|id| {
+                let acct = self
+                    .spends
+                    .get(&id)
+                    .map(|c| *c.lock().unwrap_or_else(|e| e.into_inner()))
+                    .unwrap_or_default();
+                (id, Self::metrics_from(&acct.spend))
+            })
+            .collect();
+        let rows: Vec<peers::Row> = spend_rows
+            .iter()
+            .map(|(id, m)| peers::Row {
+                peer: id,
+                metrics: m,
+                coverage: None,
+                link: None,
+                quota_bytes: self
+                    .inbound_terms(id)
+                    .map(|t| t.bytes_per_day)
+                    .unwrap_or(0),
+            })
+            .collect();
 
         // **Peerings, from disk — not links, from memory.** A peering is the
         // durable artifact (RFC 3 §4); a link is a socket that was open a
@@ -8654,7 +8726,21 @@ impl App {
             // governs. "A disconnect decision should be one keystroke from
             // the evidence justifying it. If it is not, operators will not
             // make it, and the accountability model degrades to nothing."
-            let budget = match self.inbound_terms(id) {
+            // **What is enforced, which is not the same as what was signed.**
+            //
+            // This branched on `inbound_terms` and told an operator with no
+            // countersigned credential that "nothing is scoped or enforced on
+            // this link" — true when it was written, and false since
+            // `budget_for` began falling back to `LinkTerms::default()`
+            // rather than to no budget at all. So the panel reported an
+            // unmetered link that was in fact metered at the defaults, and
+            // §12's evidence was missing for exactly the peerings whose
+            // standing is most in doubt.
+            //
+            // The terms shown are now the terms applied, and the missing
+            // credential is said separately — it is a different fact.
+            let applied = self.inbound_terms(id);
+            let budget = match Some(applied.unwrap_or_default()) {
                 Some(t) => {
                     let acct = self
                         .spends
@@ -8671,8 +8757,14 @@ impl App {
                         Some(n) => format!("{:.0}% novel", n * 100.0),
                         None => "nothing offered".into(),
                     };
+                    // The credential's own standing, said separately from the
+                    // terms being applied. A peering with none is metered at
+                    // the defaults above; that it has none is a fact about the
+                    // ceremony, not about the meter.
                     let term = match self.credential_standing(id) {
-                        Standing::Live(credential::Life::Current, _) => String::new(),
+                        Standing::Live(credential::Life::Current, _) if applied.is_some() => {
+                            String::new()
+                        }
                         other => format!("\n    {}", other.line(id, self.now_s())),
                     };
                     // **RFC 3 §12's aggregates, and only aggregates.** §12
@@ -8712,11 +8804,9 @@ impl App {
                         },
                     )
                 }
-                // Not a detail: a peering with no *usable* credential is one
-                // where nothing is scoped or enforced, and RFC 3 §4 makes
-                // saying which of the reasons applies a MUST — an expiry and
-                // a peering that was never countersigned look identical from
-                // here and are not the same thing at all.
+                // Unreachable: the terms above fall back to the defaults, as
+                // `budget_for` does. Kept so the two cannot drift apart
+                // silently if either stops falling back.
                 None => format!(
                     "\n    {}",
                     self.credential_standing(id).line(id, self.now_s())
@@ -8734,8 +8824,33 @@ impl App {
             } else {
                 String::new()
             };
+            // **What deserves saying out loud** — `Row::highlights`, whose
+            // thresholds and wording were written and tested and reached no
+            // operator, because nothing built a row to call it on. The eclipse
+            // indicator is the one that cannot be inferred from the numbers
+            // above it.
+            let alarms: String = rows
+                .iter()
+                .find(|r| r.peer == id)
+                .map(|r| {
+                    r.highlights()
+                        .iter()
+                        .map(|h| format!("\n    ! {h}"))
+                        .collect()
+                })
+                .unwrap_or_default();
             out.push_str(&format!(
-                "{who}  peered  ·  {link}{privacy}  ·  {policy}\n    {how}{budget}{nodelist}\n"
+                "{who}  peered  ·  {link}{privacy}  ·  {policy}\n    {how}{budget}{nodelist}{alarms}\n"
+            ));
+        }
+        // RFC 3 §12's closing requirement, and RFC 8 §5.3's restatement of it:
+        // "a disconnect decision should be one keystroke from the evidence
+        // justifying it." The evidence is above; this is the keystroke.
+        if !peerings.is_empty() {
+            out.push_str(&format!(
+                "\n  [{}] disconnect the selected peer  ·  `peer forget <id>` \
+                 removes the peering itself (RFC 3 §8.4)\n",
+                peers::DISCONNECT_KEY
             ));
         }
         // Links to nodes we have no peering with cannot exist — `establish`
@@ -16817,6 +16932,87 @@ mod tests {
         // not be reported as peered.
         a.ensure_peer_dir("cccc3333").unwrap();
         assert_eq!(a.peer_ids(), vec!["aaaa1111", "bbbb2222"]);
+    }
+
+    /// **RFC 3 §12's evidence reaches the operator, and the keystroke is
+    /// beside it.**
+    ///
+    /// > "A disconnect decision should be one keystroke from the evidence
+    /// > justifying it. If it is not, operators will not make it, and the
+    /// > accountability model degrades to nothing."
+    ///
+    /// The panel, its thresholds and its highlights were written and tested;
+    /// `peers_panel` built `Vec::new()` and passed it, so none of it was ever
+    /// shown. That is the same shape as a bound with no caller — a mechanism
+    /// that exists and does not run — and the reason it was worth a test
+    /// rather than a reading.
+    #[test]
+    fn the_peers_panel_shows_the_evidence_and_the_keystroke() {
+        let (mut a, _b, _, _) = peered_pair("panel-evidence");
+        // The panel lists peerings from disk, so the counters have to be keyed
+        // the way it reads them.
+        let peer = a.peer_ids().first().cloned().expect("a peering");
+
+        // Traffic, as an exchange would record it: offered, charged, refused.
+        {
+            let budget = a.budget_for(&peer).expect("a peering has a budget");
+            let mut acct = budget.spend.lock().unwrap_or_else(|e| e.into_inner());
+            acct.spend.offered = 1_000;
+            acct.spend.objects = 40;
+            acct.spend.bytes = 4 * 1024 * 1024;
+            acct.spend.refused = 12;
+        }
+
+        let panel = a.peers_panel();
+        // §12's key metric, and the volume behind it.
+        assert!(panel.contains("4% novel"), "no novelty ratio:\n{panel}");
+        assert!(panel.contains("960 duplicate(s)"), "no duplicates:\n{panel}");
+        assert!(panel.contains("refused over budget"), "no refusals:\n{panel}");
+        // And the action, one keystroke away from all of it.
+        assert!(
+            panel.contains(&format!("[{}] disconnect", peers::DISCONNECT_KEY)),
+            "the evidence has no action beside it:\n{panel}"
+        );
+    }
+
+    /// **An unmeasured metric must not read as a good one.**
+    ///
+    /// `unique_source` is §12's eclipse indicator — "high means cutting them
+    /// partitions you" — and nothing measures it. Rendered as `0%` it says
+    /// cutting the peer is safe, which is the reassuring answer arrived at by
+    /// not looking. Coverage is the same: `Coverage::default()` is all zeros,
+    /// and "coverage 0%" is RFC 0 §7.4's alarm condition reported as fact.
+    #[test]
+    fn an_unmeasured_metric_reads_as_unknown() {
+        let m = App::metrics_from(&quota::Spend {
+            day: 1,
+            bytes: 1_000,
+            objects: 5,
+            offered: 10,
+            refused: 0,
+        });
+        assert_eq!(m.novelty_ratio(), Some(0.5), "novelty is measured");
+        assert_eq!(
+            m.unique_source_ratio(),
+            None,
+            "the eclipse indicator is not measured and must not claim zero"
+        );
+
+        let row = peers::Row {
+            peer: "q3m9",
+            metrics: &m,
+            coverage: None,
+            link: None,
+            quota_bytes: 4_096,
+        };
+        let line = row.render();
+        assert!(line.contains("unique    —"), "{line}");
+        assert!(line.contains("coverage    —"), "{line}");
+        assert!(
+            row.highlights().is_empty(),
+            "an unmeasured indicator raised an alarm: {:?}",
+            row.highlights()
+        );
     }
 
     /// **The render loop reaches the retention cap.**
