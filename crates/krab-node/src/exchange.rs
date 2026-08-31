@@ -521,6 +521,8 @@ fn descend<C: Corpus + ?Sized>(
     let mut resolved: BTreeSet<(u32, u32)> = BTreeSet::new();
     let mut rounds = 0usize;
     let mut said_done = false;
+    // Whether RFC 5 §4.4's manifest fallback has already been sent.
+    let mut fell_back = false;
 
     for _ in 0..MAX_MESSAGES {
         match session.recv()? {
@@ -535,9 +537,45 @@ fn descend<C: Corpus + ?Sized>(
 
                 rounds += 1;
                 let answer = if rounds > RBSR_MAX_ROUNDS {
-                    // RFC 5 §4.4's cap. Stop descending; what has already
-                    // crossed stands.
-                    krab_proto::recon::Response::default()
+                    // **RFC 5 §4.4: "cap round trips (SHOULD be 8) *and fall
+                    // back to manifest mode on exceeding it*."**
+                    //
+                    // The cap was enforced and the fallback was not: this
+                    // returned an empty response, so the descent said
+                    // `RangeDone` and the exchange ended having moved whatever
+                    // had crossed so far. That is the right answer for the
+                    // adversary the cap exists for — "an adversarial peer can
+                    // otherwise manufacture divergence patterns that never
+                    // converge" — and the wrong one for two honest nodes whose
+                    // disagreement is simply too wide to descend in eight
+                    // rounds. They would give up where manifest mode, which
+                    // needs one round trip, would have finished.
+                    //
+                    // Falling back means listing the ranges still in dispute
+                    // rather than splitting them further. `respond` already
+                    // does exactly that for a range it resolves as a leaf, so
+                    // the fallback is the leaf path applied to everything left
+                    // — no second code path, and nothing an adversary gains,
+                    // because what it produces is bounded by the same
+                    // `MAX_PER_EXCHANGE` every other manifest is.
+                    // **Once.** The first version listed on every round past
+                    // the cap, so a peer sending a two-byte `Range` drew a
+                    // manifest back each time, up to `MAX_MESSAGES` of them —
+                    // the amplification RFC 5 §12 names, reintroduced by the
+                    // fix for a different requirement. The fallback is a
+                    // fallback, not a mode.
+                    if fell_back {
+                        krab_proto::recon::Response::default()
+                    } else {
+                        fell_back = true;
+                        krab_proto::recon::Response {
+                            list: fresh
+                                .iter()
+                                .flat_map(|r| corpus.entries(r.lo, r.hi))
+                                .collect(),
+                            ..Default::default()
+                        }
+                    }
                 } else {
                     respond(corpus, &fresh)
                 };
@@ -1077,6 +1115,91 @@ mod tests {
         assert_eq!(ma.received, 0);
         assert_eq!(mb.received, 0);
         assert_eq!(a.len(), 10);
+    }
+
+    /// **RFC 5 §4.4: "cap round trips (SHOULD be 8) and fall back to manifest
+    /// mode on exceeding it."**
+    ///
+    /// The cap was enforced and the fallback was not — past the eighth round
+    /// this end answered with nothing, said `RangeDone`, and the exchange
+    /// finished having moved whatever had already crossed. Correct for the
+    /// adversary the cap exists for; wrong for two honest nodes whose
+    /// disagreement is wider than eight rounds of splitting can resolve, who
+    /// would give up where one manifest round trip would have finished.
+    ///
+    /// Driven past the cap by a peer that answers every `Range` with the same
+    /// `Range`, which is the shape §4.4 names: "an adversarial peer can
+    /// manufacture divergence patterns that never converge."
+    #[test]
+    fn a_descent_that_hits_the_round_cap_falls_back_to_listing() {
+        struct Stubborn {
+            range: Range,
+            sent: Vec<Control>,
+        }
+        impl Session for Stubborn {
+            fn send(&mut self, msg: &Control) -> Result<(), Error> {
+                self.sent.push(msg.clone());
+                Ok(())
+            }
+            fn recv(&mut self) -> Result<Option<Control>, Error> {
+                // The same disputed range, for ever.
+                Ok(Some(Control::Range(vec![self.range])))
+            }
+            fn close(&mut self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let mut store = store_with(0..40);
+        // A range this end holds objects in, with a fingerprint that will
+        // never match — so `respond` always disputes it.
+        let held = store.entries_in_range(0, u32::MAX);
+        let (lo, hi) = (held[0].0, held[held.len() - 1].0 + 1);
+        let mut peer = Stubborn {
+            range: Range {
+                lo,
+                hi,
+                fingerprint: krab_crypto::Fingerprint::ZERO,
+                count: 1,
+            },
+            sent: Vec::new(),
+        };
+
+        let mut view = StoreView::new(&mut store, NOW);
+        let _ = descend(&mut peer, &mut view, [0; 32], Half::Responder, 0);
+
+        // Past the cap, this end must have *listed* rather than gone quiet.
+        // The manifests before the cap are leaf listings; what matters is that
+        // one arrives after eight rounds of `Range`, which is where the old
+        // code sent `RangeDone` and stopped.
+        let ranges_in = peer
+            .sent
+            .iter()
+            .filter(|m| matches!(m, Control::Range(_)))
+            .count();
+        let manifests = peer
+            .sent
+            .iter()
+            .filter(|m| matches!(m, Control::Manifest { .. }))
+            .count();
+        assert!(
+            ranges_in <= RBSR_MAX_ROUNDS + 1,
+            "the descent did not stop splitting at the cap: {ranges_in} rounds"
+        );
+        assert!(
+            manifests > 0,
+            "the descent hit the cap and listed nothing — §4.4's fallback"
+        );
+        // And the listing is what the peer asked about, not the whole corpus.
+        let listed: usize = peer
+            .sent
+            .iter()
+            .filter_map(|m| match m {
+                Control::Manifest { entries, .. } => Some(entries.len()),
+                _ => None,
+            })
+            .sum();
+        assert!(listed > 0 && listed <= MAX_PER_EXCHANGE * (RBSR_MAX_ROUNDS + 2));
     }
 
     /// **Both main loops end.** `MAX_MESSAGES` documents a cap on this and

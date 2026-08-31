@@ -1354,3 +1354,88 @@ Tor's onion service, amateur bands, and `short` framing, none of them built —
 
 Running total across RFCs 1–4: **95 requirements, 15 unmet or partly unmet,
 3 conflicts.** Four of the fifteen were fixed by the pass that found them.
+
+---
+
+## 21. RFC 5, requirement by requirement — 2026-08-31
+
+17 lines carrying 19 occurrences; one is RFC 2119 boilerplate, and one is a
+mode table listing `PushOnly → MUST NOT be used`, restated as prose four
+sections later. **17 requirements.**
+
+§12 of this plan recorded RFC 5 as the one document with **zero** unmet
+requirements, and flagged that as a caution rather than a compliment: "the
+document whose requirements are most nearly mechanical, and therefore the
+easiest to check by grep." Reading it line by line found one.
+
+| § | requirement | verdict | enforced at |
+|---|---|---|---|
+| 2 | reconciliation MUST be scoped to the filter | met + tested | `ExchangeView.filter`, checked on `put` |
+| 3.1 | truncated identifiers MUST NOT appear in a routing header, stored structures, or a request outside a session | met, with a note | see below |
+| 4.1 | `PushOnly` MUST NOT be used as a link's sync mode | met structurally | `Mode` has two variants and neither is `PushOnly` |
+| 4.4 | fingerprints MUST be additively composable, `Σ H(id) mod 2²⁵⁶` | met + tested | `Fingerprint::add`, and `sub` for prefix sums |
+| 4.4 | implementations MUST cap round trips | met + tested | `RBSR_MAX_ROUNDS = 8` |
+| 4.4 | …**and fall back to manifest mode on exceeding it** | **was unmet, now met** | `descend`, see below |
+| 4.5 | `PushOnly` MUST NOT be used as a link's sync mode | met structurally | the same requirement, stated twice |
+| 5 | deployments MUST NOT rely on LoRa as a majority transport | deployment obligation | the SHOULD-warn at 30 % of links is not implemented |
+| 6.1 | reconciliation MUST run on a Poisson schedule, randomised interval and peer order, independent of user activity | met + tested | `Scheduler::due` takes time and entropy and nothing else — RFC 0 I-5 |
+| 7 | the index MUST be fully rebuildable from the segments by one scan | **was unmet, now met** | `rebuild_index`, closed 2026-08-30 |
+| 8 | a receiver MUST reject any object whose expiry has passed | met + tested | I2 |
+| 8 | a node MUST maintain a tombstone set | met + tested | `Store::tombstones` |
+| 8 | a node MUST maintain a `min_expiry` watermark | met + tested | `Store::watermark`, advertised in `HELLO` |
+| 8 | tombstones MUST be bounded | met + tested | `prune_tombstones` |
+| 8 | an implementation MUST drop tombstones past the horizon | met + tested | same, at `expiry + MAX_TTL` |
+| 9 | eviction MUST be oldest-first and uniform across shards | met + tested | `evict_to` takes a byte budget and nothing else |
+| 9 | eviction policy MUST NOT depend on any property other than age | met structurally | the signature is the enforcement — there is no parameter a policy could enter through |
+
+### The one §12 missed: the fallback, not the cap
+
+> "Implementations MUST cap round trips (SHOULD be 8) **and fall back to
+> manifest mode on exceeding it.** An adversarial peer can otherwise
+> manufacture divergence patterns that never converge."
+
+`RBSR_MAX_ROUNDS = 8` exists, is used, and is named in a comment citing §4.4 —
+which is exactly why a keyword-anchored pass reads the requirement as met. Past
+the cap, `descend` answered with an empty response, said `RangeDone`, and the
+exchange ended having moved whatever had already crossed.
+
+That is the right outcome for the adversary the cap exists for and the wrong
+one for two honest nodes whose disagreement is simply wider than eight rounds
+of splitting can resolve: they give up where **one manifest round trip would
+have finished**. §4.4 asks for both behaviours and only one was built.
+
+Falling back means listing the ranges still in dispute instead of splitting
+them further, which is what `respond` already does for a range it resolves as a
+leaf — so the fallback is the leaf path applied to what is left, with no second
+code path to disagree with the first.
+
+**And the first version of the fix was wrong in a way the test caught.** It
+listed on *every* round past the cap, so a peer sending a two-byte `Range`
+drew a manifest back each time, up to `MAX_MESSAGES` of them — the
+amplification RFC 5 §12 names, reintroduced by the fix for a different
+requirement in the same file. The fallback fires once. The bound in the test
+was what failed, not the behaviour under test.
+
+### §3.1 and the truncated-identifier index
+
+§3.1 says truncated identifiers MUST NOT appear "in stored structures".
+`Store::by_trunc` is a map keyed by exactly that.
+
+Recorded as met, with the reasoning rather than the conclusion: the rule
+protects against *accepting* a truncated identifier as a claim outside an
+agreed scope, because 16 bytes is grindable. `by_trunc` is a local index over
+objects this node already holds, derived rather than persisted — it is rebuilt
+by `rebuild_index` and appears in no artifact — and every read of it
+(`get_truncated`, `has_truncated`) is reached only from inside a session.
+
+That is a reading, not a proof, and it is written down so the next person
+disagrees with an argument rather than rediscovering the question.
+
+### Counts
+
+17 requirements. **15 met** (12 with a test that names them), **1 deployment
+obligation** whose optional warning is unimplemented, and **1 that was unmet
+and is now met**. No vacuous, no conflicts.
+
+Running total across RFCs 1–5: **112 requirements, 16 unmet or partly unmet,
+3 conflicts.** Six of the sixteen were fixed by the pass that found them.
