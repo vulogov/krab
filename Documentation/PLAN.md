@@ -1208,3 +1208,73 @@ was unmet when this pass began and was fixed during it.
 Running total across RFC 1 and RFC 2: **47 requirements, 13 unmet or partly
 unmet, 3 conflicts.** Two of the thirteen were fixed by the passes that found
 them.
+
+---
+
+## 19. RFC 3, requirement by requirement — 2026-08-30
+
+22 lines carrying 25 occurrences; one is RFC 2119 boilerplate. **22
+requirements**, more of them documentation and default-value obligations than
+either previous document — RFC 3 is about a ceremony between people, and
+several of its MUSTs bind what an operator is told rather than what a byte does.
+
+| § | requirement | verdict | enforced at |
+|---|---|---|---|
+| 3 | every signed document MUST prefix its signing input with a domain unique to that type | met + **now mechanised** | twelve `DOMAIN` constants; `domain_separation.rs` |
+| 3 | a signature over one type MUST NOT be valid over any other | met + tested | same |
+| 3 | a credential body MUST be a flat CBOR map | met | `Credential::encode` embeds parties, flags and terms as `bstr`, never as nested maps |
+| 3 | MUST render any credential as HJSON on request | **unmet** | recorded §11; `peer show` renders prose |
+| 4 | MUST reject a link whose validity exceeds 180 days | met + tested | `credential::MAX_TERM_DAYS` |
+| 4 | MUST surface an expired peering as an explicit state | met + tested | `Standing::Live(Life::Expired)`, shown in `peers` |
+| 5 | the negotiation chain MUST NOT be published | met | written to `peers/<id>/chain`; no path puts it in the corpus |
+| 6.1 | three consequences MUST be stated in deployment documentation | met | `PEERING.md`, and RFC 3 §6.1 itself |
+| 6.1 | the relay-responsibility price MUST be stated as a deliberate choice | met | same |
+| 8.2 | deltas MUST reference the last full fragment by hash | met + tested | `fragment::DOMAIN_BASE`; a reader without the base refuses |
+| 8.3 | share flags MUST default to false | met + tested | `Flags::default` |
+| 8.4 | on termination a node MUST purge attributable artifacts | met + tested | `peer forget` |
+| 8.4 | and MUST retain the corpus | met + tested | same test asserts both halves |
+| 9 | rollcall opt-in MUST be the default | met + tested | `rollcall`, and it says so twice |
+| 10 | ring signatures MUST NOT be built unless the token path fails | met | not built |
+| 11.1 | MUST NOT present remote peering as equivalent | met | `peer meet` output says so at length |
+| 11.3 | MUST demonstrate peering and first message with all interfaces down | met + tested | `courier_only_peering_completes_with_no_network`, in `smoke.sh` |
+| 12 | MUST NOT retain per-object provenance | met + tested | `PeerMetrics` is counters only, by construction |
+| 13 | MUST warn below the lower bound for the transport mix | met + tested | `krab_node::warnings::evaluate` |
+| 14 | the credential store MUST be encrypted under the RFC 7 hierarchy | met | sealed under `epoch_key` before `atomic::write` |
+| 14 | an introduction token MUST be bound to the requester's `sig_pk` | met + tested | `introduction::Token` |
+| 14 | and MUST be single-use | met + tested | `introduction::Spent` |
+
+### What this pass found
+
+**Nothing unmet that was not already recorded.** RFC 3 is the first document to
+come through with only its known gap — §3's HJSON rendering — and that is
+worth stating plainly rather than glossing: the yield of this method is not
+constant, and a document about a human ceremony has fewer places for a silent
+byte-level omission to hide.
+
+**§3's rule was met and is now enforced.** Twelve domain constants, all
+distinct, and nothing prevented a thirteenth reusing a string. RFC 3 states the
+general rule instead of one more constant precisely because the next document
+inherits it, so the check belongs in the suite rather than in a reviewer's
+head: `no_two_signed_documents_share_a_domain_string` walks every `pub const
+… = b"krab/…"` in the workspace and refuses a collision. Verified against a
+deliberate one — pointing `introduction::DOMAIN` at `krab/link/v1` fails it and
+names both files.
+
+What it cannot check is that a signed document *has* a domain at all. A
+document written with no prefix is invisible to it, and RFC 3 §3 exists because
+the credential was exactly that case until somebody noticed.
+
+**§3's flat-map rule was met for the stated reason**, which is worth recording
+because it is the kind of rule an implementation usually satisfies by accident
+and then breaks: `Credential::encode` embeds parties, flags and terms as byte
+strings rather than as nested maps, and RFC 3's reasoning — "a nested map's
+keys restart, and a decoder reading both levels from one cursor correctly
+rejects its own encoder's output" — is the reason it must stay that way.
+
+### Counts
+
+22 requirements. **21 met** (14 with a test that names them), **1 unmet**
+(§3's HJSON rendering, already recorded), no vacuous, no new conflicts.
+
+Running total across RFCs 1–3: **69 requirements, 14 unmet or partly unmet,
+3 conflicts.** Three of the fourteen were fixed by the pass that found them.
