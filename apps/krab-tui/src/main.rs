@@ -326,6 +326,27 @@ fn main() -> io::Result<()> {
         return picture::run_child();
     }
 
+    // **RFC 7 §9's startup check.** "Implementations MUST fail loudly at
+    // startup if locking is unavailable rather than proceeding unlocked."
+    //
+    // Loudly, and not fatally. §9 lists memory locking among hardening
+    // measures — beside disabling hibernation and swap, which this program
+    // also cannot do — and a node that refused to start on a machine with a
+    // low `RLIMIT_MEMLOCK` would be a node an operator runs with the warning
+    // suppressed. What §9 forbids is proceeding *silently*, which is what this
+    // did until now by not having the mechanism at all.
+    //
+    // Printed before the terminal is taken, so it is on the scrollback an
+    // operator keeps rather than in a pane that clears.
+    let locking = krab_lock::available();
+    if let Err(why) = &locking {
+        eprintln!("krab: {why}");
+        eprintln!(
+            "krab: continuing. Disable swap, or use a randomly-keyed swap \
+             device — see Documentation/SECURE-DELETE.md."
+        );
+    }
+
     let mut app = match App::from_args(std::env::args().skip(1)) {
         Ok(app) => app,
         Err(usage) => {
@@ -412,7 +433,20 @@ struct App {
     locked: bool,
     quit: bool,
     /// This node's keys, once `init` has completed. `None` on a fresh install.
-    identity: Option<Identity>,
+    /// **RFC 7 §9's locked pages**, for the secret §11 calls irreplaceable:
+    /// "losing identity means every peer must re-verify out of band, in
+    /// person, from scratch."
+    ///
+    /// `Held` locks when the machine allows it and says so when it does not.
+    /// It is a `Deref` wrapper, so every reader below is unchanged — the
+    /// difference is that this allocation is made once, never moves, and is
+    /// kept out of swap.
+    ///
+    /// **What this does not cover**, stated because §9.1 requires it: a value
+    /// copied out of here onto the stack is not in a locked page, and the
+    /// compiler may have copied it before it ever arrived. Locking reduces
+    /// exposure; it does not eliminate it.
+    identity: Option<krab_lock::Held<Identity>>,
     /// The passphrase being typed. Never echoed — see `View::masked`.
     passphrase: line::Line,
     /// The current epoch wrapper key `W_N`, held **only while unlocked**.
@@ -9569,7 +9603,7 @@ impl App {
                 &mut OsRng,
             );
         }
-        self.identity = Some(id);
+        self.identity = Some(krab_lock::Held::new(id));
         self.epoch_key = Some(w);
         self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
         self.alias_key = Some(alias::Aliases::key_from_kek(&kek));
@@ -9898,7 +9932,7 @@ impl App {
                     // Every key this node will ever hold originates here.
                     let id = Identity::generate(&mut OsRng);
                     self.output = format!("generated {}", id.short_id());
-                    self.identity = Some(id);
+                    self.identity = Some(krab_lock::Held::new(id));
                 }
                 self.init_step = Some(next);
                 if next == InitStep::ShowBackup {
@@ -10231,7 +10265,7 @@ mod tests {
         id.kek_params.m_kib = 64;
         id.kek_params.t = 1;
         id.kek_params.p = 1;
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("a passphrase");
         a.open_store().expect("store opens");
         a
@@ -10388,7 +10422,7 @@ mod tests {
     #[test]
     fn finishing_init_opens_the_current_epoch() {
         let mut a = App::default();
-        a.identity = Some(Identity::generate(&mut OsRng));
+        a.identity = Some(krab_lock::Held::new(Identity::generate(&mut OsRng)));
         a.passphrase = line::Line::from("a passphrase");
         // Use cheap Argon2id parameters; the specified ones are exercised in
         // `krab_crypto::kek`.
@@ -10450,7 +10484,7 @@ mod tests {
     #[test]
     fn wipe_asks_once_then_destroys() {
         let mut a = App::default();
-        a.identity = Some(Identity::generate(&mut entropy::OsRng));
+        a.identity = Some(krab_lock::Held::new(Identity::generate(&mut entropy::OsRng)));
         type_command(&mut a, "wipe");
         assert!(a.output.contains("cannot be undone"), "{}", a.output);
         assert!(a.identity.is_some(), "first wipe only prompts");
@@ -10653,7 +10687,7 @@ mod tests {
                 home: b.home.clone(),
                 ..App::default()
             };
-            b2.identity = Some(Identity::generate(&mut OsRng));
+            b2.identity = Some(krab_lock::Held::new(Identity::generate(&mut OsRng)));
             b2.epoch_key = b.epoch_key;
             type_command(&mut b2, &format!("peer pad {}", a.at("b.pad").display()));
         }
@@ -10701,7 +10735,7 @@ mod tests {
                 home: n.home.clone(),
                 ..App::default()
             };
-            n2.identity = Some(Identity::generate(&mut OsRng));
+            n2.identity = Some(krab_lock::Held::new(Identity::generate(&mut OsRng)));
             n2.epoch_key = n.epoch_key;
             type_command(&mut n2, "peer offer");
         }
@@ -10749,7 +10783,7 @@ mod tests {
                 home: b.home.clone(),
                 ..App::default()
             };
-            b2.identity = Some(Identity::generate(&mut OsRng));
+            b2.identity = Some(krab_lock::Held::new(Identity::generate(&mut OsRng)));
             b2.epoch_key = b.epoch_key;
             type_command(&mut b2, "peer offer");
         }
@@ -15548,7 +15582,7 @@ mod tests {
         their_id.kek_params.m_kib = 64;
         their_id.kek_params.t = 1;
         their_id.kek_params.p = 1;
-        them.identity = Some(their_id);
+        them.identity = Some(krab_lock::Held::new(their_id));
         them.passphrase = line::Line::from("their passphrase");
         them.open_store().unwrap();
         type_command(&mut them, "peer offer");
@@ -15562,7 +15596,7 @@ mod tests {
         id.kek_params.m_kib = 64;
         id.kek_params.t = 1;
         id.kek_params.p = 1;
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("open sesame please");
         a.open_store().unwrap();
         let node_id = a.identity.as_ref().unwrap().node_id();
@@ -15618,7 +15652,7 @@ mod tests {
         id.kek_params.m_kib = 64;
         id.kek_params.t = 1;
         id.kek_params.p = 1;
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("the right one");
         a.open_store().unwrap();
         drop(a);
@@ -15657,7 +15691,7 @@ mod tests {
         id.kek_params.m_kib = 64;
         id.kek_params.t = 1;
         id.kek_params.p = 1;
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("passphrase");
         a.open_store().unwrap();
         type_command(&mut a, "peer offer");
@@ -15715,7 +15749,7 @@ mod tests {
         id.kek_params.m_kib = 64;
         id.kek_params.t = 1;
         id.kek_params.p = 1;
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("the real one");
         a.open_store().unwrap();
         type_command(&mut a, "peer offer");
@@ -15760,7 +15794,7 @@ mod tests {
         id.kek_params.m_kib = 64;
         id.kek_params.t = 1;
         id.kek_params.p = 1;
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("the real one");
         a.open_store().unwrap();
         let node_id = a.identity.as_ref().unwrap().node_id();
@@ -15794,7 +15828,7 @@ mod tests {
         id.kek_params.m_kib = 64;
         id.kek_params.t = 1;
         id.kek_params.p = 1;
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("only one");
         a.open_store().unwrap();
         drop(a);
@@ -15825,7 +15859,7 @@ mod tests {
         id.kek_params.m_kib = 64;
         id.kek_params.t = 1;
         id.kek_params.p = 1;
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("passphrase");
         a.open_store().unwrap();
         type_command(&mut a, "peer offer");
@@ -15972,7 +16006,7 @@ mod tests {
         id.kek_params.m_kib = 64;
         id.kek_params.t = 1;
         id.kek_params.p = 1;
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("passphrase");
         a.open_store().unwrap();
 
@@ -16385,13 +16419,13 @@ mod tests {
         );
 
         // Enter walks the ceremony; cheap Argon2 so the test is not a minute.
-        a.identity = Some({
+        a.identity = Some(krab_lock::Held::new({
             let mut id = Identity::generate(&mut OsRng);
             id.kek_params.m_kib = 64;
             id.kek_params.t = 1;
             id.kek_params.p = 1;
             id
-        });
+        }));
         for _ in 0..6 {
             a.advance_init();
         }
@@ -16752,7 +16786,7 @@ mod tests {
         id.kek_params.t = 1;
         id.kek_params.p = 1;
         let fingerprint = id.short_id();
-        a.identity = Some(id);
+        a.identity = Some(krab_lock::Held::new(id));
         a.passphrase = line::Line::from("a passphrase");
         a.open_store().expect("the store opens");
         assert!(a.has_stored_identity(), "something must be on disk");
@@ -16916,7 +16950,7 @@ mod tests {
             id.kek_params.m_kib = 64;
             id.kek_params.t = 1;
             id.kek_params.p = 1;
-            a.identity = Some(id);
+            a.identity = Some(krab_lock::Held::new(id));
             a.passphrase = line::Line::from("a passphrase");
             a.open_store().expect("the store opens");
             // The corpus is a directory of segments now, so starting without

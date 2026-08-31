@@ -1,0 +1,15 @@
+[package]
+name = "krab-lock"
+description = "Memory locking for key material — RFC 7 §9, and the workspace's only unsafe boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# **No dependencies, deliberately.** See the module header: vendoring `libc`
+# to call three POSIX functions would mean auditing `libc`, and the audit is
+# the point of this crate existing at all.
+[dependencies]
+zeroize = "1"

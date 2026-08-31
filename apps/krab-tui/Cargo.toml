@@ -23,6 +23,7 @@ krab = { workspace = true }
 krab-core = { workspace = true }
 krab-crypto = { workspace = true }
 krab-fabric = { workspace = true }
+krab-lock = { workspace = true }
 krab-node = { workspace = true }
 krab-proto = { workspace = true }
 krab-store = { workspace = true }

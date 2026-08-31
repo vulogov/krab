@@ -206,3 +206,69 @@ fn no_session_driver_loops_without_a_bound() {
          the loop needs a count — see MAX_MESSAGES."
     );
 }
+
+/// **`unsafe` lives in exactly one crate.**
+///
+/// RFC 7 §9 needs `mlock`, `mlock` is a foreign function, and there is no safe
+/// way to call one — so the workspace has an unsafe boundary. `krab-lock` is
+/// it, and the value of putting it in a crate of its own rather than a block
+/// inside a larger file is entirely in this test: an auditor who has read that
+/// file has read every unsafe line in the tree, and a diff to any other crate
+/// cannot quietly add one.
+///
+/// Checked by reading the sources rather than by trusting the attributes,
+/// because an attribute can be removed in the same commit that adds the code
+/// it was guarding.
+#[test]
+fn unsafe_code_lives_only_in_the_crate_that_exists_for_it() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut files = Vec::new();
+    for dir in ["crates", "apps"] {
+        for entry in std::fs::read_dir(workspace.join(dir)).unwrap().flatten() {
+            rust_sources(&entry.path().join("src"), &mut files);
+        }
+    }
+    assert!(files.len() > 30, "found {} sources — the walk is wrong", files.len());
+
+    let mut offenders = Vec::new();
+    let mut boundary_seen = false;
+    for f in &files {
+        let src = std::fs::read_to_string(f).unwrap();
+        let in_boundary = f.components().any(|c| c.as_os_str() == "krab-lock");
+        // `unsafe` as a keyword: a block, an `impl`, an `extern`, or an `fn`.
+        // Not the word in prose — every crate here discusses it at length.
+        let uses = src.lines().any(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//")
+                && !t.starts_with("///")
+                && !t.starts_with("*")
+                && (t.contains("unsafe {")
+                    || t.starts_with("unsafe impl")
+                    || t.starts_with("unsafe extern")
+                    || t.starts_with("unsafe fn")
+                    || t.contains("= unsafe"))
+        });
+        if uses && in_boundary {
+            boundary_seen = true;
+        }
+        if uses && !in_boundary {
+            offenders.push(f.display().to_string());
+        }
+    }
+    assert!(
+        boundary_seen,
+        "no unsafe found in krab-lock — the walk is not reading it, and a test \
+         that cannot see the boundary cannot police it"
+    );
+    assert!(
+        offenders.is_empty(),
+        "unsafe outside `krab-lock`:\n  {}\n\nThe boundary is a whole crate on \
+         purpose. If this code genuinely needs it, it belongs there.",
+        offenders.join("\n  ")
+    );
+}

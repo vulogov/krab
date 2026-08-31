@@ -732,6 +732,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "krab-lock"
+version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "krab-node"
 version = "0.1.0"
 dependencies = [
@@ -777,6 +784,7 @@ dependencies = [
  "krab-core",
  "krab-crypto",
  "krab-fabric",
+ "krab-lock",
  "krab-node",
  "krab-proto",
  "krab-store",

@@ -219,12 +219,13 @@ What it means concretely, for this build:
 - **Fixed-size arrays are used for key material** rather than `Vec`, because
   growth reallocates and leaves the previous contents behind. That is a
   reduction in exposure, not a removal of it.
-- **`mlock` is not implemented.** RFC 7 §9 asks for it, and asks an
-  implementation to "fail loudly at startup if locking is unavailable rather
-  than proceeding unlocked". This build does neither: **key material may be
-  paged to swap, and nothing warns.** Disabling swap, or using a
-  randomly-keyed swap device, is the operator's mitigation and this build
-  does not substitute for it. Recorded as unmet in `PLAN.md` §23.
+- **`mlock` is implemented, for one secret.** `krab-lock` locks the pages the
+  identity's private keys live in, and warns loudly at startup if the kernel
+  refuses — usually `RLIMIT_MEMLOCK` headroom, which `ulimit -l` raises. The
+  epoch key, the KEK, the reservoir roots and the tag table are **not** locked,
+  and `Documentation/UNSAFE-AUDIT.md` says why for each. Disabling swap, or
+  using a randomly-keyed swap device, remains the operator's mitigation for
+  everything not on that first line.
 - **Hibernation writes all of RAM to disk** and defeats every mechanism in
   this document. RFC 7 §9 names it; nothing in software can prevent it.
 

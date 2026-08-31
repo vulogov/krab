@@ -9,6 +9,7 @@ members = [
     "crates/krab-crypto",
     "crates/krab-store",
     "crates/krab-proto",
+    "crates/krab-lock",
     "crates/krab-fabric",
     "crates/krab-node",
     "crates/krab",
@@ -37,6 +38,7 @@ krab-core = { path = "crates/krab-core" }
 krab-crypto = { path = "crates/krab-crypto" }
 krab-store = { path = "crates/krab-store" }
 krab-proto = { path = "crates/krab-proto" }
+krab-lock = { path = "crates/krab-lock" }
 krab-fabric = { path = "crates/krab-fabric" }
 krab-node = { path = "crates/krab-node" }
 krab = { path = "crates/krab" }
