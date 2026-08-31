@@ -4139,6 +4139,51 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         )
     }
 
+    /// `peer show <peer>` — RFC 3 §3's HJSON rendering.
+    ///
+    /// > "Implementations MUST render any credential as HJSON on request
+    /// > (`krab peer show`), and **that rendering is what an operator
+    /// > inspects**."
+    ///
+    /// Unimplemented until now, which made §3's sentence false in both
+    /// halves: there was no rendering, and what an operator inspected was the
+    /// `peers` panel's prose summary — a *description* of the credential
+    /// written by this program, not the document itself. The difference
+    /// matters exactly where it is least convenient: a counterparty who
+    /// altered a term is caught by reading the document, and not by reading a
+    /// summary that says what the program believes the document says.
+    ///
+    /// The credential is read from disk and decoded, so what is rendered is
+    /// what is stored rather than what is in memory.
+    fn peer_show(&mut self, who: Option<&str>) -> String {
+        let Some(who) = who else {
+            return "usage: peer show <peer>\n\nRenders the stored peer-link \
+                    as HJSON — RFC 3 §3. This is the document itself, not a \
+                    summary of it."
+                .into();
+        };
+        let Some(w) = self.epoch_key else {
+            return "locked — unlock first".into();
+        };
+        let short = who.to_string();
+        let Some(sealed) = std::fs::read(self.peer_path(&short, artifact::PeerFile::Credential))
+            .ok()
+        else {
+            return format!(
+                "no credential for {short}. `peers` lists the peerings this \
+                 node holds; a peering with no credential was never \
+                 countersigned."
+            );
+        };
+        let Ok(bytes) = krab_crypto::kek::open_under(&w, b"krab/credential", &sealed) else {
+            return format!("the stored credential for {short} did not open");
+        };
+        let Some(cred) = credential::Credential::decode(&bytes) else {
+            return format!("the stored credential for {short} did not decode");
+        };
+        credential::to_hjson(&cred, self.now_s())
+    }
+
     /// `peer forget <peer>` — RFC 3 §8.4.
     ///
     /// > "Objects are content-addressed and unattributed, so the corpus is
@@ -6185,6 +6230,7 @@ impl App {
                     Some(Peering::Wrap) => self.peer_wrap(arg(rest, 1).as_deref()),
                     Some(Peering::Meet) => self.peer_meet(rest),
                     Some(Peering::Verified) => self.peer_verified(arg(rest, 1).as_deref()),
+                    Some(Peering::Show) => self.peer_show(arg(rest, 1).as_deref()),
                     Some(Peering::Reseal) => {
                         let tail = rest.trim().strip_prefix("reseal").unwrap_or("").to_string();
                         self.peer_reseal(&tail)
@@ -17001,6 +17047,27 @@ mod tests {
         // not be reported as peered.
         a.ensure_peer_dir("cccc3333").unwrap();
         assert_eq!(a.peer_ids(), vec!["aaaa1111", "bbbb2222"]);
+    }
+
+    /// **RFC 3 §3's verb exists and reads the stored document.**
+    ///
+    /// The rendering's completeness is asserted next to the renderer, in
+    /// `credential::tests`. What is asserted here is the plumbing: the verb
+    /// the RFC names by name, and that it reads from disk rather than from
+    /// memory, so what an operator inspects is what is stored.
+    #[test]
+    fn peer_show_is_the_verb_rfc3_names() {
+        let (mut a, _b, _, _) = peered_pair("hjson-verb");
+        let peer = a.peer_ids().first().cloned().expect("a peering");
+
+        type_command(&mut a, "peer show");
+        assert!(a.output.contains("usage: peer show"), "{}", a.output);
+        assert!(a.output.contains("RFC 3 §3"), "{}", a.output);
+
+        // A peering with no countersigned credential says which of the two
+        // reasons applies, rather than reporting an empty document.
+        type_command(&mut a, &format!("peer show {peer}"));
+        assert!(a.output.contains("never countersigned"), "{}", a.output);
     }
 
     /// **RFC 3 §12's evidence reaches the operator, and the keystroke is

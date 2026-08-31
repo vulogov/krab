@@ -268,6 +268,114 @@ pub struct Credential {
     pub sig_b: Option<[u8; 64]>,
 }
 
+/// Render a credential as HJSON — RFC 3 §3.
+///
+/// > "Implementations MUST render any credential as HJSON on request
+/// > (`krab peer show`), and **that rendering is what an operator inspects**."
+///
+/// # Why this is written rather than pulled in
+///
+/// HJSON is JSON with comments, unquoted keys and optional commas. This
+/// *emits* it and never parses it, so there is nothing to depend on: a
+/// serialiser for a format whose grammar is "JSON, relaxed" is a formatting
+/// function, and adding a crate to produce text would be the larger risk.
+///
+/// The comments are the point. §3's own table gives each key a meaning, and a
+/// rendering an operator inspects should carry that meaning rather than
+/// assuming they have the RFC open. HJSON permits them; JSON would not, which
+/// is most of why §3 asks for HJSON.
+///
+/// # What it must not do
+///
+/// **Omit anything.** If this is what an operator inspects, a field it does
+/// not show is a field nobody checks — including the ones a malicious
+/// counterparty would most want unexamined. Every key in §3's table appears,
+/// and so does the absence of a signature, which is the difference between a
+/// contract and a claim.
+///
+/// The canonical form remains CBOR. This is a view of the document, never the
+/// document — the same relationship `markdown` has to a message body, and for
+/// the same reason.
+pub fn to_hjson(c: &Credential, now_s: u64) -> String {
+    let hex = |b: &[u8]| -> String {
+        b.iter().map(|x| alloc_hex(*x)).collect::<Vec<_>>().join("")
+    };
+    let party = |label: &str, p: &Party| -> String {
+        format!(
+            "  {label}:\n  {{\n                 # short id, as it appears everywhere else in the interface\n                 id: {}\n                 sig_pk: {}   # Ed25519 identity\n                 kx_pk:  {}   # X25519 correspondence\n  }}\n",
+            crate::short_id(&p.node_id()),
+            hex(&p.sig_pk),
+            hex(&p.kx_pk),
+        )
+    };
+    let terms = |label: &str, t: &LinkTerms| -> String {
+        format!(
+            "  {label}:\n  {{\n                 # RFC 3 §6 — a ceiling this side is held to\n                 bytes_per_day:   {}\n                 objects_per_day: {}\n                 # RFC 3 §7 — a floor this side promises, and breach is detectable\n                 retention_days:  {}\n                 max_bucket:      {}   # index into RFC 1 §8.1's table\n                 relay:           {}\n                 shard_bits:      {}\n  }}\n",
+            t.bytes_per_day,
+            t.objects_per_day,
+            t.retention_days,
+            t.policy.max_bucket,
+            t.policy.relay,
+            t.policy.shard_bits,
+        )
+    };
+    let sig = |label: &str, s: &Option<[u8; 64]>| -> String {
+        match s {
+            Some(v) => format!("  {label}: {}\n", hex(v)),
+            // Stated, not omitted. RFC 3 §3: "a singly-signed document lets one
+            // party assert a relationship the other never agreed to."
+            None => format!(
+                "  {label}: null   # NOT SIGNED — this is a proposal, not a contract\n"
+            ),
+        }
+    };
+
+    let mut out = String::from("{\n");
+    out.push_str("  # RFC 3 §3 peer-link. Canonical form is CBOR; this is a view of it.\n");
+    out.push_str("  version: 1\n");
+    out.push_str(&party("a", &c.a));
+    out.push_str(&party("b", &c.b));
+    out.push_str(&format!("  established_s: {}\n", c.established_s));
+    out.push_str(&format!(
+        "  expires_s:     {}   # {}\n",
+        c.expires_s,
+        if c.expires_s <= now_s {
+            "EXPIRED".to_string()
+        } else {
+            format!("{} day(s) left", (c.expires_s - now_s) / 86_400)
+        }
+    ));
+    out.push_str(&format!(
+        "  nonce: {}   # 16 bytes, so a superseded link cannot be replayed\n",
+        hex(&c.nonce)
+    ));
+    out.push_str(&terms("terms_ab", &c.terms_ab));
+    out.push_str(&terms("terms_ba", &c.terms_ba));
+    out.push_str("  flags:\n  {\n");
+    out.push_str(&format!(
+        "    # RFC 3 §8.3 — opt in to being listed, never out\n             a_shares_b: {}\n    b_shares_a: {}\n             class_mask: {}   # RFC 1 §5's classes this link carries\n  }}\n",
+        c.flags.a_shares_b, c.flags.b_shares_a, c.flags.class_mask
+    ));
+    if c.transports.is_empty() {
+        out.push_str("  transports: []   # courier-only, and byte-identical either way\n");
+    } else {
+        out.push_str("  transports:\n  [\n");
+        for t in &c.transports {
+            out.push_str(&format!("    {t}\n"));
+        }
+        out.push_str("  ]\n");
+    }
+    out.push_str(&sig("sig_a", &c.sig_a));
+    out.push_str(&sig("sig_b", &c.sig_b));
+    out.push_str("}\n");
+    out
+}
+
+/// Two lowercase hex digits.
+fn alloc_hex(b: u8) -> String {
+    format!("{b:02x}")
+}
+
 /// RFC 3 §4 — prompt for renewal at this fraction of the term.
 ///
 /// > "Implementations SHOULD prompt for renewal at 75% of the term."
@@ -773,6 +881,99 @@ fn transports_from(bytes: &[u8]) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **RFC 3 §3: "implementations MUST render any credential as HJSON on
+    /// request, and that rendering is what an operator inspects."**
+    ///
+    /// There was no rendering and no verb, so what an operator inspected was
+    /// the `peers` panel's prose — a *description* of the credential written
+    /// by this program rather than the document. The difference matters
+    /// exactly where it is least convenient: a counterparty who altered a term
+    /// is caught by reading the document, not by reading a summary of what the
+    /// program believes it says.
+    ///
+    /// **Omitting nothing is the requirement.** A field this does not show is
+    /// a field nobody checks, including the ones a malicious counterparty
+    /// would most want unexamined.
+    #[test]
+    fn hjson_shows_every_field_rfc3_defines() {
+        let mut c = Credential {
+            a: Party {
+                sig_pk: [1; 32],
+                kx_pk: [2; 32],
+            },
+            b: Party {
+                sig_pk: [3; 32],
+                kx_pk: [4; 32],
+            },
+            established_s: 1_000_000,
+            expires_s: 1_000_000 + 90 * 86_400,
+            nonce: [7; 16],
+            terms_ab: LinkTerms {
+                retention_days: 30,
+                bytes_per_day: 12345,
+                objects_per_day: 678,
+                ..LinkTerms::default()
+            },
+            terms_ba: LinkTerms::default(),
+            flags: Flags {
+                a_shares_b: true,
+                b_shares_a: false,
+                class_mask: 3,
+            },
+            transports: Vec::new(),
+            sig_a: Some([9; 64]),
+            sig_b: None,
+        };
+
+        let out = to_hjson(&c, 1_000_000);
+        for key in [
+            "version:",
+            "a:",
+            "b:",
+            "established_s:",
+            "expires_s:",
+            "nonce:",
+            "terms_ab:",
+            "terms_ba:",
+            "flags:",
+            "transports:",
+            "sig_a:",
+            "sig_b:",
+        ] {
+            assert!(out.contains(key), "§3's {key} is missing:\n{out}");
+        }
+        // The terms an operator is actually checking, with their values.
+        assert!(out.contains("bytes_per_day:   12345"), "{out}");
+        assert!(out.contains("objects_per_day: 678"), "{out}");
+        assert!(out.contains("retention_days:  30"), "{out}");
+        assert!(out.contains("a_shares_b: true") && out.contains("b_shares_a: false"));
+
+        // **HJSON, not JSON** — the comments are most of why §3 asks for it,
+        // and they carry §3's own meanings so an operator need not have the
+        // document open beside the terminal.
+        assert!(out.contains('#'), "no annotation; plain JSON would do:\n{out}");
+        assert!(out.starts_with('{') && out.trim_end().ends_with('}'));
+
+        // **An unsigned side is stated, not omitted.** §3: "a singly-signed
+        // document lets one party assert a relationship the other never agreed
+        // to. Mutual signature makes the link a contract rather than a claim."
+        assert!(
+            out.contains("sig_b: null") && out.contains("NOT SIGNED"),
+            "a missing signature was not surfaced:\n{out}"
+        );
+
+        // Both signed reads as neither missing.
+        c.sig_b = Some([8; 64]);
+        let signed = to_hjson(&c, 1_000_000);
+        assert!(!signed.contains("NOT SIGNED"), "{signed}");
+
+        // Expiry is rendered against the clock it is read at, because "is this
+        // still valid" is the question an operator opens it with.
+        assert!(signed.contains("day(s) left"), "{signed}");
+        let lapsed = to_hjson(&c, c.expires_s + 1);
+        assert!(lapsed.contains("EXPIRED"), "{lapsed}");
+    }
     use super::*;
     use crate::identity::Identity;
     use krab_crypto::rng::NotRandom;

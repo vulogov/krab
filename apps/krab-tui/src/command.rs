@@ -340,6 +340,11 @@ impl Command {
         ),
         ("peer status", "how far along each peering is"),
         (
+            "peer show <peer>",
+            "the peer-link itself, as HJSON — RFC 3 §3. Not a summary: the \
+             document, so an altered term is visible",
+        ),
+        (
             "peer rekey <peer>",
             "mix fresh entropy into a live peering — needs a link up",
         ),
@@ -564,6 +569,15 @@ pub enum Peering {
     /// A ceremony that recorded it automatically would be recording that
     /// something happened which it cannot observe.
     Verified,
+    /// Render a peering's credential as HJSON — RFC 3 §3.
+    ///
+    /// > "Implementations MUST render any credential as HJSON on request
+    /// > (`krab peer show`), and that rendering is what an operator
+    /// > inspects."
+    ///
+    /// The verb the RFC names, because the RFC names it: an operator told to
+    /// run `peer show` by a document should find `peer show`.
+    Show,
     /// Upgrade a peering's channel classification in place.
     ///
     /// A weak peering is recoverable rather than permanent: start on
@@ -630,6 +644,7 @@ impl Peering {
             "wrap" => Peering::Wrap,
             "meet" => Peering::Meet,
             "verified" => Peering::Verified,
+            "show" => Peering::Show,
             "reseal" => Peering::Reseal,
             "accept" => Peering::Accept,
             "seal" => Peering::Seal,

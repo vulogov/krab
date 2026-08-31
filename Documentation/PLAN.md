@@ -1800,3 +1800,75 @@ buys a minute a day rather than a core.
 
 Two of the ten: RFC 3 §3's HJSON rendering and RFC 7 §9's memory locking.
 Eight have been closed by the passes that found them.
+
+---
+
+## 26. RFC 3 §3's HJSON rendering, closed — 2026-08-31
+
+> "Implementations MUST render any credential as HJSON on request
+> (`krab peer show`), and **that rendering is what an operator inspects**."
+
+There was no `peer show`. The verb the RFC names by name did not exist, so §3's
+sentence was false in both halves.
+
+### What an operator was inspecting instead
+
+The `peers` panel's prose: quota percentages, standing, novelty, the credential
+term. All of it accurate, and all of it a **description** of the credential
+written by this program rather than the document itself.
+
+The difference is invisible until it matters, and then it is the whole thing.
+RFC 3 §3 makes the credential "simultaneously the contract governing what
+[peering] means", and §6.1 makes a quota dispute "a checkable statement against
+a signed artifact rather than a unilateral judgement". A counterparty who
+altered a term is caught by reading the document. A summary of what the program
+believes the document says catches nothing, because the program believes the
+altered term.
+
+### Written, not depended on
+
+HJSON is JSON with comments, unquoted keys and optional commas. This *emits* it
+and never parses it, so there was nothing to depend on: a serialiser for a
+format whose grammar is "JSON, relaxed" is a formatting function, and adding a
+crate to produce text would have been the larger risk in a tree that names
+every dependency in `Cargo.toml` with a paragraph.
+
+**The comments are most of why §3 asks for HJSON rather than JSON.** §3's table
+gives each key a meaning; a rendering an operator inspects should carry that
+meaning rather than assume the RFC is open beside the terminal. So each field
+is annotated with what it is for — the quota as "a ceiling this side is held
+to", retention as "a floor this side promises, and breach is detectable", the
+share flags with §8.3's "opt in to being listed, never out".
+
+### Omitting nothing is the requirement
+
+A field the rendering does not show is a field nobody checks, including the
+ones a malicious counterparty would most want unexamined. Every key in §3's
+table appears, and so does the **absence** of a signature:
+
+```
+  sig_b: null   # NOT SIGNED — this is a proposal, not a contract
+```
+
+§3: "a singly-signed document lets one party assert a relationship the other
+never agreed to… Mutual signature makes the link a contract rather than a
+claim." A renderer that omitted an empty field would have hidden exactly that.
+
+Expiry is rendered against the clock it is read at, because "is this still
+valid" is the question an operator opens the document with.
+
+### Where the tests are
+
+The rendering's completeness is asserted in `credential::tests`, on constructed
+credentials covering signed, half-signed and lapsed. The verb's plumbing —
+that it exists, that it reads from disk rather than from memory, and that a
+peering with no credential says which of the two reasons applies — is asserted
+in `main`. Splitting them puts the completeness assertion next to the thing
+whose completeness is at stake, where a new field added to `Credential` is
+one file away from the test that would fail.
+
+### What remains
+
+One of the ten: RFC 7 §9's memory locking, which is a dependency decision and
+an unsafe-boundary decision rather than a commit. Nine have been closed by the
+passes that found them.
