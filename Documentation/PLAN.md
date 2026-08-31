@@ -1519,3 +1519,125 @@ a single shard space that RFC 6 §3.4 asks channels to sit outside.
 
 Running total across RFCs 1–6: **137 requirements, 17 unmet or partly unmet,
 3 conflicts.** Seven of the seventeen were fixed by the pass that found them.
+
+---
+
+## 23. RFC 7, requirement by requirement — 2026-08-31
+
+29 lines carrying 34 occurrences — the most of any document. One is RFC 2119
+boilerplate; one is the `⚠ CRITICAL DEFECT` header, which is a status marker
+rather than a requirement; and one — §5.3's "high-traffic nodes MUST republish
+weekly" — was **withdrawn by RFC 2 §9.1**, which removed the `MAX_OBJECT`
+ceiling it rested on. **30 requirements.**
+
+| § | requirement | verdict | enforced at |
+|---|---|---|---|
+| 4 | MUST NOT rely on file deletion or overwriting for any forward-secrecy property | met | `shred`'s module doc states it; every erasure is key destruction |
+| 4.1 | MUST store the KDF parameters alongside the salt | met + tested | `kek.params` |
+| 5.3 | high-traffic nodes MUST republish weekly | **withdrawn** | RFC 2 §9.1 removes the ceiling it rested on |
+| 6 | *(the `⚠ CRITICAL DEFECT` header)* | **closed in the body** | §6's own text withdraws the broken derivation; the code implements the replacement |
+| 6.1 | MUST destroy `root_N` once `root_{N+1}` is derived | met + tested | `Reservoir::advance_to` — "this line is the destruction claim" |
+| 6.1 | MUST NOT retain any value from which a destroyed chunk can be recomputed | met + tested | the ratchet is one-way; no root is kept |
+| 6.1 | a chunk outside the acceptance window MUST be unrecoverable | met + tested | same |
+| 6.1 | `chunk_N` MUST NOT be used as a message key | met + tested | `Mode::AuthPsk` — HPKE `mode_auth_psk`, `psk_id = u32_le(N)` |
+| 6.2 | both parties MUST contribute to the reservoir | met + tested | `R_A ⊕ R_B`, two courier legs |
+| 6.2 | a contribution MUST reach its destination over a channel not depending on the asymmetric cryptography it outlives | met | `peer pad` is removable media; the live path is refused post-quantum credit |
+| 6.2 | MUST record that a network-established reservoir has no post-quantum property | met + tested | `Channel::Network` in the peer record |
+| 6.2 | and MUST surface it wherever the link is displayed | met + tested | `peers` shows it per link |
+| 6.4 | the reservoir material MUST NOT appear in the credential | met + tested | the credential carries identifier and epoch only |
+| 6.4 | a part-finished ceremony MUST NOT accept a second, differing card | met + tested | `ceremony`, with the substitution attack named |
+| 8 | MUST store ciphertext and derive on display | met | `receive`'s module doc; there is no plaintext cache and no Sent folder |
+| 8.1 | MUST make the retention consequence visible before the window elapses | met | `pin` exists and `status` reports the horizon |
+| 9 | **`mlock` key buffers; MUST fail loudly at startup if locking is unavailable** | **unmet** | nothing calls `mlock`; see below |
+| 9 | `Debug` on key types MUST print nothing | met + tested | every key type prints `<redacted>` |
+| 9.1 | the "Rust cannot guarantee a secret was never copied" limit MUST appear in the security considerations of any release | **was unmet, now met** | `SECURE-DELETE.md` |
+| 10 | neither panic wipe nor dead-man timer MUST be enabled by default | met | the chord is a chord; the timer is not built |
+| 10 | both MUST be discoverable | partly met | the chord is in `help`; there is no timer to discover |
+| 10 | the dead-man timer MUST warn well before it fires | vacuous | not built |
+| 11 | the identity key MUST be backed up offline at creation | met + tested | `init` shows the words once, as a step |
+| 11 | MUST state plainly that message history is not recoverable | met + tested | said at `init` and in `help` |
+| 12 | MUST surface prekey burn rate, not merely remaining count | met | `status` |
+| 13.1 | senders MUST use the deterministic index when the tag mode is pairwise | met + tested | `compose` |
+| 13.2 | recipients MUST attempt all live batches in constant time | met + tested | `Inbox::scan_with` |
+| 13.2 | and MUST NOT stop at first success | met + tested | same |
+| 13.3 | MUST cap inbox-tagged decapsulation attempts per peer per epoch | **unmet** | `Attempts` caps per scan; the same gap as RFC 2 §7.2 and §7.4 |
+
+### The `⚠ CRITICAL DEFECT` header, traced
+
+It has been quoted in this plan and never followed. It says §6 "MUST NOT BE
+IMPLEMENTED AS WRITTEN" because `msg_key = HKDF(chunk_N, "krab/msg/v1" ‖ tag)`
+derives one key per *(pair, epoch)* rather than per message — keystream reuse
+and Poly1305 one-time-key recovery, "confidentiality **and** integrity lost for
+all reservoir-protected traffic between a pair within an epoch". Status is
+recorded as "open, awaiting fix".
+
+**The body of §6 already carries the fix.** Further down, the same section says
+"the previous derivation is withdrawn. `chunk_N` is not a message key and MUST
+NOT be used as one", and specifies HPKE `mode_auth_psk` with `psk = chunk_N`
+and `psk_id = u32_le(N)`. That is what `krab_crypto::seal::Mode::AuthPsk`
+implements, and the epoch travels as `psk_id` so a chunk cannot be replayed
+into a different one.
+
+So the header is stale rather than the code being broken. It is a status marker
+that outlived its status — the same defect class this series keeps finding, in
+the document that defines the property. **Recorded, not edited**: the RFCs are
+frozen, and correcting a header is an editor's job. What is fixed here is that
+it has now been traced rather than repeated.
+
+### §9's `mlock`, and why it is not a line of code
+
+> "`mlock`/`VirtualLock` key buffers. The full secret working set is under
+> 100 KB (§2.1), so this is cheap. On Linux it requires `RLIMIT_MEMLOCK`
+> headroom; implementations MUST fail loudly at startup if locking is
+> unavailable rather than proceeding unlocked."
+
+Neither half is implemented: nothing locks, and nothing fails loudly. Key
+material may be paged to swap and nothing says so. RFC 2 §4.3 and §8 both lean
+on this for the tag table, which is why it surfaced during that document's pass
+and was deferred to this one.
+
+It is not a one-line fix. `mlock` needs `libc` or a wrapper crate, and every
+crate in this workspace carries `#![forbid(unsafe_code)]` — so it is a
+dependency decision and an unsafe-boundary decision at once, in a tree that has
+exactly one such boundary today (`getrandom`). It also cannot be done honestly
+by locking *some* buffers: the requirement is about the working set, and a
+partial lock invites the belief that the rest is covered.
+
+What has been done instead is to say so where an operator reads: RFC 7 §9.1's
+disclosure now appears in `SECURE-DELETE.md`, naming `mlock` as unimplemented,
+hibernation as undefeatable, and the operator's own swap configuration as the
+mitigation this build does not substitute for.
+
+### Counts
+
+30 requirements. **25 met** (19 with a test that names them), **1 withdrawn**,
+**1 vacuous**, **1 partly met**, and **2 unmet** — §9's memory locking and
+§13.3's inbox decapsulation cap, the latter being the third statement of a
+requirement RFC 2 makes twice. One was unmet when this pass began and was fixed
+during it.
+
+### The series, whole
+
+| document | requirements | unmet | fixed by the pass |
+|---|---|---|---|
+| RFC 1 | 31 | 2 | 1 |
+| RFC 2 | 16 | 4 | 1 |
+| RFC 3 | 22 | 1 | 0 |
+| RFC 4 | 26 | 0 | 1 |
+| RFC 5 | 17 | 0 | 1 |
+| RFC 6 | 25 | 1 | 1 |
+| RFC 7 | 30 | 2 | 1 |
+| **total** | **167** | **10** | **6** |
+
+Plus 3 conflicts between frozen documents (#10 `EPOCH_WINDOW` vs W, #11 channel
+shard space, #12 reserved header bits), 2 requirements withdrawn by later RFCs,
+and 12 vacuous or unrepresentable.
+
+**167 requirements, against the "~150 MUSTs" this plan quoted for weeks.** The
+figure was close by accident: it counted lines, and lines are neither
+requirements nor occurrences.
+
+Six unmet requirements were closed by the passes that found them. The four that
+remain are RFC 1 §10's opaque relay of unknown versions, RFC 2/7's inbox
+decapsulation cap, RFC 3 §3's HJSON rendering, and RFC 7 §9's memory locking —
+each recorded with why it is not a commit.

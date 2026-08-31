@@ -192,3 +192,42 @@ is real and it is probabilistic; the guarantee is elsewhere.
 
 Each would add a claim the implementation cannot support. The hierarchy already
 provides the property; the right move is to make sure everything is inside it.
+
+---
+
+## In memory, the same limit applies — and it is worse
+
+Everything above is about a secret leaving the disk. RFC 7 §9.1 states the
+limit on the other side of that boundary, and requires it be said out loud:
+
+> **Rust cannot guarantee a secret was never copied.** Moves, reallocation,
+> and compiler optimisations may leave residue that zeroizing never sees.
+> Fixed buffers and `mlock` reduce the exposure substantially; nothing
+> eliminates it. This MUST appear in the security considerations of any
+> release rather than being glossed.
+
+It is stated here because it had been stated only in the specification, which
+is not a release document — the requirement is that a *release* say it, and
+this is the release document about exactly this subject.
+
+What it means concretely, for this build:
+
+- **`Zeroize` on drop reaches the buffer a value currently occupies.** It does
+  not reach a buffer an earlier `Vec` growth abandoned, a stack slot the
+  optimiser spilled to, or a register. `Line::overwrite` and
+  `TagTable`'s `Drop` both say so where they are implemented.
+- **Fixed-size arrays are used for key material** rather than `Vec`, because
+  growth reallocates and leaves the previous contents behind. That is a
+  reduction in exposure, not a removal of it.
+- **`mlock` is not implemented.** RFC 7 §9 asks for it, and asks an
+  implementation to "fail loudly at startup if locking is unavailable rather
+  than proceeding unlocked". This build does neither: **key material may be
+  paged to swap, and nothing warns.** Disabling swap, or using a
+  randomly-keyed swap device, is the operator's mitigation and this build
+  does not substitute for it. Recorded as unmet in `PLAN.md` §23.
+- **Hibernation writes all of RAM to disk** and defeats every mechanism in
+  this document. RFC 7 §9 names it; nothing in software can prevent it.
+
+`panic = "abort"` is set, so a panic cannot produce a core dump carrying key
+material, and `Debug` on every key type prints a redaction rather than bytes.
+Those two are real and they are narrow.
