@@ -1729,3 +1729,74 @@ and `IdMismatch`, `Expired` and `BadPadding` still bite.
 Three of the ten: RFC 2/7's inbox decapsulation cap, RFC 3 §3's HJSON
 rendering, and RFC 7 §9's memory locking. Seven of the ten have now been closed
 by the passes that found them.
+
+---
+
+## 25. The inbox decapsulation cap, closed — 2026-08-31
+
+Stated three times — RFC 2 §7.2, RFC 2 §7.4, RFC 7 §13.3 — and unmet in a way
+none of the earlier passes saw, because a constant with the right name existed.
+
+### The cap was on the wrong path
+
+`MAX_ATTEMPTS_PER_SCAN` bounds `Inbox::scan_with`: the **pairwise** path. Its
+own doc comment cited RFC 2 §9 and argued that per-scan was stricter than per
+peer per epoch, which is true and was answering the wrong question.
+
+Every statement of the requirement is about the other path. RFC 7 §13.3:
+
+> "**Inbox-mode objects have no sender to index by** and therefore require
+> exhaustive search. Implementations MUST cap inbox-tagged decapsulation
+> attempts per peer per epoch. This is the DoS surface RFC 1 §6.4 identifies,
+> and it is narrower than that section implies — it applies to inbox mode
+> specifically."
+
+The pairwise path is cheap by construction: §13.1 makes the deterministic index
+mandatory, so a matched tag names its sender and the candidate set is small.
+`scan_requests` is the expensive one — and it had **no cap, no cache, and no
+budget of any kind**. A full HPKE decapsulation per object bearing this node's
+inbox tag, for as many as a peer cared to send, on a path any stranger can
+reach because computing an inbox tag needs only the target's public key.
+
+RFC 1 §6.4's other requirement was missing there too: "implementations MUST
+cache failed `(id, epoch)` pairs so a replayed object costs one lookup". The
+cache existed, in the same struct, and this path did not consult it.
+
+### Why per epoch and not per peer
+
+Every statement says "per peer per epoch", and an inbox-tagged object **has no
+peer** — that is the premise of the sentence imposing it. The object arrived
+over some link, but RFC 3 §12 forbids remembering which:
+
+> "Implementations MUST NOT retain per-object provenance: arrival timestamps
+> and per-object attribution are a forensic reconstruction of the graph and its
+> timing gradients, sitting on disk, waiting for seizure."
+
+So the two cannot both be satisfied literally, and the choice is which. A
+per-peer cap needs the provenance §12 refuses; a per-epoch cap needs nothing.
+**Per epoch is strictly stronger against the attack** — it bounds total work
+rather than one attacker's share, and an adversary holding several peerings
+gains nothing by spreading the flood. What it gives up is attribution, which
+§12 has already given up on purpose.
+
+That is a fourth tension between frozen documents. Unlike #10, #11 and #12 it
+is resolvable without an editor, because one reading is strictly safer than the
+other — recorded rather than numbered.
+
+### The budget refills on the epoch, not the scan
+
+`refresh` is per scan and a scan runs on every tick, so reusing it would have
+been a cap that bounds nothing. `charge_inbox` takes the epoch and resets when
+it turns. Exhaustion is silent: RFC 0 §6 makes delivery failure silent, and a
+peer told it had exhausted the budget would know it had found the cap.
+
+**256 attempts per epoch, derived from what §13 measured.** Exhaustive search
+across a 512-key batch at 200 tag-matched objects costs 30.7 s. This is the
+exhaustive path, so 256 is on the order of a minute of CPU per epoch in the
+worst case §13 prices — beyond any honest first-contact volume, and a flood
+buys a minute a day rather than a core.
+
+### What remains
+
+Two of the ten: RFC 3 §3's HJSON rendering and RFC 7 §9's memory locking.
+Eight have been closed by the passes that found them.

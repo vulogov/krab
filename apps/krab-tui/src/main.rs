@@ -1915,8 +1915,17 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         // First-contact requests, on our own inbox tag. Shown at the top: a
         // request needs a human decision (RFC 3 §11's ceremony is a deliberate
         // act), and burying it under mail would mean it is never made.
+        // Disjoint field borrows: `store` is read, `attempts` is spent.
+        let attempts = &mut self.attempts;
         let requests = self.store.with(|st| {
-            receive::scan_requests(st, id.correspondence(), &id.node_id(), epoch, (0, u32::MAX))
+            receive::scan_requests(
+                st,
+                id.correspondence(),
+                &id.node_id(),
+                epoch,
+                (0, u32::MAX),
+                attempts,
+            )
         });
         for inc in &requests {
             let receive::Incoming::Request { request: r, .. } = inc else {
@@ -2562,9 +2571,10 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
                 now.saturating_add(45 * 1440) + 1,
             )
         };
-        let incoming = self
-            .store
-            .with(|s| receive::scan_requests(s, id.correspondence(), &me, now_epoch(), window));
+        let attempts = &mut self.attempts;
+        let incoming = self.store.with(|s| {
+            receive::scan_requests(s, id.correspondence(), &me, now_epoch(), window, attempts)
+        });
         if incoming.is_empty() {
             return "no first-contact requests.\n\nThey arrive on your inbox \
                     tag, which anyone holding your public key can compute — so \
@@ -3205,9 +3215,10 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         let me = id.node_id();
         let epoch = now_epoch();
         let window = (0u32, u32::MAX);
-        let incoming = self
-            .store
-            .with(|s| receive::scan_requests(s, id.correspondence(), &me, epoch, window));
+        let attempts = &mut self.attempts;
+        let incoming = self.store.with(|s| {
+            receive::scan_requests(s, id.correspondence(), &me, epoch, window, attempts)
+        });
         let Some(doc) = (nums[0] as usize)
             .checked_sub(1)
             .and_then(|n| incoming.get(n))
@@ -15821,6 +15832,7 @@ mod tests {
                 &b.identity.as_ref().unwrap().node_id(),
                 now_epoch(),
                 (0, u32::MAX),
+                &mut receive::Attempts::new(),
             )
         });
         assert_eq!(incoming.len(), 1, "the request was not recognised");
@@ -15877,6 +15889,7 @@ mod tests {
                 &c.identity.as_ref().unwrap().node_id(),
                 now_epoch(),
                 (0, u32::MAX),
+                &mut receive::Attempts::new(),
             )
         });
         assert!(

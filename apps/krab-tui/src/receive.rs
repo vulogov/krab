@@ -282,6 +282,7 @@ pub fn scan_requests(
     our_node_id: &[u8; 32],
     now: Epoch,
     window: (u32, u32),
+    attempts: &mut Attempts,
 ) -> Vec<Incoming> {
     // An inbox tag needs only our own public key — which is the property that
     // makes first contact possible and makes it linkable within an epoch
@@ -313,6 +314,25 @@ pub fn scan_requests(
         if env.tag_mode != 1 || env.enc.len() != ENC_LEN {
             continue;
         }
+        // **RFC 7 §13.3's cap, on the path §13.3 is about.**
+        //
+        // Everything below this line is the exhaustive search §13.3 names —
+        // an HPKE decapsulation against an object bearing this node's inbox
+        // tag, with no sender to index by. It had no bound at all, so a peer
+        // could spend this node's CPU for the price of objects it had already
+        // paid to store.
+        //
+        // The cache first: a replayed object costs one lookup, which is RFC 1
+        // §6.4's requirement and was also absent here.
+        if attempts.known_bad(&id.0, header.expiry_min) {
+            continue;
+        }
+        if !attempts.charge_inbox(now) {
+            // Out of budget for this epoch. Not an error and not reported:
+            // RFC 0 §6 makes delivery failure silent, and a peer that learned
+            // it had exhausted the budget would know it had found the cap.
+            break;
+        }
         let mut enc = [0u8; ENC_LEN];
         enc.copy_from_slice(env.enc);
         let aad = crate::compose::aad_for(&header, &env);
@@ -329,6 +349,7 @@ pub fn scan_requests(
             continue;
         };
         let Ok(pt) = ctx.open(env.ciphertext, &aad) else {
+            attempts.remember_bad(id.0, header.expiry_min);
             continue;
         };
         // A request, or a counter answering one — RFC 3 §5.2. Both travel to
@@ -376,6 +397,15 @@ pub struct Inbox;
 pub struct Attempts {
     bad: std::collections::HashSet<([u8; 32], u32)>,
     spent: usize,
+    /// Inbox-tagged decapsulations spent in `epoch` — RFC 7 §13.3.
+    ///
+    /// Separate from `spent`, which refills per scan. This one refills per
+    /// **epoch**, because that is the window §13.3 names and because a
+    /// per-scan bound on the exhaustive path would be no bound at all: a scan
+    /// runs on every tick.
+    inbox_spent: usize,
+    /// The epoch `inbox_spent` counts for.
+    inbox_epoch: Option<Epoch>,
 }
 
 /// Entries kept. Each is 36 bytes plus set overhead, so this is tens of KB.
@@ -389,7 +419,56 @@ pub const MAX_REMEMBERED: usize = 4096;
 /// generous against honest traffic: a node whose correspondents send more than
 /// this many objects that match a tag and fail to open, in one pass, is under
 /// attack rather than busy.
+///
+/// # Which path this bounds, and which one the RFCs were talking about
+///
+/// This bounds [`Inbox::scan_with`], the **pairwise** path — and every
+/// statement of the requirement is about the other one. RFC 7 §13.3:
+///
+/// > "**Inbox-mode objects have no sender to index by** and therefore require
+/// > exhaustive search. Implementations MUST cap inbox-tagged decapsulation
+/// > attempts per peer per epoch. This is the DoS surface RFC 1 §6.4
+/// > identifies, and it is narrower than that section implies — it applies to
+/// > inbox mode specifically."
+///
+/// The pairwise path is the cheap one by construction: §13.1 makes the
+/// deterministic index mandatory, so a matched tag names its sender and the
+/// candidate set is small. [`scan_requests`] is the expensive one, and it had
+/// no cap, no cache, and no budget of any kind — a full HPKE decapsulation per
+/// object bearing this node's inbox tag, for as many as a peer cared to send.
+///
+/// So the bound existed and was applied to the path that did not need it.
+/// [`MAX_INBOX_ATTEMPTS_PER_EPOCH`] is the one §13.3 asks for.
 pub const MAX_ATTEMPTS_PER_SCAN: usize = 256;
+
+/// Inbox-tagged trial decapsulations one epoch may spend — RFC 7 §13.3.
+///
+/// # Why per epoch and not per peer
+///
+/// Every statement of this requirement says "per peer per epoch", and an
+/// inbox-tagged object **has no peer**. That is the premise of the sentence
+/// that imposes it: "inbox-mode objects have no sender to index by". The
+/// object arrived from *some* link, but RFC 3 §12 forbids retaining which —
+/// "implementations MUST NOT retain per-object provenance: arrival timestamps
+/// and per-object attribution are a forensic reconstruction of the graph and
+/// its timing gradients, sitting on disk, waiting for seizure."
+///
+/// So the two requirements cannot both be satisfied literally, and the choice
+/// is which to satisfy: a per-peer cap needs the provenance §12 refuses, and a
+/// per-epoch cap needs nothing. **Per epoch is strictly stronger against the
+/// attack** — it bounds the total work rather than one attacker's share, and
+/// an adversary with several peerings gains nothing by spreading the flood.
+/// What it gives up is attribution, which §12 has already given up on purpose.
+///
+/// # Why this number
+///
+/// **Derived from what §13 measured.** Exhaustive search across a 512-key
+/// batch at 200 tag-matched objects costs 30.7 seconds; indexed, 0.06 s. This
+/// is the inbox path, so it is the exhaustive one, and 256 attempts is on the
+/// order of a minute of CPU per epoch in the worst case §13 prices — enough
+/// that no honest first-contact volume approaches it, and bounded enough that
+/// a flood buys a minute a day rather than a core.
+pub const MAX_INBOX_ATTEMPTS_PER_EPOCH: usize = 256;
 
 impl Attempts {
     /// A fresh budget. Made per scan; the cache within it persists across
@@ -408,6 +487,29 @@ impl Attempts {
         if self.bad.len() < MAX_REMEMBERED {
             self.bad.insert((id, expiry));
         }
+    }
+
+    /// Spend one inbox-tagged decapsulation — RFC 7 §13.3.
+    ///
+    /// `false` once this epoch's budget is gone. Refills when the epoch turns,
+    /// and not before: `refresh` is per scan and deliberately does not touch
+    /// it, or the cap would reset on every tick and bound nothing.
+    pub fn charge_inbox(&mut self, epoch: Epoch) -> bool {
+        if self.inbox_epoch != Some(epoch) {
+            self.inbox_epoch = Some(epoch);
+            self.inbox_spent = 0;
+        }
+        if self.inbox_spent >= MAX_INBOX_ATTEMPTS_PER_EPOCH {
+            return false;
+        }
+        self.inbox_spent += 1;
+        true
+    }
+
+    /// Inbox-tagged decapsulations spent this epoch. For tests and RFC 3 §12.
+    #[cfg(test)]
+    pub fn inbox_spent(&self) -> usize {
+        self.inbox_spent
     }
 
     /// Spend one attempt. `false` once the budget for this scan is gone.
@@ -708,6 +810,39 @@ mod attempt_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// **RFC 7 §13.3, on the path §13.3 is about.**
+    ///
+    /// > "Inbox-mode objects have no sender to index by and therefore require
+    /// > exhaustive search. Implementations MUST cap inbox-tagged
+    /// > decapsulation attempts per peer per epoch."
+    ///
+    /// `MAX_ATTEMPTS_PER_SCAN` bounded `Inbox::scan_with` — the **pairwise**
+    /// path, which §13.1 makes cheap by making the deterministic index
+    /// mandatory. `scan_requests`, the exhaustive one, had no cap, no cache
+    /// and no budget: a full HPKE decapsulation per object bearing this node's
+    /// inbox tag, for as many as a peer cared to send.
+    #[test]
+    fn inbox_decapsulation_is_capped_per_epoch() {
+        let mut a = Attempts::new();
+        let epoch = Epoch(20_700);
+
+        for i in 0..MAX_INBOX_ATTEMPTS_PER_EPOCH {
+            assert!(a.charge_inbox(epoch), "refused at {i}, below the cap");
+        }
+        assert!(!a.charge_inbox(epoch), "the cap did not bind");
+        assert_eq!(a.inbox_spent(), MAX_INBOX_ATTEMPTS_PER_EPOCH);
+
+        // **A scan does not refill it.** `refresh` is per scan and a scan runs
+        // on every tick, so a per-scan bound on the exhaustive path would be
+        // no bound at all.
+        a.refresh();
+        assert!(!a.charge_inbox(epoch), "a scan refilled the epoch budget");
+
+        // The epoch does.
+        assert!(a.charge_inbox(Epoch(20_701)));
+        assert_eq!(a.inbox_spent(), 1);
+    }
 
     /// **RFC 2 §4.3: "Table entries MUST be zeroized on drop."**
     ///
