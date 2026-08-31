@@ -219,6 +219,15 @@ pub struct CarriagePolicy {
     pub enabled: bool,
     /// Shard bits for the channel space, RFC 6 §3.4.
     ///
+    /// **This is the separate shard space §3.4 requires** — errata E-2. RFC 2
+    /// §6's `shard_k` shards destination *tags* for sealed mail and is
+    /// negotiated in the credential; this shards channel *identifiers* and is
+    /// local. Two configurations over two disjoint namespaces, which is
+    /// RFC 0 I-2's namespace separation doing what it exists for.
+    ///
+    /// Two audit passes recorded §3.4 as unmet after finding only the first of
+    /// the two. If a third looks, the answer is here.
+    ///
     /// Acceptance is by **prefix**, never by exact identifier: an exact list is
     /// a list of your interests handed to your peer, and a peer curious whether
     /// you follow channel X can simply add X and watch. A `k`-bit bucket means

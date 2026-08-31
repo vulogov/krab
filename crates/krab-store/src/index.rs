@@ -247,8 +247,22 @@ impl Store {
         // trade explicitly by scoping I4, and the alternative it rejects is a
         // permanent partition.
         let readable = header.version == krab_core::object::VERSION;
-        if readable && krab_core::object::Class::from_byte(header.class).is_none() {
-            return Err(Reject::Unrecognised);
+        if readable {
+            if krab_core::object::Class::from_byte(header.class).is_none() {
+                return Err(Reject::Unrecognised);
+            }
+            // I3's other half — "reserved flag bits zero" — and it is here
+            // rather than in `RoutingHeader::parse` because it is version-
+            // scoped and `parse` is not. §10 requires reserved bits be
+            // *ignored* on receipt so a future version may define them; §11's
+            // I3 requires them zero for a version this build knows. Conflict
+            // #12, resolved in `Documentation/RFC-ERRATA.md`: both, in their
+            // own scope. Rejecting regardless of version would refuse the
+            // first v2 object that used bit 2, which is the partition §10
+            // exists to prevent.
+            if header.flags & krab_core::object::FLAG_RESERVED != 0 {
+                return Err(Reject::Unrecognised);
+            }
         }
         // I3's second half — "reserved flag bits zero" — is already done, in
         // `RoutingHeader::parse` above, whose contract says so: it "validates
@@ -1324,10 +1338,28 @@ mod tests {
             let id = krab_crypto::object_id(&bytes);
             assert_eq!(
                 s.ingest(id, bytes, 0, MAX_TTL),
-                Err(Reject::Malformed),
+                Err(Reject::Unrecognised),
                 "reserved flag bit {bit} was accepted"
             );
         }
+        // **And a version this build cannot read keeps them**, because §10
+        // says so and because a future version may mean something by them.
+        let h = RoutingHeader {
+            version: 9,
+            class: 0,
+            size_bucket: 0,
+            flags: 0b0000_0100,
+            expiry_min: DAY,
+            tag: Tag([1; 8]),
+        };
+        let bytes = canonical_bytes(&h, &[0xFFu8; 40]).unwrap();
+        let id = krab_crypto::object_id(&bytes);
+        assert_eq!(
+            s.ingest(id, bytes, 0, MAX_TTL),
+            Ok(()),
+            "a reserved bit refused an object §10 requires be carried"
+        );
+
         // The two that are defined still pass.
         for flags in [0u8, 0b01, 0b10, 0b11] {
             let h = RoutingHeader {

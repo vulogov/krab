@@ -25,6 +25,20 @@ pub const EPOCH_SECS: u64 = 86_400;
 /// may arrive up to `MAX_TTL / EPOCH` epochs after the epoch its tag derives
 /// from, and a recipient with a narrower window simply never computed that tag
 /// — the object is accepted, stored, and undecryptable.
+/// **±45, and RFC 2 §5's "±30" default is withdrawn** — errata E-1,
+/// `Documentation/RFC-ERRATA.md`.
+///
+/// RFC 1 §6.2 requires at least `MAX_TTL / EPOCH` and forbids narrowing below
+/// it; RFC 2 §5 defaults to ±30, which is below that floor. The two documents
+/// were measuring different things: RFC 2 sized W against observed delivery
+/// latency, RFC 1 against the TTL the protocol declares valid. A recipient
+/// whose window is narrower never computes the tag for an object arriving at
+/// the far edge of that TTL — the object is accepted, stored, and undecryptable
+/// for ever, and RFC 0 §6 guarantees nobody is told.
+///
+/// RFC 2's exposure-window concern is not dismissed: the knob is `MAX_TTL`,
+/// which moves both together. Narrowing W alone buys the same reduction by
+/// silently discarding mail.
 pub const EPOCH_WINDOW: u32 = 45;
 
 /// `MAX_TTL` in minutes — RFC 1 §2, and the bound RFC 1 §11 I2 checks against.

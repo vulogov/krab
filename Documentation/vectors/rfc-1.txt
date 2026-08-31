@@ -274,7 +274,7 @@ reject.expired Expired
 reject.too_far_future TooFarFuture
 reject.duplicate Duplicate
 reject.bad_class Unrecognised
-reject.reserved_flag_set Malformed
+reject.reserved_flag_set Unrecognised
 reject.nonzero_padding BadPadding
 reject.body_not_cbor BadBody
 reject.reserved_body_key BadBody

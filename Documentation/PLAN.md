@@ -1872,3 +1872,87 @@ one file away from the test that would fail.
 One of the ten: RFC 7 §9's memory locking, which is a dependency decision and
 an unsafe-boundary decision rather than a commit. Nine have been closed by the
 passes that found them.
+
+---
+
+## 27. The three conflicts, edited — 2026-08-31
+
+`Documentation/RFC-ERRATA.md` is the register. The RFCs are frozen and no
+frozen text was altered: the series already had the instrument for this — RFC 2
+§9 withdraws requirements from RFC 6 and RFC 7 by name, RFC 7 §13 is titled
+"Errata to RFC 1" — and this applies it to conflicts nobody noticed at the time.
+
+Three rules decide a resolution, and each entry says which one applied:
+correctness over gradient; scope before precedence; the narrower deviation.
+
+### E-1 — `EPOCH_WINDOW` vs W (#10): RFC 1 §6.2 governs, ±30 is withdrawn
+
+The two documents were measuring different things and neither said so. RFC 2
+§5 sized W against **observed delivery latency** — its table is percentiles of
+how long mail takes — and concluded ±30 covers the p99. RFC 1 §6.2 sizes it
+against the TTL the protocol **declares valid**, because an object may
+legitimately arrive `MAX_TTL` after its tag's epoch.
+
+A recipient with the narrower window never computes that tag. The object is
+accepted, stored, and undecryptable for ever, and RFC 0 §6 guarantees nobody is
+told. A p99 argument cannot reach that: the p100 is what the expiry field
+permits, and the failure is total past the window rather than proportional.
+
+RFC 2's exposure-window concern is not dismissed — §5 is right that "every
+retained epoch is a decryptable epoch" and right that the two cannot be tuned
+independently. **The knob is `MAX_TTL`**, which moves both. Narrowing W alone
+buys the same reduction by silently discarding mail, which is not a trade an
+operator can consent to because they are never told about it.
+
+### E-2 — the channel shard space (#11): no conflict, and two audits were wrong
+
+RFC 2 §6 shards **destination tags** — `peering::Policy::shard_bits`,
+negotiated in the credential. RFC 6 §3.4 asks for a separate space over
+**channel identifiers**, and it exists: `krab_crypto::CarriagePolicy` carries
+its own `shard_bits` and `shard` and decides with `accepts(&post.channel_id())`.
+
+Two configurations, two disjoint namespaces, neither constraining the other —
+RFC 0 I-2's namespace separation doing exactly what it is for.
+
+**§12 of this plan recorded §3.4 as unmet, and §22 repeated it.** Both had
+found `filter::Filter` and not `CarriagePolicy`, and concluded "there is one
+space". There are two. That is a claim of absence asserted over a set that was
+not the whole set — the third time in this series, and twice by passes looking
+for that error specifically.
+
+### E-3 — reserved header bits (#12): both, in their own scope
+
+I3 is scoped "class known **for this ver**"; §10 is the forward-compatibility
+section and its subject is a version the receiver does not know. Read with
+those scopes they do not overlap:
+
+- emission: always zero, both agree;
+- receipt, version known: reject — §11's covert-channel argument, since the
+  identifier covers the flags;
+- receipt, version unknown: carry — a future version may define those bits, and
+  refusing would refuse the first object that used one.
+
+"Ignored" means *assign no meaning*, not *do not reject*. The check moved out
+of `RoutingHeader::parse`, which is version-blind by design, into
+`Store::ingest`, where the version is known. The conformance vector
+`reject.reserved_flag_set` becomes `Unrecognised` rather than `Malformed`: it
+is I3's refusal, not a header that failed to parse.
+
+This was a live defect and not only a paper one. After §24 made the store carry
+unknown versions, `parse` was still refusing reserved bits regardless of
+version — so a v2 object using bit 2 would have been refused, which is the
+partition §24 had just fixed, reintroduced through a different door.
+
+### E-4 — the inbox cap against provenance
+
+Recorded as an entry rather than a fourth conflict, because one reading is
+strictly safer: a per-epoch cap bounds total work rather than one attacker's
+share and needs no provenance, so RFC 3 §12 is untouched. Already implemented
+in §25; the register now says why the "per peer" dimension was dropped.
+
+### What this leaves
+
+Nothing on the conflict list, and nothing unmet from the requirement pass. What
+remains is scope this project has deliberately not built — Tor's onion service,
+amateur-band profiles, `short` framing, cover traffic, SF11/SF12 LoRa profiles
+— each recorded as vacuous or unrepresentable in §§17–23 rather than as met.

@@ -54,8 +54,12 @@ pub const MAX_OBJECT: u32 = 262_144;
 pub const FLAG_LINK_LOCAL: u8 = 1 << 0;
 /// `flags` bit 1 — no-relay.
 pub const FLAG_NO_RELAY: u8 = 1 << 1;
-/// Bits 2–7 are reserved and MUST be zero (RFC 1 §10).
-const FLAG_RESERVED: u8 = !(FLAG_LINK_LOCAL | FLAG_NO_RELAY);
+/// Bits 2–7 are reserved and MUST be zero on emission (RFC 1 §10).
+///
+/// Public because the *receipt* rule is version-scoped and therefore lives in
+/// the store, not here — see [`RoutingHeader::parse`] and conflict #12 in
+/// `Documentation/RFC-ERRATA.md`.
+pub const FLAG_RESERVED: u8 = !(FLAG_LINK_LOCAL | FLAG_NO_RELAY);
 
 /// Per-epoch unlinkable destination identifier, 8 bytes (RFC 1 §4.1, RFC 2 §4).
 ///
@@ -174,13 +178,30 @@ impl RoutingHeader {
     /// first protocol revision, permanently — the nodes that would bridge the
     /// partition are the ones offline for a month.
     ///
-    /// It validates only what is frozen for all versions: reserved flag bits
-    /// are zero, and `size_bucket` indexes a defined bucket.
+    /// It validates only what is frozen for all versions: `size_bucket`
+    /// indexes a defined bucket, without which the object cannot be routed,
+    /// filtered or expired at all.
+    ///
+    /// # Reserved flag bits, and the two sections that disagreed
+    ///
+    /// §10 says reserved bits "MUST be zero on emission and MUST be **ignored**
+    /// on receipt". §11's I3 requires them zero and §11 says a receiver MUST
+    /// **reject** an object unless every check holds. For the same field, one
+    /// section says ignore and the other says refuse — recorded as conflict
+    /// #12 and resolved in `Documentation/RFC-ERRATA.md`.
+    ///
+    /// The resolution, and what this implements: **both are right in their own
+    /// scope.** I3 is scoped "for this ver", so for a version this build knows,
+    /// a non-zero reserved bit is a rejection — the covert channel §11
+    /// describes for padding, in a different field. For a version it does not
+    /// know, §10 governs: a future version may define those bits, and refusing
+    /// would partition the network at the revision that used them, which is
+    /// precisely what §10 exists to prevent.
+    ///
+    /// So the check moved from here into `Store::ingest`, where the version is
+    /// already known and where every other version-scoped check lives.
     pub fn parse(bytes: &[u8]) -> Result<RoutingHeader, Error> {
         if bytes.len() < ROUTING_HEADER_LEN {
-            return Err(Error::Malformed);
-        }
-        if bytes[3] & FLAG_RESERVED != 0 {
             return Err(Error::Malformed);
         }
         if bytes[2] as usize >= BUCKETS.len() {
@@ -623,13 +644,30 @@ mod tests {
         }
     }
 
+    /// **Reserved flag bits are not rejected here, and that is conflict #12's
+    /// resolution.**
+    ///
+    /// §10 requires them "ignored on receipt" so a future version may define
+    /// them; §11's I3 requires them zero *for a known version*. Rejecting in
+    /// this version-blind parse would refuse the first v2 object that used bit
+    /// 2 — the partition §10 exists to prevent. The rejection lives in
+    /// `Store::ingest`, where the version is known.
     #[test]
-    fn rejects_reserved_flag_bits_and_undefined_buckets() {
+    fn a_reserved_flag_bit_parses_and_is_refused_where_the_version_is_known() {
         for bit in 2..8 {
             let mut b = hdr().write();
             b[3] = 1 << bit;
-            assert_eq!(RoutingHeader::parse(&b), Err(Error::Malformed), "bit {bit}");
+            let p = RoutingHeader::parse(&b).expect("the frozen header still parses");
+            assert_eq!(p.flags, 1 << bit, "the bit was not preserved for a relay");
+            assert!(
+                p.flags & FLAG_RESERVED != 0,
+                "a caller cannot tell a reserved bit is set"
+            );
         }
+    }
+
+    #[test]
+    fn rejects_undefined_buckets() {
         for bucket in 6u8..=255 {
             let mut b = hdr().write();
             b[2] = bucket;
