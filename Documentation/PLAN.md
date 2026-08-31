@@ -1144,3 +1144,67 @@ after #10 and #11.
 (§10 opaque relay), **1 unmet by design** (§12's second implementation), and
 **1 conflict**. One requirement — §11's per-peer rejection counter — was unmet
 when this pass began and was fixed during it.
+
+---
+
+## 18. RFC 2, requirement by requirement — 2026-08-30
+
+17 lines carrying 19 occurrences; one is RFC 2119 boilerplate and one is RFC 2
+*withdrawing* a MUST from RFC 6 and RFC 7 rather than imposing one. **16
+requirements.**
+
+| § | requirement | verdict | enforced at |
+|---|---|---|---|
+| 3 | a node identifier MUST NOT appear in a tag position | met | tags are `pairwise_tag`/`inbox_tag` output; no path writes an id into `RoutingHeader::tag` |
+| 3 | a destination tag MUST NOT appear in a beacon, nodelist fragment, rollcall entry, transport header, or any log line | met + tested | `activity_log`'s own test refuses a line containing "tag"; beacons and rollcall carry node ids |
+| 3.4 | unknown address keys MUST be preserved and ignored, not stripped | vacuous | the `dst=` address form is modelled in `krab-sizes` and is not parsed by the node |
+| 4.3 | table entries MUST be zeroized on drop | **was unmet, now met** | `impl Drop for TagTable` |
+| 5 | W MUST default to ±30 | **conflict #10** | `EPOCH_WINDOW = 45`; RFC 1 §6.2 requires ≥45 |
+| 5 | W MUST NOT be below ±14 | met | 45 |
+| 5.1 | MUST accept objects whose epoch falls within W of local time | met + tested | `TagTable::build` covers `pairwise_window` |
+| 5.1 | MUST NOT emit when median-of-peers time diverges by more than ±6 h | **unmet** | no median-of-peers estimate exists — recorded §11 |
+| 7.1 | the envelope MUST NOT indicate which recipient key was used | met | §4.2's five keys carry no index |
+| 7.2 | inbox-tagged objects MUST be rate-capped per peer per epoch | **unmet** | `Attempts` caps per scan, not per peer per epoch — recorded §11 |
+| 7.4 | MUST cache failed `(id, epoch)` pairs | met + tested | `receive::Attempts` |
+| 7.4 | MUST cap inbox-tagged decapsulation per peer per epoch | **unmet** | same requirement as §7.2, stated twice |
+| 7.4 | MUST attempt all live batches in constant time | met + tested | `Inbox::scan_with` |
+| 7.4 | and MUST NOT stop at first success | met + tested | same |
+| 8 | MUST warn about in-flight loss on rotation | **unmet** | no correspondence-key rotation command exists to warn from |
+| 8 | the precomputation table MUST be treated as key material: never paged, never logged, never persisted | **partly met** | never logged and never persisted; **never paged is unmet** — nothing calls `mlock` |
+
+### What this pass found
+
+**RFC 2 §4.3's zeroization was absent**, and it is the requirement RFC 2 argues
+hardest for: the table "is a map from tag to correspondent, which is exactly
+the correlation the design exists to prevent", and §8 calls it "the single most
+valuable artifact on a seized running node". `Shared` zeroizes; the identity
+keys zeroize; the one structure whose *contents* are public and whose *shape*
+is the secret had no `Drop` at all.
+
+Fixed, with its limit stated where it is implemented: the values are
+overwritten, the `HashMap` keys cannot be, and the keys are tags — public by
+construction, readable off the wire. What must not survive is which of them
+belong to this node's correspondents, and that is what the values hold.
+
+**"Never paged" is unmet and is not a RFC 2 problem.** Nothing in this tree
+calls `mlock`; RFC 7 §9's memory-locking requirement is unmet across the board,
+and it is recorded here because §4.3 and §8 both lean on it. It belongs to
+RFC 7's pass.
+
+**§8's rotation warning is unmet in a way worth distinguishing** from the
+others: the warning is missing because the thing it warns about is missing.
+There is no command that rotates a correspondence key, so there is nothing to
+warn from. `peer rekey` rotates the *reservoir*, which is a different key with
+different consequences and already warns about its own.
+
+### Counts
+
+16 requirements. **9 met** (6 with a test that names them), **1 vacuous**,
+**4 unmet** — median-of-peers time, the inbox decapsulation cap stated twice,
+and the rotation warning — **1 partly met** (paged/logged/persisted, two of
+three), and **1 conflict** already recorded as #10. One — §4.3's zeroization —
+was unmet when this pass began and was fixed during it.
+
+Running total across RFC 1 and RFC 2: **47 requirements, 13 unmet or partly
+unmet, 3 conflicts.** Two of the thirteen were fixed by the passes that found
+them.

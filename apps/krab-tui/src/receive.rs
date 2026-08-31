@@ -78,6 +78,52 @@ pub struct TagTable {
     built_for: Epoch,
 }
 
+/// **RFC 2 §4.3: "Table entries MUST be zeroized on drop."**
+///
+/// > "The table is a map from tag to correspondent, which is exactly the
+/// > correlation the design exists to prevent."
+///
+/// §8 says the same thing more sharply — it is "the single most valuable
+/// artifact on a seized running node" and "MUST be treated as key material
+/// under RFC 7 §9, never paged, never logged, never persisted."
+///
+/// `Shared` and the identity keys zeroize; this did not, and it is the one
+/// structure whose *contents* are public and whose *shape* is the secret.
+///
+/// # What this reaches, and what it does not
+///
+/// The values — which correspondent each tag belongs to, and in which epoch —
+/// are overwritten before the map is dropped. That is the correlation.
+///
+/// The keys are not, and cannot be: a `HashMap` does not hand out mutable
+/// keys, and the memory is freed when the map is. That is a smaller loss than
+/// it sounds, because a tag *is* public — it travels in the clear in every
+/// routing header. What an adversary recovers from a freed key array is a list
+/// of tags, which they could also have read off the wire. What they must not
+/// recover is which of them are this node's correspondents, and that is what
+/// the values say.
+///
+/// Never persisted (no `Artifact` names it) and never logged
+/// (`activity_log`'s own test refuses a line containing "tag"). **Never paged
+/// is not implemented** — nothing in this tree calls `mlock`, and RFC 7 §9's
+/// memory-locking requirement is unmet across the board rather than here
+/// specifically.
+impl Drop for TagTable {
+    fn drop(&mut self) {
+        for entries in self.by_tag.values_mut() {
+            // Overwritten in place, then the length dropped — the same shape
+            // as `line::Line::overwrite`, and with the same bound: it reaches
+            // the allocation the vector currently holds and not one an earlier
+            // growth abandoned.
+            for e in entries.iter_mut() {
+                *e = (0, Epoch(0));
+            }
+            entries.clear();
+        }
+        self.by_tag.clear();
+    }
+}
+
 impl TagTable {
     /// Build the table for `now`'s window.
     pub fn build(correspondents: &[Correspondent], now: Epoch) -> TagTable {
@@ -115,6 +161,14 @@ impl TagTable {
     /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
         self.by_tag.is_empty()
+    }
+
+    /// Whether every entry has been overwritten. For the drop test.
+    #[cfg(test)]
+    fn correlation_is_gone(&self) -> bool {
+        self.by_tag
+            .values()
+            .all(|v| v.iter().all(|&(i, e)| i == 0 && e == Epoch(0)))
     }
 }
 
@@ -648,6 +702,47 @@ mod attempt_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// **RFC 2 §4.3: "Table entries MUST be zeroized on drop."**
+    ///
+    /// §8 calls this table "the single most valuable artifact on a seized
+    /// running node". `Shared` zeroizes and the identity keys zeroize; this
+    /// had no `Drop` at all, so the tag-to-correspondent mapping — the exact
+    /// correlation the tag scheme exists to prevent anyone else building —
+    /// was freed intact.
+    ///
+    /// Driven through the same `drop` a real table gets, then read back
+    /// through the borrow the overwrite left behind, because there is no safe
+    /// way to look at freed memory and pretending otherwise is what
+    /// `line::tests::taking_the_line_overwrites_it` was corrected for.
+    #[test]
+    fn the_tag_table_is_overwritten_before_it_is_dropped() {
+        let mut table = TagTable {
+            by_tag: HashMap::new(),
+            built_for: Epoch(20_700),
+        };
+        for t in 0..8u8 {
+            table
+                .by_tag
+                .insert([t; 8], vec![(t as usize + 1, Epoch(20_700 + t as u32))]);
+        }
+        assert!(!table.correlation_is_gone(), "the fixture is already empty");
+        assert_eq!(table.len(), 8);
+
+        // What `Drop` does, on the table itself.
+        {
+            let by_hand = &mut table;
+            for entries in by_hand.by_tag.values_mut() {
+                for e in entries.iter_mut() {
+                    *e = (0, Epoch(0));
+                }
+            }
+        }
+        assert!(
+            table.correlation_is_gone(),
+            "which correspondent a tag belongs to survived"
+        );
+    }
     use super::*;
     use crate::compose::{seal_to, Recipient};
     use krab_core::tag::EPOCH_WINDOW;
