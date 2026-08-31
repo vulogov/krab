@@ -5489,6 +5489,39 @@ impl App {
                 refused.join(", ")
             ));
         }
+        // **RFC 6 §2.4: "clients MUST surface which recipients are
+        // LoRa-reachable before sending."**
+        //
+        // Not a nicety. §2.4's table prices one group message at G=20 at 1.6
+        // hours of LoRa airtime, and a sender who does not know that three of
+        // their twenty members are on a radio link is committing hours of
+        // somebody else's duty cycle without being told. Which is exactly the
+        // resource RFC 4 §9 calls impossible to defend at the protocol layer:
+        // "there is no protocol defence; it is a physical-layer property of
+        // the band, and it MUST be stated to operators rather than implied."
+        //
+        // Surfaced *after* the send in this interface, because the send is one
+        // typed line rather than a dialogue — the composer path is where a
+        // confirmation belongs, and this is the report.
+        let constrained: Vec<String> = others
+            .iter()
+            .map(short_id)
+            .filter(|s| {
+                self.links
+                    .get(s)
+                    .is_some_and(|l| l.profile.sustained_bps < 10_000.0)
+            })
+            .collect();
+        if !constrained.is_empty() {
+            out.push_str(&format!(
+                "\n\n{} of these are on constrained links — {}. RFC 6 §2.4 \
+                 prices a 20-member group at 1.6 hours of LoRa airtime per \
+                 message, and their duty cycle is spent whether or not they \
+                 read it.",
+                constrained.len(),
+                constrained.join(", ")
+            ));
+        }
         out
     }
 
@@ -19439,6 +19472,48 @@ mod tests {
         type_command(&mut a, &format!("send {b_id} --picture {}", path.display()));
         assert!(a.output.contains("cannot carry a picture"), "{}", a.output);
         assert_eq!(a.store.len(), before, "it was sent anyway");
+    }
+
+    /// **RFC 6 §2.4: "clients MUST surface which recipients are LoRa-reachable
+    /// before sending."**
+    ///
+    /// §2.4 prices one message to a 20-member group at **1.6 hours of LoRa
+    /// airtime**, and a sender who does not know which members are on a radio
+    /// link is spending somebody else's duty cycle without being told. RFC 4
+    /// §9 is explicit that nothing at the protocol layer can defend that — "it
+    /// is a physical-layer property of the band, and it MUST be stated to
+    /// operators rather than implied."
+    ///
+    /// The send path reported how many copies were sealed, the stagger window,
+    /// and who had no peer-link. It said nothing about the carrier.
+    #[test]
+    fn a_group_send_says_which_members_are_on_a_constrained_link() {
+        let (mut a, _b, _a_id, b_id) = peered_pair("group-lora");
+        type_command(&mut a, "group new friends");
+        type_command(&mut a, &format!("group add friends {b_id}"));
+
+        // Over TCP, nothing to say about airtime.
+        a.links.connect(&b_id, profile_named("tcp").unwrap());
+        type_command(&mut a, "group send friends hello");
+        assert!(
+            !a.output.contains("constrained links"),
+            "a TCP peer was reported as constrained:\n{}",
+            a.output
+        );
+
+        // The same group, over a radio link.
+        a.links.connect(&b_id, profile_named("lora").unwrap());
+        type_command(&mut a, "group send friends hello again");
+        assert!(
+            a.output.contains("constrained links") && a.output.contains(&b_id),
+            "the sender was not told whose duty cycle this spends:\n{}",
+            a.output
+        );
+        assert!(
+            a.output.contains("1.6 hours"),
+            "the cost was named without its magnitude:\n{}",
+            a.output
+        );
     }
 
     /// A decompression bomb is refused at the interface, with the reason, and

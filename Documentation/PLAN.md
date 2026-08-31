@@ -1439,3 +1439,83 @@ and is now met**. No vacuous, no conflicts.
 
 Running total across RFCs 1–5: **112 requirements, 16 unmet or partly unmet,
 3 conflicts.** Six of the sixteen were fixed by the pass that found them.
+
+---
+
+## 22. RFC 6, requirement by requirement — 2026-08-31
+
+22 lines carrying 28 occurrences; one is RFC 2119 boilerplate, and one —
+§2.8's "members of large groups MUST republish prekeys weekly" — was
+**withdrawn by RFC 2 §9**, which corrected the batch-size model it rested on.
+**25 requirements.**
+
+| § | requirement | verdict | enforced at |
+|---|---|---|---|
+| 2.4 | MUST warn above 25 members | met + tested | `groups::WARN_ABOVE` |
+| 2.4 | MUST refuse above 50 | met + tested | `groups::REFUSE_ABOVE` |
+| 2.4 | clients MUST surface which recipients are LoRa-reachable before sending | **was unmet, now met** | `group send`, see below |
+| 2.6 | divergence MUST be surfaced, not silently resolved | met + tested | `Group::divergence` |
+| 2.6 | MUST record roster authority | met + tested | `groups::Authority`, encoded |
+| 2.6 | and MUST NOT allow it to change | met + tested | no path rewrites it |
+| 2.7 | MUST stagger fan-out over a randomised window | met + tested | `fanout::offsets` |
+| 2.7 | W MUST be derived from the observed background rate, not a constant | met + tested | `App::background_rate` is arrivals ÷ hours |
+| 2.8 | members of large groups MUST republish weekly | **withdrawn** | RFC 2 §9.2 retracts it by name |
+| 2.8 | MUST surface prekey burn rate | met | `status` reports it |
+| 2.8 | MUST warn when joining a group would make cadence insufficient | met + tested | `groups`, at join |
+| 3.3 | shared-write channels MUST NOT be added | met | not built |
+| 3.4 | nodes MUST support excluding class 1 via `class_mask` | met | `filter::Filter` |
+| 3.4 | channel carriage MUST be off by default | met + tested | `CarriagePolicy::default` |
+| 3.4 | channels MUST occupy a separate shard space from sealed traffic | **unmet — conflict #11** | one shard space; RFC 2 §6 defines one |
+| 3.4 | a node MUST be able to carry its operator's mail and no channels | met + tested | carriage off is the default state |
+| 3.6 | the jurisdiction consequence MUST be stated where a user enables channels | met + tested | `channel carry on` arms, then commits, and says why |
+| 5.1 | the security context MUST be visible in the composer | met + tested | `Banner::PublicSignedPermanent` |
+| 5.2 | the first channel post of a session MUST require explicit confirmation | met + tested | two-step, like `wipe` |
+| 5.3 | reply MUST default to a private sealed message to the author | met | `reply` composes a sealed message |
+| 5.3 | the publish action MUST be a separate keystroke | met | `channel post` is its own verb |
+| 5.4 | roster divergence MUST be shown, never silently merged | met + tested | the same requirement as §2.6, restated |
+| 5.5 | group size and prekey adequacy MUST be shown at join time, not failure time | met + tested | `groups`, at join |
+| 6 | users MUST be told channels are permanent at the point of posting | met + tested | the banner, and the first-post confirmation |
+
+### §2.4: whose duty cycle is being spent
+
+> "Groups over LoRa SHOULD NOT exceed 10 members, and **clients MUST surface
+> which recipients are LoRa-reachable before sending.**"
+
+`group send` reported how many copies were sealed, the stagger window, and who
+had no peer-link. It said nothing about the carrier.
+
+§2.4's own table is why that matters: one message to a 20-member group is
+**1.6 hours of LoRa airtime**. A sender who does not know that three of their
+twenty members are on a radio link is committing hours of somebody else's duty
+cycle, and RFC 4 §9 is explicit that nothing at the protocol layer can defend
+it — "there is no protocol defence; it is a physical-layer property of the
+band, and it MUST be stated to operators rather than implied."
+
+Now named, with the figure, per send.
+
+### And a link that would not change its transport
+
+Writing the test for the above found `LinkTable::connect` using
+`or_insert_with`, so a second `connect` to a peer that already had a link kept
+the **first** profile and discarded the one passed in. `connect <peer> lora
+<addr>` after `connect <peer> tcp <addr>` reported success and left the node
+believing the peer was still on TCP.
+
+That profile decides the sync mode (RFC 5 §4.1), the object ceiling (RFC 4 §5.4
+and §9), the session deadline, and what the peers panel says about location
+privacy. All four would have been answered for a carrier the link no longer
+used. The session is deliberately kept across the change: a profile describes
+the carrier, an open socket is a fact about the world, and tearing one down on
+re-`connect` would kill a working exchange.
+
+Not an RFC 6 requirement — found by testing one.
+
+### Counts
+
+25 requirements. **23 met** (18 with a test that names them), **1 withdrawn**
+by a later RFC, and **1 unmet** — §3.4's separate shard space, which is
+conflict #11 and cannot be closed without an RFC editor, since RFC 2 §6 defines
+a single shard space that RFC 6 §3.4 asks channels to sit outside.
+
+Running total across RFCs 1–6: **137 requirements, 17 unmet or partly unmet,
+3 conflicts.** Seven of the seventeen were fixed by the pass that found them.

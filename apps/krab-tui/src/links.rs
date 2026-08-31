@@ -169,17 +169,34 @@ impl LinkTable {
     /// Establishes a transport and **nothing else**. There is no reconcile
     /// call here and no way to add one without giving this module a dependency
     /// it does not have.
+    /// Begin establishing a link to `peer` over `profile`.
+    ///
+    /// # The profile is adopted, and it used to be ignored
+    ///
+    /// This was `or_insert_with`, so a second `connect` to a peer that already
+    /// had a link kept the **first** profile and discarded the one passed in.
+    /// `connect <peer> lora <addr>` after `connect <peer> tcp <addr>` therefore
+    /// reported success and left the node believing the peer was still on TCP
+    /// — which decides the sync mode (RFC 5 §4.1), the object ceiling (RFC 4
+    /// §5.4 and §9), the session deadline, and what the peers panel tells the
+    /// operator about location privacy. Every one of those would have been
+    /// answered for a carrier the link no longer used.
+    ///
+    /// The session is deliberately kept. A profile is a description of the
+    /// carrier; an open socket is a fact about the world, and dropping it here
+    /// would make a re-`connect` tear down a working exchange.
     pub fn connect(&mut self, peer: &str, profile: LinkProfile) -> &LinkState {
         let entry = self
             .links
             .entry(peer.to_string())
             .or_insert_with(|| LinkState {
                 peer: peer.to_string(),
-                profile,
+                profile: profile.clone(),
                 transport: Transport::Down,
                 next_sync_min: None,
                 session: None,
             });
+        entry.profile = profile;
         entry.transport = Transport::Establishing;
         entry
     }
