@@ -233,7 +233,10 @@ pub fn into_object(b: &Bulletin, now_min: u32, ttl_min: u32) -> Option<(ObjectId
 /// Returns `None` for anything that is not a well-formed, **verifying**
 /// bulletin — so a caller cannot accidentally act on an unauthenticated one.
 pub fn from_object(bytes: &[u8]) -> Option<Bulletin> {
-    let header = RoutingHeader::parse(bytes).ok()?;
+    // `parse_readable`, not `parse`: RFC 1 §10 has the store carry objects
+    // whose version this build does not know, and a bulletin decoder must not be
+    // handed one.
+    let header = RoutingHeader::parse_readable(bytes).ok()?;
     if header.class != Class::Bulletin as u8 {
         return None;
     }

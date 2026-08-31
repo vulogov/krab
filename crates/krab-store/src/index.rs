@@ -203,17 +203,51 @@ impl Store {
             return Err(Reject::IdMismatch);
         }
 
-        // RFC 1 §11 I3 — version and class are recognised.
+        // **RFC 1 §10 — a version this node cannot read is carried, not
+        // refused.**
         //
-        // `RoutingHeader::parse` deliberately does not check these: parsing and
-        // validating are separate so there is one rejection path rather than
-        // two, and the store is where an object is admitted. A v2 object is
-        // well-formed and unreadable here, and storing it would mean relaying
-        // bytes whose meaning this node cannot check.
-        if header.version != 1 {
-            return Err(Reject::Unrecognised);
-        }
-        if krab_core::object::Class::from_byte(header.class).is_none() {
+        // > "A relay encountering `ver` it does not know MUST route, filter,
+        // > and expire from the 16-byte routing header alone, and MUST store
+        // > and forward the remaining bytes opaquely. This is safe because the
+        // > identifier covers the whole object; an unparsed object cannot be
+        // > tampered with undetected."
+        //
+        // This refused `version != 1`, with the reasoning that an object it
+        // could not fully validate must not enter the store. §10 answers that
+        // argument in its own sentence — I5 is what makes an opaque object
+        // safe — and states the cost of getting it wrong: "the first protocol
+        // revision partitions the network along version lines and the
+        // partition is permanent, because the nodes that would bridge it are
+        // the ones offline for a month." Invisible until there is a v2, and
+        // unrepairable afterwards by exactly the nodes that would repair it.
+        //
+        // # Which of §11's checks still apply
+        //
+        // The ones answerable from the frozen sixteen bytes, and §11 scopes
+        // the rest itself:
+        //
+        // - **I1's length** — `size_bucket` is frozen, so this applies.
+        // - **I2** — `expiry_min` is frozen. Applies.
+        // - **I3** — "class known **for this ver**". Unanswerable for a
+        //   version whose class table is unknown, so it is checked only for a
+        //   version this build defines. The reserved flag bits are frozen and
+        //   `RoutingHeader::parse` has already refused them.
+        // - **I4** — "no unknown keys **for a known ver**". §11's own wording
+        //   excludes it, and it could not be applied anyway without a decoder
+        //   for a format this build does not have.
+        // - **I1's zero padding** — needs the body length, which needs I4.
+        //   Excluded with it.
+        // - **I5** — the identifier covers every byte. Applies, and is the
+        //   whole of §10's safety argument.
+        // - **I6** — identifier-based. Applies.
+        //
+        // What is given up is real and worth naming: for an unreadable version
+        // the padding rule cannot be enforced, so §8.1's covert channel is
+        // open in objects this node relays and cannot read. §10 makes that
+        // trade explicitly by scoping I4, and the alternative it rejects is a
+        // permanent partition.
+        let readable = header.version == krab_core::object::VERSION;
+        if readable && krab_core::object::Class::from_byte(header.class).is_none() {
             return Err(Reject::Unrecognised);
         }
         // I3's second half — "reserved flag bits zero" — is already done, in
@@ -244,8 +278,14 @@ impl Store {
         // were skipped, and §11's own aside had already predicted it — "in a
         // reference implementation of this document, three of these six were
         // absent and nothing failed."
-        let body_len = krab_core::object::validate_body(&bytes).map_err(|_| Reject::BadBody)?;
-        krab_core::object::verify_padding(&bytes, body_len).map_err(|_| Reject::BadPadding)?;
+        //
+        // Both are skipped for a version this build cannot read — see the note
+        // on §10 above for why, and for what that costs.
+        if readable {
+            let body_len =
+                krab_core::object::validate_body(&bytes).map_err(|_| Reject::BadBody)?;
+            krab_core::object::verify_padding(&bytes, body_len).map_err(|_| Reject::BadPadding)?;
+        }
 
         // RFC 1 §11 check 2 — this is what stops a relay extending TTL to
         // force indefinite storage.

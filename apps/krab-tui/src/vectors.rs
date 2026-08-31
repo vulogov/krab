@@ -490,6 +490,82 @@ pub fn generate() -> String {
     for (name, reject) in rejections() {
         out.push_str(&format!("reject.{name} {reject}\n"));
     }
+
+    // ---- §10 acceptance: a version this build cannot read ----
+    out.push('\n');
+    out.push_str("## forward compatibility (§10)\n");
+    out.push_str(
+        "# anchor: an unknown `ver` is CARRIED, not refused. §10: \"a relay\n\
+         # encountering `ver` it does not know MUST route, filter, and expire\n\
+         # from the 16-byte routing header alone, and MUST store and forward\n\
+         # the remaining bytes opaquely.\" An implementation that rejects here\n\
+         # partitions the network at the first protocol revision.\n",
+    );
+    for (name, outcome) in forward_compatibility() {
+        out.push_str(&format!("forward.{name} {outcome}\n"));
+    }
+    out
+}
+
+/// RFC 1 §10's acceptances, and the checks that still apply to them.
+fn forward_compatibility() -> Vec<(&'static str, &'static str)> {
+    const NOW: u32 = 29_766_000;
+    let v2 = |expiry: u32, salt: u8, body: &[u8]| {
+        let h = RoutingHeader {
+            version: 2,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: expiry,
+            tag: Tag([salt; 8]),
+        };
+        let b = canonical_bytes(&h, body).unwrap();
+        (krab_crypto::object_id(&b), b)
+    };
+    let name_of = |r: Result<(), Reject>| -> &'static str {
+        match r {
+            Ok(()) => "carried",
+            Err(Reject::Expired) => "Expired",
+            Err(Reject::TooFarFuture) => "TooFarFuture",
+            Err(Reject::IdMismatch) => "IdMismatch",
+            Err(Reject::BadPadding) => "BadPadding",
+            Err(_) => "other",
+        }
+    };
+    let mut out = Vec::new();
+
+    // A body no v1 decoder could read. Carried anyway — that is §10.
+    let mut s = Store::new();
+    let (id, b) = v2(NOW + 40_000, 1, &[0xFFu8; 40]);
+    out.push(("unknown_version", name_of(s.ingest(id, b, NOW, u32::MAX))));
+
+    // I5 still applies, and is the whole of §10's safety argument: "the
+    // identifier covers the whole object; an unparsed object cannot be
+    // tampered with undetected."
+    let (_, b) = v2(NOW + 40_001, 2, &[0xFFu8; 40]);
+    let (wrong, _) = v2(NOW + 40_002, 3, &[0xFFu8; 40]);
+    out.push((
+        "unknown_version_id_mismatch",
+        name_of(s.ingest(wrong, b, NOW, u32::MAX)),
+    ));
+
+    // I2 still applies: the expiry is in the frozen header.
+    let (id, b) = v2(NOW - 1, 4, &[0xFFu8; 40]);
+    out.push((
+        "unknown_version_expired",
+        name_of(s.ingest(id, b, NOW, u32::MAX)),
+    ));
+
+    // I1's length still applies: `size_bucket` is in the frozen header.
+    let (_, b) = v2(NOW + 40_003, 5, &[0xFFu8; 40]);
+    let mut short = b.clone();
+    short.truncate(short.len() - 1);
+    let id = krab_crypto::object_id(&short);
+    out.push((
+        "unknown_version_bad_length",
+        name_of(s.ingest(id, short, NOW, u32::MAX)),
+    ));
+
     out
 }
 
@@ -559,13 +635,9 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
     let _ = s.ingest(id, b.clone(), NOW, u32::MAX);
     out.push(("duplicate", name_of(s.ingest(id, b, NOW, u32::MAX))));
 
-    // I3 — version and class must be recognised. A v2 object is well-formed
-    // and unreadable here; storing it would mean relaying bytes whose meaning
-    // this node cannot check.
-    let mut junk = bytes.clone();
-    junk[0] = 2; // version
-    let id = krab_crypto::object_id(&junk);
-    out.push(("bad_version", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+    // I3 — the class must be recognised **for a known version**. A version
+    // this build does not know is not a rejection at all: RFC 1 §10 requires
+    // it be carried, and that vector lives in the acceptance section below.
 
     let mut junk = bytes.clone();
     junk[1] = 0xFF; // class

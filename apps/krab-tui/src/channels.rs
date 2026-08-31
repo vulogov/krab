@@ -67,7 +67,10 @@ pub fn into_object(p: &Post, now_min: u32, ttl_min: u32) -> Option<(ObjectId, Ve
 /// unauthenticated post by forgetting to check. A post arrives by flooding
 /// from anyone.
 pub fn from_object(bytes: &[u8]) -> Option<Post> {
-    let header = RoutingHeader::parse(bytes).ok()?;
+    // `parse_readable`, not `parse`: RFC 1 §10 has the store carry objects
+    // whose version this build does not know, and a post decoder must not be
+    // handed one.
+    let header = RoutingHeader::parse_readable(bytes).ok()?;
     if header.class != Class::Bulletin as u8 {
         return None;
     }

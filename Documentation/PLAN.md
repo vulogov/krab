@@ -1641,3 +1641,91 @@ Six unmet requirements were closed by the passes that found them. The four that
 remain are RFC 1 §10's opaque relay of unknown versions, RFC 2/7's inbox
 decapsulation cap, RFC 3 §3's HJSON rendering, and RFC 7 §9's memory locking —
 each recorded with why it is not a commit.
+
+---
+
+## 24. RFC 1 §10's opaque relay, closed — 2026-08-31
+
+The most consequential of the ten unmet requirements §23 tallied, and the one
+whose cost is invisible until it is too late to pay.
+
+> "A relay encountering `ver` it does not know MUST route, filter, and expire
+> from the 16-byte routing header alone, and MUST store and forward the
+> remaining bytes opaquely. This is safe because the identifier covers the
+> whole object; an unparsed object cannot be tampered with undetected."
+>
+> "Without opaque relay of unknown versions, the first protocol revision
+> partitions the network along version lines and the partition is permanent,
+> because the nodes that would bridge it are the ones offline for a month."
+
+`Store::ingest` refused `version != 1`, and there was no other path into the
+corpus.
+
+### The argument that was answered in advance
+
+The deviation was deliberate and its reasoning sat in a comment: an object this
+node cannot fully validate must not enter the store, because the identifier
+covers bytes it did not understand — a malleability surface. §10 answers that
+in its own sentence: the identifier covers the *whole* object, so an unparsed
+one cannot be tampered with undetected. **I5 is what makes opacity safe**, and
+I5 applies to every version.
+
+### Which of §11's checks survive, and why
+
+§11 scopes the exclusions itself; nothing here was invented.
+
+| check | applies to an unreadable version? | why |
+|---|---|---|
+| I1 length | yes | `size_bucket` is in the frozen header |
+| I1 zero padding | **no** | needs the body length, which needs I4 |
+| I2 expiry | yes | `expiry_min` is frozen |
+| I3 class | **no** | §11 says "class known **for this ver**" |
+| I3 reserved flags | yes | frozen; `RoutingHeader::parse` already refuses them |
+| I4 body | **no** | §11 says "no unknown keys **for a known ver**" |
+| I5 identifier | yes | covers every byte — §10's whole safety argument |
+| I6 duplicate/tombstone | yes | identifier-based |
+
+**What is given up is real.** For a version this node cannot read, the padding
+rule cannot be enforced, so RFC 1 §8.1's covert channel is open in objects it
+relays and cannot open. §10 makes that trade by scoping I4, and the alternative
+it rejects is a permanent partition. Stated here rather than discovered later.
+
+### Nothing decodes what it cannot read
+
+`RoutingHeader::parse` stays version-blind — routing, filtering and expiry are
+exactly what §10 says must work without knowing the version.
+`parse_readable` is its counterpart and guards everything that reads *past* the
+sixteen frozen bytes: both inbox scans, `channels::from_object`, and
+`bulletin::from_object`. The corpus is no longer all v1, and a decoder that
+assumed otherwise would hand a future format's bytes to a v1 parser.
+
+### Where §10 and RFC 6 §3.4 collide
+
+An unreadable object in the **public** class cannot be identified as a channel
+post or as infrastructure, so the carriage decision cannot be made by decoding.
+§10 says carry it; RFC 6 §3.4 says "a node MUST be able to carry its operator's
+mail and no channels at all".
+
+**The operator's decision wins.** RFC 6 §3.6 makes carriage a statement about
+legal exposure in their jurisdiction, and hosting future public content
+*because it could not be identified* is exactly the false claim about that
+exposure `will_carry` exists to prevent. The class byte is frozen, so this much
+is decidable without a decoder.
+
+The cost, stated: a carriage-off node also declines a v2 prekey batch or roster,
+which §10 would have it relay. A partial deviation, on one class, for nodes
+that have opted out of that class — the narrower of the two failures available.
+
+### The vectors say so
+
+`Documentation/vectors/rfc-1.txt` gains a `## forward compatibility (§10)`
+section. `reject.bad_version Unrecognised` is gone, because it was recording
+the defect as conformance — another implementation reading that file would have
+copied the partition. Four vectors replace it: an unknown version is `carried`,
+and `IdMismatch`, `Expired` and `BadPadding` still bite.
+
+### What remains
+
+Three of the ten: RFC 2/7's inbox decapsulation cap, RFC 3 §3's HJSON
+rendering, and RFC 7 §9's memory locking. Seven of the ten have now been closed
+by the passes that found them.

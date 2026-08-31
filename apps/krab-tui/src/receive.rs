@@ -296,7 +296,11 @@ pub fn scan_requests(
         let Some(bytes) = store.get(&id) else {
             continue;
         };
-        let Ok(header) = RoutingHeader::parse(bytes) else {
+        // **Only a version this build can read.** RFC 1 §10 has the store
+        // carry objects whose `ver` is unknown, so the corpus is no longer all
+        // v1 and a scan that assumed it was would hand a future format's bytes
+        // to `decode_envelope`.
+        let Ok(header) = RoutingHeader::parse_readable(bytes) else {
             continue;
         };
         let Some(&epoch) = tags.get(&header.tag.0) else {
@@ -492,7 +496,9 @@ impl Inbox {
             };
             out.examined += 1;
 
-            let Ok(header) = RoutingHeader::parse(bytes) else {
+            // As above: relayed objects of an unknown version are carried,
+            // never opened.
+            let Ok(header) = RoutingHeader::parse_readable(bytes) else {
                 continue;
             };
             let candidates = table.candidates(&header.tag);

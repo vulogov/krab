@@ -223,6 +223,29 @@ impl ExchangeView {
         if header.class != krab_core::object::Class::Bulletin as u8 {
             return true;
         }
+        // **A version this build cannot read, in the public class.**
+        //
+        // RFC 1 §10 says carry it; RFC 6 §3.4 says "a node MUST be able to
+        // carry its operator's mail and no channels at all". For a v1 object
+        // both hold, because decoding tells us whether it is a channel post or
+        // infrastructure. For an unreadable one they collide, and something
+        // has to give.
+        //
+        // The operator's decision wins. RFC 6 §3.6 makes carriage a statement
+        // about legal exposure in their jurisdiction — "moves a node from 'I
+        // relay for four friends' to 'I host public content'" — and hosting
+        // future public content *because it could not be identified* is the
+        // false claim about that exposure this function exists to prevent.
+        // The class byte is in the frozen header, so this much is decidable
+        // without a decoder even when the body is not.
+        //
+        // The cost, stated: a carriage-off node also declines a v2 prekey
+        // batch or roster, which §10 would have it relay. That is a partial
+        // deviation on one class for nodes that have opted out of that class,
+        // and it is the narrower of the two failures available here.
+        if !header.is_readable() {
+            return self.carriage.enabled;
+        }
         match crate::channels::from_object(bytes) {
             // A channel post. Accepted by prefix, never by exact identifier:
             // an exact list is a list of your interests handed to your peer
@@ -381,6 +404,167 @@ mod tests {
     use krab_core::object::{canonical_bytes, RoutingHeader, Tag};
 
     const NOW: u32 = 29_766_000;
+
+    /// **RFC 1 §10 — a version this node cannot read is carried, and never
+    /// opened.**
+    ///
+    /// > "A relay encountering `ver` it does not know MUST route, filter, and
+    /// > expire from the 16-byte routing header alone, and MUST store and
+    /// > forward the remaining bytes opaquely."
+    ///
+    /// `ingest` refused `version != 1`, so this node relayed nothing it could
+    /// not read — and §10 states the cost: "the first protocol revision
+    /// partitions the network along version lines and the partition is
+    /// permanent, because the nodes that would bridge it are the ones offline
+    /// for a month."
+    #[test]
+    fn an_object_of_an_unknown_version_is_carried_and_never_opened() {
+        let store = SharedStore::new(Store::new());
+        let mut view = ExchangeView::new(
+            store.clone(),
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+            NOW,
+            krab_fabric::profile::MaxBucket(5),
+        );
+
+        // A body no v1 decoder could read, under a version this build has
+        // never heard of.
+        let h = RoutingHeader {
+            version: 9,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: NOW + 40_000,
+            tag: Tag([4; 8]),
+        };
+        let bytes = canonical_bytes(&h, &[0xFFu8; 40]).unwrap();
+        let id = krab_crypto::object_id(&bytes);
+
+        view.put(bytes.clone());
+        assert!(
+            store.with(|s| s.contains(&id)),
+            "an unknown version was refused — that is the partition §10 forbids"
+        );
+
+        // And it is offered onward, byte for byte.
+        use krab_proto::recon::Corpus;
+        assert_eq!(
+            view.get(&id.truncated()).as_deref(),
+            Some(&bytes[..]),
+            "it was stored but not relayed"
+        );
+
+        // What must *not* happen: nothing decodes it. Both readers refuse the
+        // header before reaching a body parser.
+        assert!(
+            krab_core::object::RoutingHeader::parse_readable(&bytes).is_err(),
+            "a v9 body would be handed to a v1 decoder"
+        );
+        assert!(crate::channels::from_object(&bytes).is_none());
+        assert!(crate::bulletin::from_object(&bytes).is_none());
+    }
+
+    /// **The checks that survive an unreadable version are the frozen ones.**
+    ///
+    /// §10's safety argument is I5 — "the identifier covers the whole object;
+    /// an unparsed object cannot be tampered with undetected" — so I5 must
+    /// still bite, and so must every other check answerable from the sixteen
+    /// frozen bytes.
+    #[test]
+    fn an_unknown_version_still_faces_every_frozen_check() {
+        let mut store = Store::new();
+        let build = |expiry: u32, salt: u8| {
+            let h = RoutingHeader {
+                version: 9,
+                class: 0,
+                size_bucket: 0,
+                flags: 0,
+                expiry_min: expiry,
+                tag: Tag([salt; 8]),
+            };
+            let b = canonical_bytes(&h, &[0xFFu8; 40]).unwrap();
+            (krab_crypto::object_id(&b), b)
+        };
+
+        // I5 — the identifier must name the content.
+        let (_, bytes) = build(NOW + 40_000, 1);
+        let (other, _) = build(NOW + 40_001, 2);
+        assert_eq!(
+            store.ingest(other, bytes, NOW, u32::MAX),
+            Err(krab_store::Reject::IdMismatch)
+        );
+
+        // I2 — expiry is in the frozen header.
+        let (id, b) = build(NOW - 1, 3);
+        assert_eq!(
+            store.ingest(id, b, NOW, u32::MAX),
+            Err(krab_store::Reject::Expired)
+        );
+
+        // I1's length — `size_bucket` is in the frozen header.
+        let (_, b) = build(NOW + 40_002, 4);
+        let mut short = b.clone();
+        short.truncate(short.len() - 1);
+        let id = krab_crypto::object_id(&short);
+        assert_eq!(
+            store.ingest(id, short, NOW, u32::MAX),
+            Err(krab_store::Reject::BadPadding)
+        );
+        assert!(store.is_empty());
+    }
+
+    /// **An unreadable object in the public class follows the operator's
+    /// carriage decision, not §10.**
+    ///
+    /// The two collide: §10 says carry it, RFC 6 §3.4 says a node must be able
+    /// to carry its operator's mail and no channels at all. For a v1 object
+    /// decoding settles it; for an unreadable one it cannot, and hosting
+    /// future public content *because it could not be identified* is the false
+    /// claim about legal exposure (RFC 6 §3.6) that `will_carry` exists to
+    /// prevent.
+    #[test]
+    fn an_unreadable_bulletin_follows_the_carriage_setting() {
+        let h = RoutingHeader {
+            version: 9,
+            class: krab_core::object::Class::Bulletin as u8,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: NOW + 40_000,
+            tag: Tag([7; 8]),
+        };
+        let bytes = canonical_bytes(&h, &[0xFFu8; 40]).unwrap();
+        let id = krab_crypto::object_id(&bytes);
+
+        let off = SharedStore::new(Store::new());
+        let mut view = ExchangeView::new(
+            off.clone(),
+            NOW,
+            krab_crypto::CarriagePolicy::default(),
+            crate::filter::Filter::unscoped(),
+            NOW,
+            krab_fabric::profile::MaxBucket(5),
+        );
+        assert!(!krab_crypto::CarriagePolicy::default().enabled);
+        view.put(bytes.clone());
+        assert!(
+            !off.with(|s| s.contains(&id)),
+            "a carriage-off node hosted public content it could not identify"
+        );
+
+        let on = SharedStore::new(Store::new());
+        let mut view = ExchangeView::new(
+            on.clone(),
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+            NOW,
+            krab_fabric::profile::MaxBucket(5),
+        );
+        view.put(bytes);
+        assert!(on.with(|s| s.contains(&id)), "carriage on refused it anyway");
+    }
 
     /// **RFC 1 §11 — "rejection MUST be silent to the peer beyond ordinary
     /// flow control, and MUST be counted per peer as a quota signal."**

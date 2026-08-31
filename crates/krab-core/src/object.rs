@@ -76,6 +76,13 @@ impl core::fmt::Debug for Tag {
     }
 }
 
+/// The protocol version this build encodes and decodes — RFC 1 §4.1.
+///
+/// A *different* version is not an error. RFC 1 §10 requires a relay to carry
+/// one opaquely, which is why this constant guards decoders rather than the
+/// store: see [`RoutingHeader::parse_readable`].
+pub const VERSION: u8 = 1;
+
 /// Content-addressed object identifier: BLAKE3-256, 32 bytes (RFC 1 §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObjectId(pub [u8; 32]);
@@ -189,6 +196,33 @@ impl RoutingHeader {
             expiry_min: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             tag: Tag(tag),
         })
+    }
+
+    /// Parse, and require a version whose *body* this build can read.
+    ///
+    /// # Why every decoder must ask
+    ///
+    /// RFC 1 §10 requires a relay to carry an object whose `ver` it does not
+    /// know — "MUST route, filter, and expire from the 16-byte routing header
+    /// alone, and MUST store and forward the remaining bytes opaquely". So the
+    /// store holds objects no decoder here understands, and a decoder that
+    /// assumed otherwise would hand a future version's body to a v1 parser.
+    ///
+    /// [`RoutingHeader::parse`] stays version-blind, because routing,
+    /// filtering and expiry are exactly what §10 says must work without
+    /// knowing the version. This is its counterpart: the guard for anything
+    /// that reads *past* the sixteen frozen bytes.
+    pub fn parse_readable(bytes: &[u8]) -> Result<RoutingHeader, Error> {
+        let header = RoutingHeader::parse(bytes)?;
+        if header.version != VERSION {
+            return Err(Error::UnsupportedVersion(header.version as u16));
+        }
+        Ok(header)
+    }
+
+    /// Whether this build understands the body behind this header.
+    pub fn is_readable(&self) -> bool {
+        self.version == VERSION
     }
 
     /// Serialise to the sixteen frozen bytes.
