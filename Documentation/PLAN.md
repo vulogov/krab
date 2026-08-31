@@ -1278,3 +1278,79 @@ rejects its own encoder's output" — is the reason it must stay that way.
 
 Running total across RFCs 1–3: **69 requirements, 14 unmet or partly unmet,
 3 conflicts.** Three of the fourteen were fixed by the pass that found them.
+
+---
+
+## 20. RFC 4, requirement by requirement — 2026-08-31
+
+25 lines carrying 30 occurrences; one is RFC 2119 boilerplate. Several lines
+carry three clauses — §8's `short` rule is one sentence with three prohibitions.
+**26 requirements.**
+
+| § | requirement | verdict | enforced at |
+|---|---|---|---|
+| 4.1 | constrained links MUST hold sessions open across cycles | met | `LinkTable` keeps the session; nothing closes on idle |
+| 4.1 | both parties MUST verify the peer's static key against the credential | met + tested | `noise::check_peer`, both halves |
+| 4.2 | *(framing table: 2 frames at 65 536, 5 at 262 144)* | met | chunked transport, Pass 14 §1 |
+| 5.2 | the onion key MUST NOT derive from the identity key | vacuous | no onion service; `socks` is an outbound feature only |
+| 5.2 | clients MUST show bootstrap progress | vacuous | as above |
+| 5.4 | LoRa `max_bucket` MUST NOT exceed 1024 at SF7–SF10 | met | `lora_sf10` is `MaxBucket(1)` |
+| 5.4 | …and 256 at SF11–SF12 | **unrepresentable** | no SF11/SF12 profile exists — see below |
+| 5.4 | filtering is at the sender | met + tested | `ExchangeView::get`, closed 2026-08-30 |
+| 5.4 | armor MUST be off on LoRa | met | `lora_sf10` sets `armor: false` |
+| 5.5 | the container MUST be a flat sequence of length-prefixed records | met + tested | courier archive is `frame::write` records |
+| 5.5 | filenames MUST be ignored entirely | met + tested | import reads content, never the name |
+| 5.5 | compression MUST be off | met | nothing compresses — §14 |
+| 5.5 | every object MUST be verified by content hash on ingest | met + tested | I5, first check in `ingest` |
+| 5.5 | MUST NOT open a foreign database file | met | the archive is this project's own format |
+| 5.5 | an archive MUST be a time window selected by expiry range | met + tested | `courier::pack` takes `(lo, hi)` |
+| 5.5 | MUST NOT restrict an archive to objects acquired since a previous one | met | no acquisition time is recorded to restrict by |
+| 7 | classes 0, 2, 3 MUST NOT be carried on amateur bands | vacuous | no amateur-band profile exists |
+| 7 | amateur and ISM MUST NOT be conflated in configuration | vacuous | as above |
+| 8 | a `short` message MUST NOT be forwarded | met + tested | `validate_body` refuses class 3 |
+| 8 | MUST NOT be stored beyond display | met + tested | same |
+| 8 | MUST NOT enter reconciliation | met + tested | same |
+| 8 | the 64-bit MAC caveat MUST be restated in security documentation | vacuous | `short` framing is not implemented |
+| 9 | handshake timeout MUST be enforced | met + tested | `HANDSHAKE_TIMEOUT_S`, Pass 15 |
+| 9 | concurrent in-progress handshakes MUST be capped | met + tested | `MAX_PENDING_HANDSHAKES`, Pass 14 |
+| 9 | frame length MUST be validated before allocation | met + tested | `frame::read_len` |
+| 9 | objects exceeding the link's `max_bucket` MUST be rejected before buffering | **was unmet, now met** | `ExchangeView::put` |
+| 9 | the LoRa duty-cycle attack MUST be stated to operators | met | RFC 4 §9 and `PEERING.md` |
+| 10 | clients MUST show which links provide location privacy | met + tested | `peers` panel, `loc ● / ○` per link |
+
+### Two ceilings, not one
+
+§5.4 and §9 both constrain `max_bucket` and they are **different
+requirements**. §5.4 filters at the *sender*, so a constrained link never
+spends airtime on something the far end cannot take; §9 rejects at the
+*receiver*, so a peer that ignores the agreement cannot make this node hold
+what it agreed not to carry. One is about waste, the other about a peer
+behaving badly.
+
+Only §5.4's was implemented, and only since 2026-08-30. §9's is now in
+`ExchangeView::put`, with its own limit recorded: "before buffering" is
+satisfied as early as this code can manage, because the frame reader has
+already read the bytes by the time anything knows which link they came from,
+and its bound is `frame::MAX_CONTROL` rather than the link's. Refusing in `put`
+is before the *store* buffers it, which is the allocation that lasts.
+
+### The one that is neither met nor unmet
+
+§5.4 gives a table for SF7 through SF12. **The implementation offers one row.**
+`LinkProfile::lora_sf10` is the only LoRa profile, so the SF11–SF12 ceiling
+cannot be violated — and an operator running SF11 hardware has no profile that
+describes it, and would use the SF10 one, which admits 1 KB objects where §5.4
+caps them at 256 B.
+
+That is not a rule broken; it is a configuration that cannot be expressed.
+Recorded as unrepresentable rather than vacuous, because vacuous suggests
+nothing is missing.
+
+### Counts
+
+26 requirements. **19 met** (14 with a test that names them), **6 vacuous** —
+Tor's onion service, amateur bands, and `short` framing, none of them built —
+**1 unrepresentable**, and **0 unmet**, after one was fixed by this pass.
+
+Running total across RFCs 1–4: **95 requirements, 15 unmet or partly unmet,
+3 conflicts.** Four of the fifteen were fixed by the pass that found them.

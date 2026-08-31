@@ -292,6 +292,26 @@ impl Corpus for ExchangeView {
             if !self.filter.admits(&header, self.retention_now_min) {
                 return;
             }
+            // **RFC 4 §9: "objects exceeding the link's `max_bucket` MUST be
+            // rejected before buffering."**
+            //
+            // Distinct from §5.4's ceiling, which this view also applies in
+            // `get`. §5.4 filters at the *sender* so a constrained link never
+            // spends airtime on something the far end cannot take; §9 rejects
+            // at the *receiver* so a peer cannot make this node hold what it
+            // agreed not to carry. The two are complements — one is about
+            // waste, the other about a peer that ignores the agreement — and
+            // only the first was implemented.
+            //
+            // "Before buffering" is satisfied as early as this code can: the
+            // frame reader has already read the bytes by the time anything
+            // knows which link they came from, and its own bound is
+            // `frame::MAX_CONTROL` rather than the link's. Refusing here is
+            // before the *store* buffers it, which is the allocation that
+            // lasts.
+            if !self.max_bucket.admits(header.size_bucket) {
+                return;
+            }
         }
         // RFC 3 §6 — the byte and object budget on the link, checked before
         // the object lands and charged only if it does. Exceeding it stops
@@ -494,6 +514,54 @@ mod tests {
             tcp.max_bucket,
         );
         assert!(wide.get(&big.truncated()).is_some());
+    }
+
+    /// **RFC 4 §9 — the same ceiling, on the receiving side.**
+    ///
+    /// > "Objects exceeding the link's `max_bucket` MUST be rejected before
+    /// > buffering."
+    ///
+    /// A different requirement from §5.4's, and only §5.4's was implemented.
+    /// §5.4 filters at the sender so a constrained link never spends airtime
+    /// on something the far end cannot take; §9 rejects at the receiver so a
+    /// peer that ignores the agreement cannot make this node hold what it
+    /// agreed not to carry.
+    #[test]
+    fn a_link_does_not_store_more_than_it_admits() {
+        use krab_proto::recon::Corpus;
+
+        let store = SharedStore::new(Store::new());
+        let lora = krab_fabric::profile::LinkProfile::lora_sf10();
+        let mut view = ExchangeView::new(
+            store.clone(),
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+            NOW,
+            lora.max_bucket,
+        );
+
+        let object = |bucket: u8, salt: u8| {
+            let h = RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: bucket,
+                flags: 0,
+                expiry_min: NOW + 40_000 + salt as u32,
+                tag: Tag([salt; 8]),
+            };
+            canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).unwrap()
+        };
+
+        view.put(object(1, 1));
+        assert_eq!(store.len(), 1, "an object this link carries was refused");
+
+        view.put(object(3, 2));
+        assert_eq!(
+            store.len(),
+            1,
+            "a peer put an object past the agreed ceiling into the store"
+        );
     }
 
     /// Carriage that hosts everything, for the tests that are about locking
