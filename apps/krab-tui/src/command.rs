@@ -480,6 +480,15 @@ impl Command {
             "decoded and re-encoded; EXIF is stripped",
         ),
         ("picture save <file>", "write the selected picture out"),
+        (
+            "start-tor [binary]",
+            "launch this node's own tor — no config file, RFC 4 §5.2",
+        ),
+        ("stop-tor", "stop it; the onion addresses go with it"),
+        (
+            "deadman <days> | off",
+            "wipe if this node is not unlocked in time — RFC 7 §10",
+        ),
     ];
 
     /// The chords, which are not typed and so are not in [`Self::SYNOPSES`].
@@ -817,6 +826,39 @@ pub fn admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every verb this parser accepts appears in `help`.**
+    ///
+    /// RFC 7 §10 is the sharp case: "both MUST be discoverable" — the panic
+    /// wipe *and* the dead-man timer. `deadman` was built, parsed, dispatched,
+    /// documented in its own module and tested, and was **not in this list**,
+    /// so `help` had never heard of it. A safety feature nobody can find is
+    /// not a safety feature, and RFC 8 §4.3's whole argument is that a
+    /// consequential setting must be stated rather than assumed.
+    ///
+    /// `start-tor` and `stop-tor` were missing the same way and for the same
+    /// reason: three verbs added in one pass, none of them added here.
+    ///
+    /// Canonical spellings only — [`Command::to_string`] gives those, so the
+    /// short forms (`msg`, `pic`, `chan`, `exit`) are deliberately not
+    /// required to appear. A synonym that is not advertised is a convenience;
+    /// a verb that is not advertised does not exist.
+    #[test]
+    fn every_verb_is_in_help() {
+        let listed: Vec<&str> = Command::SYNOPSES
+            .iter()
+            .filter_map(|(verb, _)| verb.split_whitespace().next())
+            .collect();
+        let missing: Vec<String> = Command::ALL
+            .iter()
+            .map(|c| c.to_string())
+            .filter(|v| !listed.contains(&v.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these verbs work and `help` does not mention them: {missing:?}"
+        );
+    }
 
     /// **`ALL` is complete.** The match is exhaustive, so a variant added to
     /// the enum fails to compile here until it is added to `ALL` too — which

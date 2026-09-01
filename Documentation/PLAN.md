@@ -519,8 +519,8 @@ are listed so the gap in the audit is visible rather than implied.
 | §4.3 — carriage warning at the point of enabling, default off | met |
 | §6 — decode/re-encode, pixel cap, no viewer, LoRa refusal | met |
 | §7 — fingerprint beside display names, confusable detection | met |
-| §9 — **per link, whether it provides LOCATION privacy** | **unmet.** Nothing renders it |
-| §9 — **per link, whether it provides VOLUME privacy** | **unmet.** Nothing renders it |
+| §9 — **per link, whether it provides LOCATION privacy** | **met** — `peers` renders `loc ● / ○` from `LinkProfile::location_privacy`. §13 recorded this fixed on 2026-08-27 and this table was never updated (swept 2026-09-01) |
+| §9 — **per link, whether it provides VOLUME privacy** | **met** — `vol ● / ○` from `LinkProfile::volume_privacy`, same history (swept 2026-09-01) |
 
 **Not yet checked**: §2.1's zeroize-on-close and the MUST NOT on caching
 decrypted bodies (`self.messages` holds plaintext and is cleared on lock —
@@ -1087,9 +1087,9 @@ available by counting anything.
 | 8.2 | cover MUST match the bucket distribution of real traffic | **met + tested** | sampled from what `ExchangeView::put` accepts; a node that has observed nothing emits nothing (§29) |
 | 9.2 | MUST show a fingerprint alongside any display name | met + tested | `alias::Aliases::show` renders both, always |
 | 9.3 | truncated identifiers MUST NOT appear in a routing header, a `WANT` outside a session, or any stored structure | met | the header has no such field; `by_trunc` is derived and unpersisted |
-| 10 | a relay MUST route, filter and expire an unknown `ver` from the header alone, and MUST store and forward it opaquely | **UNMET** | see below |
+| 10 | a relay MUST route, filter and expire an unknown `ver` from the header alone, and MUST store and forward it opaquely | **met + tested** | closed in §24; `RoutingHeader::parse` is version-blind and `ingest` carries what it cannot read (swept 2026-09-01) |
 | 10 | reserved header bits MUST be zero on emission | met | `RoutingHeader::write` |
-| 10 | and MUST be ignored on receipt | **conflict #12** | `parse` rejects; §11 I3 requires rejecting |
+| 10 | and MUST be ignored on receipt | **met — errata E-3** | reject for a known version, carry for an unknown one; the check moved from `parse` to `ingest` (§27, swept 2026-09-01) |
 | 11 | a receiver MUST reject unless I1–I6 hold | met + tested | `Store::ingest`; vectors name each |
 | 11 | every check MUST be applied before an object enters the store | met | I1 and I4 closed 2026-08-29 |
 | 11 | I5 MUST run before anything consulting the identifier | met | first check in `ingest` |
@@ -1139,6 +1139,10 @@ after #10 and #11.
 
 ### Counts
 
+> **Counts superseded by §30 (2026-09-01).** The verdicts in the table above
+> were corrected by that sweep; the paragraph below is the tally as it stood on
+> the date of this section and is kept as the record of it.
+
 31 requirements. **25 met** (17 with a test that names them), **4 vacuous**
 (cover traffic and inner-plaintext keys, both unimplemented in v1), **1 unmet**
 (§10 opaque relay), **1 unmet by design** (§12's second implementation), and
@@ -1159,14 +1163,14 @@ requirements.**
 | 3 | a destination tag MUST NOT appear in a beacon, nodelist fragment, rollcall entry, transport header, or any log line | met + tested | `activity_log`'s own test refuses a line containing "tag"; beacons and rollcall carry node ids |
 | 3.4 | unknown address keys MUST be preserved and ignored, not stripped | vacuous | the `dst=` address form is modelled in `krab-sizes` and is not parsed by the node |
 | 4.3 | table entries MUST be zeroized on drop | **was unmet, now met** | `impl Drop for TagTable` |
-| 5 | W MUST default to ±30 | **conflict #10** | `EPOCH_WINDOW = 45`; RFC 1 §6.2 requires ≥45 |
+| 5 | W MUST default to ±30 | **withdrawn — errata E-1** | RFC 1 §6.2's floor governs; `EPOCH_WINDOW = 45` and W is not independently configurable (§27, swept 2026-09-01) |
 | 5 | W MUST NOT be below ±14 | met | 45 |
 | 5.1 | MUST accept objects whose epoch falls within W of local time | met + tested | `TagTable::build` covers `pairwise_window` |
 | 5.1 | MUST NOT emit when median-of-peers time diverges by more than ±6 h | **unmet** | no median-of-peers estimate exists — recorded §11 |
 | 7.1 | the envelope MUST NOT indicate which recipient key was used | met | §4.2's five keys carry no index |
-| 7.2 | inbox-tagged objects MUST be rate-capped per peer per epoch | **unmet** | `Attempts` caps per scan, not per peer per epoch — recorded §11 |
+| 7.2 | inbox-tagged objects MUST be rate-capped per peer per epoch | **met — errata E-4** | capped per epoch by `MAX_INBOX_ATTEMPTS_PER_EPOCH`; the *per peer* dimension is withdrawn, because attributing an inbox-tagged object to a link is the provenance RFC 3 §12 forbids (§25, swept 2026-09-01) |
 | 7.4 | MUST cache failed `(id, epoch)` pairs | met + tested | `receive::Attempts` |
-| 7.4 | MUST cap inbox-tagged decapsulation per peer per epoch | **unmet** | same requirement as §7.2, stated twice |
+| 7.4 | MUST cap inbox-tagged decapsulation per peer per epoch | **met — errata E-4** | same requirement as §7.2, stated twice; same resolution (swept 2026-09-01) |
 | 7.4 | MUST attempt all live batches in constant time | met + tested | `Inbox::scan_with` |
 | 7.4 | and MUST NOT stop at first success | met + tested | same |
 | 8 | MUST warn about in-flight loss on rotation | **unmet** | no correspondence-key rotation command exists to warn from |
@@ -1199,6 +1203,10 @@ different consequences and already warns about its own.
 
 ### Counts
 
+> **Counts superseded by §30 (2026-09-01).** The verdicts in the table above
+> were corrected by that sweep; the paragraph below is the tally as it stood on
+> the date of this section and is kept as the record of it.
+
 16 requirements. **9 met** (6 with a test that names them), **1 vacuous**,
 **4 unmet** — median-of-peers time, the inbox decapsulation cap stated twice,
 and the rotation warning — **1 partly met** (paged/logged/persisted, two of
@@ -1223,7 +1231,7 @@ several of its MUSTs bind what an operator is told rather than what a byte does.
 | 3 | every signed document MUST prefix its signing input with a domain unique to that type | met + **now mechanised** | twelve `DOMAIN` constants; `domain_separation.rs` |
 | 3 | a signature over one type MUST NOT be valid over any other | met + tested | same |
 | 3 | a credential body MUST be a flat CBOR map | met | `Credential::encode` embeds parties, flags and terms as `bstr`, never as nested maps |
-| 3 | MUST render any credential as HJSON on request | **unmet** | recorded §11; `peer show` renders prose |
+| 3 | MUST render any credential as HJSON on request | **met + tested** | closed in §26; `peer show` renders the credential itself as HJSON (swept 2026-09-01) |
 | 4 | MUST reject a link whose validity exceeds 180 days | met + tested | `credential::MAX_TERM_DAYS` |
 | 4 | MUST surface an expired peering as an explicit state | met + tested | `Standing::Live(Life::Expired)`, shown in `peers` |
 | 5 | the negotiation chain MUST NOT be published | met | written to `peers/<id>/chain`; no path puts it in the corpus |
@@ -1272,6 +1280,10 @@ keys restart, and a decoder reading both levels from one cursor correctly
 rejects its own encoder's output" — is the reason it must stay that way.
 
 ### Counts
+
+> **Counts superseded by §30 (2026-09-01).** The verdicts in the table above
+> were corrected by that sweep; the paragraph below is the tally as it stood on
+> the date of this section and is kept as the record of it.
 
 22 requirements. **21 met** (14 with a test that names them), **1 unmet**
 (§3's HJSON rendering, already recorded), no vacuous, no new conflicts.
@@ -1452,6 +1464,10 @@ disagrees with an argument rather than rediscovering the question.
 
 ### Counts
 
+> **Counts superseded by §30 (2026-09-01).** The verdicts in the table above
+> were corrected by that sweep; the paragraph below is the tally as it stood on
+> the date of this section and is kept as the record of it.
+
 17 requirements. **15 met** (12 with a test that names them), **1 deployment
 obligation** whose optional warning is unimplemented, and **1 that was unmet
 and is now met**. No vacuous, no conflicts.
@@ -1484,7 +1500,7 @@ Running total across RFCs 1–5: **112 requirements, 16 unmet or partly unmet,
 | 3.3 | shared-write channels MUST NOT be added | met | not built |
 | 3.4 | nodes MUST support excluding class 1 via `class_mask` | met | `filter::Filter` |
 | 3.4 | channel carriage MUST be off by default | met + tested | `CarriagePolicy::default` |
-| 3.4 | channels MUST occupy a separate shard space from sealed traffic | **unmet — conflict #11** | one shard space; RFC 2 §6 defines one |
+| 3.4 | channels MUST occupy a separate shard space from sealed traffic | **was never unmet — errata E-2** | one shard space; RFC 2 §6 defines one |
 | 3.4 | a node MUST be able to carry its operator's mail and no channels | met + tested | carriage off is the default state |
 | 3.6 | the jurisdiction consequence MUST be stated where a user enables channels | met + tested | `channel carry on` arms, then commits, and says why |
 | 5.1 | the security context MUST be visible in the composer | met + tested | `Banner::PublicSignedPermanent` |
@@ -1531,6 +1547,10 @@ Not an RFC 6 requirement — found by testing one.
 
 ### Counts
 
+> **Counts superseded by §30 (2026-09-01).** The verdicts in the table above
+> were corrected by that sweep; the paragraph below is the tally as it stood on
+> the date of this section and is kept as the record of it.
+
 25 requirements. **23 met** (18 with a test that names them), **1 withdrawn**
 by a later RFC, and **1 unmet** — §3.4's separate shard space, which is
 conflict #11 and cannot be closed without an RFC editor, since RFC 2 §6 defines
@@ -1567,11 +1587,11 @@ ceiling it rested on. **30 requirements.**
 | 6.4 | a part-finished ceremony MUST NOT accept a second, differing card | met + tested | `ceremony`, with the substitution attack named |
 | 8 | MUST store ciphertext and derive on display | met | `receive`'s module doc; there is no plaintext cache and no Sent folder |
 | 8.1 | MUST make the retention consequence visible before the window elapses | met | `pin` exists and `status` reports the horizon |
-| 9 | **`mlock` key buffers; MUST fail loudly at startup if locking is unavailable** | **unmet** | nothing calls `mlock`; see below |
+| 9 | **`mlock` key buffers; MUST fail loudly at startup if locking is unavailable** | **met** | `krab_lock::Held` locks and reports; `VirtualLock` on Windows (§28, swept 2026-09-01) |
 | 9 | `Debug` on key types MUST print nothing | met + tested | every key type prints `<redacted>` |
 | 9.1 | the "Rust cannot guarantee a secret was never copied" limit MUST appear in the security considerations of any release | **was unmet, now met** | `SECURE-DELETE.md` |
-| 10 | neither panic wipe nor dead-man timer MUST be enabled by default | met | the chord is a chord; the timer is not built |
-| 10 | both MUST be discoverable | partly met | the chord is in `help`; there is no timer to discover |
+| 10 | neither panic wipe nor dead-man timer MUST be enabled by default | met + tested | the chord is a chord; the timer is armed only by `deadman <days>` (§28, swept 2026-09-01) |
+| 10 | both MUST be discoverable | **was unmet, now met + tested** | the chord is in `help`; `deadman` was **not**, from §28 until this sweep — `every_verb_is_in_help` is the guard (§30) |
 | 10 | the dead-man timer MUST warn well before it fires | **met** | last quarter of the window, proportional to the period (§28) |
 | 11 | the identity key MUST be backed up offline at creation | met + tested | `init` shows the words once, as a step |
 | 11 | MUST state plainly that message history is not recoverable | met + tested | said at `init` and in `help` |
@@ -1579,7 +1599,7 @@ ceiling it rested on. **30 requirements.**
 | 13.1 | senders MUST use the deterministic index when the tag mode is pairwise | met + tested | `compose` |
 | 13.2 | recipients MUST attempt all live batches in constant time | met + tested | `Inbox::scan_with` |
 | 13.2 | and MUST NOT stop at first success | met + tested | same |
-| 13.3 | MUST cap inbox-tagged decapsulation attempts per peer per epoch | **unmet** | `Attempts` caps per scan; the same gap as RFC 2 §7.2 and §7.4 |
+| 13.3 | MUST cap inbox-tagged decapsulation attempts per peer per epoch | **met — errata E-4** | the same requirement as RFC 2 §7.2 and §7.4, and the same resolution (§25, swept 2026-09-01) |
 
 ### The `⚠ CRITICAL DEFECT` header, traced
 
@@ -1627,15 +1647,24 @@ disclosure now appears in `SECURE-DELETE.md`, naming `mlock` as unimplemented,
 hibernation as undefeatable, and the operator's own swap configuration as the
 mitigation this build does not substitute for.
 
-### Counts
+### Counts — as of 2026-08-31, superseded by §30
 
-30 requirements. **25 met** (19 with a test that names them), **1 withdrawn**,
-**1 vacuous**, **1 partly met**, and **2 unmet** — §9's memory locking and
-§13.3's inbox decapsulation cap, the latter being the third statement of a
-requirement RFC 2 makes twice. One was unmet when this pass began and was fixed
-during it.
+29 requirements in the table above. **25 met**, **1 withdrawn**, **1 partly
+met**, and **2 unmet** — §9's memory locking and §13.3's inbox decapsulation
+cap, the latter being the third statement of a requirement RFC 2 makes twice.
 
-### The series, whole
+Both were closed afterwards — §28 built the memory locking and §25 closed the
+cap — and neither closure came back to this paragraph until the sweep in §30.
+The rows above now say so; this paragraph is left as written, dated, because
+the pattern it is an instance of is the finding.
+
+### The series, whole — **recounted 2026-09-01, see §30**
+
+The table below is the count as it stood on 2026-08-31. It is wrong in three
+independent ways and is kept because §30 needs something to be a correction
+*of*: the per-document totals do not match the tables they summarise, the
+"unmet" column counts requirements that had already been closed in this very
+document, and the grand total is the sum of the wrong column.
 
 | document | requirements | unmet | fixed by the pass |
 |---|---|---|---|
@@ -1648,18 +1677,9 @@ during it.
 | RFC 7 | 30 | 2 | 1 |
 | **total** | **167** | **10** | **6** |
 
-Plus 3 conflicts between frozen documents (#10 `EPOCH_WINDOW` vs W, #11 channel
-shard space, #12 reserved header bits), 2 requirements withdrawn by later RFCs,
-and 12 vacuous or unrepresentable.
-
 **167 requirements, against the "~150 MUSTs" this plan quoted for weeks.** The
 figure was close by accident: it counted lines, and lines are neither
-requirements nor occurrences.
-
-Six unmet requirements were closed by the passes that found them. The four that
-remain are RFC 1 §10's opaque relay of unknown versions, RFC 2/7's inbox
-decapsulation cap, RFC 3 §3's HJSON rendering, and RFC 7 §9's memory locking —
-each recorded with why it is not a commit.
+requirements nor occurrences. The true figure is 171 — see §30.
 
 ---
 
@@ -2266,3 +2286,148 @@ which is graph information handed out for nothing.
   CI job is what closes it.
 - **`del_onion` is untested against a live daemon** for the same reason.
 - **No `cargo fmt` gate**, unchanged from §28 and for the same reason.
+
+---
+
+## 30. The audit tables, swept against the code — 2026-09-01
+
+§29 corrected §20's counts and named the mechanism: *"a count kept beside a
+table must be derived from the table or it will drift, and nothing here derives
+it."* This section applies that to every table in the document, and to the
+tables themselves rather than only their summaries — because it turned out the
+rows had drifted too, and in the direction that matters least and reads worst:
+**the audit understated what is built.**
+
+### Nine rows that said unmet and were not
+
+Every one of these was closed by a later section of this same document, or by
+an errata entry, and none of the closures came back to the row it closed.
+
+| table | row | said | closed by |
+|---|---|---|---|
+| §9 RFC 8 | §9 LOCATION privacy per link | unmet, "nothing renders it" | §13, 2026-08-27 |
+| §9 RFC 8 | §9 VOLUME privacy per link | unmet, "nothing renders it" | §13, same day |
+| §17 RFC 1 | §10 opaque relay of an unknown `ver` | **UNMET** | §24 |
+| §17 RFC 1 | §10 reserved bits ignored on receipt | conflict #12 | errata **E-3**, §27 |
+| §18 RFC 2 | §5 W defaults to ±30 | conflict #10 | errata **E-1**, §27 — withdrawn |
+| §18 RFC 2 | §7.2 inbox cap per peer per epoch | unmet | errata **E-4**, §25 |
+| §18 RFC 2 | §7.4 the same, stated twice | unmet | same |
+| §19 RFC 3 | §3 HJSON rendering of a credential | unmet | §26 |
+| §22 RFC 6 | §3.4 separate channel shard space | unmet, conflict #11 | errata **E-2** — never unmet |
+| §23 RFC 7 | §9 `mlock` key buffers | unmet | §28 |
+| §23 RFC 7 | §13.3 inbox cap, third statement | unmet | errata **E-4**, §25 |
+
+Each was verified against the code before the row was changed, not against the
+section that claimed to have closed it — `MAX_INBOX_ATTEMPTS_PER_EPOCH` in
+`receive.rs`, `krab_lock::Held`, `CarriagePolicy::accepts`, `parse_readable`
+and `Reject::Unrecognised`, `LinkProfile::location_privacy` — because a
+document that can be stale about the code can be stale about itself.
+
+**Two of the eleven are not "we built it and forgot".** E-1 and E-2 changed
+what the requirement *is*: §5's ±30 default was withdrawn in favour of RFC 1
+§6.2's floor, and §3.4 was met all along by a second shard space the audit had
+not found. A row saying "unmet" for a withdrawn requirement is worse than a
+stale row — it invites someone to implement something the series decided
+against.
+
+### One row that said met and was not
+
+**RFC 7 §10: "both MUST be discoverable."** The row said *partly met — the
+chord is in `help`; there is no timer to discover.* §28 built the timer. The
+row was then wrong twice over, because §28 also **did not add `deadman` to
+`Command::SYNOPSES`**, so `help` had never heard of it. A dead-man timer an
+operator cannot find is not a dead-man timer, and it is the requirement §10
+states in as many words.
+
+`start-tor` and `stop-tor` were missing the same way, from the same pass. Three
+verbs added in one commit, none of them advertised.
+
+Fixed, with the guard that stops it recurring: **`every_verb_is_in_help`**
+walks `Command::ALL`, takes each verb's canonical `Display` spelling, and fails
+if `SYNOPSES` does not list it. Probed by removing `deadman` again, which fails
+with `these verbs work and help does not mention them: ["deadman"]`.
+
+Synonyms — `msg`, `pic`, `chan`, `exit` — are deliberately exempt. A synonym
+that is not advertised is a convenience; a verb that is not advertised does not
+exist.
+
+### The series, recounted from the tables
+
+Derived by walking the rows, not by adding up prose:
+
+| document | rows | met | vacuous | unrepresentable | partly met | withdrawn | **unmet** |
+|---|---|---|---|---|---|---|---|
+| RFC 1 | 35 | 32 | 2 | — | — | — | **1** |
+| RFC 2 | 16 | 11 | 1 | — | 1 | 1 | **2** |
+| RFC 3 | 22 | 22 | — | — | — | — | 0 |
+| RFC 4 | 28 | 25 | 2 | 1 | — | — | 0 |
+| RFC 5 | 17 | 17 | — | — | — | — | 0 |
+| RFC 6 | 24 | 23 | — | — | — | 1 | 0 |
+| RFC 7 | 29 | 28 | — | — | — | 1 | 0 |
+| **total** | **171** | **158** | **5** | **1** | **1** | **3** | **3** |
+
+**171, not 167.** The old figure was the sum of per-document totals that had
+each been written from a tally rather than counted from a table; four of the
+seven were wrong, in both directions. Nothing was added to the series — the
+frozen documents have not changed since 2026-08-31 — this is arithmetic being
+done properly for the first time.
+
+### What is actually unmet, now that the noise is gone
+
+Three rows, and only two of them are code:
+
+- **RFC 2 §5.1 — median-of-peers time.** "MUST NOT emit when the estimate
+  diverges by more than ±6 h." Nothing in the tree computes it (`grep -i median`
+  finds nothing outside this document). A node with a wrong clock emits objects
+  with wrong expiries, and RFC 0 §6 makes the resulting non-delivery silent —
+  which is the shape of failure this project treats as most expensive.
+- **RFC 2 §8 — the in-flight-loss warning on correspondence-key rotation.**
+  Unmet because there is no correspondence-key rotation verb to warn *from*.
+  `onion rotate` is now the shape to copy: write the new state first, say
+  plainly what the operator's peers will experience, and name what is
+  reversible.
+- **RFC 1 §12 — two independent implementations MUST agree on every conformance
+  vector.** Unmet by design and not by omission: there is one implementation.
+  It is recorded so that "we have vectors" is never mistaken for "the vectors
+  have been checked against someone else's code".
+
+And one partly met, unchanged: **RFC 2 §8's precomputation table as key
+material** — "never paged, never logged, never persisted". Two of three hold;
+`App::tag_table` is a plain `Option<TagTable>` and not a `krab_lock::Held`, so
+the recognition table is pageable while the identity is not.
+
+The five vacuous and one unrepresentable rows are the amateur-band and
+SF11/SF12 requirements (**postponed for want of hardware**, §28), plus
+compression, inner-plaintext keys and address keys — all of them requirements
+about features this version does not have.
+
+### The counts are now derived
+
+Every per-section "Counts" paragraph above is marked superseded rather than
+rewritten, because rewriting them would recreate exactly the thing that broke:
+a number kept next to a table by hand. **The table in this section is the only
+count in this document that is checked**, and it is checked by
+`krab-node/tests/plan_counts.rs`, which reads `PLAN.md` as data the way
+`domain_separation.rs` reads the source tree.
+
+Two tests, failing for two different reasons:
+
+- `the_recount_matches_the_audit_tables` walks §17–§23, buckets each verdict
+  cell, and compares the tallies with this section's row for that document. It
+  catches a table edited without its summary **and** a summary edited without
+  its table — probed in both directions.
+- `the_total_is_the_sum_of_the_documents` adds this section's own columns and
+  compares them with its total row, and checks that the buckets partition the
+  rows. The old "167" was this kind of error and nothing would have caught it.
+
+**What it deliberately does not check is whether a verdict is true.** That is a
+question about the code, and no parser can answer it — `MAX_INBOX_ATTEMPTS_PER_EPOCH`
+existing does not prove it caps the right thing. The eleven stale rows this
+section corrects were found by reading the code, and the next eleven will have
+to be too. What the test removes is the *other* failure, the one that has now
+happened three times: the arithmetic quietly ceasing to describe the table it
+sits under.
+
+A cell whose verdict this test cannot classify is a failure rather than a
+default, so inventing a new verdict wording fails loudly instead of being
+silently counted as met.
