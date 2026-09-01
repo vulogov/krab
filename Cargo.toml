@@ -46,7 +46,15 @@ krab = { path = "crates/krab" }
 [profile.release]
 opt-level = 3
 lto = true
-# RFC 0 §4.3 / RFC 7: no core dumps carrying key material.
+# RFC 0 §4.3 / RFC 7 §9. **Not a core-dump control** — this comment used to
+# say it was, and had it backwards: abort raises SIGABRT, whose default
+# disposition is to write a core file, while unwinding writes none. What
+# suppresses dumps is `RLIMIT_CORE`/`PR_SET_DUMPABLE`, applied by
+# `krab_lock::harden` at the first statement of `main`.
+#
+# It stays for the reason it is actually worth having: a panic must not unwind
+# through a partially-zeroized structure, running `Drop` on key material in an
+# unknown state.
 panic = "abort"
 # Reproducible builds are `build-reproducible.sh`, not a profile key.
 #

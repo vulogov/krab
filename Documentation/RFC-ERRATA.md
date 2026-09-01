@@ -204,6 +204,73 @@ surfaces a flood.
 
 ---
 
+## E-5 — the restricted-discovery client key *(an underspecification, not a conflict)*
+
+**RFC 4 §5.2:**
+
+> Only clients holding an authorised key can decrypt the service descriptor,
+> so the sync endpoint is not merely unlisted but unenumerable and
+> unconfirmable by anyone who is not already a peer. **The authorised-client
+> set derives directly from the node's signed credentials.**
+
+"Derives directly from" is not a construction. Tor's `ClientAuthV3` needs a
+specific x25519 keypair per authorised client: the service publishes the public
+half, the client holds the private half. §5.2 says where the set comes from and
+never says how the keys are computed, so it is not implementable interoperably
+as written.
+
+This entry is not a contradiction between two documents. It is recorded here
+because the consequence of two implementations choosing differently is the same
+as a contradiction and is worse to diagnose: **peers simply cannot reach each
+other, and nothing says why.** A client whose derived key is not in the
+service's list cannot decrypt the descriptor, so the service is invisible to
+it — which is indistinguishable from the node being offline, and RFC 0 §6
+already makes delivery failure silent.
+
+### Resolution: derive from the static-static agreement, under a distinct domain string.
+
+```
+S  = X25519(my_credential_key, their_credential_key)      (RFC 1 §6.2's S)
+sk = clamp(BLAKE3-derive-key("krab/onion-client-auth/v1", S))
+pk = X25519(sk, basepoint)
+```
+
+The service passes `pk` for every verified peering as `ClientAuthV3=`; the
+client hands `sk` to its own tor. X25519 agreement is symmetric, so both ends
+compute the same pair and neither has to send the other anything — which is
+what makes the set "derive directly from the credentials" in the strongest
+sense available: it is a pure function of who has peered with whom.
+
+**Why not the credential's own key.** The shortcut is to hand tor the peer's
+existing Noise static: it is already x25519 and already in the credential. §5.2
+forbids exactly this one paragraph earlier — "reusing an Ed25519 key across the
+Krab protocol and the hidden-service protocol is textbook cross-protocol
+exposure" — and that argument does not depend on which key or which direction.
+
+**Why reusing `S` is not the same mistake.** `S` is secret input to a KDF under
+a distinct domain string, which is the construction §5.2 explicitly permits for
+the service key itself. Nothing about RFC 1 §6.2's tag derivation is
+recoverable from this output, or the reverse.
+
+**What is given up.** The service knows the client's private half. This is
+worth stating and is not worth closing: the key exists so the service can
+decide who may decrypt its descriptor, and a service abusing it can only
+impersonate a client to itself. Between different peers the values are
+unrelated, because each derives from a different `S` — checked by
+`different_peerings_give_unrelated_keys`.
+
+**A card that does not verify contributes nothing**, and the count of skipped
+peers is reported to the operator. Admitting an unverifiable credential would
+widen the set §5.2 exists to narrow; dropping it silently would leave an
+operator wondering why one peer can never reach them.
+
+**In the code:** `krab_crypto::onion::client_auth`, and
+`App::onion_client_set` which walks the peer directory. The domain string is
+`krab_crypto::onion::DOMAIN_CLIENT_AUTH`, covered by RFC 3 §3's
+domain-separation test.
+
+---
+
 ## Status
 
 | entry | conflict | resolved by | implemented |
@@ -212,6 +279,7 @@ surfaces a flood.
 | E-2 | #11 channel shard space | rule 2 | no conflict; requirement was already met |
 | E-3 | #12 reserved header bits | rule 2 | yes — check moved to `ingest` |
 | E-4 | inbox cap vs provenance | rule 1 | yes — per epoch |
+| E-5 | §5.2's client-auth key is unspecified | — underspecification | yes — `onion::client_auth` |
 
 No frozen text was altered. Each affected section carries a pointer to its
 entry in the source that implements it, the way RFC 7's own `⚠ CRITICAL DEFECT`

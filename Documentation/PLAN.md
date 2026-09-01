@@ -1071,8 +1071,8 @@ available by counting anything.
 | 4.3 | unknown body keys MUST be rejected | met + tested | `decode_envelope`; ingest I4 |
 | 4.3 | unknown *inner plaintext* keys MUST be ignored | vacuous | the inner plaintext is a marker and bytes, not a keyed map |
 | 5.2 | nodes MUST support excluding class 1 via `class_mask` | met | `filter::Filter`, `Policy::class_mask` |
-| 5.3 | cover objects MUST be indistinguishable from `sealed` | vacuous | nothing emits cover in v1 |
-| 5.3 | cover MUST use class 0, not class 2 | vacuous | as above; `ReservedCover` exists only to reserve the value |
+| 5.3 | cover objects MUST be indistinguishable from `sealed` | **met, unwired** | `krab_node::cover` — same class, header shape, body shape; no production emitter yet (§28) |
+| 5.3 | cover MUST use class 0, not class 2 | **met, unwired** | `Cover::emit` writes class 0; a test fails if it ever writes 2 (§28) |
 | 5.4 | the size/timing caveat MUST be restated in security considerations | met | documentation obligation, met by RFC 1 §8.2 and this tree's `SECURE-DELETE.md` |
 | 6.2 | `EPOCH_WINDOW` MUST be ≥ `MAX_TTL / EPOCH` | met | `MAX_TTL_MIN = EPOCH_WINDOW * 1440` derives the other way; conflict #10 |
 | 6.2 | a deployment MUST NOT narrow it | met | not configurable |
@@ -1084,7 +1084,7 @@ available by counting anything.
 | 7 | MUST NOT be a deployment-wide default | met | no setting expresses one |
 | 8.1 | padding MUST be zero | met + tested | `canonical_bytes` |
 | 8.1 | a receiver MUST reject non-zero padding | met + tested | ingest I1, `non_zero_padding_is_refused` |
-| 8.2 | cover MUST match the bucket distribution of real traffic | vacuous | nothing emits cover |
+| 8.2 | cover MUST match the bucket distribution of real traffic | **met, unwired** | sampled from observed traffic; a node that has observed nothing emits nothing (§28) |
 | 9.2 | MUST show a fingerprint alongside any display name | met + tested | `alias::Aliases::show` renders both, always |
 | 9.3 | truncated identifiers MUST NOT appear in a routing header, a `WANT` outside a session, or any stored structure | met | the header has no such field; `by_trunc` is derived and unpersisted |
 | 10 | a relay MUST route, filter and expire an unknown `ver` from the header alone, and MUST store and forward it opaquely | **UNMET** | see below |
@@ -1292,8 +1292,8 @@ carry three clauses — §8's `short` rule is one sentence with three prohibitio
 | 4.1 | constrained links MUST hold sessions open across cycles | met | `LinkTable` keeps the session; nothing closes on idle |
 | 4.1 | both parties MUST verify the peer's static key against the credential | met + tested | `noise::check_peer`, both halves |
 | 4.2 | *(framing table: 2 frames at 65 536, 5 at 262 144)* | met | chunked transport, Pass 14 §1 |
-| 5.2 | the onion key MUST NOT derive from the identity key | vacuous | no onion service; `socks` is an outbound feature only |
-| 5.2 | clients MUST show bootstrap progress | vacuous | as above |
+| 5.2 | the onion key MUST NOT derive from the identity key | **met** | `krab_crypto::onion` — derived from a dedicated root, never the identity (§28) |
+| 5.2 | clients MUST show bootstrap progress | **met** | polled on the tick, rendered on the status line (§28) |
 | 5.4 | LoRa `max_bucket` MUST NOT exceed 1024 at SF7–SF10 | met | `lora_sf10` is `MaxBucket(1)` |
 | 5.4 | …and 256 at SF11–SF12 | **unrepresentable** | no SF11/SF12 profile exists — see below |
 | 5.4 | filtering is at the sender | met + tested | `ExchangeView::get`, closed 2026-08-30 |
@@ -1305,12 +1305,12 @@ carry three clauses — §8's `short` rule is one sentence with three prohibitio
 | 5.5 | MUST NOT open a foreign database file | met | the archive is this project's own format |
 | 5.5 | an archive MUST be a time window selected by expiry range | met + tested | `courier::pack` takes `(lo, hi)` |
 | 5.5 | MUST NOT restrict an archive to objects acquired since a previous one | met | no acquisition time is recorded to restrict by |
-| 7 | classes 0, 2, 3 MUST NOT be carried on amateur bands | vacuous | no amateur-band profile exists |
-| 7 | amateur and ISM MUST NOT be conflated in configuration | vacuous | as above |
+| 7 | classes 0, 2, 3 MUST NOT be carried on amateur bands | vacuous | no amateur-band profile exists — **postponed for want of hardware**, §28 |
+| 7 | amateur and ISM MUST NOT be conflated in configuration | vacuous | as above — **postponed**, §28 |
 | 8 | a `short` message MUST NOT be forwarded | met + tested | `validate_body` refuses class 3 |
 | 8 | MUST NOT be stored beyond display | met + tested | same |
 | 8 | MUST NOT enter reconciliation | met + tested | same |
-| 8 | the 64-bit MAC caveat MUST be restated in security documentation | vacuous | `short` framing is not implemented |
+| 8 | the 64-bit MAC caveat MUST be restated in security documentation | **met** | `SECURE-DELETE.md`, final section (§28) |
 | 9 | handshake timeout MUST be enforced | met + tested | `HANDSHAKE_TIMEOUT_S`, Pass 15 |
 | 9 | concurrent in-progress handshakes MUST be capped | met + tested | `MAX_PENDING_HANDSHAKES`, Pass 14 |
 | 9 | frame length MUST be validated before allocation | met + tested | `frame::read_len` |
@@ -1553,7 +1553,7 @@ ceiling it rested on. **30 requirements.**
 | 9.1 | the "Rust cannot guarantee a secret was never copied" limit MUST appear in the security considerations of any release | **was unmet, now met** | `SECURE-DELETE.md` |
 | 10 | neither panic wipe nor dead-man timer MUST be enabled by default | met | the chord is a chord; the timer is not built |
 | 10 | both MUST be discoverable | partly met | the chord is in `help`; there is no timer to discover |
-| 10 | the dead-man timer MUST warn well before it fires | vacuous | not built |
+| 10 | the dead-man timer MUST warn well before it fires | **met** | last quarter of the window, proportional to the period (§28) |
 | 11 | the identity key MUST be backed up offline at creation | met + tested | `init` shows the words once, as a step |
 | 11 | MUST state plainly that message history is not recoverable | met + tested | said at `init` and in `help` |
 | 12 | MUST surface prekey burn rate, not merely remaining count | met | `status` |
@@ -1952,7 +1952,118 @@ in §25; the register now says why the "per peer" dimension was dropped.
 
 ### What this leaves
 
-Nothing on the conflict list, and nothing unmet from the requirement pass. What
-remains is scope this project has deliberately not built — Tor's onion service,
-amateur-band profiles, `short` framing, cover traffic, SF11/SF12 LoRa profiles
-— each recorded as vacuous or unrepresentable in §§17–23 rather than as met.
+Nothing on the conflict list, and nothing unmet from the requirement pass.
+
+*(That paragraph named Tor's onion service, `short` framing and cover traffic
+as not built. All three are built now — see §28. Amateur-band profiles and the
+SF11/SF12 LoRa profiles remain unbuilt, and §28 records why they are now
+**postponed** rather than merely absent.)*
+
+---
+
+## 28. Windows, Tor, and three unbuilt requirements — 2026-08-31
+
+A single pass, recorded together because several of its parts corrected
+earlier entries in this document.
+
+### What was built
+
+| area | state before | state now |
+|---|---|---|
+| `VirtualLock` (RFC 7 §9) | `#[cfg(unix)]` only; Windows ran unlocked | both platforms, one `lock_pages`/`unlock_pages` boundary |
+| `RLIMIT_CORE`/`PR_SET_DUMPABLE`/`PT_DENY_ATTACH` (RFC 7 §9) | **not implemented** | `krab_lock::harden`, first statement of `main` |
+| SOCKS5 client (RFC 4 §5.2) | a six-line doc comment, not in `mod.rs`, never compiled | implemented |
+| `tor` supervision (RFC 4 §5.2) | none | `backend::tor` — args only, zero-byte torrc, ephemeral control port |
+| onion key (RFC 4 §5.2) | vacuous (§21) | `krab_crypto::onion` — permanent, derived, never stored |
+| restricted discovery (RFC 4 §5.2) | vacuous (§21) | `ClientAuthV3` from verified peerings — errata **E-5** |
+| dead-man timer (RFC 7 §10) | not built | `deadman` verb, fires before the passphrase prompt |
+| `short` framing (RFC 4 §8) | not built | `krab_crypto::short` |
+| cover traffic (RFC 1 §5.3, §8.2) | not built | `krab_node::cover` |
+| CI | **none at all** | `.github/workflows/ci.yml`, five jobs |
+
+### Three corrections to things this document or the code asserted
+
+**`panic = "abort"` is not a core-dump control.** `Cargo.toml`,
+`SECURE-DELETE.md` and `ADVERSARIAL-PASS.md` all said it was what stopped a
+core dump carrying key material. It is the opposite: abort raises `SIGABRT`,
+whose default disposition is to write a core file, while unwinding writes none.
+RFC 7 §9 lists three measures and this build had shipped only the one that
+makes a dump *more* likely, while describing it as doing the other two's job.
+All three now exist. `panic = "abort"` stays for its real reason — a panic must
+not unwind through a partially-zeroized structure.
+
+**The tree already compiles C.** An earlier assessment in this document
+compared arti's seven `-sys` crates against "zero C dependencies here". That
+was measured by counting `-sys` suffixes and missed build scripts that shell
+out to a compiler: `blake3`'s `build.rs` invokes `cc`, and
+`target/debug/build/blake3-*/out/libblake3_neon.a` exists on any developer's
+machine. The arti conclusion is unchanged — seven `-sys` crates is a different
+order of magnitude — but the reproducible-builds argument is weaker than it was
+stated to be. It is also why `x86_64-pc-windows-msvc` cannot be cross-built
+from macOS: blake3 asks `cc` for `/arch:AVX512`. windows-gnu cross-checks fine
+and a native MSVC build works.
+
+**`socks` was a name, not a stub.** `LinkProfile::location_privacy` has always
+matched `"socks"` and `"tor"`, and `profile_named` had no arm for either, so
+the branch was unreachable rather than false. `LinkProfile::tor()` is what
+makes that sentence true rather than dead.
+
+### Amateur bands and SF11/SF12 LoRa — POSTPONED, not merely absent
+
+RFC 4 §7's two requirements and the SF11/SF12 profiles are **postponed for want
+of hardware**, at the operator's direction. This is a stronger statement than
+the "vacuous" they were previously recorded as, and the distinction matters:
+
+- *Vacuous* said the requirement had nothing to constrain, which invited a
+  future reader to satisfy it by writing a profile table.
+- *Postponed* says the opposite: **a profile written without a radio to test it
+  against would be worse than none.** RFC 4 §7 governs what may legally be
+  carried on an amateur band, and §11 notes that a LoRa transmission is
+  direction-findable — a physical-layer property no protocol can undo. Both are
+  claims about the physical world, and neither can be verified by a test suite.
+
+So the rows in §20 stay `vacuous` as a statement about the code, and this
+paragraph is the statement about the project: they are not to be implemented
+until someone can put a packet on a real radio and measure it.
+
+### What is built but not yet wired
+
+Stated here rather than left for an audit to find:
+
+- **`krab_node::cover` has no production caller.** The generator, the
+  distribution matching and the emitter's own record are implemented and
+  tested; nothing on the node's send path calls `emit` yet. Wiring it needs a
+  Poisson schedule and a decision about which links may afford it — RFC 0 §7.3
+  says cover is "unaffordable on a constrained link", so it must not simply be
+  switched on for every profile.
+- **`krab_crypto::short` has no production caller.** The framing, the AEAD and
+  the truncated-MAC verification are implemented and tested; nothing composes
+  or displays a `short` message yet.
+- **No `Fabric` implementation over Tor.** `tor::dial` works and is tested, but
+  nothing in the link table constructs a session through it, so
+  `connect <peer> tor <addr>` has no path.
+- **Onion rotation is not a verb.** `onion::service_key` takes a rotatable
+  counter as RFC 4 §5.2 requires; the caller passes 0 and nothing advances it.
+
+### What is verified, and how
+
+- **1254 tests**, clippy clean under CI's `-D warnings` across `--all-features`.
+- The Tor launch path is verified **against a real `tor` 0.4.9.11**: launched,
+  cookie-authenticated over the control port, ephemeral SOCKS port read back,
+  bootstrap queried, killed, cookie shredded. The test skips when tor is absent
+  and is deliberately not `#[ignore]`d.
+- `RLIMIT_CORE` was verified by **read-back, not return code** — a child
+  inherits rlimits, so `ulimit -Hc` in a child shows `unlimited → 0`. That
+  mattered: the soft limit was already 0 on the development machine, so the
+  return code alone could not distinguish "applied" from "no-op".
+- **`VirtualLock` has still never executed.** It cross-compiles and
+  clippy-cleans for both Windows targets and nothing more. The Windows CI job
+  added in this pass is what closes it, and it has not run yet.
+
+### Not added: a `cargo fmt` gate
+
+The CI has none, deliberately. `cargo fmt --all --check` reports 126 diffs
+across 28 files, 25 of which predate this pass. A gate would go red on its
+first run for reasons unrelated to any change being tested, and a red check
+people learn to ignore trains them past the Windows job too. Turning it on is
+two commits: `cargo fmt --all` touching nothing else, then the gate.

@@ -301,6 +301,11 @@ impl LinkTable {
 pub fn profile_named(kind: &str) -> Option<LinkProfile> {
     Some(match kind {
         "tcp" => LinkProfile::tcp(),
+        // RFC 4 §5.2. `socks` is accepted as a synonym because the cargo
+        // feature and `location_privacy` have both spelled it that way since
+        // before either did anything, and an operator who typed it would
+        // otherwise get "unknown link kind" for a transport that exists.
+        "tor" | "socks" => LinkProfile::tor(),
         "serial" | "modem" => LinkProfile::serial(),
         "courier" => LinkProfile::courier(),
         "lora" => LinkProfile::lora_sf10(),

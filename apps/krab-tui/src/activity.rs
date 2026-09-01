@@ -157,6 +157,30 @@ pub struct NodeState {
     pub ceremony: Option<CeremonyStep>,
     /// Deriving the KEK. **Foreground** — the interface is stopped for it.
     pub unlocking: bool,
+    /// Tor's bootstrap percentage while it is still coming up — RFC 4 §5.2.
+    ///
+    /// `None` once done, or when no tor is running.
+    ///
+    /// # Why a percentage is allowed here and forbidden three lines away
+    ///
+    /// RFC 8 §5.1 forbids progress indicators, and
+    /// `sending_shows_a_queue_and_never_progress` enforces it by asserting the
+    /// status line never contains `%`. That rule is about **message
+    /// transfer**: a percentage that moves when the operator sends is a
+    /// statement that their action caused a transfer, which is the activity
+    /// leak §5.1 exists to prevent.
+    ///
+    /// Tor's bootstrap is not that. It is a transport coming up — the same
+    /// category as [`NodeState::establishing`] — it starts when the operator
+    /// types `start-tor` and not when they send anything, and it reveals
+    /// nothing about mail because no mail is involved. RFC 4 §5.2 requires it
+    /// outright:
+    ///
+    /// > clients MUST show bootstrap progress or users will believe the node
+    /// > is broken at every start.
+    ///
+    /// The two requirements are about different subjects and both are met.
+    pub tor_bootstrap: Option<u8>,
 }
 
 impl Activity {
@@ -327,6 +351,12 @@ pub fn status_line_with(state: &NodeState, spinner: &Spinner) -> String {
             None => parts.push(activity.to_string()),
         }
     }
+    // RFC 4 §5.2's MUST. First, because it is the one thing on this line an
+    // operator is actively waiting on, and because a node that has not
+    // bootstrapped is not reachable however healthy the rest looks.
+    if let Some(pct) = state.tor_bootstrap {
+        parts.push(format!("tor bootstrapping {pct}%"));
+    }
     if state.queued > 0 {
         parts.push(format!("{} queued", state.queued));
     }
@@ -339,6 +369,57 @@ pub fn status_line_with(state: &NodeState, spinner: &Spinner) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **RFC 4 §5.2's MUST: bootstrap progress is shown.**
+    ///
+    /// "Clients MUST show bootstrap progress or users will believe the node is
+    /// broken at every start." Bootstrap takes tens of seconds, so the absence
+    /// of this is not cosmetic — it is a node that looks broken every time.
+    #[test]
+    fn tor_bootstrap_progress_is_shown_while_it_is_coming_up() {
+        let coming_up = NodeState {
+            tor_bootstrap: Some(45),
+            ..Default::default()
+        };
+        let line = status_line(&coming_up);
+        assert!(line.contains("45%"), "no bootstrap progress in {line:?}");
+        assert!(line.contains("tor"));
+    }
+
+    /// And it goes away when done, rather than sitting at 100% for ever.
+    #[test]
+    fn a_bootstrapped_tor_says_nothing() {
+        let done = NodeState {
+            tor_bootstrap: None,
+            ..Default::default()
+        };
+        assert!(!status_line(&done).contains("tor"));
+    }
+
+    /// **The two rules that look like they conflict, pinned together.**
+    ///
+    /// RFC 8 §5.1 forbids a progress indicator for message transfer; RFC 4
+    /// §5.2 requires one for Tor bootstrap. They are about different subjects,
+    /// and this is what stops a future change collapsing them: sending must
+    /// still show no percentage even while tor is bootstrapping, and the
+    /// percentage that is present must be tor's.
+    #[test]
+    fn sending_shows_no_progress_even_while_tor_bootstraps() {
+        let both = NodeState {
+            queued: 3,
+            next_sync_in_s: Some(7_800),
+            tor_bootstrap: Some(20),
+            ..Default::default()
+        };
+        let line = status_line(&both);
+        assert!(line.contains("3 queued"));
+        assert!(line.contains("tor bootstrapping 20%"));
+        // The only percentage on the line is tor's.
+        assert_eq!(line.matches('%').count(), 1);
+        for forbidden in ["sending", "transferring", "uploading"] {
+            assert!(!line.contains(forbidden), "{forbidden} in {line:?}");
+        }
+    }
 
     /// The central requirement: composing and sending produce no activity,
     /// because there is none to produce.

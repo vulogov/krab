@@ -85,11 +85,33 @@ pub enum Artifact {
     /// to this node and by whom. `introduction::Spent` forgets each nonce at
     /// its token's expiry for that reason; this is what destroys the rest.
     IntroductionsSpent,
+    /// The onion service root — RFC 4 §5.2.
+    ///
+    /// 32 bytes sealed under the KEK, from which every onion address this node
+    /// has ever published is derived. **Not the identity key**, which §5.2
+    /// forbids deriving it from, and not derived from the KEK either: a root
+    /// that followed the passphrase would silently change the node's network
+    /// address every time an operator changed it.
+    ///
+    /// Destroyed by the wipe like everything else, and the consequence is
+    /// worth stating: a wiped node cannot resume its old `.onion`. That is
+    /// correct. The address is a durable pseudonym peers have written down,
+    /// and a wipe is the operator saying that pseudonym must stop existing.
+    OnionRoot,
+    /// The dead-man deadline — RFC 7 §10.
+    ///
+    /// **The one artefact written in the clear.** It has to be: the timer
+    /// exists to fire when nobody has unlocked the node, so the deadline must
+    /// be legible without the passphrase. Sealed under the KEK it could only
+    /// be read after an unlock, which is the event that cancels it.
+    ///
+    /// Two integers and nothing that identifies anyone — see `deadman.rs`.
+    DeadMan,
 }
 
 impl Artifact {
     /// Every artifact. Used by the test that keeps this file honest.
-    pub const ALL: [Artifact; 15] = [
+    pub const ALL: [Artifact; 17] = [
         Artifact::IdentityWrapped,
         Artifact::KekParams,
         Artifact::Corpus,
@@ -105,6 +127,8 @@ impl Artifact {
         Artifact::Nodelist,
         Artifact::Pinned,
         Artifact::Aliases,
+        Artifact::OnionRoot,
+        Artifact::DeadMan,
     ];
 
     /// The name on disk.
@@ -125,6 +149,8 @@ impl Artifact {
             Artifact::Nodelist => "nodelist.sent",
             Artifact::Pinned => "pinned.archive",
             Artifact::Aliases => "aliases",
+            Artifact::OnionRoot => "onion.root",
+            Artifact::DeadMan => "deadman.stamp",
         }
     }
 
@@ -150,7 +176,9 @@ impl Artifact {
             | Artifact::IntroductionsSpent
             | Artifact::Nodelist
             | Artifact::Pinned
-            | Artifact::Aliases => true,
+            | Artifact::Aliases
+            | Artifact::OnionRoot
+            | Artifact::DeadMan => true,
         }
     }
 }

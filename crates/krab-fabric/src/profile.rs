@@ -188,6 +188,59 @@ impl LinkProfile {
         }
     }
 
+    /// A Tor onion service link — RFC 4 §5.2.
+    ///
+    /// TCP underneath, so the byte budget is TCP's shape; what differs is
+    /// latency and throughput. 200 kB/s is a deliberately conservative figure
+    /// for a three-hop circuit to a rendezvous point — the honest answer is
+    /// that it varies by an order of magnitude with the relays chosen, and a
+    /// profile is a floor to plan against rather than a measurement.
+    ///
+    /// # `location_privacy` is true here, and this is what makes it reachable
+    ///
+    /// [`LinkProfile::location_privacy`] has always matched `"socks"` and
+    /// `"tor"`, and nothing ever constructed a profile with either kind — so
+    /// the branch was unreachable rather than wrong, and no link could claim a
+    /// privacy it did not have. This constructor is what turns that from dead
+    /// code into the true statement it was written to be.
+    ///
+    /// # A tension with §5.2 worth recording rather than resolving here
+    ///
+    /// [`LatencyClass`]'s own documentation lists "IP, Tor" under
+    /// [`LatencyClass::Interactive`], which derives [`Mode::Rbsr`]. But §5.2
+    /// says:
+    ///
+    /// > A ~3 s circuit RTT is irrelevant to store-and-forward but fatal to a
+    /// > chatty protocol — which is an independent argument for RFC 5's
+    /// > manifest mode over multi-round reconciliation on these links.
+    ///
+    /// Those pull in opposite directions: RBSR trades round trips for bytes,
+    /// and a round trip here costs about three seconds rather than about a
+    /// millisecond, so several descent levels cost tens of seconds where
+    /// TCP's cost nothing.
+    ///
+    /// **`Interactive` is chosen** because `LatencyClass` names Tor there
+    /// explicitly and that classification is frozen, whereas §5.2's sentence
+    /// is an argument rather than a requirement — and because `sync_mode` must
+    /// agree between both ends of a link (see [`LatencyClass::sync_mode`]), so
+    /// this is not a knob one node may turn alone. It is recorded here, and in
+    /// `Documentation/PLAN.md`, as a question for the errata register rather
+    /// than settled by this constructor.
+    pub fn tor() -> LinkProfile {
+        LinkProfile {
+            kind: "tor",
+            sustained_bps: 200_000.0,
+            duty_cycle: 1.0,
+            latency_class: LatencyClass::Interactive,
+            metered: false,
+            max_bucket: MaxBucket(5),
+            shard_k: 0,
+            class_mask: u16::MAX,
+            armor: false,
+            fec: false,
+        }
+    }
+
     /// A serial line at 115 200 baud — RFC 4 §5.3.
     ///
     /// "A direct cable, a wired radio modem, or an X.25 PAD are all serviceable

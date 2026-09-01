@@ -24,10 +24,19 @@
 //! lines to gain three declarations, and the audit is the entire reason this
 //! crate exists.
 //!
-//! The three declarations are below. `mlock`, `munlock` and `sysconf` are
-//! POSIX, their signatures have been stable for thirty years, and each is four
-//! lines. The trade is: a larger dependency graph and an unreadable audit, or
-//! twelve lines an auditor can check against `man 2 mlock` in a minute.
+//! The declarations are below. `mlock`, `munlock` and `sysconf` are POSIX,
+//! their signatures have been stable for thirty years, and each is four lines;
+//! `VirtualLock` and `VirtualUnlock` are the Win32 equivalents and are the
+//! same shape. The trade is: a larger dependency graph and an unreadable
+//! audit, or twenty lines an auditor can check against `man 2 mlock` and
+//! Microsoft's `memoryapi.h` documentation in a minute.
+//!
+//! # Platforms
+//!
+//! Unix locks with `mlock`, Windows with `VirtualLock`. Anywhere else
+//! [`LockedBox::new`] returns [`Unavailable::Unsupported`] and [`Held`] falls
+//! back to the ordinary heap, saying so. RFC 7 §9 names both calls, so
+//! neither is an extension.
 //!
 //! # What locking does and does not buy
 //!
@@ -56,10 +65,27 @@
 
 #![deny(missing_docs)]
 // Not `forbid`: this crate exists to contain `unsafe`. Every use below is
-// preceded by the argument for why it is sound, and there are five.
+// preceded by the argument for why it is sound.
+//
+// There is deliberately no count here. An earlier version said "there are
+// five", which was wrong before this sentence was written and would have gone
+// stale again the moment a platform arm was added — the same defect this
+// workspace keeps finding elsewhere: a comment true when written and false
+// after the code moved. `Documentation/UNSAFE-AUDIT.md` groups the uses by
+// argument, which is what an auditor actually needs; the grouping does not
+// change when an arm is added to one of them.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use core::ffi::{c_int, c_long, c_void};
+pub mod harden;
+
+use core::ffi::c_void;
+// `c_int` is a return type on both platforms' calls; `c_long` is `sysconf`'s
+// alone. Gated so a build for a platform with neither is warning-clean rather
+// than carrying imports it has no use for.
+#[cfg(any(unix, windows))]
+use core::ffi::c_int;
+#[cfg(unix)]
+use core::ffi::c_long;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
 
@@ -78,6 +104,30 @@ unsafe extern "C" {
     fn sysconf(name: c_int) -> c_long;
 }
 
+// The Win32 equivalents.
+//
+// `extern "system"` rather than `"C"`: Win32 is `stdcall` on 32-bit x86 and
+// the C convention everywhere else, and `"system"` is the spelling that means
+// "whichever of those this target uses". Writing `"C"` would be correct on
+// x86-64 and silently wrong on `i686-pc-windows-msvc`.
+//
+// **The return convention is inverted from `mlock`'s and that is the trap
+// here.** `mlock` returns 0 for success; `VirtualLock` returns a `BOOL`, so
+// non-zero is success and 0 is failure. `lock_pages` is the only caller of
+// either and it is where the two are reconciled.
+//
+// `LPVOID` is `void *`, so the pointer is `*mut` — unlike `mlock`'s
+// `const void *`. `SIZE_T` is `usize` and `BOOL` is a 32-bit `int`, which is
+// `c_int` on every Windows target.
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// `BOOL VirtualLock(LPVOID lpAddress, SIZE_T dwSize);`
+    fn VirtualLock(addr: *mut c_void, len: usize) -> c_int;
+    /// `BOOL VirtualUnlock(LPVOID lpAddress, SIZE_T dwSize);`
+    fn VirtualUnlock(addr: *mut c_void, len: usize) -> c_int;
+}
+
 /// `_SC_PAGESIZE`: 30 on Linux, 29 on macOS and the BSDs.
 ///
 /// The one place a wrong number would be silent rather than loud, so
@@ -89,7 +139,8 @@ const SC_PAGESIZE: c_int = 30;
 #[cfg(all(unix, not(target_os = "linux")))]
 const SC_PAGESIZE: c_int = 29;
 
-/// Fallback if `sysconf` answers something absurd.
+/// Fallback if `sysconf` answers something absurd, and the figure Windows
+/// uses outright.
 ///
 /// 4 KiB is the smallest page any supported platform uses, and rounding *up*
 /// to a larger figure would be the unsafe direction: a lock shorter than the
@@ -97,6 +148,24 @@ const SC_PAGESIZE: c_int = 29;
 const PAGE_FALLBACK: usize = 4096;
 
 /// The system page size, as `mlock` understands it.
+///
+/// # Why Windows does not read it
+///
+/// Win32 has no scalar getter for the page size. `GetSystemInfo` fills a
+/// twelve-field `SYSTEM_INFO`, one member of which is a union, and reading
+/// `dwPageSize` out of it means declaring that layout exactly — the offset is
+/// load-bearing, a mistake in it is silent, and it is markedly harder to check
+/// against the documentation than the four lines of `VirtualLock` above. That
+/// trades away the one property this crate exists for.
+///
+/// So Windows uses the constant, and the existing fallback argument carries it
+/// unchanged: **4 KiB is the small direction, and the small direction is the
+/// safe one.** Every Windows target Rust supports — x86, x86-64, aarch64 —
+/// uses 4 KiB pages today. If one ever did not, the allocation would be
+/// smaller than a page and `VirtualLock` would round *out* to the containing
+/// page: over-locking, which spends working-set quota on a neighbour but
+/// leaves nothing swappable. The failure mode is the benign one by
+/// construction, not by luck.
 fn page_size() -> usize {
     #[cfg(unix)]
     {
@@ -117,18 +186,85 @@ fn page_size() -> usize {
     }
 }
 
+/// Lock `len` bytes at `addr` into physical memory.
+///
+/// The single place the two platforms' calls are reconciled, so that
+/// [`LockedBox::new`] has one body rather than one per platform — the drop
+/// order in [`LockedBox::drop`] is the crate's most load-bearing argument and
+/// it should not be written twice.
+fn lock_pages(addr: *mut c_void, len: usize) -> Result<(), Unavailable> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `addr` is a live allocation of `len` bytes owned by the
+        // caller, which is what `mlock` requires. It reads and writes nothing.
+        if unsafe { mlock(addr as *const c_void, len) } == 0 {
+            Ok(())
+        } else {
+            Err(Unavailable::Refused)
+        }
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: as above — `VirtualLock` takes the same ownership of the
+        // range and likewise neither reads nor writes it.
+        //
+        // Non-zero is success here, the opposite of `mlock`. Getting this
+        // backwards would report every successful lock as a refusal, which
+        // `Held` would quietly absorb by falling back to the heap.
+        if unsafe { VirtualLock(addr, len) } != 0 {
+            Ok(())
+        } else {
+            Err(Unavailable::Refused)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (addr, len);
+        Err(Unavailable::Unsupported)
+    }
+}
+
+/// Undo [`lock_pages`].
+///
+/// The result is deliberately discarded on both platforms: the only caller is
+/// [`LockedBox::drop`], the memory is about to be freed, and there is no
+/// action a failure would justify.
+fn unlock_pages(addr: *mut c_void, len: usize) {
+    #[cfg(unix)]
+    {
+        // SAFETY: the same address and length that `lock_pages` was given.
+        unsafe { munlock(addr as *const c_void, len) };
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: as above.
+        unsafe { VirtualUnlock(addr, len) };
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (addr, len);
+    }
+}
+
 /// Why locking is not available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unavailable {
     /// The platform has no implementation here.
     ///
-    /// Windows has `VirtualLock` and this crate does not call it. Reported
-    /// rather than silently skipped, because RFC 7 §9's requirement is to
-    /// **fail loudly** rather than proceed unlocked, and a platform without
-    /// the mechanism is exactly the case that sentence is about.
+    /// Unix and Windows both do — `mlock` and `VirtualLock`, the two RFC 7 §9
+    /// names. This is for anything else. Reported rather than silently
+    /// skipped, because §9's requirement is to **fail loudly** rather than
+    /// proceed unlocked, and a platform without the mechanism is exactly the
+    /// case that sentence is about.
     Unsupported,
-    /// The kernel refused. On Linux this is almost always `RLIMIT_MEMLOCK`
-    /// headroom, which an operator raises with `ulimit -l`.
+    /// The kernel refused.
+    ///
+    /// On Linux this is almost always `RLIMIT_MEMLOCK` headroom, which an
+    /// operator raises with `ulimit -l`. On Windows it is the process
+    /// **minimum working set size**: `VirtualLock` charges against that quota
+    /// and fails with `ERROR_WORKING_SET_QUOTA` once it is spent. The two are
+    /// the same situation under different names, which is why they share a
+    /// variant.
     Refused,
     /// The allocator refused a page-aligned allocation.
     NoMemory,
@@ -143,8 +279,9 @@ impl core::fmt::Display for Unavailable {
             ),
             Unavailable::Refused => f.write_str(
                 "the kernel refused to lock memory — on Linux this is usually \
-                 RLIMIT_MEMLOCK headroom (`ulimit -l`). Key material may be \
-                 written to swap or to a hibernation image (RFC 7 §9)",
+                 RLIMIT_MEMLOCK headroom (`ulimit -l`), on Windows the process \
+                 minimum working set size. Key material may be written to swap \
+                 or to a hibernation image (RFC 7 §9)",
             ),
             Unavailable::NoMemory => f.write_str("could not allocate a page to lock"),
         }
@@ -198,47 +335,36 @@ impl<T> LockedBox<T> {
     /// second one. A constructor that consumed its argument on the error path
     /// would force every such caller to be infallible or wasteful.
     pub fn new(value: T) -> Result<LockedBox<T>, (Unavailable, T)> {
-        #[cfg(not(unix))]
-        {
-            return Err((Unavailable::Unsupported, value));
+        let page = page_size();
+        let size = core::mem::size_of::<T>().max(1).div_ceil(page) * page;
+        let align = core::mem::align_of::<T>().max(page);
+        let Ok(layout) = Layout::from_size_align(size, align) else {
+            return Err((Unavailable::NoMemory, value));
+        };
+
+        // SAFETY: `layout` has a non-zero size — `max(1)` above, then rounded
+        // up to at least one page — which is `alloc_zeroed`'s only
+        // precondition. Zeroed rather than uninitialised so that a failure
+        // between here and the write below leaves a blank page rather than
+        // whatever the allocator last held.
+        let raw = unsafe { alloc_zeroed(layout) };
+        let Some(ptr) = NonNull::new(raw as *mut T) else {
+            return Err((Unavailable::NoMemory, value));
+        };
+
+        if let Err(why) = lock_pages(raw as *mut c_void, layout.size()) {
+            // SAFETY: `raw` came from `alloc_zeroed` with this same `layout`
+            // and has not been freed. Nothing partially locked escapes.
+            unsafe { dealloc(raw, layout) };
+            return Err((why, value));
         }
-        #[cfg(unix)]
-        {
-            let page = page_size();
-            let size = core::mem::size_of::<T>().max(1).div_ceil(page) * page;
-            let align = core::mem::align_of::<T>().max(page);
-            let Ok(layout) = Layout::from_size_align(size, align) else {
-                return Err((Unavailable::NoMemory, value));
-            };
 
-            // SAFETY: `layout` has a non-zero size — `max(1)` above, then
-            // rounded up to at least one page — which is `alloc_zeroed`'s only
-            // precondition. Zeroed rather than uninitialised so that a failure
-            // between here and the write below leaves a blank page rather than
-            // whatever the allocator last held.
-            let raw = unsafe { alloc_zeroed(layout) };
-            let Some(ptr) = NonNull::new(raw as *mut T) else {
-                return Err((Unavailable::NoMemory, value));
-            };
-
-            // SAFETY: `ptr` is a live allocation of `layout.size()` bytes that
-            // this function owns, which is exactly what `mlock` requires. It
-            // reads and writes nothing.
-            let locked = unsafe { mlock(raw as *const c_void, layout.size()) };
-            if locked != 0 {
-                // SAFETY: `raw` came from `alloc_zeroed` with this same
-                // `layout` and has not been freed.
-                unsafe { dealloc(raw, layout) };
-                return Err((Unavailable::Refused, value));
-            }
-
-            // SAFETY: `ptr` is aligned to at least `align_of::<T>()` (the
-            // layout demanded `max(page)`), non-null, and points at an
-            // allocation large enough for a `T`. Nothing has been written
-            // there yet, so no old value is being dropped.
-            unsafe { ptr.as_ptr().write(value) };
-            Ok(LockedBox { ptr, layout })
-        }
+        // SAFETY: `ptr` is aligned to at least `align_of::<T>()` (the layout
+        // demanded `max(page)`), non-null, and points at an allocation large
+        // enough for a `T`. Nothing has been written there yet, so no old
+        // value is being dropped.
+        unsafe { ptr.as_ptr().write(value) };
+        Ok(LockedBox { ptr, layout })
     }
 
     /// Borrow the value.
@@ -275,13 +401,8 @@ impl<T> Drop for LockedBox<T> {
             slice.zeroize();
         }
 
-        #[cfg(unix)]
-        {
-            // SAFETY: the same address and length that were locked in `new`.
-            // A failure here is not actionable — the memory is about to be
-            // freed either way — so the result is deliberately discarded.
-            unsafe { munlock(bytes as *const c_void, self.layout.size()) };
-        }
+        // The same address and length that were locked in `new`.
+        unlock_pages(bytes as *mut c_void, self.layout.size());
 
         // SAFETY: `bytes` came from `alloc_zeroed` with `self.layout`, has not
         // been freed, and nothing references it after this point.
@@ -475,6 +596,35 @@ mod tests {
         let shown = format!("{h:?}");
         assert!(shown == "Held(<locked>)" || shown == "Held(<unlocked>)", "{shown}");
         assert_eq!(h.is_locked(), shown.contains("<locked>"));
+    }
+
+    /// **On a platform RFC 7 §9 names, `Unsupported` must never be the
+    /// answer.** Unix and Windows both have a mechanism; only a third
+    /// platform may say it has none.
+    ///
+    /// The Windows arm is why this exists. It cross-compiles cleanly from a
+    /// Mac and is *executed* nowhere in this suite, so the failure it guards
+    /// against is a build that declares `VirtualLock`, never routes to it, and
+    /// reports `Unsupported` — whereupon `Held` falls back to the ordinary
+    /// heap and RFC 7 §9's requirement is quietly unmet on a platform that
+    /// could have met it. Every other test here would still pass.
+    ///
+    /// `Refused` is a legitimate answer on both: a Linux container with no
+    /// `RLIMIT_MEMLOCK` headroom and a Windows process at its working-set
+    /// quota are real machines, and the point of `Held` is to run on them.
+    #[test]
+    fn a_named_platform_never_reports_unsupported() {
+        if let Err(why) = available() {
+            #[cfg(any(unix, windows))]
+            assert_ne!(
+                why,
+                Unavailable::Unsupported,
+                "this platform has a locking call and RFC 7 §9 names it, so \
+                 reporting `Unsupported` means the arm was compiled but not \
+                 reached"
+            );
+            let _ = why;
+        }
     }
 
     /// The startup probe answers, one way or the other, without panicking.

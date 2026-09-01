@@ -63,6 +63,11 @@ introductions.spent
 nodelist.sent
 pinned.archive
 aliases
+onion.root
+deadman.stamp
+# The run directory krab gives its own `tor`: the empty torrc, tor's data
+# directory, and the control-port and cookie files it writes there.
+tor/
 
 # Every PeerFile variant. They live in `peers/<node-id>/`, and that whole
 # directory is node state — the list of who this node has peered with is a

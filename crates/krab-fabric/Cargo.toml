@@ -56,7 +56,7 @@ krab-core = { workspace = true }
 krab-proto = { workspace = true }
 
 [features]
-default = ["tcp", "courier", "sim", "serial"]
+default = ["tcp", "courier", "sim", "serial", "socks"]
 tcp = []
 socks = ["tcp"]
 serial = ["dep:serialport"]

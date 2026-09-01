@@ -219,16 +219,94 @@ What it means concretely, for this build:
 - **Fixed-size arrays are used for key material** rather than `Vec`, because
   growth reallocates and leaves the previous contents behind. That is a
   reduction in exposure, not a removal of it.
-- **`mlock` is implemented, for one secret.** `krab-lock` locks the pages the
-  identity's private keys live in, and warns loudly at startup if the kernel
-  refuses — usually `RLIMIT_MEMLOCK` headroom, which `ulimit -l` raises. The
-  epoch key, the KEK, the reservoir roots and the tag table are **not** locked,
-  and `Documentation/UNSAFE-AUDIT.md` says why for each. Disabling swap, or
-  using a randomly-keyed swap device, remains the operator's mitigation for
-  everything not on that first line.
+- **Memory locking is implemented, for one secret, on unix and Windows.**
+  `krab-lock` locks the pages the identity's private keys live in — `mlock` on
+  unix, `VirtualLock` on Windows — and warns loudly at startup if the kernel
+  refuses. That is usually `RLIMIT_MEMLOCK` headroom on unix, which `ulimit -l`
+  raises, and the process minimum working set size on Windows. The epoch key,
+  the KEK, the reservoir roots and the tag table are **not** locked, and
+  `Documentation/UNSAFE-AUDIT.md` says why for each. Disabling swap, or using a
+  randomly-keyed swap device, remains the operator's mitigation for everything
+  not on that first line.
+- **Windows operators have three extra exposures**, none of which this program
+  can detect or fix: automatic crash dumps and Windows Error Reporting capture
+  process memory regardless of locking; the pagefile is not encrypted unless
+  `fsutil behavior set EncryptPagingFile 1` has been run; and the Windows arm
+  is compiled and cross-checked but has never been *executed* by this project's
+  test suite. `UNSAFE-AUDIT.md` states each in full. They are listed here
+  because RFC 7 §9.1 requires the limits appear in a release document, and a
+  limit that applies to one platform only is still a limit.
 - **Hibernation writes all of RAM to disk** and defeats every mechanism in
   this document. RFC 7 §9 names it; nothing in software can prevent it.
 
-`panic = "abort"` is set, so a panic cannot produce a core dump carrying key
-material, and `Debug` on every key type prints a redaction rather than bytes.
+- **Core dumps and debugger attach are shut at the first statement of `main`.**
+  `krab_lock::harden` sets `RLIMIT_CORE` to 0 — soft *and* hard, so it cannot
+  be raised back by this process — and on Linux clears `PR_SET_DUMPABLE`, which
+  suppresses dumps and blocks same-uid `ptrace` in one call. macOS additionally
+  refuses debugger attach with `PT_DENY_ATTACH`. On Windows this is only
+  **partial**: `SetErrorMode` suppresses the crash dialog, Windows Error
+  Reporting can still collect a dump, and there is no supported way for a
+  process to refuse a debugger. The startup line says which of these you got.
+
+  **None of it stops root, Administrator, or physical access.** It raises the
+  cost for an adversary running at this process's own privilege. RFC 7 §4's
+  crypto-shredding is what addresses seizure; this is defence in depth behind
+  it and must not be described to an operator as more.
+
+`panic = "abort"` is set so a panic cannot unwind through a partially-zeroized
+structure, and `Debug` on every key type prints a redaction rather than bytes.
 Those two are real and they are narrow.
+
+**A correction.** This paragraph previously said `panic = "abort"` was what
+stopped a core dump carrying key material, as did `Cargo.toml` and
+`ADVERSARIAL-PASS.md`. It is the opposite: abort raises `SIGABRT`, whose
+default disposition is to write a core file, whereas unwinding writes none. RFC
+7 §9 lists `panic = "abort"`, `RLIMIT_CORE = 0` and `prctl(PR_SET_DUMPABLE, 0)`
+as three separate measures; this build had implemented only the first and
+described it as doing the job of the other two. All three are now in place.
+
+---
+
+## The 64-bit MAC on `short` framing — RFC 4 §8
+
+§8 does not merely permit this disclosure, it requires it:
+
+> A 64-bit truncated MAC is defensible only because the link is pairwise,
+> mutually authenticated, and low-volume. Implementations MUST restate this in
+> their security documentation rather than treating it as settled by citation.
+
+This is that restatement, and it sits beside RFC 7 §9.1's above because the two
+are the same kind of obligation: a limit the specification insists a *release*
+state in its own words rather than point at.
+
+**An 8-byte tag gives an online forger a 2⁻⁶⁴ chance per attempt.** By modern
+standards that is not a comfortable margin — 128 bits is the default for good
+reason — and it is accepted here only because all three of §8's conditions hold.
+Each is load-bearing:
+
+- **Pairwise.** There is exactly one other party who could forge, and they
+  already hold the key, so forgery gains them nothing they cannot do honestly.
+- **Mutually authenticated.** A forger must be inside an established Noise
+  session (RFC 4 §4.1) to deliver an attempt at all. An off-path attacker gets
+  no attempts, not merely unlikely ones.
+- **Low-volume.** The counter caps a key at 65 535 messages, and
+  `krab_crypto::short::seal` **refuses** rather than wrapping — a repeated
+  nonce under ChaCha20-Poly1305 leaks the Poly1305 key, so a wrap is silent and
+  total. The reservoir rotates the key per epoch (RFC 7 §6) long before the cap
+  in normal use.
+
+**If any of those three stops being true, this framing stops being
+defensible.** In particular `short` must never be carried on a broadcast link,
+on a channel, or on anything a third party can inject into. Nothing in the type
+system enforces that — it is a deployment property, which is why it is written
+here rather than left to a comment.
+
+Two further properties of the implementation, since §8 asks for candour rather
+than citation:
+
+- The tag comparison has **no early exit**. Returning at the first differing
+  byte would leak how much of a forged tag was correct, which is precisely the
+  grind an 8-byte tag cannot afford.
+- The 10-byte header travels in the clear and is **authenticated as associated
+  data**. Without that, the destination tag and expiry of a message an attacker
+  cannot read would still be malleable.

@@ -16,4 +16,12 @@ pub mod serial;
 pub mod listener;
 pub mod tcp;
 
+// RFC 4 §5.2's Tor backend. `socks` dials, `tor` launches and drives the
+// daemon; both need `tcp`'s stream machinery, which is why the `socks` feature
+// enables it.
+#[cfg(feature = "socks")]
+pub mod socks;
+#[cfg(feature = "socks")]
+pub mod tor;
+
 pub mod sim;

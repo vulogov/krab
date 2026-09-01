@@ -60,6 +60,59 @@ use std::path::Path;
 /// Domain label binding the identity record to its purpose.
 pub const CONTEXT_IDENTITY: &[u8] = b"krab/identity/v1";
 
+/// Domain label for the onion service root — RFC 4 §5.2.
+///
+/// Distinct from [`CONTEXT_IDENTITY`] for the same reason [`CONTEXT_DURESS`]
+/// is: an AEAD context is what stops a record sealed for one purpose opening
+/// as another, and §5.2's whole requirement is that the onion key and the
+/// identity key are not the same secret.
+pub const CONTEXT_ONION: &[u8] = b"krab/onion-root/v1";
+
+/// Seal the onion service root under a **KEK subkey**.
+///
+/// # Why a subkey and not the KEK
+///
+/// RFC 7 §4 makes the KEK memory-only and re-derived on unlock, so nothing
+/// holds it between commands — and `start-tor` is a command, typed long after
+/// the passphrase. The codebase's existing answer is a domain-separated
+/// subkey held for the unlocked lifetime, which is what `pin_key` and
+/// `alias_key` already are, and this follows it exactly rather than inventing
+/// a second pattern or retaining the KEK itself.
+///
+/// The root must **not** be sealed under the epoch key: `W_N` rotates and the
+/// onion address must not. That is the same mistake `pin.rs` records — "a pin
+/// whose key is the epoch key is unreadable exactly when it was supposed to be
+/// readable" — with a network address instead of mail.
+///
+/// 32 bytes and no structure: the address is a pure function of these bytes
+/// and the rotation counter, and the counter is what the operator asks for
+/// rather than something stored.
+pub fn write_onion_root(
+    path: &Path,
+    root: &krab_crypto::onion::OnionRoot,
+    key: &[u8; 32],
+    rng: &mut impl Rng,
+) -> Result<(), Error> {
+    let sealed = krab_crypto::kek::seal_under(key, CONTEXT_ONION, root.as_bytes(), rng)
+        .map_err(|_| Error::Malformed)?;
+    crate::atomic::write(path, &sealed).map_err(|_| Error::Malformed)
+}
+
+/// Read the onion service root back.
+///
+/// [`Error::Absent`] means this node has never published an onion service,
+/// which is the ordinary case and not a fault — the caller generates one.
+pub fn read_onion_root(
+    path: &Path,
+    key: &[u8; 32],
+) -> Result<krab_crypto::onion::OnionRoot, Error> {
+    let sealed = std::fs::read(path).map_err(|_| Error::Absent)?;
+    let plain =
+        krab_crypto::kek::open_under(key, CONTEXT_ONION, &sealed).map_err(|_| Error::Locked)?;
+    let bytes = <[u8; 32]>::try_from(plain.as_slice()).map_err(|_| Error::Malformed)?;
+    Ok(krab_crypto::onion::OnionRoot::from_bytes(bytes))
+}
+
 /// Encode a reservoir for storage: the current root **and its ratchet epoch**.
 ///
 /// RFC 7 §6.4 requires the peer-link record "the reservoir identifier and

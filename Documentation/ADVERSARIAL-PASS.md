@@ -295,7 +295,11 @@ A CBOR array head with an 8-byte length declares up to 2⁶⁴ elements. In a
 46-byte message, `Vec::with_capacity` multiplied that by the element size and
 overflowed, panicking inside the allocator.
 
-**RFC 7 §9 sets `panic = "abort"`** so a core dump cannot carry key material.
+**RFC 7 §9 sets `panic = "abort"`** so a panic cannot unwind through a
+partially-zeroized structure. *(This sentence used to say it was what stopped a
+core dump carrying key material. That was backwards — abort raises `SIGABRT`,
+which dumps core by default. `krab_lock::harden` is what suppresses dumps; see
+`Documentation/UNSAFE-AUDIT.md`.)*
 So this was not a caught error: the process died. Any peer past the Noise
 handshake could kill a node with one small frame, repeatedly, and anyone at all
 could do it through a courier archive — `read_archive` reaches the same parser

@@ -75,6 +75,7 @@ mod render;
 mod request;
 mod rollcall;
 mod shared;
+mod deadman;
 mod shred;
 mod spoken;
 mod sync;
@@ -315,6 +316,26 @@ fn default_home() -> PathBuf {
 }
 
 fn main() -> io::Result<()> {
+    // **RFC 7 §9's process hardening, and it is genuinely the first statement
+    // in the program.**
+    //
+    // `RLIMIT_CORE = 0` and `PR_SET_DUMPABLE = 0` only protect what has not
+    // been dumped yet, so every line above this one would be a window. There
+    // is nothing to put above it: argument parsing can panic, and a panic
+    // under `panic = "abort"` raises `SIGABRT`, whose default disposition is
+    // to write a core file.
+    //
+    // Deliberately *before* the decoder-child check below, so the child is
+    // hardened too. It holds no key material, which is the point of it — but
+    // it is also the process most likely to be made to crash on purpose (RFC 8
+    // §6: image parsers are the richest source of remote code execution), and
+    // a dump of a compromised decoder is worth denying an attacker even when
+    // the secrets are elsewhere.
+    //
+    // The report is printed further down, beside the memory-locking one, so
+    // that an operator sees one hardening block rather than two.
+    let hardening = krab_lock::harden::harden();
+
     // **Before anything else.** RFC 8 §6 wants image decoding in a separate
     // process; this is that process, and it is this same binary re-invoked.
     //
@@ -346,6 +367,32 @@ fn main() -> io::Result<()> {
              device — see Documentation/SECURE-DELETE.md."
         );
     }
+    // The other half of §9, applied at the top of `main` and reported here.
+    // Silence means both core dumps and debugger attach are shut; anything
+    // else names what is still open and what an operator can do about it.
+    if let Some(advice) = hardening.advice() {
+        eprintln!("krab: {advice}");
+    }
+
+    // **Windows says something even when locking succeeds**, which no other
+    // platform does here.
+    //
+    // On unix a successful `mlock` is the end of the story for the pages it
+    // covers. On Windows a successful `VirtualLock` leaves two exposures the
+    // lock does not touch and this program cannot close: crash dumps and
+    // Windows Error Reporting capture process memory without regard to
+    // locking, and the pagefile is unencrypted by default. An operator who saw
+    // no warning would reasonably conclude there was nothing to know.
+    //
+    // One line, pointing at the document that has the detail, rather than the
+    // detail itself — this prints on every start and a paragraph would train
+    // people to skip it.
+    #[cfg(windows)]
+    eprintln!(
+        "krab: on Windows, crash dumps and Windows Error Reporting can capture \
+         key material regardless of memory locking, and the pagefile is not \
+         encrypted by default — see Documentation/UNSAFE-AUDIT.md."
+    );
 
     let mut app = match App::from_args(std::env::args().skip(1)) {
         Ok(app) => app,
@@ -377,6 +424,20 @@ fn main() -> io::Result<()> {
     .filter(|n| atomic::clear_stale(&app.home.join(n)))
     .count();
 
+    // **RFC 7 §10's dead-man timer, before the passphrase prompt.**
+    //
+    // The timer exists for a node whose operator cannot return, so the one
+    // moment it has to work is the moment nobody is going to unlock it.
+    // Checking it after an unlock would be checking it only when it is moot.
+    //
+    // It runs here rather than inside `run`: this is above the terminal setup
+    // three lines down, so a node that destroyed itself says so on the
+    // scrollback an operator keeps, not in a pane that clears. And if it
+    // fired, `has_stored_identity` below is already false, so the greeting
+    // that follows says "no identity" — which is true, and is exactly what
+    // §10 means by presenting as a fresh install.
+    let deadman_notice = app.deadman_on_start();
+
     app.body = if app.has_stored_identity() {
         if interrupted > 0 {
             format!(
@@ -390,6 +451,13 @@ fn main() -> io::Result<()> {
     } else {
         "no identity. `init` to create one.".into()
     };
+    // Printed to the scrollback *and* put in the pane. A dead-man that fired
+    // is the most consequential thing this program can report, and a message
+    // only in a pane is one an operator can clear without reading.
+    if let Some(notice) = deadman_notice {
+        eprintln!("krab: {notice}");
+        app.body = format!("{notice}\n\n{}", app.body);
+    }
     install_panic_hook();
     let mut term = setup()?;
     let result = app.run(&mut term);
@@ -485,6 +553,13 @@ struct App {
     /// never written — RFC 7 §4's rule for the KEK applies to anything
     /// derived from it.
     pin_key: Option<[u8; 32]>,
+    /// The subkey the onion root is sealed under — RFC 4 §5.2.
+    ///
+    /// Derived from the **KEK**, like `pin_key` and for the same reason: the
+    /// KEK is memory-only (RFC 7 §4) and `start-tor` runs long after the
+    /// passphrase, while `W_N` rotates and a network address must not. Held
+    /// while unlocked, cleared on lock, never written.
+    onion_key: Option<[u8; 32]>,
     /// Two-hop reachability, from nodelist fragments peers have sent —
     /// RFC 3 §8.
     ///
@@ -512,6 +587,28 @@ struct App {
     /// (`NO-CONFIG.md`), and a lock clears it, so a node comes back invisible
     /// unless its operator says otherwise.
     rollcall: rollcall::Listing,
+    /// The `tor` this node launched — RFC 4 §5.2.
+    ///
+    /// `None` until `start-tor`. Not started automatically: RFC 4 §5.1 says
+    /// plain TCP "is the correct choice and Tor is unnecessary complexity" for
+    /// many deployments, and a node that silently opened a Tor circuit on
+    /// every start would be making a network-visible decision its operator did
+    /// not ask for.
+    ///
+    /// Dropping this kills the daemon, so a wipe that clears the field is a
+    /// wipe that stops tor — but `panic_wipe` calls `stop()` explicitly rather
+    /// than relying on that, because "the daemon dies because a field was
+    /// assigned" is exactly the kind of load-bearing side effect this codebase
+    /// keeps finding broken.
+    tor: Option<krab_fabric::backend::tor::TorProcess>,
+    /// This node's `.onion`, once published. Derived, so it is the same at
+    /// every start (RFC 4 §5.2).
+    onion: Option<String>,
+    /// The last bootstrap reading, polled on the tick.
+    ///
+    /// RFC 4 §5.2: "clients MUST show bootstrap progress or users will believe
+    /// the node is broken at every start."
+    tor_bootstrap: Option<krab_fabric::backend::tor::Bootstrap>,
     /// Groups — RFC 6 §2. Closed rosters, sealed per member.
     groups: Vec<groups::Group>,
     /// Fan-out copies waiting for their release time — RFC 6 §2.7.
@@ -691,10 +788,14 @@ impl Default for App {
             listen_error: None,
             roster: channels::Roster::default(),
             rollcall: rollcall::Listing::default(),
+            tor: None,
+            onion: None,
+            tor_bootstrap: None,
             introductions: Vec::new(),
             spends: std::collections::HashMap::new(),
             reach: Vec::new(),
             pin_key: None,
+            onion_key: None,
             warned_shred_at: None,
             last_scan_fail: 0,
             pending_bases: Vec::new(),
@@ -927,7 +1028,373 @@ impl App {
         }
         self.spinner.tick();
         self.tick_schedule();
+        self.tick_tor();
         true
+    }
+
+    /// Poll tor's bootstrap — RFC 4 §5.2's "clients MUST show bootstrap
+    /// progress or users will believe the node is broken at every start."
+    ///
+    /// Stops polling once tor reports 100%: the interesting part is the tens
+    /// of seconds before that, and a control-port round trip on every tick for
+    /// the rest of the process's life buys nothing.
+    ///
+    /// A daemon that has died is noticed here and reported once. That matters
+    /// more than it looks: without it, a node whose tor was killed would keep
+    /// showing whatever progress it last saw, and an operator would believe
+    /// they were reachable when they were not.
+    fn tick_tor(&mut self) {
+        let Some(tor) = self.tor.as_mut() else {
+            return;
+        };
+        if !tor.is_running() {
+            self.tor = None;
+            self.tor_bootstrap = None;
+            self.node.tor_bootstrap = None;
+            self.onion = None;
+            self.output = "tor: the daemon exited. This node is no longer \
+                           reachable over its onion address. `start-tor` to \
+                           restart it."
+                .into();
+            return;
+        }
+        if self.tor_bootstrap.as_ref().is_some_and(|b| b.is_done()) {
+            return;
+        }
+        if let Ok(b) = tor.bootstrap() {
+            // RFC 4 §5.2's MUST is that it is *shown*, so the status line's
+            // copy is updated here rather than read from `self.tor_bootstrap`
+            // by the renderer — `NodeState` is what the view sees.
+            self.node.tor_bootstrap = if b.is_done() { None } else { Some(b.percent) };
+            self.tor_bootstrap = Some(b);
+        }
+    }
+
+    /// `start-tor [path]` — RFC 4 §5.2.
+    ///
+    /// Starts the daemon *and* publishes this node's onion service, so that
+    /// afterwards the node is reachable as a server and can dial as a client.
+    /// Doing only one of those would be the more obvious design and the wrong
+    /// one: a node that could dial but not be dialled is a node whose peers
+    /// cannot reconcile with it, and RFC 5's exchange is symmetric.
+    fn start_tor(&mut self, path: Option<&str>) -> String {
+        if self.tor.is_some() {
+            return match &self.onion {
+                Some(a) => format!("tor is already running. This node is {a}"),
+                None => "tor is already running.".into(),
+            };
+        }
+        // The root is sealed under the KEK, so this needs an unlocked node.
+        // Refusing here rather than starting tor and failing at `ADD_ONION`
+        // keeps the daemon from being launched for a command that cannot
+        // finish.
+        let Some(onion_key) = self.onion_key else {
+            return "locked — `unlock` first. The onion root is sealed under a \
+                    KEK subkey (RFC 4 §5.2, RFC 7 §4)."
+                .into();
+        };
+
+        let run_dir = self.home.join("tor");
+        let launch = match path {
+            Some(p) => match krab_fabric::backend::tor::TorLaunch::at(p, &run_dir) {
+                Ok(l) => l,
+                Err(e) => return format!("start-tor: {e}"),
+            },
+            None => krab_fabric::backend::tor::TorLaunch::on_path(&run_dir),
+        };
+
+        let mut tor = match krab_fabric::backend::tor::TorProcess::launch(&launch) {
+            Ok(t) => t,
+            Err(e) => return format!("start-tor: {e}"),
+        };
+
+        // The permanent address. Generated on first use and sealed; read back
+        // every time after, so the `.onion` a peer wrote down keeps working.
+        let root_path = self.path(artifact::Artifact::OnionRoot);
+        let (root, fresh) = match persist::read_onion_root(&root_path, &onion_key) {
+            Ok(r) => (r, false),
+            Err(persist::Error::Absent) => {
+                let mut rng = OsRng;
+                (krab_crypto::onion::OnionRoot::generate(&mut rng), true)
+            }
+            Err(e) => {
+                tor.stop();
+                return format!("start-tor: cannot read the onion root: {e:?}");
+            }
+        };
+        if fresh {
+            let mut rng = OsRng;
+            if let Err(e) = persist::write_onion_root(&root_path, &root, &onion_key, &mut rng) {
+                tor.stop();
+                return format!("start-tor: cannot store the onion root: {e:?}");
+            }
+        }
+
+        // Counter 0 until rotation is a verb. §5.2 wants it rotatable; the
+        // mechanism is in `krab_crypto::onion` and the operator-facing half is
+        // not written, which is recorded in PLAN.md rather than implied by a
+        // hard-coded zero with no comment.
+        let key = krab_crypto::onion::service_key(&root, 0);
+        let mut b64 = key.to_base64();
+
+        let port = self.listen_port_for_onion();
+        // **RFC 4 §5.2's restricted discovery.** One authorised client per
+        // verified peering, derived rather than stored.
+        let (clients, skipped) = self.onion_client_set();
+        let address = match tor.add_onion(&b64, 9001, port, &clients) {
+            Ok(a) => a,
+            Err(e) => {
+                crate::overwrite(&mut b64);
+                tor.stop();
+                return format!("start-tor: {e}");
+            }
+        };
+        crate::overwrite(&mut b64);
+
+        let socks = tor.socks_port();
+        let binary = tor.binary().to_string();
+        self.tor_bootstrap = tor.bootstrap().ok();
+        self.node.tor_bootstrap = self
+            .tor_bootstrap
+            .as_ref()
+            .filter(|b| !b.is_done())
+            .map(|b| b.percent);
+        self.tor = Some(tor);
+        self.onion = Some(address.clone());
+
+        let discovery = if clients.is_empty() {
+            "\n\nThis service is UNRESTRICTED — you have no verified peerings, \
+             so there is no authorised-client set to derive and anyone who \
+             learns the address can reach it. Peer with someone and restart \
+             tor to close it."
+                .to_string()
+        } else {
+            let mut s = format!(
+                "\n\nRestricted discovery is ON for {} peer(s). Only they can \
+                 decrypt the descriptor, so the address is unenumerable by \
+                 anyone else (RFC 4 §5.2).",
+                clients.len()
+            );
+            if skipped > 0 {
+                s.push_str(&format!(
+                    "\n\n{skipped} peer(s) were SKIPPED — their peer-link did not \
+                     verify. They will not be able to reach this node. Check \
+                     `peer show <name>`."
+                ));
+            }
+            s
+        };
+        format!(
+            "tor started.\n\
+             \n  binary     {binary}\
+             \n  socks      127.0.0.1:{socks}\
+             \n  address    {address}:9001\
+             \n  forwarding to 127.0.0.1:{port}\
+             \n\n\
+             Give peers the address above. It is derived, so it is the same \
+             every start.\n\
+             Bootstrap takes tens of seconds; progress is on the status line.\
+             {discovery}"
+        )
+    }
+
+    /// The restricted-discovery client set — RFC 4 §5.2.
+    ///
+    /// > Only clients holding an authorised key can decrypt the service
+    /// > descriptor, so the sync endpoint is not merely unlisted but
+    /// > unenumerable and unconfirmable by anyone who is not already a peer.
+    /// > **The authorised-client set derives directly from the node's signed
+    /// > credentials.**
+    ///
+    /// Which is what this is: one entry per verified peer-link, derived from
+    /// the static-static agreement with that peer's credential key. No list is
+    /// stored and nothing is exchanged — a node's authorised set is a pure
+    /// function of who it has peered with, so it is right by construction
+    /// whenever the peerings are.
+    ///
+    /// A card that fails `verify()` contributes nothing. That is deliberate
+    /// and it is the strict direction: an unverifiable credential is not
+    /// evidence of a peering, and admitting one would widen the set that
+    /// §5.2 exists to narrow.
+    ///
+    /// Returns the base32 public halves, and a count of peers skipped, so the
+    /// caller can tell an operator that some peer will not be able to reach
+    /// them rather than leaving it to be discovered as silence.
+    fn onion_client_set(&self) -> (Vec<String>, usize) {
+        let Some(identity) = self.identity.as_ref() else {
+            return (Vec::new(), 0);
+        };
+        let me = krab_crypto::dh::SecretKey::from_bytes(identity.noise_bytes());
+        let (mut set, mut skipped) = (Vec::new(), 0usize);
+        for peer in self.peer_ids() {
+            let card = std::fs::read(self.peer_path(&peer, artifact::PeerFile::Link))
+                .ok()
+                .and_then(|b| peering::Card::decode(&b).ok())
+                .filter(|c| c.verify());
+            let Some(card) = card else {
+                skipped += 1;
+                continue;
+            };
+            let pk = krab_crypto::dh::PublicKey(card.noise_static_pk);
+            // `agree` rejects a low-order public key, which would produce an
+            // all-zero shared secret and therefore the *same* auth key for
+            // every peer holding one. Skipping is the only safe answer.
+            match krab_crypto::dh::agree(&me, &pk) {
+                Some(shared) => set.push(krab_crypto::onion::client_auth(&shared).public_base32()),
+                None => skipped += 1,
+            }
+        }
+        set.sort();
+        (set, skipped)
+    }
+
+    /// `deadman [<days>|off]` — RFC 7 §10.
+    ///
+    /// Bare, it reports. That is deliberate: §10 requires the timer be
+    /// discoverable, and a verb that only ever *sets* something is one an
+    /// operator cannot use to find out what is already armed.
+    fn deadman_command(&mut self, rest: &str) -> String {
+        let path = self.path(artifact::Artifact::DeadMan);
+        let now = self.now_s();
+
+        if rest.is_empty() {
+            return match deadman::read(&path) {
+                deadman::Stamp::Absent => "dead-man timer: off.\n\n\
+                     `deadman <days>` arms it. The node destroys itself if it \
+                     is not unlocked within that many days; unlocking resets \
+                     the clock. It warns for the last quarter of the window.\n\n\
+                     Off is the default and stays off until you type this \
+                     (RFC 7 §10)."
+                    .into(),
+                deadman::Stamp::Unreadable => format!(
+                    "dead-man timer: the stamp at {} is not readable, so the \
+                     timer is OFF. Re-arm it with `deadman <days>` if you \
+                     meant it to be on.",
+                    path.display()
+                ),
+                deadman::Stamp::Armed(d) => {
+                    let left = d.remaining_s(now);
+                    format!(
+                        "dead-man timer: armed, {} days.\n  fires in {}d {}h \
+                         unless this node is unlocked\n  unlocking resets it",
+                        d.days,
+                        left / 86_400,
+                        (left % 86_400) / 3_600
+                    )
+                }
+            };
+        }
+
+        if rest.eq_ignore_ascii_case("off") {
+            // Shredded rather than removed: the stamp is in the clear, and
+            // "this node had a dead-man timer set for 30 days" is a fact about
+            // the operator's expectations worth destroying properly.
+            let mut rng = OsRng;
+            return if shred::remove(&path, &mut rng) {
+                "dead-man timer: off. The node will not destroy itself on a \
+                 timer."
+                    .into()
+            } else {
+                "dead-man timer: off (there was none armed).".into()
+            };
+        }
+
+        let Ok(days) = rest.parse::<u32>() else {
+            return "usage: deadman <days> | deadman off | deadman".into();
+        };
+        let d = match deadman::DeadMan::new(now, days) {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+        match deadman::write(&path, &d) {
+            Ok(()) => format!(
+                "dead-man timer armed: {days} days.\n\n\
+                 This node DESTROYS ITSELF if it is not unlocked within \
+                 {days} days. Unlocking resets the clock. It warns for the \
+                 last quarter of the window.\n\n\
+                 The deadline is stored in the clear — it has to be, because \
+                 the timer must fire when nobody can unlock the node. Anyone \
+                 holding this disk can see a timer is set and when it expires."
+            ),
+            Err(e) => format!("could not arm the dead-man timer: {e}"),
+        }
+    }
+
+    /// Fire the dead-man timer if its window has passed — RFC 7 §10.
+    ///
+    /// **Called before the passphrase is asked for**, which is the whole
+    /// design: the timer exists for a node whose operator cannot return, so
+    /// the one moment it must work is the moment nobody is going to unlock it.
+    /// Checking after an unlock would be checking only when it is moot.
+    ///
+    /// Returns the message to show, if anything happened.
+    fn deadman_on_start(&mut self) -> Option<String> {
+        let path = self.path(artifact::Artifact::DeadMan);
+        let now = self.now_s();
+        match deadman::read(&path) {
+            deadman::Stamp::Absent => None,
+            // Reported, not acted on. A corrupt byte must not destroy a node,
+            // and an operator who armed a timer needs to know it is not armed
+            // any more.
+            deadman::Stamp::Unreadable => Some(format!(
+                "warning: the dead-man stamp at {} is unreadable, so no timer \
+                 is armed. Re-arm with `deadman <days>` if you meant it to be.",
+                path.display()
+            )),
+            deadman::Stamp::Armed(d) if d.expired(now) => {
+                let out = self.panic_wipe();
+                Some(format!(
+                    "DEAD-MAN TIMER FIRED. This node was not unlocked within \
+                     {} days and has destroyed itself (RFC 7 §10).\n\n{out}",
+                    d.days
+                ))
+            }
+            deadman::Stamp::Armed(d) => d.warning(now),
+        }
+    }
+
+    /// Re-arm on unlock — "wipe if **not unlocked** within N days".
+    ///
+    /// Silent: an operator who unlocks daily should not be told daily that
+    /// they have reset a timer they know about. The warning path is what
+    /// speaks, and it speaks only when the window is closing.
+    fn deadman_rearm(&mut self) {
+        let path = self.path(artifact::Artifact::DeadMan);
+        if let deadman::Stamp::Armed(d) = deadman::read(&path) {
+            if let Ok(fresh) = deadman::DeadMan::new(self.now_s(), d.days) {
+                let _ = deadman::write(&path, &fresh);
+            }
+        }
+    }
+
+    /// `stop-tor`.
+    fn stop_tor(&mut self) -> String {
+        match self.tor.take() {
+            Some(mut t) => {
+                t.stop();
+                self.onion = None;
+                self.tor_bootstrap = None;
+                self.node.tor_bootstrap = None;
+                "tor stopped. The onion address is unpublished; it will be the \
+                 same one when you `start-tor` again."
+                    .into()
+            }
+            None => "tor is not running.".into(),
+        }
+    }
+
+    /// Which local port the onion service forwards to.
+    ///
+    /// The node's own listener if one is up, so that `start-tor` after
+    /// `listen` does the thing an operator means. Falls back to the default
+    /// port rather than refusing: an operator who starts tor first and listens
+    /// second should not have to restart tor.
+    fn listen_port_for_onion(&self) -> u16 {
+        self.listen
+            .as_ref()
+            .and_then(|a| a.rsplit(':').next())
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(9001)
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -6251,6 +6718,18 @@ impl App {
                 self.output = "passphrase:".into();
             }
             Command::Wipe => self.output = self.panic_wipe(),
+            Command::StartTor => {
+                // The argument is a path and may contain spaces on Windows,
+                // so it is everything after the verb rather than `arg(1)`.
+                let rest = line.trim().strip_prefix("start-tor").unwrap_or("").trim();
+                let path = if rest.is_empty() { None } else { Some(rest) };
+                self.output = self.start_tor(path);
+            }
+            Command::StopTor => self.output = self.stop_tor(),
+            Command::DeadMan => {
+                let rest = line.trim().strip_prefix("deadman").unwrap_or("").trim();
+                self.output = self.deadman_command(rest);
+            }
             Command::Peer => {
                 let rest = line.trim().strip_prefix("peer").unwrap_or("");
                 self.output = match Peering::parse(rest) {
@@ -9255,6 +9734,28 @@ impl App {
         // the credentials that define them — so a socket still accepting the
         // statics of former peers is a node answering for an identity that no
         // longer exists.
+        // **Tor dies first, and it dies now.**
+        //
+        // Before the erasure below, not after: an onion service is a published
+        // address answering for this node, and every millisecond it keeps
+        // answering while the identity behind it is being destroyed is a
+        // millisecond somebody can confirm the node is here. It is also the
+        // one thing in this function that is visible from outside the machine.
+        //
+        // `stop` kills rather than shutting down politely, for the same reason
+        // this whole path exists — a wipe that waited for circuits to close
+        // would be a wipe that waited.
+        //
+        // Called explicitly rather than left to `Option::take`'s drop, so that
+        // "the daemon stops" is a statement in this function that a reader can
+        // find, not a consequence of a field assignment somewhere else.
+        if let Some(mut tor) = self.tor.take() {
+            tor.stop();
+        }
+        self.onion = None;
+        self.tor_bootstrap = None;
+        self.node.tor_bootstrap = None;
+
         self.inbound = None;
         self.allowed.set(Vec::new());
         self.links = links::LinkTable::new();
@@ -9606,6 +10107,9 @@ impl App {
         self.identity = Some(krab_lock::Held::new(id));
         self.epoch_key = Some(w);
         self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
+        self.onion_key = Some(kek.subkey(persist::CONTEXT_ONION));
+        // RFC 7 §10: an unlock is what resets the dead-man window.
+        self.deadman_rearm();
         self.alias_key = Some(alias::Aliases::key_from_kek(&kek));
         self.locked = false;
 
@@ -9762,6 +10266,9 @@ impl App {
         // RFC 7 §8.1's long-lived key. From the KEK, so it survives every
         // epoch shred — which is the only reason a pin is worth anything.
         self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
+        self.onion_key = Some(kek.subkey(persist::CONTEXT_ONION));
+        // RFC 7 §10: an unlock is what resets the dead-man window.
+        self.deadman_rearm();
         self.alias_key = Some(alias::Aliases::key_from_kek(&kek));
         self.save(&kek)?;
         // `kek` drops here. RFC 7 §4: it is memory-only and never written, and
@@ -10072,6 +10579,7 @@ impl App {
         self.pending_bases.clear();
         // Derived from the KEK, so it goes when the KEK does.
         self.pin_key = None;
+        self.onion_key = None;
         self.alias_key = None;
         self.warned_shred_at = None;
         self.last_scan_fail = 0;
@@ -10398,6 +10906,153 @@ mod tests {
         type_command(from, &format!("peer pad {}", dest.display()));
         assert!(dest.exists(), "peer pad wrote nothing: {}", from.output);
         dest.to_string_lossy().into_owned()
+    }
+
+    /// **RFC 4 §5.2: the authorised-client set derives from the peerings.**
+    ///
+    /// A node with no peers has an empty set — and therefore, honestly, an
+    /// unrestricted service. A node with a peering has exactly one entry, and
+    /// it is the entry that peer will derive for itself.
+    #[test]
+    fn the_onion_client_set_comes_from_verified_peerings() {
+        let alone = ready_node("onion-set-alone");
+        let (set, skipped) = alone.onion_client_set();
+        assert!(set.is_empty(), "a node with no peers authorised somebody");
+        assert_eq!(skipped, 0);
+
+        let (a, b, _a_of_b, _b_of_a) = peered_pair("onion-set");
+        let (a_set, a_skipped) = a.onion_client_set();
+        let (b_set, b_skipped) = b.onion_client_set();
+        assert_eq!(a_set.len(), 1, "A did not authorise its peer");
+        assert_eq!(b_set.len(), 1, "B did not authorise its peer");
+        assert_eq!(a_skipped, 0);
+        assert_eq!(b_skipped, 0);
+
+        // **The two ends agree.** A authorises the key B will hand its own
+        // tor, and vice versa — which is what makes restricted discovery work
+        // without either sending the other an auth key.
+        assert_eq!(
+            a_set, b_set,
+            "the two ends of a peering derived different client-auth keys, so \
+             neither could decrypt the other's descriptor"
+        );
+
+        // And it is base32 of 32 bytes: 52 characters, no padding, which is
+        // what tor's `ClientAuthV3` grammar accepts.
+        assert_eq!(a_set[0].len(), 52);
+        assert!(!a_set[0].contains('='));
+        assert!(a_set[0]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+    }
+
+    /// **A peer whose card does not verify is skipped and counted**, not
+    /// silently admitted. Admitting one would widen the set §5.2 exists to
+    /// narrow; dropping it silently would leave an operator wondering why a
+    /// peer cannot reach them.
+    #[test]
+    fn an_unverifiable_peer_is_skipped_and_reported() {
+        let (a, _b, _, _) = peered_pair("onion-set-bad");
+        assert_eq!(a.onion_client_set().0.len(), 1);
+
+        // Corrupt the stored card so its signature no longer checks. The
+        // directory name is whatever `peer_ids` reports, which is the same
+        // set `onion_client_set` walks.
+        let peer = a.peer_ids().first().expect("no peer directory").clone();
+        let link = a.peer_path(&peer, artifact::PeerFile::Link);
+        let mut bytes = std::fs::read(&link).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xff;
+        std::fs::write(&link, &bytes).unwrap();
+
+        let (set, skipped) = a.onion_client_set();
+        assert!(set.is_empty(), "an unverifiable card was authorised");
+        assert_eq!(skipped, 1, "the skip was not counted");
+    }
+
+    /// **The dead-man timer actually destroys the node.**
+    ///
+    /// `deadman.rs`'s own tests cover the arithmetic; none of them touch an
+    /// `App`, so none of them would notice if `deadman_on_start` were never
+    /// called, called after the unlock, or wired to something other than
+    /// `panic_wipe`. That gap is the whole failure mode — a timer that is
+    /// armed, warns, and then does nothing.
+    #[test]
+    fn an_expired_dead_man_destroys_the_node() {
+        let mut a = ready_node("deadman-fires");
+        type_command(&mut a, "deadman 7");
+        assert!(a.path(artifact::Artifact::DeadMan).exists(), "not armed");
+        assert!(a.has_stored_identity(), "no identity to destroy");
+
+        // Backdate the stamp past its window. This is what a week of nobody
+        // unlocking looks like from the node's side.
+        let stale = deadman::DeadMan {
+            armed_at_s: a.now_s() - 8 * 86_400,
+            days: 7,
+        };
+        deadman::write(&a.path(artifact::Artifact::DeadMan), &stale).unwrap();
+
+        let notice = a.deadman_on_start().expect("no notice on an expired timer");
+        assert!(notice.contains("DEAD-MAN TIMER FIRED"), "{notice}");
+        assert!(
+            !a.has_stored_identity(),
+            "the timer fired but the node survived"
+        );
+        assert!(a.identity.is_none(), "the identity is still in memory");
+    }
+
+    /// And an unexpired one does not — the other half, because a test that
+    /// only proved firing would pass on a timer that fired every start.
+    #[test]
+    fn an_unexpired_dead_man_leaves_the_node_alone() {
+        let mut a = ready_node("deadman-waits");
+        type_command(&mut a, "deadman 30");
+        assert!(a.deadman_on_start().is_none(), "warned or fired too early");
+        assert!(a.has_stored_identity(), "the node was destroyed early");
+
+        // Inside the last quarter it warns, and still does not fire.
+        let soon = deadman::DeadMan {
+            armed_at_s: a.now_s() - 25 * 86_400,
+            days: 30,
+        };
+        deadman::write(&a.path(artifact::Artifact::DeadMan), &soon).unwrap();
+        let w = a.deadman_on_start().expect("no warning inside the window");
+        assert!(w.contains("DEAD-MAN TIMER:"), "{w}");
+        assert!(!w.contains("FIRED"), "{w}");
+        assert!(a.has_stored_identity(), "a warning destroyed the node");
+    }
+
+    /// **RFC 7 §10: off by default.** A node nobody has told about the timer
+    /// must never fire one.
+    #[test]
+    fn a_node_without_a_stamp_never_fires() {
+        let mut a = ready_node("deadman-default");
+        assert!(!a.path(artifact::Artifact::DeadMan).exists());
+        assert!(a.deadman_on_start().is_none());
+        assert!(a.has_stored_identity());
+    }
+
+    /// Unlocking resets the window — `deadman_rearm` is on the unlock path.
+    #[test]
+    fn unlocking_re_arms_the_timer() {
+        let mut a = ready_node("deadman-rearm");
+        type_command(&mut a, "deadman 10");
+        let path = a.path(artifact::Artifact::DeadMan);
+        let stale = deadman::DeadMan {
+            armed_at_s: a.now_s() - 9 * 86_400,
+            days: 10,
+        };
+        deadman::write(&path, &stale).unwrap();
+
+        a.deadman_rearm();
+        let deadman::Stamp::Armed(back) = deadman::read(&path) else {
+            panic!("the stamp vanished");
+        };
+        assert_eq!(back.days, 10, "the period changed");
+        assert!(
+            back.armed_at_s >= a.now_s() - 2,
+            "the deadline was not moved forward"
+        );
     }
 
     fn type_command(a: &mut App, s: &str) {

@@ -48,6 +48,28 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
+    /// **Not in RFC 8 §5.** The dead-man timer — RFC 7 §10.
+    ///
+    /// `deadman <days>` arms it, `deadman off` disarms, bare `deadman` reports.
+    ///
+    /// §10 requires it be discoverable and not on by default. It is a verb
+    /// like any other, listed in `help`, and absent until typed.
+    DeadMan,
+    /// **Not in RFC 8 §5.** Start this node's own `tor` — RFC 4 §5.2.
+    ///
+    /// `start-tor [absolute-path-to-tor]`. With no argument, whatever `tor` is
+    /// on `PATH`; with one, exactly that binary, which is the answer for an
+    /// operator who does not trust `PATH`.
+    ///
+    /// Launches the daemon on arguments alone — no `torrc`, per
+    /// `NO-CONFIG.md` — and publishes this node's derived onion address, so
+    /// that afterwards the node can both be reached and reach out.
+    StartTor,
+    /// **Not in RFC 8 §5.** Stop the `tor` this node started.
+    ///
+    /// The address is derived, so stopping and starting gets the same one
+    /// back. A panic wipe also stops it, immediately and without this verb.
+    StopTor,
     /// **Not in RFC 8 §5.** Keep a conversation past the retention window —
     /// RFC 8 §10, RFC 7 §8.1.
     ///
@@ -192,7 +214,7 @@ impl Command {
     /// to 19 of 26 without anything noticing. `every_variant_is_in_all` closes
     /// that: it matches on `Command` exhaustively, so a new variant does not
     /// compile until it appears here.
-    pub const ALL: [Command; 34] = [
+    pub const ALL: [Command; 37] = [
         Command::Pin,
         Command::Note,
         Command::Alias,
@@ -214,6 +236,9 @@ impl Command {
         Command::Request,
         Command::Unlock,
         Command::Wipe,
+        Command::StartTor,
+        Command::StopTor,
+        Command::DeadMan,
         Command::Connect,
         Command::Disconnect,
         Command::Rollcall,
@@ -239,6 +264,9 @@ impl Command {
             "duress" => Command::Duress,
             "request" => Command::Request,
             "wipe" => Command::Wipe,
+            "start-tor" => Command::StartTor,
+            "stop-tor" => Command::StopTor,
+            "deadman" => Command::DeadMan,
             "connect" => Command::Connect,
             "disconnect" => Command::Disconnect,
             "rollcall" => Command::Rollcall,
@@ -498,6 +526,9 @@ impl fmt::Display for Command {
             Command::Duress => "duress",
             Command::Request => "request",
             Command::Wipe => "wipe",
+            Command::StartTor => "start-tor",
+            Command::StopTor => "stop-tor",
+            Command::DeadMan => "deadman",
             Command::Connect => "connect",
             Command::Disconnect => "disconnect",
             Command::Rollcall => "rollcall",
@@ -780,6 +811,9 @@ mod tests {
                 Command::Request => {}
                 Command::Unlock => {}
                 Command::Wipe => {}
+                Command::StartTor => {}
+                Command::StopTor => {}
+                Command::DeadMan => {}
                 Command::Connect => {}
                 Command::Disconnect => {}
                 Command::Rollcall => {}
@@ -795,7 +829,7 @@ mod tests {
                 Command::Verify => {}
             }
         }
-        assert_eq!(Command::ALL.len(), 34);
+        assert_eq!(Command::ALL.len(), 37);
     }
 
     /// **Every verb round-trips.** RFC 8 §5's ten, and the sixteen it omits.

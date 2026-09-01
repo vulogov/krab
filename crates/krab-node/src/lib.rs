@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod cover;
 pub mod exchange;
 pub mod lock;
 pub mod metrics;

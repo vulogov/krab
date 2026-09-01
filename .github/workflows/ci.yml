@@ -1,0 +1,149 @@
+# Continuous integration.
+#
+# This is the repository's first CI configuration, and it exists for one
+# concrete reason before any general one: `crates/krab-lock` contains the
+# workspace's only `unsafe`, half of it is the Windows arm — `VirtualLock`,
+# `VirtualUnlock`, `SetErrorMode`, `IsDebuggerPresent` — and **that half has
+# never been executed**. It cross-compiles and it passes clippy for both
+# Windows targets, which establishes that the declarations are well-formed and
+# nothing more. `Documentation/UNSAFE-AUDIT.md` says so in as many words:
+#
+#   > What would close this: running `cargo test -p krab-lock` on Windows.
+#   > That is one line in CI and it is the only thing that turns the arm from
+#   > *compiled* into *working*.
+#
+# This is that line. Everything else here is ordinary hygiene.
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# A push that supersedes an in-flight run cancels it. CI that reports on stale
+# commits is CI people learn to ignore.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a CI failure costs nothing and is the difference between
+  # "a test failed" and knowing where.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------
+  # The reason this file exists.
+  #
+  # Separate from the full matrix below and deliberately narrow: it runs the
+  # unsafe boundary's own tests on a real Windows kernel. If the full suite
+  # turns out to have unrelated Windows problems, this job still answers the
+  # question the audit asked, and it answers it first.
+  # ---------------------------------------------------------------------
+  windows-unsafe-boundary:
+    name: krab-lock on Windows (the audit's open question)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain argument: `rust-toolchain.toml` pins 1.94.1 and rustup
+      # honours it. Naming a version here would create a second place for the
+      # toolchain to be specified, and they would disagree eventually.
+      - name: Show toolchain
+        run: rustup show
+      # `--nocapture` is not decoration. Every test in this crate tolerates a
+      # refusal — a container that cannot lock is a real machine — so a green
+      # run does not by itself say *which* branch executed.
+      # `report_what_this_platform_granted` prints it, and that print is the
+      # artefact this job exists to produce.
+      - name: Test the unsafe boundary
+        run: cargo test -p krab-lock -- --nocapture
+
+  # ---------------------------------------------------------------------
+  # Everything else, on the three platforms the project targets.
+  #
+  # Windows is a first-class target here, not an afterthought — but its full
+  # suite has never run either, so a failure in this job is information rather
+  # than a regression until it has passed once.
+  # ---------------------------------------------------------------------
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not cancel the others: which platforms fail
+      # is the whole content of a first run.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Show toolchain
+        run: rustup show
+      - name: Test
+        run: cargo test --workspace
+
+  # There is deliberately **no `cargo fmt --check` gate**, and this is the
+  # reason rather than an oversight.
+  #
+  # The tree is not currently rustfmt-clean: `cargo fmt --all --check` reports
+  # 126 diffs across 28 files, and 25 of those files predate this workflow. A
+  # gate added today would fail on its first run for reasons unrelated to any
+  # change being tested, and a red check that everyone knows to ignore is worse
+  # than no check — it trains people past the ones that matter, including the
+  # Windows job above.
+  #
+  # Turning it on is a two-step job for whoever wants it: run `cargo fmt --all`
+  # as its own commit touching nothing else, then add the gate in the commit
+  # after. Doing it as a side effect of a feature branch would bury real
+  # changes in a thousand lines of reflow.
+  lint:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        # `--all-features` matters: `socks` and `serial` are features, and a
+        # lint that only ever sees the default set does not cover them.
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # Cross-compilation is what caught a Linux-only clippy warning in
+  # `krab-lock::harden` that never appeared on the development Mac. It is
+  # cheap and it covers the arms no runner executes.
+  cross:
+    name: cross-check ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-gnu
+          - x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+      - name: Check
+        run: cargo clippy -p krab-lock -p krab-fabric --target ${{ matrix.target }} --all-targets -- -D warnings
+
+  # The two shell suites. Bash only, so Linux and macOS — they drive real
+  # nodes over real sockets and are the tests that have historically caught
+  # what unit tests did not.
+  smoke:
+    name: smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Smoke
+        run: ./smoke.sh
+      - name: Three nodes
+        run: ./smoke-three-nodes.sh
