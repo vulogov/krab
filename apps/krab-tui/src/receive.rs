@@ -105,9 +105,18 @@ pub struct TagTable {
 ///
 /// Never persisted (no `Artifact` names it) and never logged
 /// (`activity_log`'s own test refuses a line containing "tag"). **Never paged
-/// is not implemented** — nothing in this tree calls `mlock`, and RFC 7 §9's
-/// memory-locking requirement is unmet across the board rather than here
-/// specifically.
+/// is now held too**: `App::tag_table` is a `krab_lock::Held<TagTable>`, so
+/// the table lives in `mlock`ed pages beside the identity. That closes the
+/// third of §9's three clauses; the note here used to say it was unmet, which
+/// was true when `mlock` did not exist in this tree and stayed on the page
+/// after it did.
+///
+/// **What `Held` locks is the box, not the map's heap allocations.** A
+/// `HashMap` owns a table allocated elsewhere, and moving the struct into
+/// locked pages does not move that. So this is an improvement rather than a
+/// guarantee, and the honest statement is: the table's header cannot be paged,
+/// its buckets can. Closing that needs a locked allocator, which is a larger
+/// change than this one and is not pretended to be done here.
 impl Drop for TagTable {
     fn drop(&mut self) {
         for entries in self.by_tag.values_mut() {

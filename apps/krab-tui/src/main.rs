@@ -213,6 +213,37 @@ fn meet_failure(e: bootstrap::Error) -> String {
     }
 }
 
+/// RFC 2 §9's in-flight-loss warning, in one place.
+///
+/// > Rotation is the only remedy. It costs almost nothing locally (12 ms of
+/// > ECDH at 200 correspondents) and a great deal socially: every
+/// > correspondent must learn the new key before they can address you, and
+/// > messages in flight under the old key are lost. Implementations SHOULD
+/// > make rotation available and **MUST warn about in-flight loss**, which on
+/// > a courier route may be weeks of traffic.
+///
+/// One copy, shown before the passphrase is asked for and again with the
+/// result, because the two are read at different moments and the second is the
+/// one an operator keeps on screen while they act on it.
+fn rotation_warning() -> String {
+    format!(
+        "**Rotating loses mail that is already on its way to you.**\n\n\
+         Pairwise tags come from a shared secret between your correspondence \
+         key and each peer's. Replacing yours changes every one of those \
+         secrets, so anything sent to you under the old tags can never be \
+         opened — not by you, not by anyone. On a courier route that may be \
+         weeks of traffic (RFC 2 §9), and nothing will report it: the objects \
+         arrive, are stored, and match nothing.\n\n\
+         Every correspondent must be given a new card before they can reach \
+         you again, and until they are, their mail to you is lost the same \
+         way.\n\n\
+         What this buys is the reason to do it anyway: a stolen copy of your \
+         old key can no longer link your future correspondence, only the \
+         {} days of it that are still retained.",
+        krab_core::tag::MAX_TTL_DAYS
+    )
+}
+
 /// Seconds since the Unix epoch, or zero if the clock is before it.
 fn now_seconds() -> u64 {
     std::time::SystemTime::now()
@@ -803,7 +834,22 @@ struct App {
     /// §4.3) and the corpus is rescanned far more often than the epoch turns.
     /// Dropped on lock: it is derived from static-static shared secrets, so it
     /// is content-key material and a relay must not hold it.
-    tag_table: Option<receive::TagTable>,
+    /// **Key material, and held as such** — RFC 2 §9.
+    ///
+    /// > The precomputation table **is** the correlation. It maps tags to
+    /// > correspondents — precisely what the design prevents everyone else
+    /// > from doing. It is the single most valuable artifact on a seized
+    /// > running node and MUST be treated as key material under RFC 7 §9,
+    /// > never paged, never logged, never persisted.
+    ///
+    /// Three requirements, and only two of them used to hold. Never persisted:
+    /// nothing writes it, and it is rebuilt on every epoch rollover. Never
+    /// logged: it has no `Debug` that prints tags. **Never paged** was the
+    /// missing one — this was a plain `Option<TagTable>` on the heap while the
+    /// identity beside it sat in locked pages, so the artifact §9 calls "the
+    /// single most valuable" on a seized node was the one that could reach
+    /// swap.
+    tag_table: Option<krab_lock::Held<receive::TagTable>>,
     /// The correspondent names `tag_table` was built from. A table is stale
     /// when this no longer matches, not only when the epoch has rolled.
     tag_table_peers: Vec<String>,
@@ -812,6 +858,8 @@ struct App {
     attempts: receive::Attempts,
     /// Set by the confirmation prompt, consumed by the next command.
     confirmed: bool,
+    /// Whether the passphrase prompt is for a correspondence-key rotation.
+    rotating: bool,
     /// Where the first-run ceremony has got to, if it is running.
     init_step: Option<InitStep>,
     /// Whether the passphrase prompt is unlocking rather than initialising.
@@ -904,6 +952,7 @@ impl Default for App {
             attempts: receive::Attempts::new(),
             tag_table_peers: Vec::new(),
             confirmed: false,
+            rotating: false,
             init_step: None,
             unlocking: false,
         }
@@ -1484,6 +1533,101 @@ impl App {
             // Tor is gone, so the service went with it.
             None => format!("contact endpoint {address} is gone with tor."),
         }
+    }
+
+    /// Replace the correspondence key — RFC 2 §9.
+    ///
+    /// The warning is printed **before** the passphrase is asked for, not
+    /// after the key has changed. §9's MUST is that implementations "MUST warn
+    /// about in-flight loss"; a warning shown alongside the result is a
+    /// notification, and the thing it is warning about has already happened.
+    ///
+    /// # What moves and what does not
+    ///
+    /// Only the X25519 correspondence key. `node_id` is the Ed25519 identity
+    /// and stays, so peers still know who this is; the Noise static stays, so
+    /// configured link addresses still work. Rotating either of those would be
+    /// becoming a different node rather than rotating a key.
+    ///
+    /// # Why the backup words are shown again
+    ///
+    /// RFC 7 §11 makes the backup a one-time ceremony at creation, and
+    /// `Identity::backup_phrase` says showing it again on request "would turn
+    /// a one-time ceremony into a settings item". This is not a request: the
+    /// words that were written down no longer restore this node, because half
+    /// of what they encode has just been replaced. Withholding them would
+    /// leave an operator holding a backup that silently restores the wrong
+    /// key — which is the failure §11 exists to prevent, arrived at from the
+    /// other side. So a rotation is its own ceremony, and shows them once.
+    fn rotate_correspondence(&mut self, passphrase: &[u8]) -> String {
+        let Some(held) = self.identity.as_ref() else {
+            return "no identity — nothing to rotate".into();
+        };
+        // The KEK is memory-only (RFC 7 §4), so it is re-derived here from the
+        // passphrase just typed. That also makes the passphrase a second
+        // authorisation for a destructive act, which is why this verb asks for
+        // it at all rather than using the open session.
+        let kek = match held.kek(passphrase) {
+            Ok(k) => k,
+            Err(e) => return format!("could not derive the key: {e:?}"),
+        };
+        if !self.stored_identity_opens(&kek, held.kek_params) {
+            return "that passphrase does not open this node's identity. \
+                    Nothing was rotated."
+                .into();
+        }
+
+        // The path is resolved before the identity is borrowed mutably, so
+        // the write below borrows only what it is writing.
+        let wrapped = self.path(artifact::Artifact::IdentityWrapped);
+        let Some(held) = self.identity.as_mut() else {
+            return "no identity — nothing to rotate".into();
+        };
+        held.rotate_correspondence(&mut OsRng);
+        let words = held.backup_phrase();
+        let short = held.short_id();
+
+        if let Err(e) = persist::write_identity(&wrapped, held, &kek, &mut OsRng) {
+            return format!(
+                "the new key is in memory and **was not written**: {e:?}. \
+                 Do not restart this node — rotate again once the disk is \
+                 writable, or the key that reaches disk will be the old one \
+                 while your peers have been told the new one."
+            );
+        }
+
+        // **Every derived thing that used the old key is now wrong.** The
+        // recognition table maps tags to correspondents and every one of those
+        // tags has just changed; the failure cache remembers pairs that could
+        // not be opened under a key that no longer exists.
+        self.tag_table = None;
+        self.tag_table_peers.clear();
+        self.attempts.clear();
+        self.refresh_inbox();
+
+        format!(
+            "rotated. This node is still {short} — the identity key did not \
+             move, only the correspondence key.\n\n\
+             {}\n\n\
+             **Write these down. They replace the words from `init`, which no \
+             longer restore this node.**\n\n{words}\n\n\
+             Now give every correspondent a fresh card: `peer offer` writes \
+             one. Until they have it they will address you with the old key \
+             and you will never see it — RFC 0 §6 makes that silent at both \
+             ends.",
+            rotation_warning()
+        )
+    }
+
+    /// Whether the stored identity opens under this KEK.
+    ///
+    /// The passphrase is checked against **the file**, not against the
+    /// in-memory identity, because the file is what a wrong passphrase would
+    /// leave un-rewritten: deriving a KEK always succeeds, and writing under
+    /// the wrong one produces an identity nothing can ever open again.
+    fn stored_identity_opens(&self, kek: &krab_crypto::Kek, params: krab_crypto::KekParams) -> bool {
+        let path = self.path(artifact::Artifact::IdentityWrapped);
+        persist::read_identity(&path, kek, params).is_ok()
     }
 
     /// `clock` — what this node's peers think the time is, RFC 2 §5.1.
@@ -2931,7 +3075,7 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
             .is_some_and(|t| t.is_current(epoch))
             && self.tag_table_peers == built_from;
         if !current {
-            self.tag_table = Some(receive::TagTable::build(&peers, epoch));
+            self.tag_table = Some(krab_lock::Held::new(receive::TagTable::build(&peers, epoch)));
             self.tag_table_peers = built_from;
             // A new correspondent or a new epoch can change whether a pair
             // opens, so everything remembered about failures stops being
@@ -7296,7 +7440,10 @@ impl App {
             Err(Refusal::NeedsConfirmation) => {
                 // RFC 7 §10 — the one irreversible verb, and the one prompt.
                 self.confirmed = true;
-                self.output = format!("`{cmd}` destroys the key hierarchy and cannot be undone. Type it again to confirm.");
+                self.output = format!(
+                    "`{cmd}` {}. Type it again to confirm.",
+                    cmd.destroys()
+                );
             }
             Ok(()) => {
                 self.confirmed = false;
@@ -7629,6 +7776,15 @@ impl App {
             Command::Cover => self.output = self.cover_command(line),
             Command::Onion => self.output = self.onion_command(line),
             Command::Clock => self.output = self.clock_command(),
+            Command::Rotate => {
+                // Confirmed already — `admit` refused the first typing. The
+                // passphrase comes at the prompt rather than on the command
+                // line, exactly as `unlock` does and for the same reason: a
+                // command line is echoed and can be scrolled back.
+                self.rotating = true;
+                self.init_step = Some(InitStep::Passphrase);
+                self.output = format!("{}\n\npassphrase:", rotation_warning());
+            }
             Command::Request => self.output = self.peer_request(line),
             Command::Pack => self.output = self.pack(line),
             Command::Import => self.output = self.import(line),
@@ -11215,6 +11371,23 @@ impl App {
     fn advance_init_step(&mut self) {
         let Some(step) = self.init_step else { return };
 
+        // A rotation is a single step too, and it runs before the unlock arm
+        // because a rotating node is already unlocked — the passphrase here is
+        // being asked for the KEK, not for admission.
+        if self.rotating && step == InitStep::Passphrase {
+            if self.passphrase.is_empty() {
+                self.output = "a passphrase is required".into();
+                return;
+            }
+            let passphrase = self.passphrase.take();
+            self.output = self.rotate_correspondence(passphrase.as_bytes());
+            let mut p = passphrase;
+            overwrite(&mut p);
+            self.init_step = None;
+            self.rotating = false;
+            return;
+        }
+
         // An unlock is a single step: derive and open, or refuse.
         if self.unlocking && step == InitStep::Passphrase {
             if self.passphrase.is_empty() {
@@ -11645,6 +11818,24 @@ mod tests {
         a
     }
 
+    /// The passphrase every test node uses.
+    const TEST_PASSPHRASE: &[u8] = b"a passphrase";
+
+    /// Write the identity file, as `init` does. `ready_node` holds an identity
+    /// in memory and does not persist it, and anything that re-derives the KEK
+    /// to check it — `rotate` — needs the file to check against.
+    fn persist_identity(a: &App) {
+        let id = a.identity.as_ref().expect("identity");
+        let kek = id.kek(TEST_PASSPHRASE).expect("kek");
+        persist::write_identity(
+            &a.path(artifact::Artifact::IdentityWrapped),
+            id,
+            &kek,
+            &mut OsRng,
+        )
+        .expect("the identity is written");
+    }
+
     /// Two nodes with a completed peering, and the short id each uses for the
     /// other. The sneakernet path, because that is the one that keeps the
     /// post-quantum property and so is the interesting starting point.
@@ -11810,6 +12001,176 @@ mod tests {
         assert!(a_set[0]
             .chars()
             .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+    }
+
+    /// **RFC 2 §9: the precomputation table is held as key material.**
+    ///
+    /// "Never paged" was the missing one of §9's three clauses — the table sat
+    /// on the ordinary heap while the identity beside it was in locked pages,
+    /// so the artifact §9 calls "the single most valuable" on a seized running
+    /// node was the one that could reach swap.
+    #[test]
+    fn the_tag_table_is_held_like_the_identity_is() {
+        let (mut a, _b, _a_of_b, _b_of_a) = peered_pair("tagtable-held");
+        a.refresh_inbox();
+        let table = a.tag_table.as_ref().expect("a peered node has a table");
+        assert_eq!(
+            table.is_locked(),
+            a.identity
+                .as_ref()
+                .map(|i| i.is_locked())
+                .expect("an identity"),
+            "the tag table and the identity disagree about being locked, on a \
+             machine where one of them succeeded"
+        );
+    }
+
+    /// **RFC 2 §9's rotation warns before it acts, and names in-flight loss.**
+    ///
+    /// §9's MUST is that implementations "MUST warn about in-flight loss". A
+    /// warning printed with the result is a notification — the thing it warns
+    /// about has already happened — so this asserts it appears at the
+    /// confirmation, before the passphrase is even asked for.
+    #[test]
+    fn rotation_warns_about_in_flight_loss_before_it_asks_for_anything() {
+        let (mut a, _b, _a_of_b, _b_of_a) = peered_pair("rotate-warn");
+
+        // First typing: refused, and the refusal names the specific loss.
+        type_command(&mut a, "rotate");
+        assert!(
+            a.output.contains("in flight") || a.output.contains("lost"),
+            "the confirmation does not name the loss: {}",
+            a.output
+        );
+        assert!(a.init_step.is_none(), "it asked for a passphrase unconfirmed");
+
+        // Second typing: the full warning, then the prompt.
+        type_command(&mut a, "rotate");
+        assert!(a.output.contains("weeks of traffic"), "{}", a.output);
+        assert!(a.output.contains("new card"), "{}", a.output);
+        assert!(a.output.ends_with("passphrase:"), "{}", a.output);
+        assert_eq!(a.init_step, Some(InitStep::Passphrase));
+        assert!(a.rotating);
+    }
+
+    /// **A wrong passphrase rotates nothing.**
+    ///
+    /// Deriving a KEK always succeeds, so the check is against the stored
+    /// file. Writing the identity under a KEK the file was not sealed with
+    /// produces an identity nothing can ever open again.
+    #[test]
+    fn a_wrong_passphrase_leaves_the_key_alone() {
+        let (mut a, _b, _a_of_b, _b_of_a) = peered_pair("rotate-badpass");
+        persist_identity(&a);
+        let before = a
+            .identity
+            .as_ref()
+            .expect("identity")
+            .card(Policy::default())
+            .correspondence_pk;
+
+        let out = a.rotate_correspondence(b"not the passphrase");
+        assert!(out.contains("does not open"), "{out}");
+        assert_eq!(
+            a.identity
+                .as_ref()
+                .expect("identity")
+                .card(Policy::default())
+                .correspondence_pk,
+            before,
+            "a wrong passphrase changed the key"
+        );
+    }
+
+    /// **Rotation replaces the correspondence key, keeps the identity, and
+    /// invalidates everything derived from the old one.**
+    ///
+    /// `node_id` staying is what makes this rotation rather than becoming a
+    /// different node: RFC 3 §9.2's rollcall, RFC 6's channels and every
+    /// stored peer-link are keyed on it.
+    #[test]
+    fn rotation_moves_the_correspondence_key_and_nothing_else() {
+        let (mut a, _b, _a_of_b, _b_of_a) = peered_pair("rotate-does");
+        persist_identity(&a);
+        a.refresh_inbox();
+        assert!(a.tag_table.is_some(), "no table to invalidate");
+
+        let (before, node_id, noise, old_tag) = {
+            let id = a.identity.as_ref().expect("identity");
+            let before = id.card(Policy::default());
+            let node_id = id.node_id();
+            let noise = id.noise_bytes();
+        // The tag B would use for A today, under the key about to be retired.
+        let their_card = std::fs::read(a.peer_path(
+            a.peer_ids().first().expect("a peer"),
+            artifact::PeerFile::Link,
+        ))
+        .ok()
+        .and_then(|b| peering::Card::decode(&b).ok())
+        .expect("a stored peer-link");
+            let shared = id
+                .agree_with(&krab_crypto::dh::PublicKey(their_card.correspondence_pk))
+                .expect("agreement");
+            (
+                before,
+                node_id,
+                noise,
+                krab_crypto::pairwise_tag(&shared, now_epoch()),
+            )
+        };
+        assert!(
+            !a.tag_table
+                .as_ref()
+                .expect("a table")
+                .candidates(&old_tag)
+                .is_empty(),
+            "the table does not recognise its own peer, so the check below \
+             would pass for the wrong reason"
+        );
+
+        let out = a.rotate_correspondence(TEST_PASSPHRASE);
+        assert!(out.contains("rotated."), "{out}");
+
+        let (after, kek, params) = {
+            let id = a.identity.as_ref().expect("identity");
+            let after = id.card(Policy::default());
+            assert_ne!(
+                after.correspondence_pk, before.correspondence_pk,
+                "the correspondence key did not move"
+            );
+            assert_eq!(id.node_id(), node_id, "the identity key moved");
+            assert_eq!(id.noise_bytes(), noise, "the transport key moved");
+            (after, id.kek(TEST_PASSPHRASE).expect("kek"), id.kek_params)
+        };
+        // **The table no longer recognises the tag the peer will use.** That
+        // is the operator-visible consequence and the reason the warning
+        // exists: until B is given the new card it addresses A with the old
+        // shared secret, and A's recognition table has stopped containing it.
+        //
+        // The first version of this asserted the table was `None`. It is not —
+        // `refresh_inbox` rebuilds it immediately, correctly, under the new
+        // key — so that assertion was testing the invalidation and not the
+        // thing invalidation is *for*.
+        a.refresh_inbox();
+        let table = a.tag_table.as_ref().expect("rebuilt under the new key");
+        assert!(
+            table.candidates(&old_tag).is_empty(),
+            "the table still recognises a tag derived from the retired key"
+        );
+
+        // And the new key is on disk, not only in memory: a restart must not
+        // hand back the key the peers have been told to stop using.
+        let stored = persist::read_identity(
+            &a.path(artifact::Artifact::IdentityWrapped),
+            &kek,
+            params,
+        )
+        .expect("the identity file opens");
+        assert_eq!(
+            stored.card(Policy::default()).correspondence_pk,
+            after.correspondence_pk,
+            "the rotated key was never written"
+        );
     }
 
     /// **RFC 2 §5.1: a diverged clock stops emission and nothing else.**

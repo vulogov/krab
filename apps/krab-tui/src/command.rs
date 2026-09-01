@@ -192,6 +192,12 @@ pub enum Command {
     /// The onion endpoints — RFC 4 §5.2's rotation and RFC 3 §9.2's
     /// contact/sync separation.
     Onion,
+    /// Replace the correspondence key — RFC 2 §9's rotation.
+    ///
+    /// Destructive, and in a way `wipe` is not: `wipe` destroys this node,
+    /// while this destroys **the ability of every correspondent to reach it**
+    /// until they are given the new card, and loses whatever was in flight.
+    Rotate,
     /// What this node's peers think the time is — RFC 2 §5.1.
     ///
     /// A report and never a setting: the repair for a divergence is the system
@@ -236,7 +242,7 @@ impl Command {
     /// to 19 of 26 without anything noticing. `every_variant_is_in_all` closes
     /// that: it matches on `Command` exhaustively, so a new variant does not
     /// compile until it appears here.
-    pub const ALL: [Command; 41] = [
+    pub const ALL: [Command; 42] = [
         Command::Pin,
         Command::Note,
         Command::Alias,
@@ -274,6 +280,7 @@ impl Command {
         Command::Cover,
         Command::Onion,
         Command::Clock,
+        Command::Rotate,
         Command::Keys,
         Command::Reach,
         Command::Peers,
@@ -305,6 +312,7 @@ impl Command {
             "cover" => Command::Cover,
             "onion" => Command::Onion,
             "clock" => Command::Clock,
+            "rotate" => Command::Rotate,
             "message" | "msg" => Command::Message,
             "keys" => Command::Keys,
             "reach" => Command::Reach,
@@ -445,6 +453,10 @@ impl Command {
             "the two onion endpoints, and rotating the sync one",
         ),
         ("clock", "what your peers think the time is — RFC 2 §5.1"),
+        (
+            "rotate",
+            "new correspondence key — LOSES MAIL IN FLIGHT, RFC 2 §9",
+        ),
         ("request", "ask a peer for an object by name"),
         ("pack <file>", "write queued objects out for a courier"),
         ("import <file>", "take in what a courier brought"),
@@ -546,6 +558,7 @@ impl Command {
             self,
             Command::Send
                 | Command::Short
+                | Command::Rotate
                 | Command::Onion
                 | Command::Peer
                 | Command::Init
@@ -562,8 +575,33 @@ impl Command {
     /// passphrase, and RFC 7 §10 makes the case that a confirmation at the
     /// moment of seizure is the wrong shape. Wipe is not reversible by
     /// anything, so it is the one place a prompt earns its friction.
+    /// Whether this verb destroys something irreversibly.
+    ///
+    /// Two now. `wipe` destroys this node; `rotate` destroys every
+    /// correspondent's ability to reach it until they hold the new card, and
+    /// loses whatever was in flight under the old key — RFC 2 §9's "messages
+    /// in flight under the old key are lost", which "on a courier route may be
+    /// weeks of traffic". Neither is undone by a passphrase, which is the line
+    /// `lock` sits on the other side of.
     pub fn is_destructive(&self) -> bool {
-        matches!(self, Command::Wipe)
+        matches!(self, Command::Wipe | Command::Rotate)
+    }
+
+    /// What typing this verb a second time will do, for the confirmation.
+    ///
+    /// Per verb, because a single sentence covering both would have to be
+    /// vague enough to cover both — and the whole value of a confirmation is
+    /// that it names the specific loss.
+    pub fn destroys(&self) -> &'static str {
+        match self {
+            Command::Wipe => "destroys the key hierarchy and cannot be undone",
+            Command::Rotate => {
+                "replaces your correspondence key: mail already in flight to you \
+                 is lost for good, and no correspondent can reach you until they \
+                 have your new card (RFC 2 §9)"
+            }
+            _ => "cannot be undone",
+        }
     }
 }
 
@@ -592,6 +630,7 @@ impl fmt::Display for Command {
             Command::Cover => "cover",
             Command::Onion => "onion",
             Command::Clock => "clock",
+            Command::Rotate => "rotate",
             Command::Message => "message",
             Command::Keys => "keys",
             Command::Reach => "reach",
@@ -882,6 +921,7 @@ mod tests {
                 Command::Cover => {}
                 Command::Onion => {}
                 Command::Clock => {}
+                Command::Rotate => {}
                 Command::Pin => {}
                 Command::Note => {}
                 Command::Alias => {}
@@ -921,7 +961,7 @@ mod tests {
                 Command::Verify => {}
             }
         }
-        assert_eq!(Command::ALL.len(), 41);
+        assert_eq!(Command::ALL.len(), 42);
     }
 
     /// **Every verb round-trips.** RFC 8 §5's ten, and the sixteen it omits.

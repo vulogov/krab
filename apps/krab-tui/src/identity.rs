@@ -75,6 +75,40 @@ impl Identity {
         }
     }
 
+    /// Replace the correspondence key — RFC 2 §9's rotation.
+    ///
+    /// > Static-static ECDH is the structural weakness. Pairwise tags derive
+    /// > from a stable shared secret, so compromise of either long-term X25519
+    /// > key retroactively links every message between that pair across the
+    /// > entire retained corpus… Rotation is the only remedy.
+    ///
+    /// **Only the correspondence key moves.** The Ed25519 identity stays, so
+    /// `node_id` stays, so every peer still knows who this is and every
+    /// signature ever made still verifies. Rotating the identity key instead
+    /// would not be rotation, it would be becoming a different node — and RFC
+    /// 3 §9.2's rollcall, RFC 6's channels and every stored peer-link are all
+    /// keyed on `node_id`.
+    ///
+    /// The Noise static is left alone for the same reason it is separate in
+    /// the first place (see this module's table): it is a *transport*
+    /// identity, and rotating it would break every configured link address
+    /// without touching the correlation §9 is about.
+    ///
+    /// # What this cannot undo
+    ///
+    /// The old key's shared secrets are gone with it, so **mail in flight
+    /// under the old tags can never be opened** — §9's "messages in flight
+    /// under the old key are lost", which "on a courier route may be weeks of
+    /// traffic". The caller must have said so before calling this.
+    pub fn rotate_correspondence(&mut self, rng: &mut impl Rng) {
+        // The old secret is dropped here. `x25519_dalek::StaticSecret` is
+        // built with the `zeroize` feature (see `krab-crypto/Cargo.toml`), so
+        // the assignment overwrites it rather than leaving it on the heap —
+        // which is the whole point of rotating and would be undone by a
+        // residue RFC 7 §9 warns about.
+        self.correspondence = SecretKey::generate(rng);
+    }
+
     /// `node_id`, RFC 3 §2.
     pub fn node_id(&self) -> [u8; 32] {
         self.signing.node_id()

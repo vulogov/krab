@@ -1173,8 +1173,8 @@ requirements.**
 | 7.4 | MUST cap inbox-tagged decapsulation per peer per epoch | **met — errata E-4** | same requirement as §7.2, stated twice; same resolution (swept 2026-09-01) |
 | 7.4 | MUST attempt all live batches in constant time | met + tested | `Inbox::scan_with` |
 | 7.4 | and MUST NOT stop at first success | met + tested | same |
-| 8 | MUST warn about in-flight loss on rotation | **unmet** | no correspondence-key rotation command exists to warn from |
-| 8 | the precomputation table MUST be treated as key material: never paged, never logged, never persisted | **partly met** | never logged and never persisted; **never paged is unmet** — nothing calls `mlock` |
+| 9 | MUST warn about in-flight loss on rotation | **was unmet, now met + tested** | `rotate`, warned at the confirmation and again at the prompt — before the passphrase is asked for (§32). *The § was wrong here too: this is RFC 2 §9, not §8* |
+| 9 | the precomputation table MUST be treated as key material: never paged, never logged, never persisted | **was partly met, now met** | `App::tag_table` is a `krab_lock::Held<TagTable>`; the header is in locked pages and the map's buckets are not, which is stated rather than claimed away (§32). *RFC 2 §9, not §8* |
 
 ### What this pass found
 
@@ -2358,13 +2358,13 @@ Derived by walking the rows, not by adding up prose:
 | document | rows | met | vacuous | unrepresentable | partly met | withdrawn | **unmet** |
 |---|---|---|---|---|---|---|---|
 | RFC 1 | 35 | 32 | 2 | — | — | — | **1** |
-| RFC 2 | 16 | 12 | 1 | — | 1 | 1 | **1** |
+| RFC 2 | 16 | 14 | 1 | — | — | 1 | **0** |
 | RFC 3 | 22 | 22 | — | — | — | — | 0 |
 | RFC 4 | 28 | 25 | 2 | 1 | — | — | 0 |
 | RFC 5 | 17 | 17 | — | — | — | — | 0 |
 | RFC 6 | 24 | 23 | — | — | — | 1 | 0 |
 | RFC 7 | 29 | 28 | — | — | — | 1 | 0 |
-| **total** | **171** | **159** | **5** | **1** | **1** | **3** | **2** |
+| **total** | **171** | **161** | **5** | **1** | — | **3** | **1** |
 
 **171, not 167.** The old figure was the sum of per-document totals that had
 each been written from a tally rather than counted from a table; four of the
@@ -2381,20 +2381,15 @@ only one of those two is code.
   It was unmet when this sweep ran: nothing computed the estimate. The table
   above counts it as met, and the count is checked, so the two cannot drift
   apart again.
-- **RFC 2 §8 — the in-flight-loss warning on correspondence-key rotation.**
-  Unmet because there is no correspondence-key rotation verb to warn *from*.
-  `onion rotate` is now the shape to copy: write the new state first, say
-  plainly what the operator's peers will experience, and name what is
-  reversible.
+- ~~**RFC 2 §8 — the in-flight-loss warning on correspondence-key rotation.**~~
+  **Closed in §32**, which also found the § was wrong: it is RFC 2 §9.
 - **RFC 1 §12 — two independent implementations MUST agree on every conformance
   vector.** Unmet by design and not by omission: there is one implementation.
   It is recorded so that "we have vectors" is never mistaken for "the vectors
   have been checked against someone else's code".
 
-And one partly met, unchanged: **RFC 2 §8's precomputation table as key
-material** — "never paged, never logged, never persisted". Two of three hold;
-`App::tag_table` is a plain `Option<TagTable>` and not a `krab_lock::Held`, so
-the recognition table is pageable while the identity is not.
+~~And one partly met: **RFC 2 §8's precomputation table as key material**.~~
+**Closed in §32.** The table is now a `krab_lock::Held<TagTable>`.
 
 The five vacuous and one unrepresentable rows are the amateur-band and
 SF11/SF12 requirements (**postponed for want of hardware**, §28), plus
@@ -2554,3 +2549,111 @@ And one partly met, unchanged: **RFC 2 §8's precomputation table as key
 material**. `App::tag_table` is a plain `Option<TagTable>` and not a
 `krab_lock::Held`, so the recognition table is pageable while the identity is
 not.
+
+---
+
+## 32. RFC 2 §9's rotation and its precomputation table — 2026-09-01
+
+Both of §30's remaining code items, and they are the same section of the same
+document — which the audit had recorded as **§8** for both. §8 is "Errata,"
+about prekey batch sizing. The two requirements are in §9, Security
+considerations. A wrong section number is a small error with a specific cost:
+anyone checking the row against the RFC reads about prekeys and concludes the
+row is nonsense.
+
+### Rotation, and what it is allowed to move
+
+> Rotation is the only remedy. It costs almost nothing locally (12 ms of ECDH
+> at 200 correspondents) and a great deal socially: every correspondent must
+> learn the new key before they can address you, and messages in flight under
+> the old key are lost. Implementations SHOULD make rotation available and
+> **MUST warn about in-flight loss**, which on a courier route may be weeks of
+> traffic.
+
+**Only the X25519 correspondence key moves.** The Ed25519 identity stays, so
+`node_id` stays — RFC 3 §9.2's rollcall, RFC 6's channels and every stored
+peer-link are keyed on it, and moving it would not be rotation but becoming a
+different node. The Noise static stays for the reason it is a separate key at
+all: it is a *transport* identity, and rotating it would break every configured
+link address without touching the correlation §9 is about.
+
+**The warning comes before the passphrase is asked for**, and again with the
+result. §9's MUST is to *warn*; a warning printed alongside the outcome is a
+notification, and the thing it warns about has already happened. `rotate` is
+`is_destructive`, so the first typing is refused with a sentence naming the
+specific loss — which meant `Command::destroys` had to become per-verb, since
+the one hard-coded confirmation line said "destroys the key hierarchy" and that
+is `wipe`'s consequence, not this one.
+
+**The passphrase is asked for, and checked against the file.** The KEK is
+memory-only (RFC 7 §4), so it has to be re-derived — and that makes the
+passphrase a second authorisation for a destructive act, which is why this verb
+asks rather than using the open session. Deriving a KEK always *succeeds*, so
+the check is that it opens the stored identity: writing under a KEK the file
+was not sealed with produces an identity nothing can ever open again.
+
+**The backup words are shown again, once.** RFC 7 §11 makes the backup a
+one-time ceremony and `Identity::backup_phrase` says showing it on request
+"would turn a one-time ceremony into a settings item". This is not a request:
+half of what the written-down words encode has just been replaced, so they no
+longer restore this node. Withholding them would leave an operator holding a
+backup that silently restores the wrong key — the failure §11 exists to
+prevent, reached from the other side. A rotation is its own ceremony.
+
+**A test asserts the consequence, not the mechanism.** The first version
+checked that `tag_table` was `None` after rotating. It is not — `refresh_inbox`
+rebuilds it immediately and correctly under the new key — so that assertion was
+testing the invalidation rather than what invalidation is *for*. It now
+computes the tag the peer will actually use, confirms the table recognises it
+before, and confirms it does not after. That is what the operator will
+experience and what the warning is about.
+
+### The precomputation table, and the clause that was still open
+
+> **The precomputation table is the correlation.** It maps tags to
+> correspondents — precisely what the design prevents everyone else from
+> doing. It is the single most valuable artifact on a seized running node and
+> MUST be treated as key material under RFC 7 §9, never paged, never logged,
+> never persisted.
+
+Never persisted and never logged had held since the table was written. **Never
+paged had not**, and after §28 built `krab_lock` it was the odd one out: the
+identity sat in locked pages while the artifact §9 calls "the single most
+valuable" was a plain `Option<TagTable>` on the heap.
+
+It is now `krab_lock::Held<TagTable>`, and the test asserts it agrees with the
+identity about being locked — comparing the two rather than asserting `true`,
+because on a machine where `mlock` is refused both are unlocked and a test that
+demanded success would fail for the platform rather than for the code.
+
+**What that does not achieve, stated rather than claimed away.** `Held` locks
+the box, not the map's own allocations: a `HashMap` owns a table allocated
+elsewhere, and moving the struct into locked pages does not move that. The
+header cannot be paged; the buckets can. Closing that needs a locking
+allocator, which is a larger change and is not pretended to be done here. The
+note in `receive.rs` used to say "never paged is not implemented" and was
+correct when written; it now says what is and is not covered.
+
+### What is verified
+
+- **1302 tests**, zero failures, clippy clean under `-D warnings` across
+  `--all-features`.
+- §30's derived table is updated and `plan_counts.rs` agrees, which is now the
+  routine rather than the exception.
+
+### What remains
+
+One row, and it is not code:
+
+- **RFC 1 §12** — "two independent implementations MUST agree on every
+  conformance vector." There is one implementation. The vectors exist and are
+  checked against themselves, which is not what §12 asks for and must not be
+  mistaken for it. It closes when somebody else writes a Krab, and not before.
+
+Plus the five vacuous and one unrepresentable rows — amateur bands and
+SF11/SF12, **postponed for want of hardware** (§28), and three requirements
+about features this version does not have.
+
+And the things that are built but not proven, which are not audit rows and are
+worth keeping visible: the contact endpoint's `ADD_ONION` and `del_onion` have
+never run against a real tor, and `VirtualLock` has still never executed.
