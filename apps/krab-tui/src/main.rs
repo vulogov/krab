@@ -752,6 +752,12 @@ struct App {
     /// object they accept. The emitter itself runs here, on its own Poisson
     /// schedule.
     cover: shared::SharedCover,
+    /// What this node's peers think the time is — RFC 2 §5.1.
+    ///
+    /// Fed one sample per exchange. Read before this node emits anything, and
+    /// that is the whole requirement: "MUST NOT emit objects when the
+    /// median-of-peers time estimate diverges from the local clock".
+    clock: shared::SharedClock,
     /// Mean seconds between dummies, or `None` when cover is off.
     ///
     /// **Off by default**, and that is a decision rather than an omission. RFC
@@ -883,6 +889,7 @@ impl Default for App {
             onion_counters: (0, 0),
             onion_contact: None,
             cover: shared::SharedCover::new(),
+            clock: shared::SharedClock::new(),
             cover_mean_s: None,
             cover_next_s: 0,
             shorts: std::sync::mpsc::channel(),
@@ -1477,6 +1484,123 @@ impl App {
             // Tor is gone, so the service went with it.
             None => format!("contact endpoint {address} is gone with tor."),
         }
+    }
+
+    /// `clock` — what this node's peers think the time is, RFC 2 §5.1.
+    ///
+    /// A report and never a setting. There is nothing here to configure: the
+    /// estimate is derived from traffic, and the repair for a divergence is
+    /// the system clock, which is not Krab's to change. An operator who cannot
+    /// see the estimate cannot tell a refusal to emit from a node that has
+    /// broken.
+    fn clock_command(&self) -> String {
+        let local = now_epoch().0;
+        let samples = self.clock.samples();
+        let mut out = format!("clock\n\n  local     epoch {local}\n");
+        match self.clock.median() {
+            None => out.push_str(
+                "  peers     no estimate yet\n\n\
+                 The estimate is one sample per completed exchange — the newest \
+                 epoch a peer offered. Until there is one, this node emits \
+                 normally: RFC 2 §5.1's requirement is conditional on having a \
+                 median-of-peers estimate, and a node that has spoken to nobody \
+                 has none.",
+            ),
+            Some(median) => {
+                let off = local as i64 - median as i64;
+                out.push_str(&format!(
+                    "  peers     epoch {median}, median over {samples} exchange(s)\n  \
+                     drift     {off:+} epoch(s)\n\n"
+                ));
+                match self.clock.verdict(local) {
+                    krab_node::clock::Verdict::Diverges { .. } => out.push_str(
+                        "**Emission is stopped.** Reconciliation, relaying and \
+                         receiving continue — a wrong clock only hurts this node \
+                         on the way in, and hurts everyone on the way out (RFC 2 \
+                         §5.1). Fix the system clock.",
+                    ),
+                    _ => out.push_str(
+                        "Within tolerance. One epoch of difference is what a few \
+                         minutes of skew looks like across midnight, so it is not \
+                         divergence.",
+                    ),
+                }
+                out.push_str(
+                    "\n\nThe resolution is one day, not the ±6 h §5.1 names: the \
+                     frozen routing header carries an expiry and no creation \
+                     time, and the finest emission-time value a receiver can read \
+                     without a key is the tag epoch. Errata E-6.",
+                );
+            }
+        }
+        out
+    }
+
+    /// Put an object this node **made** into its own corpus — RFC 2 §5.1's gate.
+    ///
+    /// # Every locally emitted object goes through here, and nothing else does
+    ///
+    /// That split is not a convention, it is where the two paths already ran:
+    /// objects that arrive from a peer are admitted by `ExchangeView::put` on
+    /// an exchange thread and never touch `App`. So `App`'s ingest sites were
+    /// already exactly the set of this node's own emissions, and collecting
+    /// them into one function makes §5.1's "MUST NOT emit" a property of the
+    /// call rather than a rule at thirteen call sites.
+    ///
+    /// # Why receiving is still allowed
+    ///
+    /// §5.1 is deliberately asymmetric and says why: "Emitting with a bad
+    /// clock poisons other nodes' stores with wrong expiry, and that damage
+    /// cannot be undone. Receiving with a bad clock only hurts the node
+    /// itself." So a diverged node keeps reconciling, keeps relaying, and
+    /// keeps taking delivery — it simply stops adding to the damage.
+    ///
+    /// The error is the operator's message, already written: a caller that
+    /// only knows "it did not go in" cannot say which of the two reasons it
+    /// was, and the two need very different actions.
+    fn emit(&self, id: krab_core::object::ObjectId, bytes: Vec<u8>, now_min: u32) -> Result<(), String> {
+        if let Some(why) = self.clock_refusal() {
+            return Err(why);
+        }
+        self.store
+            .with(|s| s.ingest(id, bytes, now_min, u32::MAX))
+            .map_err(|e| format!("the store refused it: {e:?}"))
+    }
+
+    /// The RFC 2 §5.1 refusal, or `None` when this node may emit.
+    ///
+    /// Separate from [`App::emit`] so the interface can *report* the state
+    /// without trying to emit something to find out.
+    fn clock_refusal(&self) -> Option<String> {
+        let krab_node::clock::Verdict::Diverges { off_by } =
+            self.clock.verdict(now_epoch().0)
+        else {
+            return None;
+        };
+        let (direction, harm) = if off_by > 0 {
+            (
+                "ahead of",
+                "Objects emitted now would carry an expiry that is wrong in \
+                 every other node's store, and RFC 2 §5.1 says that damage \
+                 cannot be undone.",
+            )
+        } else {
+            (
+                "behind",
+                "Objects emitted now would carry tags derived from an epoch \
+                 your peers have stopped computing, so they would be stored, \
+                 relayed, and never opened — RFC 0 §6 guarantees nobody is \
+                 told.",
+            )
+        };
+        Some(format!(
+            "refusing to emit: this node's clock is {} days {direction} its \
+             peers' (RFC 2 §5.1).\n\n{harm}\n\nFix the system clock. Nothing \
+             else stops — reconciliation, relaying and receiving all continue, \
+             because a wrong clock only hurts this node on the way in and \
+             hurts everyone on the way out. `clock` shows the estimate.",
+            off_by.abs()
+        ))
     }
 
     /// The restricted-discovery client set — RFC 4 §5.2.
@@ -2235,6 +2359,7 @@ impl App {
         let done = self.exchanges.0.clone();
         let shorts = self.shorts.0.clone();
         let cover = self.cover.clone();
+        let clock = self.clock.clone();
         let name = peer.to_string();
         self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
         std::thread::spawn(move || {
@@ -2250,7 +2375,9 @@ impl App {
                 )
                 // RFC 1 §8.2: the shape of real traffic, recorded where real
                 // traffic actually arrives.
-                .observing(cover);
+                .observing(cover)
+                // RFC 2 §5.1: and what its senders think the time is.
+                .timing(clock);
             // Cloned, so the totals can be folded back after the drivers
             // return: the view sees only objects it accepted, and RFC 3 §12's
             // novelty ratio needs the ones it declined as duplicates too.
@@ -2368,6 +2495,7 @@ impl App {
         let done = self.exchanges.0.clone();
         let shorts = self.shorts.0.clone();
         let cover = self.cover.clone();
+        let clock = self.clock.clone();
         let name = peer.to_string();
         // An exchange is about to put bytes on the link in both directions.
         // Set here rather than on completion: the thread runs for minutes on
@@ -2388,7 +2516,9 @@ impl App {
                 )
                 // RFC 1 §8.2: the shape of real traffic, recorded where real
                 // traffic actually arrives.
-                .observing(cover);
+                .observing(cover)
+                // RFC 2 §5.1: and what its senders think the time is.
+                .timing(clock);
             // Cloned, so the totals can be folded back after the drivers
             // return: the view sees only objects it accepted, and RFC 3 §12's
             // novelty ratio needs the ones it declined as duplicates too.
@@ -2487,11 +2617,7 @@ impl App {
         // peers like anything else. A dummy that never left would hide
         // nothing.
         let now_min = epoch.0 * 1440;
-        if self
-            .store
-            .with(|s| s.ingest(id, bytes, now_min, u32::MAX))
-            .is_ok()
-        {
+        if self.emit(id, bytes, now_min).is_ok() {
             self.save_corpus();
         }
     }
@@ -3353,8 +3479,8 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
             // One recipient is not a fan-out and has nothing to hide among a
             // window; it goes straight into the corpus like any other message.
             let (id, bytes) = sealed.remove(0);
-            if let Err(e) = self.store.with(|s| s.ingest(id, bytes, now_min, u32::MAX)) {
-                return format!("the store refused it: {e:?}");
+            if let Err(e) = self.emit(id, bytes, now_min) {
+                return e;
             }
         } else {
             let rate = self.background_rate();
@@ -4312,11 +4438,8 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
             Ok(c) => c,
             Err(e) => return format!("could not seal the counter: {e:?}"),
         };
-        if let Err(e) = self
-            .store
-            .with(|s| s.ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX))
-        {
-            return format!("the store refused it: {e:?}");
+        if let Err(e) = self.emit(composed.id, composed.bytes, epoch.0 * 1440) {
+            return e;
         }
         self.save_corpus();
 
@@ -5671,11 +5794,7 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
             let Some((oid, bytes)) = self.seal_one(p, &body) else {
                 continue;
             };
-            if self
-                .store
-                .with(|s| s.ingest(oid, bytes, now_epoch().0 * 1440, u32::MAX))
-                .is_ok()
-            {
+            if self.emit(oid, bytes, now_epoch().0 * 1440).is_ok() {
                 sent += 1;
             }
         }
@@ -5981,8 +6100,8 @@ impl App {
         let Some((oid, bytes)) = bulletin::into_object(&b, now_min, rollcall::TTL_MINUTES) else {
             return "the entry does not fit an object".into();
         };
-        if let Err(e) = self.store.with(|s| s.ingest(oid, bytes, now_min, u32::MAX)) {
-            return format!("could not publish: {e:?}");
+        if let Err(e) = self.emit(oid, bytes, now_min) {
+            return e;
         }
         self.save_corpus();
 
@@ -6403,11 +6522,8 @@ impl App {
             return format!("could not seal for {peer} — is that a completed peering?");
         };
         let epoch = now_epoch();
-        if let Err(e) = self
-            .store
-            .with(|s| s.ingest(id, bytes, epoch.0 * 1440, u32::MAX))
-        {
-            return format!("the store refused it: {e:?}");
+        if let Err(e) = self.emit(id, bytes, epoch.0 * 1440) {
+            return e;
         }
         self.save_corpus();
         self.refresh_inbox();
@@ -6607,9 +6723,7 @@ impl App {
         let now_min = now_epoch().0 * 1440;
         let n = self.pending.len();
         for p in std::mem::take(&mut self.pending) {
-            let _ = self
-                .store
-                .with(|s| s.ingest(p.id, p.bytes, now_min, u32::MAX));
+            let _ = self.emit(p.id, p.bytes, now_min);
         }
         self.save_corpus();
         n
@@ -6627,9 +6741,7 @@ impl App {
                 still.push(p);
                 continue;
             }
-            let _ = self
-                .store
-                .with(|s| s.ingest(p.id, p.bytes, now_min, u32::MAX));
+            let _ = self.emit(p.id, p.bytes, now_min);
         }
         let released = !still.is_empty() || !self.pending.is_empty();
         self.pending = still;
@@ -6672,7 +6784,7 @@ impl App {
         if let Some((oid, bytes)) =
             bulletin::into_object(&b, now_min, krab_core::tag::MAX_TTL_DAYS * 1440)
         {
-            let _ = self.store.with(|s| s.ingest(oid, bytes, now_min, u32::MAX));
+            let _ = self.emit(oid, bytes, now_min);
         }
     }
 
@@ -7516,6 +7628,7 @@ impl App {
             Command::Short => self.output = self.short_command(line),
             Command::Cover => self.output = self.cover_command(line),
             Command::Onion => self.output = self.onion_command(line),
+            Command::Clock => self.output = self.clock_command(),
             Command::Request => self.output = self.peer_request(line),
             Command::Pack => self.output = self.pack(line),
             Command::Import => self.output = self.import(line),
@@ -8872,8 +8985,8 @@ impl App {
         else {
             return "too long for one object — split it".into();
         };
-        if let Err(e) = self.store.with(|s| s.ingest(id, bytes, now_min, u32::MAX)) {
-            return format!("the store refused it: {e:?}");
+        if let Err(e) = self.emit(id, bytes, now_min) {
+            return e;
         }
         self.save_corpus();
         self.refresh_inbox();
@@ -9480,10 +9593,7 @@ impl App {
         };
 
         let n = composed.bytes.len();
-        match self
-            .store
-            .with(|s| s.ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX))
-        {
+        match self.emit(composed.id, composed.bytes, epoch.0 * 1440) {
             Ok(()) => {
                 let note = match (chunk.is_some(), their_prekey.is_some()) {
                     (true, true) => ", post-quantum, to a prekey",
@@ -9592,10 +9702,7 @@ impl App {
             Err(e) => return format!("could not seal: {e:?}"),
         };
 
-        match self
-            .store
-            .with(|s| s.ingest(composed.id, composed.bytes, epoch.0 * 1440, u32::MAX))
-        {
+        match self.emit(composed.id, composed.bytes, epoch.0 * 1440) {
             Ok(()) => {
                 self.save_corpus();
                 if let Some(nonce) = used {
@@ -10973,7 +11080,7 @@ impl App {
         let now_min = epoch.0 * 1440;
         let ttl = krab_core::tag::MAX_TTL_DAYS * 1440;
         let (oid, bytes) = bulletin::into_object(&b, now_min, ttl)?;
-        if let Err(e) = self.store.with(|s| s.ingest(oid, bytes, now_min, u32::MAX)) {
+        if let Err(e) = self.emit(oid, bytes, now_min) {
             return Some(format!("could not publish prekeys: {e:?}"));
         }
         self.save_corpus();
@@ -11703,6 +11810,123 @@ mod tests {
         assert!(a_set[0]
             .chars()
             .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+    }
+
+    /// **RFC 2 §5.1: a diverged clock stops emission and nothing else.**
+    ///
+    /// §5.1's asymmetry, checked on both halves — the node refuses to add to
+    /// the corpus and keeps every receiving path open, because "receiving with
+    /// a bad clock only hurts the node itself".
+    #[test]
+    fn a_diverged_clock_stops_emission_and_leaves_receiving_alone() {
+        let (mut a, _b, _a_of_b, b_of_a) = peered_pair("clock-diverged");
+
+        // Peers who agree with us: emission proceeds.
+        let local = now_epoch().0;
+        for _ in 0..5 {
+            a.clock.observe_exchange(local);
+        }
+        assert!(a.clock_refusal().is_none());
+        type_command(&mut a, &format!("send {b_of_a} on my way"));
+        let after_good = a.store.with(|s| s.len());
+        assert!(after_good > 0, "nothing was emitted: {}", a.output);
+
+        // Now the peers are two epochs behind: this node's clock is ahead,
+        // which is the damaging direction §5.1 names.
+        a.clock = shared::SharedClock::new();
+        for _ in 0..5 {
+            a.clock.observe_exchange(local - 3);
+        }
+        assert!(a.clock_refusal().is_some());
+        type_command(&mut a, &format!("send {b_of_a} and again"));
+        assert!(
+            a.output.contains("refusing to emit"),
+            "a diverged node emitted: {}",
+            a.output
+        );
+        assert!(a.output.contains("ahead of"), "the direction is not named: {}", a.output);
+        assert_eq!(
+            a.store.with(|s| s.len()),
+            after_good,
+            "an object reached the corpus while the clock was diverged"
+        );
+
+        // **Receiving is untouched.** An object from a peer still lands.
+        let (id, bytes) = {
+            let h = krab_core::object::RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags: 0,
+                expiry_min: now_epoch().0 * 1440 + 10_000,
+                tag: krab_core::object::Tag([9; 8]),
+            };
+            let b = krab_core::object::canonical_bytes(
+                &h,
+                &krab_core::object::example_sealed_body(2),
+            )
+            .unwrap();
+            (krab_crypto::object_id(&b), b)
+        };
+        let now_min = now_epoch().0 * 1440;
+        assert!(
+            a.store.with(|s| s.ingest(id, bytes, now_min, u32::MAX)).is_ok(),
+            "a diverged clock blocked the receive path, which §5.1 does not ask for"
+        );
+    }
+
+    /// **A node that has spoken to nobody emits normally.** §5.1's requirement
+    /// is conditional on having a median-of-peers estimate; refusing without
+    /// one would stop a fresh node composing its first message.
+    #[test]
+    fn a_node_with_no_estimate_may_emit() {
+        let (mut a, _b, _a_of_b, b_of_a) = peered_pair("clock-fresh");
+        assert_eq!(a.clock.samples(), 0);
+        assert!(a.clock_refusal().is_none());
+        type_command(&mut a, &format!("send {b_of_a} hello"));
+        assert!(!a.output.contains("refusing to emit"), "{}", a.output);
+    }
+
+    /// **Every locally emitted object goes through the gate.**
+    ///
+    /// The structural half, and the reason this is a source scan rather than a
+    /// behavioural test: §5.1's requirement is about *all* emission, and a
+    /// fourteenth call site added later would satisfy every behavioural test
+    /// here while walking straight past the check. `ExchangeView::put` is the
+    /// receive path and lives in another file, so it is not caught by this.
+    #[test]
+    fn the_only_ingest_in_this_file_is_the_one_inside_emit() {
+        let src = include_str!("main.rs");
+        // Split on the declaration itself rather than on the attribute above
+        // it: attributes accumulate — this module already carries a
+        // `#[allow]` and a comment between `#[cfg(test)]` and `mod tests` —
+        // and a marker that stops matching makes this test scan the whole
+        // file, count the tests' own ingests, and fail for the wrong reason.
+        let production = src
+            .split("\nmod tests {")
+            .next()
+            .expect("the test module marker moved");
+        let calls = production.matches("s.ingest(").count();
+        assert_eq!(
+            calls, 1,
+            "an emission path bypasses `App::emit`, and with it RFC 2 §5.1's clock gate"
+        );
+    }
+
+    /// `clock` reports and never configures — there is nothing here to set.
+    #[test]
+    fn the_clock_report_says_what_it_knows() {
+        let mut a = ready_node("clock-report");
+        type_command(&mut a, "clock");
+        assert!(a.output.contains("no estimate yet"), "{}", a.output);
+
+        let local = now_epoch().0;
+        for _ in 0..3 {
+            a.clock.observe_exchange(local);
+        }
+        type_command(&mut a, "clock");
+        assert!(a.output.contains("median over 3 exchange(s)"), "{}", a.output);
+        assert!(a.output.contains("E-6"), "the resolution gap must be named: {}", a.output);
     }
 
     /// **Rotation persists.** A counter that advanced only in memory would

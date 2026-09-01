@@ -192,6 +192,11 @@ pub enum Command {
     /// The onion endpoints — RFC 4 §5.2's rotation and RFC 3 §9.2's
     /// contact/sync separation.
     Onion,
+    /// What this node's peers think the time is — RFC 2 §5.1.
+    ///
+    /// A report and never a setting: the repair for a divergence is the system
+    /// clock, which is not Krab's to change.
+    Clock,
     /// Cover traffic — RFC 1 §5.3's Poisson dummies.
     ///
     /// Off by default and discoverable, like the dead-man timer: it costs
@@ -231,7 +236,7 @@ impl Command {
     /// to 19 of 26 without anything noticing. `every_variant_is_in_all` closes
     /// that: it matches on `Command` exhaustively, so a new variant does not
     /// compile until it appears here.
-    pub const ALL: [Command; 40] = [
+    pub const ALL: [Command; 41] = [
         Command::Pin,
         Command::Note,
         Command::Alias,
@@ -268,6 +273,7 @@ impl Command {
         Command::Short,
         Command::Cover,
         Command::Onion,
+        Command::Clock,
         Command::Keys,
         Command::Reach,
         Command::Peers,
@@ -298,6 +304,7 @@ impl Command {
             "short" => Command::Short,
             "cover" => Command::Cover,
             "onion" => Command::Onion,
+            "clock" => Command::Clock,
             "message" | "msg" => Command::Message,
             "keys" => Command::Keys,
             "reach" => Command::Reach,
@@ -437,6 +444,7 @@ impl Command {
             "onion [rotate]",
             "the two onion endpoints, and rotating the sync one",
         ),
+        ("clock", "what your peers think the time is — RFC 2 §5.1"),
         ("request", "ask a peer for an object by name"),
         ("pack <file>", "write queued objects out for a courier"),
         ("import <file>", "take in what a courier brought"),
@@ -583,6 +591,7 @@ impl fmt::Display for Command {
             Command::Short => "short",
             Command::Cover => "cover",
             Command::Onion => "onion",
+            Command::Clock => "clock",
             Command::Message => "message",
             Command::Keys => "keys",
             Command::Reach => "reach",
@@ -872,6 +881,7 @@ mod tests {
                 Command::Short => {}
                 Command::Cover => {}
                 Command::Onion => {}
+                Command::Clock => {}
                 Command::Pin => {}
                 Command::Note => {}
                 Command::Alias => {}
@@ -911,7 +921,7 @@ mod tests {
                 Command::Verify => {}
             }
         }
-        assert_eq!(Command::ALL.len(), 40);
+        assert_eq!(Command::ALL.len(), 41);
     }
 
     /// **Every verb round-trips.** RFC 8 §5's ten, and the sixteen it omits.

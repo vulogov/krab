@@ -271,6 +271,82 @@ domain-separation test.
 
 ---
 
+## E-6 — §5.1's ±6 h tolerance against the frozen header
+
+**RFC 2 §5.1:**
+
+> Implementations **MUST NOT** emit objects when the median-of-peers time
+> estimate diverges from the local clock by more than the skew tolerance
+> (±6 h, RFC 1 §2).
+
+> The corpus is itself a clock: objects carry creation timestamps from many
+> independent senders, and a running median over recently received objects
+> from multiple peers is a serviceable sanity check requiring no
+> infrastructure.
+
+**RFC 1 §4.1**, headed *"Routing header (frozen forever)"*, defines sixteen
+bytes: `ver`, `class`, `size_bucket`, `flags`, `expiry_min`, `tag`. There is no
+creation timestamp. **RFC 0 I-3:** "nothing else may be added."
+
+The second paragraph describes a field the first forbids. The requirement is
+therefore not implementable at the stated resolution by any conforming
+implementation — not because it is hard, but because the data it names does not
+exist on the wire.
+
+### Resolution: implement the check at one-epoch resolution and say so.
+
+Decided by rule 3, the narrower deviation: the requirement's *purpose* is met
+in full, and only its threshold is coarsened, in the direction that still
+catches every case §5.1 argues about.
+
+**What a receiver can actually read.** For a `sealed` object the §4.2 envelope
+carries `epoch` in the clear — key 0, the tag epoch the sender derived from its
+own clock at emission. That is a genuine "creation timestamp from an
+independent sender", and it is the only one. Its granularity is one day
+(`EPOCH_SECS = 86 400`).
+
+**Why a finer field must not be added.** This is the part worth stating
+plainly, because the obvious repair is to amend RFC 1 and put a creation
+minute in the header. A precise emission time in the clear, on every object,
+handed to every relay, is a traffic-analysis gift. RFC 3 §12 already forbids
+*retaining* per-object arrival times as "a forensic reconstruction of the graph
+and its timing gradients"; putting the sender's own clock on the wire supplies
+the same gradients to everyone, permanently, and cannot be withdrawn once
+objects exist. The coarse check is not merely the achievable answer — it is the
+correct one.
+
+**The threshold.** Emission stops when the local epoch differs from the
+median-of-peers epoch by **two or more epochs**. Not one: a one-epoch
+difference is what a few minutes of skew looks like across a midnight boundary,
+so treating it as divergence would stop a correctly-set node for part of every
+day. Two guarantees more than a full day of real divergence.
+
+**What is given up, stated rather than buried.** A clock wrong by between 6 h
+and roughly 24 h is not detected. That window is also the least damaging: §5.1's
+argument is that a bad clock "poisons other nodes' stores with wrong expiry",
+and an expiry 45 days out shifted by half a day poisons nothing — while a clock
+wrong by weeks writes tags no peer computes, which this check catches easily.
+
+**One sample per exchange, not per object.** A running median over received
+objects measures the age of the backlog rather than the network's clock:
+reconciliation moves history, so a node returning after a month sees a month of
+it and would conclude its own clock was a fortnight fast — refusing to emit at
+exactly the moment it had most to say. The maximum epoch *within* an exchange
+is a lower bound on that peer's clock; the median *across* exchanges is the
+robustness §5.1 asks for, since one peer lying about the time contributes one
+sample.
+
+This also keeps RFC 3 §12 intact. "Multiple peers" is satisfied structurally —
+one sample per exchange — and no record says which peer any sample came from,
+so there is no arrival time and no attribution anywhere.
+
+**In the code:** `krab_node::clock::PeerClock`, fed from
+`ExchangeView`'s `Drop` so no driver can forget to report, and read by
+`App::emit`, which is the single path every locally emitted object takes.
+`MAX_SKEW_EPOCHS = 2`. The operator sees the estimate with `clock`.
+
+---
+
 ## Status
 
 | entry | conflict | resolved by | implemented |
@@ -280,6 +356,7 @@ domain-separation test.
 | E-3 | #12 reserved header bits | rule 2 | yes — check moved to `ingest` |
 | E-4 | inbox cap vs provenance | rule 1 | yes — per epoch |
 | E-5 | §5.2's client-auth key is unspecified | — underspecification | yes — `onion::client_auth` |
+| E-6 | §5.1's ±6 h vs the frozen header | rule 3 | yes — one-epoch resolution, `clock::PeerClock` |
 
 No frozen text was altered. Each affected section carries a pointer to its
 entry in the source that implements it, the way RFC 7's own `⚠ CRITICAL DEFECT`

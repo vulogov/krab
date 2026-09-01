@@ -1166,7 +1166,7 @@ requirements.**
 | 5 | W MUST default to ±30 | **withdrawn — errata E-1** | RFC 1 §6.2's floor governs; `EPOCH_WINDOW = 45` and W is not independently configurable (§27, swept 2026-09-01) |
 | 5 | W MUST NOT be below ±14 | met | 45 |
 | 5.1 | MUST accept objects whose epoch falls within W of local time | met + tested | `TagTable::build` covers `pairwise_window` |
-| 5.1 | MUST NOT emit when median-of-peers time diverges by more than ±6 h | **unmet** | no median-of-peers estimate exists — recorded §11 |
+| 5.1 | MUST NOT emit when median-of-peers time diverges by more than ±6 h | **was unmet, now met — errata E-6** | `clock::PeerClock` fed one sample per exchange; `App::emit` is the only path a local object takes. One-epoch resolution, because the frozen header carries no creation time (§31) |
 | 7.1 | the envelope MUST NOT indicate which recipient key was used | met | §4.2's five keys carry no index |
 | 7.2 | inbox-tagged objects MUST be rate-capped per peer per epoch | **met — errata E-4** | capped per epoch by `MAX_INBOX_ATTEMPTS_PER_EPOCH`; the *per peer* dimension is withdrawn, because attributing an inbox-tagged object to a link is the provenance RFC 3 §12 forbids (§25, swept 2026-09-01) |
 | 7.4 | MUST cache failed `(id, epoch)` pairs | met + tested | `receive::Attempts` |
@@ -2358,13 +2358,13 @@ Derived by walking the rows, not by adding up prose:
 | document | rows | met | vacuous | unrepresentable | partly met | withdrawn | **unmet** |
 |---|---|---|---|---|---|---|---|
 | RFC 1 | 35 | 32 | 2 | — | — | — | **1** |
-| RFC 2 | 16 | 11 | 1 | — | 1 | 1 | **2** |
+| RFC 2 | 16 | 12 | 1 | — | 1 | 1 | **1** |
 | RFC 3 | 22 | 22 | — | — | — | — | 0 |
 | RFC 4 | 28 | 25 | 2 | 1 | — | — | 0 |
 | RFC 5 | 17 | 17 | — | — | — | — | 0 |
 | RFC 6 | 24 | 23 | — | — | — | 1 | 0 |
 | RFC 7 | 29 | 28 | — | — | — | 1 | 0 |
-| **total** | **171** | **158** | **5** | **1** | **1** | **3** | **3** |
+| **total** | **171** | **159** | **5** | **1** | **1** | **3** | **2** |
 
 **171, not 167.** The old figure was the sum of per-document totals that had
 each been written from a tally rather than counted from a table; four of the
@@ -2374,13 +2374,13 @@ done properly for the first time.
 
 ### What is actually unmet, now that the noise is gone
 
-Three rows, and only two of them are code:
+Three rows when this sweep ran; **two after §31 closed the first of them**, and
+only one of those two is code.
 
-- **RFC 2 §5.1 — median-of-peers time.** "MUST NOT emit when the estimate
-  diverges by more than ±6 h." Nothing in the tree computes it (`grep -i median`
-  finds nothing outside this document). A node with a wrong clock emits objects
-  with wrong expiries, and RFC 0 §6 makes the resulting non-delivery silent —
-  which is the shape of failure this project treats as most expensive.
+- ~~**RFC 2 §5.1 — median-of-peers time.**~~ **Closed the same day, in §31.**
+  It was unmet when this sweep ran: nothing computed the estimate. The table
+  above counts it as met, and the count is checked, so the two cannot drift
+  apart again.
 - **RFC 2 §8 — the in-flight-loss warning on correspondence-key rotation.**
   Unmet because there is no correspondence-key rotation verb to warn *from*.
   `onion rotate` is now the shape to copy: write the new state first, say
@@ -2431,3 +2431,126 @@ sits under.
 A cell whose verdict this test cannot classify is a failure rather than a
 default, so inventing a new verdict wording fails loudly instead of being
 silently counted as met.
+
+---
+
+## 31. RFC 2 §5.1's clock check, and a requirement that could not be met as written — 2026-09-01
+
+§30 left three unmet rows and said only two were code. This closes the first of
+those two, and closing it turned out to require an errata entry: **§5.1 names a
+mechanism RFC 1 §4.1 forbids.**
+
+### The requirement is not implementable at its stated resolution
+
+> The corpus is itself a clock: objects carry creation timestamps from many
+> independent senders…
+
+They do not. RFC 1 §4.1's routing header is titled *"frozen forever"* and
+carries `ver`, `class`, `size_bucket`, `flags`, `expiry_min` and `tag`. There is
+no creation time, and RFC 0 I-3 says "nothing else may be added". §5.1's ±6 h
+tolerance rests on a field the frozen document does not define.
+
+**The obvious repair is the wrong one.** Amending RFC 1 to carry a creation
+minute would put a precise emission time in the clear, on every object, in front
+of every relay. RFC 3 §12 already forbids *retaining* per-object arrival times
+as "a forensic reconstruction of the graph and its timing gradients"; writing
+the sender's own clock onto the wire hands the same gradients to everybody,
+permanently, and cannot be withdrawn once objects exist. The coarse check is not
+the achievable answer, it is the correct one — recorded as **errata E-6**.
+
+What a receiver can actually read is the `epoch` in the §4.2 envelope: key 0, in
+the clear, derived from the sender's clock at emission, one day wide. So the
+check detects divergence of **more than one day**, and the threshold is two
+epochs rather than one — a one-epoch difference is what a few minutes of skew
+looks like across midnight, and treating that as divergence would stop a
+correctly-set node for part of every day.
+
+What is given up is the 6–24 h window, which is also the least damaging: an
+expiry 45 days out shifted by half a day poisons nothing, while a clock wrong by
+weeks writes tags no peer computes and is caught easily.
+
+### One sample per exchange, because the obvious estimator measures the backlog
+
+A running median over received objects does not estimate the network's clock. It
+estimates **the age of the corpus being synced**: reconciliation moves history,
+so a node returning after a month receives a month of it, whose median epoch is
+a fortnight old. It would conclude its own clock was a fortnight fast and refuse
+to emit at exactly the moment it had most to say — the failure inverted.
+
+So the sample is the **maximum epoch within one exchange** — a peer with a
+correct clock almost always has something recent, and the newest thing it offers
+is a lower bound on its clock — and the estimate is the **median across
+exchanges**, which is the robustness §5.1 asks for: one peer lying about the
+time contributes one sample. There is a test for each half, including a majority
+of liars moving it, recorded as the bound rather than assumed away.
+
+This also keeps RFC 3 §12 intact. "From multiple peers" is satisfied by
+structure — one sample per exchange — and nothing records *which* peer any
+sample came from. No arrival time, no attribution, a bounded ring of integers in
+memory.
+
+**The sample is published by `Drop`, not by the caller.** There are two exchange
+drivers and four entry points between them, and "remember to report the clock
+afterwards" is the shape of rule this codebase has already been caught by twice.
+A view is constructed once per exchange and dropped when it ends, including when
+it ends by error.
+
+### Thirteen emission sites became one
+
+§5.1's requirement is about *all* emission, so a check at twelve of thirteen
+call sites satisfies nothing. The two paths were already cleanly separated and
+nobody had noticed: objects arriving from peers are admitted by
+`ExchangeView::put` on an exchange thread and never touch `App`, so **`App`'s
+thirteen ingest sites were already exactly this node's own emissions**.
+
+They now go through `App::emit`, which asks the clock first. `App::clock_refusal`
+is separate so the interface can report the state without emitting something to
+find out.
+
+The guard is a source scan — `the_only_ingest_in_this_file_is_the_one_inside_emit`
+— because this is the kind of requirement a behavioural test cannot hold: a
+fourteenth call site added next year would pass every behavioural test here and
+walk straight past the check. Probed by restoring one bypass, which fails.
+
+### Receiving is untouched, and that is §5.1's own argument
+
+> Emitting with a bad clock poisons other nodes' stores with wrong expiry, and
+> that damage cannot be undone. Receiving with a bad clock only hurts the node
+> itself.
+
+A diverged node keeps reconciling, keeps relaying, keeps taking delivery. It
+stops adding to the damage and nothing else, and the test asserts both halves —
+including that an object still lands in the corpus while emission is refused.
+
+A node with **no** estimate emits normally: §5.1's requirement is conditional on
+having a median-of-peers estimate, and a node that has spoken to nobody has
+none. Refusing there would stop a fresh node composing its first message, which
+no reading of §5.1 asks for.
+
+### `clock`, a report and never a setting
+
+There is nothing here to configure — the estimate is derived from traffic and
+the repair is the system clock, which is not Krab's to change. But an operator
+who cannot see the estimate cannot tell a refusal to emit from a node that has
+broken, so `clock` shows the local epoch, the peers' median, the drift, the
+verdict, and names E-6 for why the resolution is a day.
+
+### What is verified
+
+- **1298 tests**, zero failures, clippy clean under `-D warnings` across
+  `--all-features`.
+- §30's derived count is updated and `plan_counts.rs` agrees with it — the first
+  time a closure in this document has been checked against its own audit table
+  rather than assumed into it.
+
+### Still unmet after this
+
+- **RFC 2 §8** — the in-flight-loss warning on correspondence-key rotation.
+  Unmet because there is no correspondence-key rotation verb to warn *from*.
+- **RFC 1 §12** — two independent implementations agreeing on the conformance
+  vectors. Unmet by design; there is one implementation.
+
+And one partly met, unchanged: **RFC 2 §8's precomputation table as key
+material**. `App::tag_table` is a plain `Option<TagTable>` and not a
+`krab_lock::Held`, so the recognition table is pageable while the identity is
+not.

@@ -148,6 +148,97 @@ impl SharedCover {
     }
 }
 
+/// How many leading bytes of an object the clock estimate needs.
+///
+/// The 16-byte routing header, then the envelope's CBOR map head and its first
+/// key-value pair — key 0 is `epoch`, and RFC 1 §4.2 requires deterministic
+/// CBOR with ascending integer keys, so `epoch` is always the first thing in
+/// the body. Sixty-four bytes is generous for a map head, a small key and a
+/// `u64`, and reading a fixed prefix means this never holds a second copy of
+/// an object.
+const EPOCH_PREFIX: usize = 64;
+
+/// The tag epoch an object declares, or `None` if it does not declare one.
+///
+/// **Class 0 only.** A bulletin (class 1) has no envelope and no epoch; a
+/// `short` never reaches a store. Cover objects (emitted as class 0) do carry
+/// one, and that is correct rather than a leak: a dummy carries the epoch a
+/// real object of that moment would, which is exactly what makes it
+/// indistinguishable — and its emitter's clock is as good a sample as any
+/// other node's.
+fn declared_epoch(prefix: &[u8]) -> Option<u32> {
+    use krab_core::object::{Class, ROUTING_HEADER_LEN};
+    let header = RoutingHeader::parse(prefix).ok()?;
+    if Class::from_byte(header.class)? != Class::Sealed {
+        return None;
+    }
+    // The workspace's own strict decoder, on the map head and its first pair.
+    // `decode_envelope` would be the obvious call and cannot be used here:
+    // this is a *prefix*, so the ciphertext is missing and a complete decode
+    // must fail. Reading the leading key with the same `cbor::Reader` keeps
+    // there being one decoder — writing a second one by hand is how two
+    // decoders come to disagree about what a length means.
+    //
+    // RFC 1 §4.2 requires deterministic CBOR with ascending integer keys, so
+    // key 0 is first or the object is malformed and was refused anyway.
+    let body = prefix.get(ROUTING_HEADER_LEN..)?;
+    let mut r = krab_core::cbor::Reader::new(body);
+    let mut m = r.map().ok()?;
+    if m.key().ok()?? != 0 {
+        return None;
+    }
+    match m.value().ok()? {
+        krab_core::cbor::Item::Uint(v) => u32::try_from(v).ok(),
+        _ => None,
+    }
+}
+
+/// The median-of-peers clock estimate, shared with the exchange threads.
+///
+/// RFC 2 §5.1. Behind a lock for the same reason [`SharedCover`] is: the
+/// threads that see peers' objects are not the thread that decides whether
+/// this node may emit.
+#[derive(Clone, Default)]
+pub struct SharedClock(Arc<Mutex<krab_node::clock::PeerClock>>);
+
+impl SharedClock {
+    /// A fresh estimate, which has observed nothing and permits emission.
+    pub fn new() -> SharedClock {
+        SharedClock::default()
+    }
+
+    /// Record one exchange's highest observed epoch.
+    pub fn observe_exchange(&self, max_epoch: u32) {
+        self.with(|c| c.observe_exchange(max_epoch));
+    }
+
+    /// Whether this node may emit, given its local epoch.
+    pub fn verdict(&self, local_epoch: u32) -> krab_node::clock::Verdict {
+        self.with(|c| c.verdict(local_epoch))
+    }
+
+    /// The median epoch this node's peers appear to be in.
+    pub fn median(&self) -> Option<u32> {
+        self.with(|c| c.median())
+    }
+
+    /// How many exchanges have contributed.
+    pub fn samples(&self) -> usize {
+        self.with(|c| c.samples())
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut krab_node::clock::PeerClock) -> R) -> R {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g)
+    }
+}
+
+impl std::fmt::Debug for SharedClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SharedClock({:?} over {} exchanges)", self.median(), self.samples())
+    }
+}
+
 impl std::fmt::Debug for SharedCover {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SharedCover({} observations)", self.observations())
@@ -187,6 +278,17 @@ pub struct ExchangeView {
     /// Optional so an exchange can run without one — a locked node relaying
     /// for others still reconciles, and nothing there is emitting cover.
     cover: Option<SharedCover>,
+    /// The median-of-peers clock estimate — RFC 2 §5.1.
+    ///
+    /// One sample per exchange, published on drop rather than per object: a
+    /// running median over *objects* measures the age of the backlog, not the
+    /// network's clock, because reconciliation moves history.
+    clock: Option<SharedClock>,
+    /// The highest tag epoch any object in this exchange declared.
+    ///
+    /// A peer with a correct clock almost always has something recent, so the
+    /// newest thing it offers is a lower bound on its clock.
+    max_epoch: Option<u32>,
     /// Now, in minutes, for the retention window only.
     ///
     /// **Not `now_min`.** That field is the exchange's lower bound — `now`
@@ -238,6 +340,8 @@ impl ExchangeView {
         ExchangeView {
             store,
             now_min,
+            clock: None,
+            max_epoch: None,
             cover: None,
             carriage,
             filter,
@@ -256,6 +360,12 @@ impl ExchangeView {
     /// Record the shape of what this exchange accepts — RFC 1 §8.2.
     pub fn observing(mut self, cover: SharedCover) -> ExchangeView {
         self.cover = Some(cover);
+        self
+    }
+
+    /// Contribute this exchange to the median-of-peers clock — RFC 2 §5.1.
+    pub fn timing(mut self, clock: SharedClock) -> ExchangeView {
+        self.clock = Some(clock);
         self
     }
 
@@ -325,6 +435,25 @@ impl ExchangeView {
             Some(post) => self.carriage.accepts(&post.channel_id()),
             // A prekey batch or a roster — infrastructure, not content.
             None => true,
+        }
+    }
+}
+
+/// **The clock sample is published when the exchange ends, by `Drop`.**
+///
+/// Not by the caller. There are two exchange drivers and four entry points
+/// between them, and "remember to report the clock afterwards" is the shape of
+/// rule this codebase has already been caught by twice — a bound documented
+/// and uncalled. A view is constructed once per exchange and dropped when it
+/// finishes, including when it finishes by error, so this fires exactly once
+/// per exchange whatever happened in it.
+///
+/// An exchange that saw no sealed object contributes nothing rather than
+/// contributing a zero, which would drag the median to the Unix epoch.
+impl Drop for ExchangeView {
+    fn drop(&mut self) {
+        if let (Some(clock), Some(max)) = (&self.clock, self.max_epoch) {
+            clock.observe_exchange(max);
         }
     }
 }
@@ -439,6 +568,14 @@ impl Corpus for ExchangeView {
         // a length rather than a copy of the object: the shape is all §8.2
         // asks for, and holding the whole thing to read two fields would be a
         // second copy of every object that crosses a link.
+        // Read before `ingest` moves the bytes, like the shape below. Only the
+        // envelope's leading map is needed, and it is at a fixed offset, so
+        // this is a short prefix rather than a copy of the object.
+        let observed: Vec<u8> = if self.clock.is_some() {
+            bytes.iter().take(EPOCH_PREFIX).copied().collect()
+        } else {
+            Vec::new()
+        };
         let shape = self.cover.as_ref().and_then(|_| {
             let head: [u8; krab_core::object::ROUTING_HEADER_LEN] = bytes
                 .get(..krab_core::object::ROUTING_HEADER_LEN)?
@@ -491,6 +628,16 @@ impl Corpus for ExchangeView {
                 c.observe(&head, body_len);
             }
         }
+        // **RFC 2 §5.1's estimate, one object at a time.** The tag epoch is in
+        // the clear in the §4.2 envelope — it is the only emission-time value
+        // a receiver can read without a key, and it is what the sender's own
+        // clock produced. Only the maximum is kept; it is published once, when
+        // this view is dropped at the end of the exchange.
+        if let (Ok(_), Some(_)) = (&admitted, &self.clock) {
+            if let Some(epoch) = declared_epoch(&observed) {
+                self.max_epoch = Some(self.max_epoch.map_or(epoch, |m| m.max(epoch)));
+            }
+        }
         // **RFC 1 §11's other half.** "Rejection MUST be silent to the peer
         // beyond ordinary flow control, and MUST be counted per peer as a
         // quota signal (RFC 3)." The silence was implemented and the counting
@@ -525,6 +672,90 @@ mod tests {
     /// partitions the network along version lines and the partition is
     /// permanent, because the nodes that would bridge it are the ones offline
     /// for a month."
+    /// **RFC 2 §5.1: one clock sample per exchange, published on drop.**
+    ///
+    /// The maximum, not a per-object median — reconciliation moves history, so
+    /// a running median over objects measures the age of the backlog. A node
+    /// catching up after a month would conclude its own clock was a fortnight
+    /// fast and stop emitting at the moment it had most to say.
+    #[test]
+    fn an_exchange_contributes_its_newest_epoch_and_only_one_sample() {
+        let store = SharedStore::new(Store::new());
+        let clock = SharedClock::new();
+        {
+            let mut view = ExchangeView::new(
+                store.clone(),
+                NOW,
+                carry_all(),
+                crate::filter::Filter::unscoped(),
+                NOW,
+                krab_fabric::profile::MaxBucket(5),
+            )
+            .timing(clock.clone());
+
+            // Backlog first, then something recent — the order a manifest
+            // exchange delivers them in is not controlled by the receiver.
+            for (epoch, salt) in [(20_000u64, 1u8), (20_030, 2), (20_014, 3)] {
+                view.put(sealed_at(epoch, salt));
+            }
+            assert_eq!(
+                clock.samples(),
+                0,
+                "a sample was published before the exchange ended"
+            );
+        }
+        assert_eq!(clock.samples(), 1, "the drop did not publish");
+        assert_eq!(
+            clock.median(),
+            Some(20_030),
+            "the sample is not the newest epoch the exchange carried"
+        );
+    }
+
+    /// An exchange that carried no sealed object contributes nothing, rather
+    /// than contributing a zero that would drag the median to 1970.
+    #[test]
+    fn an_empty_exchange_contributes_no_clock_sample() {
+        let store = SharedStore::new(Store::new());
+        let clock = SharedClock::new();
+        {
+            let mut view = ExchangeView::new(
+                store.clone(),
+                NOW,
+                carry_all(),
+                crate::filter::Filter::unscoped(),
+                NOW,
+                krab_fabric::profile::MaxBucket(5),
+            )
+            .timing(clock.clone());
+            view.put(vec![0xEE; 64]);
+        }
+        assert_eq!(clock.samples(), 0);
+        assert_eq!(clock.median(), None);
+    }
+
+    /// A sealed object declaring `epoch`, as a peer would offer it.
+    fn sealed_at(epoch: u64, salt: u8) -> Vec<u8> {
+        use krab_core::object::Envelope;
+        let body = Envelope {
+            epoch,
+            tag_mode: 0,
+            suite: 1,
+            enc: &[salt; 32],
+            ciphertext: &[salt; 48],
+        }
+        .write();
+        let h = RoutingHeader {
+            version: 1,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: NOW + 10_000 + salt as u32,
+            tag: Tag([salt; 8]),
+        };
+        krab_core::object::canonical_bytes(&h, &body).unwrap()
+    }
+
     /// **RFC 1 §8.2: real traffic's shape is recorded where it arrives.**
     ///
     /// And only real traffic. The first version of this passed the *body*
