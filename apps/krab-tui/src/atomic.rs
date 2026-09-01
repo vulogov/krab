@@ -53,11 +53,27 @@ pub fn write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let tmp = temp_for(path);
 
     {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        // **Owner-only, set at creation and not afterwards.**
+        //
+        // Every file this program writes goes through here, and they were all
+        // landing at whatever the umask allowed — typically 0644, so the
+        // wrapped identity, the corpus, the peer credentials and the quota
+        // records were world-readable on a shared machine. The credentials are
+        // the sharpest case: RFC 3 §15 calls them "non-repudiable", so a
+        // readable one hands any local user the peer list *with cryptographic
+        // proof*.
+        //
+        // Set in the open flags rather than with a `chmod` afterwards, because
+        // a chmod leaves a window in which the file exists at the wider mode —
+        // short, and on a multi-user machine that is exactly who is watching.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
         f.write_all(contents)?;
         // The contents must reach the medium before the rename publishes them,
         // or the rename can land while the data has not.

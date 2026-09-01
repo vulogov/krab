@@ -214,6 +214,16 @@ pub fn write_params(path: &Path, p: &KekParams) -> Result<(), Error> {
     crate::atomic::write(path, &w.finish()).map_err(|_| Error::Io)
 }
 
+/// The largest Argon2 memory parameter a stored `params.cbor` may ask for.
+///
+/// One gibibyte, against RFC 7 §4.1's 64 MiB default. The file is read before
+/// the KEK exists and so is unauthenticated by construction; without a ceiling,
+/// anyone who can write it chooses this process's next allocation.
+///
+/// Generous rather than tight on purpose: a deployment that legitimately
+/// raised the parameter must not find its own node refusing to unlock.
+pub const MAX_ARGON2_M_KIB: u32 = 1 << 20;
+
 /// Read the KEK parameters.
 pub fn read_params(path: &Path) -> Result<KekParams, Error> {
     let bytes = std::fs::read(path).map_err(|_| Error::Absent)?;
@@ -222,7 +232,15 @@ pub fn read_params(path: &Path) -> Result<KekParams, Error> {
     let (mut m_kib, mut t, mut p, mut salt) = (None, None, None, None);
     while let Some(key) = m.key().map_err(|_| Error::Malformed)? {
         match (key, m.value().map_err(|_| Error::Malformed)?) {
-            (1, Item::Uint(v)) => m_kib = u32::try_from(v).ok(),
+            // **Bounded before it becomes an allocation.** `params.cbor` is
+            // read *before* any key exists, so it cannot be authenticated —
+            // that is what it is for. An unbounded `m_kib` therefore lets
+            // anyone who can write one file choose how many gibibytes Argon2
+            // asks for on the next unlock. The ceiling is generous against
+            // RFC 7 §4.1's 64 MiB and still refuses an address space.
+            (1, Item::Uint(v)) => {
+                m_kib = u32::try_from(v).ok().filter(|m| *m <= MAX_ARGON2_M_KIB)
+            }
             (2, Item::Uint(v)) => t = u32::try_from(v).ok(),
             (3, Item::Uint(v)) => p = u32::try_from(v).ok(),
             (4, Item::Bstr(b)) => salt = <[u8; 16]>::try_from(b).ok(),

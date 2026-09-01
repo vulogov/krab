@@ -270,6 +270,25 @@ impl<S: Read + Write> StreamSession<S> {
         }
     }
 
+    /// Write one raw chunk with a chosen marker.
+    ///
+    /// Test-only, and only because the thing worth testing is a chunk `send`
+    /// deliberately cannot produce: an empty `MORE`. A test that could only
+    /// speak through `send` could not reach the case at all.
+    #[cfg(test)]
+    fn write_chunk(&mut self, marker: u8, body: &[u8]) -> Result<(), Error> {
+        let mut framed = Vec::with_capacity(body.len() + 1);
+        framed.push(marker);
+        framed.extend_from_slice(body);
+        self.buf.resize(framed.len() + 16, 0);
+        let n = self
+            .noise
+            .write_message(&framed, &mut self.buf)
+            .map_err(|_| Error::Frame)?;
+        crate::frame::write_bytes(&mut self.stream, &self.buf[..n])?;
+        Ok(())
+    }
+
     /// The peer's static key, as presented and verified.
     pub fn peer_static(&self) -> Option<[u8; 32]> {
         self.noise
@@ -346,10 +365,17 @@ impl<S: Read + Write + Send> crate::Session for StreamSession<S> {
     /// Read one control message, reassembling it across transport messages.
     ///
     /// The accumulation is bounded by [`crate::frame::MAX_CONTROL`] — the same
-    /// number the writer is bounded by — so a peer cannot hold this end open
-    /// by sending `MORE` for ever. A message that reaches the bound without a
-    /// `LAST` is a peer exceeding what the protocol can express, which is a
-    /// closed session rather than a larger buffer.
+    /// number the writer is bounded by. A message that reaches the bound
+    /// without a `LAST` is a peer exceeding what the protocol can express,
+    /// which is a closed session rather than a larger buffer.
+    ///
+    /// **That bound alone did not stop a peer holding this end open**, and the
+    /// comment here used to say it did. It counts accumulated bytes, and a
+    /// `MORE` chunk with an empty body accumulates none — so the loop could
+    /// run for ever, one read-timeout per chunk, on a session that never
+    /// reaches `MAX_CONTROL`. An empty `MORE` is now refused: `send` marks
+    /// `MORE` only when another `MAX_CHUNK` chunk follows, so no conforming
+    /// writer produces one.
     fn recv(&mut self) -> Result<Option<krab_proto::control::Control>, Error> {
         let mut plain: Vec<u8> = Vec::new();
         loop {
@@ -376,6 +402,21 @@ impl<S: Read + Write + Send> crate::Session for StreamSession<S> {
             plain.extend_from_slice(body);
             match marker {
                 LAST => break,
+                // **A `MORE` that carries nothing is refused.**
+                //
+                // The bound above is on accumulated *bytes*, and a zero-length
+                // body accumulates none — so a peer sending `MORE` with an
+                // empty body could loop here for ever, one read-timeout per
+                // chunk, holding the session and its thread open. The doc
+                // comment on this function claimed that could not happen; it
+                // was a bound on the wrong quantity.
+                //
+                // Refusing costs nothing legitimate: `send` splits at
+                // `MAX_CHUNK` and marks `MORE` only when another chunk
+                // follows, so every conforming `MORE` body is exactly
+                // `MAX_CHUNK` bytes. An empty one is not a short write, it is
+                // a peer doing something the writer cannot produce.
+                MORE if body.is_empty() => return Err(Error::Frame),
                 MORE => continue,
                 _ => return Err(Error::Frame),
             }
@@ -483,6 +524,48 @@ mod tests {
             responder.join().unwrap(),
             Some(krab_proto::control::Control::Done)
         ));
+    }
+
+    /// **An empty `MORE` chunk is refused, and used to loop for ever.**
+    ///
+    /// The accumulation bound counts bytes, and a zero-length body adds none —
+    /// so a peer could send `MORE` with an empty body indefinitely, one
+    /// read-timeout per chunk, on a session that never approaches
+    /// `MAX_CONTROL`. The doc comment on `recv` asserted this could not
+    /// happen. It was a bound on the wrong quantity.
+    ///
+    /// Written against the raw chunk marker rather than through `send`,
+    /// because `send` cannot produce this: it marks `MORE` only when another
+    /// full chunk follows. That is also why refusing costs nothing
+    /// legitimate.
+    #[test]
+    fn an_empty_more_chunk_is_refused_rather_than_awaited() {
+        use crate::Session;
+        let (a_sk, a_pk) = generate_static().unwrap();
+        let (b_sk, b_pk) = generate_static().unwrap();
+        let (mut a_pipe, mut b_pipe) = pipe_pair();
+
+        let responder = std::thread::spawn(move || {
+            let noise = handshake_responder(&mut b_pipe, &b_sk, &a_pk).expect("responder");
+            let mut s = StreamSession::new(b_pipe, noise);
+            s.recv()
+        });
+
+        let noise = handshake_initiator(&mut a_pipe, &a_sk, &b_pk).expect("initiator");
+        let mut s = StreamSession::new(a_pipe, noise);
+        s.write_chunk(MORE, &[]).expect("the chunk goes out");
+        // Anything after it may fail on a broken pipe, and that is the point:
+        // the responder refuses at the first empty chunk and closes. Before
+        // the fix it accepted this one and waited for the next, so the failure
+        // to guard against is a *hang*, not an error — which is why the
+        // assertion is on the responder's return value and the writes after
+        // the first are allowed to fail.
+        let _ = s.send(&krab_proto::control::Control::Done);
+
+        assert!(
+            matches!(responder.join().unwrap(), Err(Error::Frame)),
+            "an empty MORE was accepted, so a peer can hold this session open"
+        );
     }
 
     /// RFC 4 §4.1's hard failure, on the initiator's side.

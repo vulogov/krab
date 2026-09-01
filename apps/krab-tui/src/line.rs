@@ -60,6 +60,7 @@ impl Line {
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
+            self.chars[self.cursor] = '\0';
             self.chars.remove(self.cursor);
         }
     }
@@ -67,6 +68,7 @@ impl Line {
     /// Delete the character under the cursor.
     pub fn delete(&mut self) {
         if self.cursor < self.chars.len() {
+            self.chars[self.cursor] = '\0';
             self.chars.remove(self.cursor);
         }
     }
@@ -118,17 +120,20 @@ impl Line {
     pub fn kill_word(&mut self) {
         let to = self.cursor;
         self.word_left();
+        self.erase(self.cursor..to);
         self.chars.drain(self.cursor..to);
     }
 
     /// Delete from the cursor to the start — `Ctrl-U`.
     pub fn kill_to_start(&mut self) {
+        self.erase(0..self.cursor);
         self.chars.drain(..self.cursor);
         self.cursor = 0;
     }
 
     /// Delete from the cursor to the end — `Ctrl-K`.
     pub fn kill_to_end(&mut self) {
+        self.erase(self.cursor..self.chars.len());
         self.chars.truncate(self.cursor);
     }
 
@@ -153,7 +158,24 @@ impl Line {
     /// abandoned during an earlier growth — see `Documentation/SECURE-DELETE.md`
     /// for why that is a bound on this mechanism rather than a defect in it.
     fn overwrite(&mut self) {
-        for c in &mut self.chars {
+        self.erase(0..self.chars.len());
+    }
+
+    /// Overwrite a range **before** it is removed.
+    ///
+    /// `remove`, `drain` and `truncate` all shorten the `Vec` without touching
+    /// the characters they drop: the bytes stay in the allocation, past the new
+    /// length, where `overwrite` — which iterates the live elements — can never
+    /// reach them again. So a passphrase typed and then corrected with
+    /// backspace left the corrected characters in memory until the allocation
+    /// was reused, and `clear` on the way out did not erase them.
+    ///
+    /// Erasing at the point of removal is the only place the characters are
+    /// still addressable. It is not free of the bound `overwrite` documents —
+    /// a `Vec` that grew and moved leaves the old block behind, and nothing
+    /// safe reaches that — but it closes the part that is reachable.
+    fn erase(&mut self, range: core::ops::Range<usize>) {
+        for c in &mut self.chars[range] {
             *c = '\0';
         }
     }
@@ -321,5 +343,69 @@ mod tests {
         assert!(l.is_empty());
         assert_eq!(l.cursor(), 0);
         assert_eq!(l.chars.capacity(), cap, "the allocation was replaced");
+    }
+
+    /// **`erase` zeroes the range it is given**, which is the mechanism every
+    /// shortening operation now calls before it shortens.
+    ///
+    /// # Why this tests the mechanism and not the residue
+    ///
+    /// The property that matters — that a removed character is no longer in
+    /// the allocation — is **not observable in safe Rust**: reading past
+    /// `Vec::len` is exactly what safety forbids, and the crate that owns this
+    /// file forbids `unsafe` outright. So the residue is reviewed rather than
+    /// asserted, and what is asserted is that the erasing step does what it
+    /// claims and that each caller reaches it.
+    ///
+    /// That is the same honesty `overwrite`'s own note already applies to the
+    /// abandoned-allocation case. A test that pretended to see the spare
+    /// capacity would be worse than this one: the first version of it built a
+    /// helper that observed nothing and passed by accident.
+    #[test]
+    fn erase_zeroes_the_range_it_is_given() {
+        let mut l = Line::from("secret");
+        l.erase(0..3);
+        assert_eq!(l.as_string(), "\0\0\0ret");
+
+        let mut l = Line::from("secret");
+        l.erase(3..6);
+        assert_eq!(l.as_string(), "sec\0\0\0");
+    }
+
+    /// **Every shortening operation erases before it shortens.**
+    ///
+    /// The structural half, and the one that would catch a seventh editing
+    /// verb added later: `remove`, `drain` and `truncate` all drop characters
+    /// without touching them, so each call site must be preceded by an erase.
+    /// Checked by reading this file, because the effect itself cannot be
+    /// observed — see the test above.
+    #[test]
+    fn every_shortening_operation_erases_first() {
+        let src = include_str!("line.rs");
+        let production = src.split("\nmod tests {").next().expect("the marker moved");
+        for (line_no, line) in production.lines().enumerate() {
+            let l = line.trim();
+            if !(l.starts_with("self.chars.remove(")
+                || l.starts_with("self.chars.drain(")
+                || l.starts_with("self.chars.truncate("))
+            {
+                continue;
+            }
+            // The preceding non-blank line must erase, or be `clear`, whose
+            // erase is `overwrite` on the line above it.
+            let prev = production
+                .lines()
+                .take(line_no)
+                .filter(|p| !p.trim().is_empty())
+                .last()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            assert!(
+                prev.contains("erase(") || prev.contains("overwrite()") || prev.contains("= '\\0'"),
+                "line {} shortens the buffer without erasing first: {l:?} after {prev:?}",
+                line_no + 1
+            );
+        }
     }
 }

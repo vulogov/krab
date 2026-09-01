@@ -56,6 +56,22 @@ lto = true
 # through a partially-zeroized structure, running `Drop` on key material in an
 # unknown state.
 panic = "abort"
+# **Arithmetic behaves the same in the shipped binary as under test.**
+#
+# Without this, `debug` panics on overflow and `release` wraps — so every
+# `never_panics_on_arbitrary_input` test in this tree was exercising semantics
+# the shipped binary does not have, and a wrap found by fuzzing would have been
+# a panic in the test and a silently wrong number in production. The numbers
+# that would wrap are expiries and sizes: an expiry that wraps is an object
+# stored for ever, and RFC 0 §6 makes that silent.
+#
+# The cost is stated rather than waved at: with `panic = "abort"` above, an
+# overflow is an abort, so this converts a silently wrong result into a
+# terminated node. That is the right direction for this program — the code
+# already prefers loud failure everywhere else, and the arithmetic on
+# attacker-controlled values is deliberately `saturating_*` so a reachable
+# overflow is a bug rather than an input.
+overflow-checks = true
 # Reproducible builds are `build-reproducible.sh`, not a profile key.
 #
 # Cargo's own `trim-paths` would be the right mechanism and is not stable in

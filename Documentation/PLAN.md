@@ -2787,3 +2787,116 @@ Zero unmet is a smaller claim than it looks and is worth deflating deliberately:
 And separately from the audit entirely: the contact endpoint's `ADD_ONION` and
 `del_onion` have never run against a real tor, and `VirtualLock` has still
 never executed.
+
+---
+
+## 34. An external review, and two findings that were wrong — 2026-09-01
+
+A review of ~78k lines against the RFC series. Seven of its findings were real
+and are fixed below; the two ranked **High** were not, and saying why matters
+more than the fixes, because both are the failure mode this document keeps
+recording under other names.
+
+### The two High findings, checked and refuted
+
+**"The per-day ingress quota is never called."** It is called, in
+`ExchangeView::put` — `acct.spend.admits(…)` before the object lands and
+`acct.spend.charge(…)` after, at `shared.rs:545-561`. `budget_for` never
+returns `None` (a comment there records that returning `None` for a
+credential-less link *was* the defect, and was fixed), and both exchange
+threads apply it with `view.with_budget(b)`. `spend.bytes` and `spend.objects`
+are incremented by `charge`; `refused` and `rejected` are incremented beside
+it. The peers panel is reporting real numbers.
+
+**"Exchange loops bound message count, not ingress bytes… ≈ 17 GB in one
+session."** The bound is not in the loop, it is in `Corpus::put`, which for
+this application *is* `ExchangeView::put` and applies the quota above. A peer's
+ingress is capped at `LinkTerms::bytes_per_day` — 100 MiB by default, and an
+eighth of that for a fresh peering under RFC 3 §6.2's standing dial. Not 17 GB;
+12.5 MiB for a new peer.
+
+Both findings read `krab-node/src/exchange.rs`, saw `take(corpus, bytes)` with
+no byte accounting, and concluded there was none. The accounting is one layer
+down, in the `Corpus` implementation the application supplies. **This is E-2's
+error exactly** — "a claim of absence asserted over a set that was not the
+whole set" — now made four times in this project, twice by audits looking for
+precisely that mistake, and this time by a reader who had not seen E-2.
+
+That is not a criticism of the review. It is the argument for the review: the
+same reading that produced two wrong findings produced seven right ones, and a
+codebase where the byte bound lives two files from the loop it bounds is a
+codebase that will keep generating this report.
+
+### What was real, and fixed
+
+| finding | fix |
+|---|---|
+| No file mode is ever set | `atomic::write` opens at `0o600`; directories at `0o700` |
+| `overflow-checks` unset in release | set, with the trade-off documented |
+| Zero-length `MORE` chunks hold a session open | refused; the doc comment claimed they could not |
+| Passphrase leaked into an un-zeroized `String` | bound, used, overwritten |
+| `Line::overwrite` misses what editing removed | erased at the point of removal |
+| Unbounded Argon2 `m_kib` from unauthenticated `params.cbor` | capped at 1 GiB |
+| tor cookie survives in `hex()`'s temporary | bound and overwritten |
+| `enforce_retention`'s comment contradicted its code | comment corrected — the code was right |
+
+**The `MORE` one is the sharpest.** `StreamSession::recv` bounds *accumulated
+bytes* against `MAX_CONTROL`, and its own doc comment said "a peer cannot hold
+this end open by sending `MORE` for ever". A chunk with an empty body
+accumulates nothing, so the bound never trips and the loop runs indefinitely,
+one read-timeout per chunk. The bound was on the wrong quantity and the comment
+asserted the property it did not have. `send` marks `MORE` only when another
+full chunk follows, so refusing an empty one costs nothing a conforming writer
+can produce.
+
+**`overflow-checks` is the one with a cost worth stating.** Without it, `debug`
+panicked on overflow and `release` wrapped — so every
+`never_panics_on_arbitrary_input` test ran under arithmetic the shipped binary
+did not have. With it, and with `panic = "abort"`, an overflow is a terminated
+node rather than a silently wrong number. That is the right direction here: the
+numbers that would wrap are expiries and sizes, an expiry that wraps is an
+object stored for ever, and RFC 0 §6 makes that silent.
+
+**`Line`'s residue is fixed as far as safe Rust reaches, and no further.**
+`remove`, `drain` and `truncate` shorten the `Vec` without touching what they
+drop, and `overwrite` iterates only live elements — so a corrected passphrase
+stayed in the allocation past the length. Each operation now erases before it
+shortens. The property cannot be *asserted*: reading past `Vec::len` is what
+safety forbids, and this crate forbids `unsafe`. So the test checks the
+mechanism and a source scan checks that every shortening call site reaches it.
+The first version of that test built a helper that observed nothing and passed
+by accident, which is worse than not testing it.
+
+### The one that was neither right nor wrong
+
+**"Two X25519s and two ChaCha20-Poly1305s in the binary… the check fails."**
+The duplication is real and is `snow`'s, and `CRYPTO-BOUNDARIES.md` documents
+it at length as the accepted cost of RFC 4 §4.1's Noise IK — including the
+audit cost, "roughly a day of someone's attention, and it is stated here so
+nobody discovers it during an audit and wonders what else was not mentioned".
+The check the reviewer ran was the binary's; the documented check is scoped to
+`krab-crypto`, and it passes.
+
+But **nothing ran either check**. It was two `cargo tree` invocations in prose,
+which is the same shape as a bound documented and never called. That is now
+`krab-node/tests/crypto_boundaries.rs`: one version of each primitive inside
+`krab-crypto`, at most two inside `krab-fabric`, and `snow` must still be in
+the tree — because if it leaves, the documented reason for the second copy is
+gone and `CRYPTO-BOUNDARIES.md` needs editing before the test does. Versions
+are deliberately not pinned; a test about cryptographic boundaries that fails
+on a routine bump teaches people to edit the test.
+
+### Not acted on, and why
+
+- **No fuzz target on `picture::transcode`.** Correct, and the module says so
+  itself. It is the right next fuzz target and is not a one-line change.
+- **The 64-bit spoken fingerprint.** Correct, and spec-level: RFC 3 §11 defines
+  it and the implementation is conformant. Changing it is an RFC amendment, not
+  a commit.
+- **`cargo audit` was not run.** It is not installed here either. It belongs in
+  CI beside the Windows job, and is recorded rather than done.
+
+### What is verified
+
+**1308 tests**, zero failures, clippy clean under `-D warnings` across
+`--all-features`. The release profile builds with `overflow-checks = true`.

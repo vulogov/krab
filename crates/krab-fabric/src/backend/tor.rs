@@ -445,7 +445,14 @@ impl TorProcess {
                 cookie_path.display()
             ))
         })?;
-        let mut cmd = format!("AUTHENTICATE {}", hex(&cookie));
+        // The hex is bound and erased too. `format!("… {}", hex(&cookie))`
+        // copies it into `cmd` and drops the temporary with the cookie still
+        // in it — `cmd` was overwritten below and the intermediate was not,
+        // which left 64 bytes of the control-port credential on the heap for
+        // every start.
+        let mut encoded = hex(&cookie);
+        let mut cmd = format!("AUTHENTICATE {encoded}");
+        overwrite(&mut encoded);
         cookie.iter_mut().for_each(|b| *b = 0);
 
         let r = self.command(&cmd);

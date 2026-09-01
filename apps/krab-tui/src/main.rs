@@ -244,6 +244,32 @@ fn rotation_warning() -> String {
     )
 }
 
+/// Create a directory owner-only — 0700 on unix, the platform default elsewhere.
+///
+/// Krab's directories name peers. `peers/<short id>/` is a list of who this
+/// node corresponds with, readable from the directory entries alone without
+/// opening a single file — which is the disclosure RFC 3 §8.4 exists to purge
+/// on termination and would be pointless to purge if any local user could have
+/// read it all along.
+///
+/// The mode is set at creation. `create_dir_all` applies it only to components
+/// it actually creates, which is the right behaviour: a home the operator made
+/// themselves keeps the mode they chose.
+fn create_dir_private(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
 /// Seconds since the Unix epoch, or zero if the clock is before it.
 fn now_seconds() -> u64 {
     std::time::SystemTime::now()
@@ -2290,10 +2316,26 @@ impl App {
     /// Keep the corpus inside the retention this node agreed to — RFC 3 §6.
     ///
     /// **Nothing called `evict_to` before**, so the corpus grew without bound
-    /// and `Policy::retention_bytes` — negotiated in the peer-link, signed by
-    /// both parties — was decorative. A node agreeing to hold a gigabyte would
-    /// hold whatever arrived, which on a fast link is a disk-filling attack
-    /// requiring no more than a generous peer.
+    /// and `Policy::retention_bytes` was decorative. A node would hold whatever
+    /// arrived, which on a fast link is a disk-filling attack requiring no more
+    /// than a generous peer.
+    ///
+    /// # The cap is the default policy's, not any peering's, and that is
+    /// deliberate
+    ///
+    /// This comment used to say `retention_bytes` was "negotiated in the
+    /// peer-link, signed by both parties", beside code reading
+    /// `Policy::default()`. The code is right and the sentence was wrong:
+    /// **the corpus is one store shared by every peering**, so there is no
+    /// single negotiated number that governs it. A per-peer figure is a
+    /// promise about a link; the disk is not per link.
+    ///
+    /// Picking the strictest peering's value would let one peer shrink what
+    /// this node holds for everyone else; picking the most generous would let
+    /// one peer raise the ceiling for everyone. Neither is a negotiation
+    /// either party consented to. So the global cap is local policy, and the
+    /// per-peering figures bound what each *link* may deliver — which is RFC 3
+    /// §6's quota, enforced in `ExchangeView::put`.
     ///
     /// Expiry runs first: RFC 5 §3 evicts under *capacity* pressure and RFC 1
     /// §11's I2 drops objects under *time* pressure, and dropping what is
@@ -7828,7 +7870,7 @@ impl App {
     /// Create a peer's directory. Called before the first write into it.
     fn ensure_peer_dir(&self, peer: &str) -> Result<(), String> {
         let d = self.home.join("peers").join(peer);
-        std::fs::create_dir_all(&d).map_err(|e| format!("could not create {}: {e}", d.display()))
+        create_dir_private(&d).map_err(|e| format!("could not create {}: {e}", d.display()))
     }
 
     /// Every peer this node has a link for.
@@ -10988,7 +11030,7 @@ impl App {
     /// directory on the command line, and a typo that silently produces an
     /// empty node is the failure this prevents.
     fn ensure_home(&self) -> Result<(), String> {
-        std::fs::create_dir_all(&self.home)
+        create_dir_private(&self.home)
             .map_err(|e| format!("could not create {}: {e}", self.home.display()))
     }
 
@@ -11271,9 +11313,16 @@ impl App {
         let Some(id) = &mut self.identity else {
             return Err("no identity to open a store for".into());
         };
-        let kek = id
-            .kek(self.passphrase.as_string().as_bytes())
-            .map_err(|e| format!("could not derive the key: {e:?}"))?;
+        // **Bound, used, overwritten.** `as_string` allocates a fresh `String`
+        // on the heap, and a temporary dropped inline is freed with the
+        // passphrase still in it — the one place on this path that did not
+        // erase it. The `take()` callers in `advance_init_step` already do
+        // this; this one was missed because it reads the field rather than
+        // consuming it.
+        let mut typed = self.passphrase.as_string();
+        let derived = id.kek(typed.as_bytes());
+        overwrite(&mut typed);
+        let kek = derived.map_err(|e| format!("could not derive the key: {e:?}"))?;
         let before = id.hierarchy.records().len();
         self.epoch_key = Some(
             id.hierarchy
