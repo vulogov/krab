@@ -11055,6 +11055,32 @@ mod tests {
         );
     }
 
+    /// Total bytes across the corpus's **segment files**.
+    ///
+    /// # Why not `metadata(dir).len()`
+    ///
+    /// That is the size of the directory *inode*, which is a filesystem detail
+    /// and not a fact about the corpus. This test used it and passed on macOS
+    /// for an accidental reason: APFS grows a directory inode about 32 bytes
+    /// per entry, so adding a segment file moved the number. On ext4 a
+    /// directory is one 4096-byte block until it needs a second, so `before`
+    /// and `after` were both 4096 and the assertion failed — which is what the
+    /// first Linux CI run reported.
+    ///
+    /// The corpus became a directory of per-segment files, and nothing
+    /// revisited the one test that measured it as a single file. The honest
+    /// measure is what those files hold, and it is the same on every platform.
+    fn corpus_bytes(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
     fn type_command(a: &mut App, s: &str) {
         a.ui.focus_command();
         for c in s.chars() {
@@ -13552,7 +13578,7 @@ mod tests {
         type_command(&mut a, &format!("send {b_id} this must outlive the process"));
 
         let corpus = b.path(artifact::Artifact::Corpus);
-        let before = std::fs::metadata(&corpus).map(|m| m.len()).unwrap_or(0);
+        let before = corpus_bytes(&corpus);
 
         let (sa, sb) = session_pair();
         a.links.connect(&b_id, profile_named("tcp").unwrap());
@@ -13589,10 +13615,10 @@ mod tests {
         );
 
         // The pane has it. The question is whether the disk does.
-        let after = std::fs::metadata(&corpus).map(|m| m.len()).unwrap_or(0);
+        let after = corpus_bytes(&corpus);
         assert!(
             after > before,
-            "the corpus on disk did not grow: {before} -> {after}. \
+            "the corpus on disk did not grow: {before} -> {after} bytes. \
              Received mail is lost when the process exits."
         );
 
