@@ -4,8 +4,17 @@
 cargo +nightly fuzz run cbor     # the CBOR reader (RFC 1 §4.3)
 cargo +nightly fuzz run object   # header, envelope, padding (RFC 1 §4, §8.1)
 cargo +nightly fuzz run control  # the wire protocol (RFC 4 §4.2, RFC 5)
-cargo +nightly fuzz run ingest   # RFC 1 §11's I1–I6 postconditions
+cargo +nightly fuzz run ingest   # RFC 1 §11's I1-I6 postconditions
+cargo +nightly fuzz run picture fuzz/corpus/picture fuzz/seeds/picture
 ```
+
+**`picture` needs its seeds, and the difference is not marginal.** `corpus/` is
+gitignored, so a fresh checkout starts a target with nothing — and for the
+image parsers that means almost every input dies on the magic bytes before
+reaching a decoder. Measured: 972 covered blocks unseeded, **3 373 with the
+seeds**, on the same target and the same machine. The seeds are seven small
+real images in `seeds/picture/`, checked in because they are the difference
+between fuzzing two image parsers and fuzzing two magic-byte comparisons.
 
 `fuzz` is excluded from the workspace: `cargo fuzz` builds under nightly with
 sanitiser flags, and the workspace release profile sets `panic = "abort"` per
@@ -27,6 +36,36 @@ tested at every truncation offset and against single-byte flips — which is the
 argument for fuzzing over hand-written robustness tests, made concretely.
 
 After the fix, `control` ran 37 668 225 executions clean.
+
+## `picture` — 2026-09-01
+
+RFC 8 §6's pipeline: two third-party parsers, on bytes a peer chose, which the
+module's own comment calls "historically the richest source of remote code
+execution". It is the largest attack surface in the system and it had **no
+target** — not by oversight but by structure. `picture` was a module of the
+interface *binary*, and `cargo fuzz` cannot depend on a binary crate.
+
+`krab-picture` is that module as a library, and it is the substantive part of
+this change; the target is what it bought.
+
+| run | corpus | executions | coverage | result |
+|---|---|---|---|---|
+| unseeded | empty | 6 243 897 | 972 blocks | clean |
+| unseeded, continued | discovered | 5 840 921 | 972 blocks | clean |
+| **seeded** | 7 real images | 325 679 | **3 373 blocks** | clean |
+
+The seeded run is three and a half times the coverage at a fiftieth of the
+execution rate, which is the shape to expect: the earlier runs were fast
+because they were rejecting, and the last one is slow because it is decoding,
+downscaling and re-encoding. **Twelve million fast executions found less than
+three hundred thousand slow ones reached**, which is the argument for checking
+seeds in rather than trusting a target's run count.
+
+What the target asserts beyond "did not crash" is the postcondition RFC 8 §6
+actually requires: the output is a PNG this implementation produced, within
+`MAX_OBJECT` and `MAX_PIXELS`, no larger than the input declared, and **not
+containing the input**. A `transcode` that passed attacker bytes through would
+satisfy every crash test and defeat the requirement entirely.
 
 ## What the targets check beyond "does not panic"
 

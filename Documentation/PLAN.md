@@ -2888,8 +2888,9 @@ on a routine bump teaches people to edit the test.
 
 ### Not acted on, and why
 
-- **No fuzz target on `picture::transcode`.** Correct, and the module says so
-  itself. It is the right next fuzz target and is not a one-line change.
+- ~~**No fuzz target on `picture::transcode`.**~~ **Done in §35**, and it was
+  not a one-line change for a structural reason: the module lived in a binary
+  crate, which `cargo fuzz` cannot depend on.
 - **The 64-bit spoken fingerprint.** Correct, and spec-level: RFC 3 §11 defines
   it and the implementation is conformant. Changing it is an RFC amendment, not
   a commit.
@@ -2900,3 +2901,86 @@ on a routine bump teaches people to edit the test.
 
 **1308 tests**, zero failures, clippy clean under `-D warnings` across
 `--all-features`. The release profile builds with `overflow-checks = true`.
+
+---
+
+## 35. `picture` becomes a crate, and gets the fuzz target — 2026-09-01
+
+§34 recorded "no fuzz target on `picture::transcode`" as correct and not a
+one-line change. The reason it was not one line is worth stating, because it is
+the finding rather than an obstacle to it: **`picture` was a module of the
+interface binary, and `cargo fuzz` cannot depend on a binary crate.**
+
+So the largest attack surface in the system — two third-party image parsers, on
+bytes a peer chose, in a module whose own comment calls them "historically the
+richest source of remote code execution" — was the one thing in the tree that
+could not be fuzzed, and was unfuzzable *by construction* rather than by
+anybody deciding not to.
+
+### The move
+
+`crates/krab-picture`. The module needed it: it was already self-contained —
+one external symbol, `krab_fabric::profile::LinkProfile` in `carriable` — and
+zero coupling to any sibling interface module. A file that could have been a
+crate all along, sitting where it could not be reached.
+
+The binary no longer links `png` or `zune-jpeg` at all; they are dependencies
+of `krab-picture` and dev-dependencies of `krab-tui`, where tests build
+fixtures. A fixture builder is not an attack surface: those bytes come from the
+test file, not from a peer.
+
+### What the target asserts, beyond not crashing
+
+A crash is a finding on its own and needs no assertion. What needs asserting is
+the property the rest of the system leans on, and it is RFC 8 §6's actual
+requirement rather than a proxy for it:
+
+> The client MUST NOT validate an image. It MUST decode and re-encode it, and
+> **MUST transmit the re-encoded bytes.**
+
+So the output is fed back through the module's own header reader and checked:
+it is a PNG this implementation produced, within `MAX_OBJECT` and `MAX_PIXELS`,
+no larger than the input declared — and **it does not contain the input**. A
+`transcode` that passed attacker bytes through would satisfy every "did not
+crash" test ever written and defeat the requirement completely. A polyglot that
+survived re-encoding shows up in that assertion and nowhere else.
+
+`dimensions` is called on every input too, including the ones `transcode`
+refuses: it runs before the pixel cap, so a panic there is reachable by anyone
+who can send a picture, decodable or not.
+
+### The seeds, and why they are checked in
+
+| run | corpus | executions | coverage | result |
+|---|---|---|---|---|
+| unseeded | empty | 6 243 897 | 972 blocks | clean |
+| unseeded, continued | discovered | 5 840 921 | 972 blocks | clean |
+| **seeded** | 7 real images | 325 679 | **3 373 blocks** | clean |
+
+**Twelve million unseeded executions reached less than a third of what three
+hundred thousand seeded ones did.** Unseeded, almost every input dies on a
+magic-byte comparison before a decoder is entered — so the first two runs were
+fast because they were rejecting, and the third is fifty times slower because
+it is actually decoding, downscaling and re-encoding.
+
+`fuzz/corpus/` is gitignored, so without checked-in seeds every fresh checkout
+would repeat the first row and report millions of clean executions against two
+parsers it never entered. `fuzz/seeds/picture/` is seven files and 28 KB.
+
+That is also a correction to how this project has been reading its own fuzz
+results: the table in `fuzz/README.md` counts executions, and executions are
+not coverage. The `control` crash found in under sixteen thousand runs is the
+same lesson from the other direction.
+
+### What is verified
+
+**1308 tests**, zero failures, clippy clean under `-D warnings` across
+`--all-features`; `krab-picture`'s own 21 tests moved with it and pass. The
+fuzz target ran clean at 3 373 covered blocks.
+
+### Still not done
+
+`cargo audit` is still not installed here and still belongs in CI beside the
+Windows job. And a clean fuzz run is evidence, not proof: 325 679 executions is
+a few minutes, and the targets that found something in this project found it
+early. This one should run for hours in CI, not for four minutes on a laptop.

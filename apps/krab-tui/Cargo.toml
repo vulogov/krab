@@ -34,14 +34,12 @@ getrandom = "0.2"
 # RFC 8 §6's picture pipeline. Pure Rust, and pinned exactly like everything
 # else in this tree — see `Documentation/REPRODUCIBLE-BUILDS.md`.
 #
-# **These are the attack surface.** RFC 8 §6 says so in as many words: image
-# parsers are historically the richest source of remote code execution, which
-# is why nothing here validates and everything is re-encoded. Two decoders is
-# two parsers; the alternative is a format nobody can send.
-png = "=0.18.1"
-zune-jpeg = "=0.5.15"
-# For the CRC in `picture`'s bomb fixtures. Already in the tree via `png`.
-crc32fast = "=1.5.0"
+# **The attack surface moved out of this crate.** RFC 8 §6 calls image parsers
+# "historically the richest source of remote code execution", and they were in
+# the interface binary — where `cargo fuzz` cannot reach them, because it cannot
+# depend on a binary crate. `krab-picture` is the same code as a library, and
+# `fuzz_targets/picture.rs` is what that bought.
+krab-picture = { workspace = true }
 # Memory hygiene, not cryptography. `krab-crypto`'s single-boundary rule is
 # about the primitives an auditor must review; `zeroize` is a volatile-write
 # helper already in the tree transitively, and a hand-rolled loop under this
@@ -49,3 +47,12 @@ crc32fast = "=1.5.0"
 zeroize = "1"
 ratatui = "0.29"
 crossterm = "0.28"
+
+[dev-dependencies]
+# **Test fixtures only.** The production binary no longer links an image
+# parser — `krab-picture` does, and it is the only crate that should. Tests
+# here build PNGs to feed through it, and a fixture builder is not an attack
+# surface: the bytes come from this file, not from a peer.
+png = "=0.18.1"
+# The CRC for the decompression-bomb fixture below it.
+crc32fast = "=1.5.0"

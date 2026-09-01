@@ -1,0 +1,22 @@
+[package]
+name = "krab-picture"
+description = "RFC 8 §6's picture pipeline — decode, cap, re-encode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# **The attack surface, and now the only crate that carries it.** RFC 8 §6:
+# image parsers are historically the richest source of remote code execution.
+# It lived in the interface binary, which is why the one module the code itself
+# names as most dangerous had no fuzz target — `cargo fuzz` cannot depend on a
+# binary crate. It has one now.
+png = "=0.18.1"
+zune-jpeg = "=0.5.15"
+# For the CRC in the bomb fixtures.
+crc32fast = "=1.5.0"
+# `carriable` answers a question about a link, and the link profile lives here.
+krab-fabric = { workspace = true }

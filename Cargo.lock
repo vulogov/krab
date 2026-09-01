@@ -750,6 +750,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "krab-picture"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "krab-fabric",
+ "png",
+ "zune-jpeg",
+]
+
+[[package]]
 name = "krab-proto"
 version = "0.1.0"
 dependencies = [
@@ -786,13 +796,13 @@ dependencies = [
  "krab-fabric",
  "krab-lock",
  "krab-node",
+ "krab-picture",
  "krab-proto",
  "krab-store",
  "png",
  "ratatui",
  "unicode-width 0.2.0",
  "zeroize",
- "zune-jpeg",
 ]
 
 [[package]]

@@ -63,7 +63,11 @@ mod negotiate;
 mod peering;
 mod peers;
 mod persist;
-mod picture;
+// The picture pipeline is its own crate — see `krab-tui/Cargo.toml` on why.
+// Aliased rather than renamed at every call site: the module path is what the
+// code and its comments have always said, and the move is about where the
+// parsers are compiled, not about what they are called.
+use krab_picture as picture;
 mod pin;
 mod prekeys;
 mod quota;

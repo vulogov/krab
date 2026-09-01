@@ -17,6 +17,9 @@ krab-core = { path = "../crates/krab-core" }
 krab-crypto = { path = "../crates/krab-crypto" }
 krab-proto = { path = "../crates/krab-proto" }
 krab-store = { path = "../crates/krab-store" }
+# RFC 8 §6's parsers. This dependency is the reason `picture` is a crate: the
+# module lived in the interface binary, and `cargo fuzz` cannot reach one.
+krab-picture = { path = "../crates/krab-picture" }
 
 [[bin]]
 name = "cbor"
@@ -42,6 +45,13 @@ bench = false
 [[bin]]
 name = "ingest"
 path = "fuzz_targets/ingest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "picture"
+path = "fuzz_targets/picture.rs"
 test = false
 doc = false
 bench = false
