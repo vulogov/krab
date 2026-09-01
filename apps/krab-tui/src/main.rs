@@ -93,6 +93,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use entropy::OsRng;
+use krab_fabric::backend::tor::ONION_PORT;
 use identity::Identity;
 use keys::{Binding, Key, KeyPress};
 use krab_crypto::rng::Rng;
@@ -119,6 +120,20 @@ const TICK: Duration = Duration::from_millis(250);
 /// back.
 ///
 /// Bounded because the wait is on the UI thread: an unbounded accept is a hung
+/// The shortest mean interval between cover objects — RFC 1 §5.3.
+///
+/// A minute. Below that the emitter stops being a privacy measure and becomes
+/// a bandwidth problem: SIM-0 puts ordinary ingress at ~0.063 MB/day per node
+/// per node, and a dummy every few seconds swamps it — which is itself a
+/// signal, since a node emitting far more than the network's own rate stands
+/// out for exactly that.
+const COVER_MIN_S: u64 = 60;
+
+/// The longest. A day, past which the emitter hides nothing: cover works by
+/// there being enough of it that a real object is not conspicuous, and one a
+/// day is not enough of anything.
+const COVER_MAX_S: u64 = 86_400;
+
 /// interface with no way to cancel it.
 const ANSWER_WAIT_S: u64 = 30;
 
@@ -722,6 +737,46 @@ struct App {
     links: LinkTable,
     /// The corpus, reachable from background exchanges.
     store: shared::SharedStore,
+    /// The two rotation counters — sync and contact, RFC 4 §5.2 and RFC 3
+    /// §9.2. Loaded from the sealed onion record at `start-tor`.
+    onion_counters: (krab_crypto::onion::Counter, krab_crypto::onion::Counter),
+    /// The contact endpoint's address while one is published — RFC 3 §9.2.
+    ///
+    /// `None` whenever no door is open, which is most of the time and is the
+    /// point: an endpoint that accepts strangers should not outlive the
+    /// arrangement to use it.
+    onion_contact: Option<String>,
+    /// Cover traffic — RFC 1 §5.3 and §8.2.
+    ///
+    /// Shared with the exchange threads, which record the shape of every real
+    /// object they accept. The emitter itself runs here, on its own Poisson
+    /// schedule.
+    cover: shared::SharedCover,
+    /// Mean seconds between dummies, or `None` when cover is off.
+    ///
+    /// **Off by default**, and that is a decision rather than an omission. RFC
+    /// 0 §7.3: "volume privacy requires cover traffic, and cover traffic is
+    /// unaffordable on a constrained link". A node that started emitting
+    /// dummies without being asked would spend an operator's LoRa duty cycle,
+    /// their metered link, or their battery, to buy a property they may not
+    /// need. RFC 8 §4.3's rule is that a setting with consequences is stated,
+    /// not assumed — so this is discoverable and unset, like the dead-man
+    /// timer and the panic wipe.
+    cover_mean_s: Option<u64>,
+    /// When the next dummy is due, drawn from the same exponential the
+    /// reconciliation schedule uses.
+    cover_next_s: u64,
+    /// `short` frames an exchange carried out — RFC 4 §8.
+    ///
+    /// Still sealed: the exchange thread has no key material, and only this
+    /// side holds the reservoir chunk the frame is keyed from. Drained,
+    /// opened, displayed, and dropped — §8's "MUST NOT be stored beyond
+    /// display" is honoured by there being nowhere for it to go.
+    #[allow(clippy::type_complexity)]
+    shorts: (
+        std::sync::mpsc::Sender<(String, Vec<Vec<u8>>)>,
+        std::sync::mpsc::Receiver<(String, Vec<Vec<u8>>)>,
+    ),
     /// Finished exchanges, reported back from their threads.
     exchanges: (
         std::sync::mpsc::Sender<activity_log::Event>,
@@ -825,6 +880,12 @@ impl Default for App {
             allowed: krab_fabric::backend::listener::Allowed::default(),
             links: LinkTable::new(),
             store: shared::SharedStore::new(krab_store::index::Store::new()),
+            onion_counters: (0, 0),
+            onion_contact: None,
+            cover: shared::SharedCover::new(),
+            cover_mean_s: None,
+            cover_next_s: 0,
+            shorts: std::sync::mpsc::channel(),
             exchanges: std::sync::mpsc::channel(),
             // Four hours. RFC 5 §6.1 fixes the shape, not the mean; this is a
             // starting point a deployment tunes.
@@ -1111,37 +1172,45 @@ impl App {
         // The permanent address. Generated on first use and sealed; read back
         // every time after, so the `.onion` a peer wrote down keeps working.
         let root_path = self.path(artifact::Artifact::OnionRoot);
-        let (root, fresh) = match persist::read_onion_root(&root_path, &onion_key) {
-            Ok(r) => (r, false),
-            Err(persist::Error::Absent) => {
-                let mut rng = OsRng;
-                (krab_crypto::onion::OnionRoot::generate(&mut rng), true)
-            }
-            Err(e) => {
-                tor.stop();
-                return format!("start-tor: cannot read the onion root: {e:?}");
-            }
-        };
+        let (root, sync_counter, contact_counter, fresh) =
+            match persist::read_onion_root(&root_path, &onion_key) {
+                Ok((r, s, c)) => (r, s, c, false),
+                Err(persist::Error::Absent) => {
+                    let mut rng = OsRng;
+                    (krab_crypto::onion::OnionRoot::generate(&mut rng), 0, 0, true)
+                }
+                Err(e) => {
+                    tor.stop();
+                    return format!("start-tor: cannot read the onion root: {e:?}");
+                }
+            };
         if fresh {
             let mut rng = OsRng;
-            if let Err(e) = persist::write_onion_root(&root_path, &root, &onion_key, &mut rng) {
+            if let Err(e) = persist::write_onion_root(
+                &root_path,
+                &root,
+                (sync_counter, contact_counter),
+                &onion_key,
+                &mut rng,
+            ) {
                 tor.stop();
                 return format!("start-tor: cannot store the onion root: {e:?}");
             }
         }
 
-        // Counter 0 until rotation is a verb. §5.2 wants it rotatable; the
-        // mechanism is in `krab_crypto::onion` and the operator-facing half is
-        // not written, which is recorded in PLAN.md rather than implied by a
-        // hard-coded zero with no comment.
-        let key = krab_crypto::onion::service_key(&root, 0);
+        // **The sync endpoint** — RFC 3 §9.2. Never published, restricted
+        // discovery, reconciliation behind it. Its counter comes from disk, so
+        // a rotation an operator performed survives the restart; storing
+        // nothing would revert the address to counter 0 at every start, which
+        // is a rotation nobody asked for.
+        let key = krab_crypto::onion::service_key(&root, sync_counter);
         let mut b64 = key.to_base64();
 
         let port = self.listen_port_for_onion();
         // **RFC 4 §5.2's restricted discovery.** One authorised client per
         // verified peering, derived rather than stored.
         let (clients, skipped) = self.onion_client_set();
-        let address = match tor.add_onion(&b64, 9001, port, &clients) {
+        let address = match tor.add_onion(&b64, ONION_PORT, port, &clients) {
             Ok(a) => a,
             Err(e) => {
                 crate::overwrite(&mut b64);
@@ -1161,6 +1230,7 @@ impl App {
             .map(|b| b.percent);
         self.tor = Some(tor);
         self.onion = Some(address.clone());
+        self.onion_counters = (sync_counter, contact_counter);
 
         let discovery = if clients.is_empty() {
             "\n\nThis service is UNRESTRICTED — you have no verified peerings, \
@@ -1188,7 +1258,7 @@ impl App {
             "tor started.\n\
              \n  binary     {binary}\
              \n  socks      127.0.0.1:{socks}\
-             \n  address    {address}:9001\
+             \n  address    {address}:{ONION_PORT}\
              \n  forwarding to 127.0.0.1:{port}\
              \n\n\
              Give peers the address above. It is derived, so it is the same \
@@ -1196,6 +1266,217 @@ impl App {
              Bootstrap takes tens of seconds; progress is on the status line.\
              {discovery}"
         )
+    }
+
+    /// `onion`, `onion rotate`, `onion contact [on|off]` — RFC 4 §5.2 and
+    /// RFC 3 §9.2.
+    ///
+    /// # The two endpoints are two services, not one with two names
+    ///
+    /// §9.2 asks for "a **contact endpoint** (accepts only peer-requests,
+    /// freely rotatable)" separated from "a **sync endpoint** (never
+    /// published, protected by Tor restricted discovery)". They differ in
+    /// three ways at once, and each one is load-bearing:
+    ///
+    /// - **different key**, under a different domain string, so no counter
+    ///   value can ever make one of them equal the other;
+    /// - **different discovery**, the sync endpoint carrying a `ClientAuthV3`
+    ///   set and the contact endpoint carrying none, because a stranger has no
+    ///   peering from which to derive an auth key;
+    /// - **different listener**, the contact endpoint mapped to the
+    ///   first-contact socket `peer meet` opens and nothing else, so what is
+    ///   behind it genuinely accepts only peer-requests.
+    ///
+    /// An implementation that published one address and called it both would
+    /// satisfy none of that: handing a stranger the sync address gives them
+    /// the reconciliation port, and no amount of restricted discovery helps
+    /// once the address is in their hands.
+    fn onion_command(&mut self, line: &str) -> String {
+        match arg(line, 1).as_deref() {
+            None => self.onion_report(),
+            Some("rotate") => self.onion_rotate(),
+            Some("contact") => match arg(line, 2).as_deref() {
+                Some("off") => self.onion_contact_close(),
+                _ => "usage: onion contact off\n\n\
+                      A contact endpoint is opened by `peer meet`, for the \
+                      length of that meeting, and closes itself when the \
+                      meeting ends. RFC 3 §9.2 makes it \"freely rotatable\"; \
+                      here it is rotated every time one is opened, so no two \
+                      strangers are ever given the same address."
+                    .into(),
+            },
+            Some(other) => format!("onion: {other:?} is not `rotate` or `contact`"),
+        }
+    }
+
+    fn onion_report(&self) -> String {
+        let (sync, contact) = self.onion_counters;
+        let mut out = String::from("onion\n\n");
+        match &self.onion {
+            Some(a) => out.push_str(&format!(
+                "  sync     {a}:{ONION_PORT}  (counter {sync})\n\
+                 \x20          never published; restricted discovery\n"
+            )),
+            None => out.push_str("  sync     not published — `start-tor` first\n"),
+        }
+        match &self.onion_contact {
+            Some(a) => out.push_str(&format!(
+                "  contact  {a}:{ONION_PORT}  (counter {contact})\n\
+                 \x20          OPEN — accepts strangers, peer-requests only\n"
+            )),
+            None => out.push_str(&format!(
+                "  contact  closed  (next counter {contact})\n\
+                 \x20          opened by `peer meet`, for that meeting only\n"
+            )),
+        }
+        out.push_str(
+            "\nThe two are separate services with separate keys (RFC 3 §9.2). \
+             Give a stranger the contact address; give a peer the sync \
+             address, and only after peering.",
+        );
+        out
+    }
+
+    /// Advance the sync endpoint's counter — RFC 4 §5.2's rotation.
+    ///
+    /// **This is destructive to reachability and says so.** Every peer holding
+    /// the old address loses it, and RFC 0 §6 makes that silent at their end:
+    /// they will see a node that has simply stopped answering. So the new
+    /// address is printed with the instruction to send it, and the old counter
+    /// is named so a rotation done by mistake can be undone — the derivation
+    /// is a pure function of root and counter, so counter *n−1* still gives
+    /// the old address.
+    fn onion_rotate(&mut self) -> String {
+        let Some(onion_key) = self.onion_key else {
+            return "locked — `unlock` first.".into();
+        };
+        let root_path = self.path(artifact::Artifact::OnionRoot);
+        let (root, sync, contact) = match persist::read_onion_root(&root_path, &onion_key) {
+            Ok(v) => v,
+            Err(persist::Error::Absent) => {
+                return "no onion root yet — `start-tor` creates one.".into()
+            }
+            Err(e) => return format!("cannot read the onion root: {e:?}"),
+        };
+        let Some(next) = sync.checked_add(1) else {
+            return "the sync counter is exhausted. That is 4 billion \
+                    rotations; if it is genuinely there, the root itself \
+                    should be replaced."
+                .into();
+        };
+
+        // Written before anything is published. A counter that advanced only
+        // in memory would revert at the next start, and the operator would
+        // have told peers an address this node no longer answers on.
+        let mut rng = OsRng;
+        if let Err(e) =
+            persist::write_onion_root(&root_path, &root, (next, contact), &onion_key, &mut rng)
+        {
+            return format!("cannot store the rotated counter: {e:?} — nothing was rotated");
+        }
+        self.onion_counters = (next, contact);
+
+        if self.tor.is_none() {
+            return format!(
+                "rotated to counter {next}. Tor is not running, so nothing is \
+                 published yet — `start-tor` will publish the new address.\n\n\
+                 Every peer holding the old address will find this node \
+                 unreachable, and will not be told why (RFC 0 §6). Send them \
+                 the new one."
+            );
+        }
+
+        let key = krab_crypto::onion::service_key(&root, next);
+        let mut b64 = key.to_base64();
+        // Both read `self` immutably, so they are resolved before the daemon
+        // is borrowed mutably below.
+        let port = self.listen_port_for_onion();
+        let (clients, _) = self.onion_client_set();
+        let published = self
+            .tor
+            .as_mut()
+            .expect("checked above")
+            .add_onion(&b64, ONION_PORT, port, &clients);
+        crate::overwrite(&mut b64);
+        let address = match published {
+            Ok(a) => a,
+            Err(e) => {
+                return format!(
+                    "the counter advanced to {next} and tor refused the new \
+                     service: {e}. `start-tor` again to publish it."
+                )
+            }
+        };
+        // The old service is withdrawn only once the new one is up, so there
+        // is no window in which neither answers.
+        if let Some(old) = self.onion.replace(address.clone()) {
+            if let Some(tor) = self.tor.as_mut() {
+                let _ = tor.del_onion(&old);
+            }
+        }
+        format!(
+            "rotated.\n\n  address  {address}:{ONION_PORT}  (counter {next})\n\n\
+             The old address is withdrawn. Every peer holding it will find \
+             this node unreachable and will not be told why (RFC 0 §6) — send \
+             them the new one.\n\n\
+             `onion rotate` again if this was a mistake: counter {sync} still \
+             derives the old address from the same root."
+        )
+    }
+
+    /// Publish a contact endpoint for one meeting — RFC 3 §9.2.
+    ///
+    /// Rotated on every open, which is what "freely rotatable" is for: two
+    /// strangers given the same contact address could each confirm the other
+    /// had been talking to this node, which is graph information handed out
+    /// for nothing.
+    ///
+    /// Returns the address, or `None` when tor is not running — in which case
+    /// `peer meet` is still perfectly usable over a plain address, and saying
+    /// so is better than refusing.
+    fn onion_contact_open(&mut self, target_port: u16) -> Option<String> {
+        let onion_key = self.onion_key?;
+        let root_path = self.path(artifact::Artifact::OnionRoot);
+        let (root, sync, contact) = persist::read_onion_root(&root_path, &onion_key).ok()?;
+        let next = contact.checked_add(1)?;
+
+        let mut rng = OsRng;
+        persist::write_onion_root(&root_path, &root, (sync, next), &onion_key, &mut rng).ok()?;
+        self.onion_counters = (sync, next);
+
+        let key = krab_crypto::onion::endpoint_key(
+            &root,
+            krab_crypto::onion::Endpoint::Contact,
+            next,
+        );
+        let mut b64 = key.to_base64();
+        // **No `ClientAuthV3`.** A stranger has no peering to derive an auth
+        // key from, so restricted discovery here would make the endpoint
+        // unreachable by exactly the people it exists for. The protection is
+        // that it is open for minutes, for one caller, and is never used again.
+        let published = self
+            .tor
+            .as_mut()?
+            .add_onion(&b64, ONION_PORT, target_port, &[]);
+        crate::overwrite(&mut b64);
+        let address = published.ok()?;
+        self.onion_contact = Some(address.clone());
+        Some(address)
+    }
+
+    /// Withdraw the contact endpoint. Called when a meeting ends, by any route.
+    fn onion_contact_close(&mut self) -> String {
+        let Some(address) = self.onion_contact.take() else {
+            return "no contact endpoint is open.".into();
+        };
+        match self.tor.as_mut() {
+            Some(tor) => match tor.del_onion(&address) {
+                Ok(()) => format!("contact endpoint {address} withdrawn."),
+                Err(e) => format!("tor refused to withdraw {address}: {e}"),
+            },
+            // Tor is gone, so the service went with it.
+            None => format!("contact endpoint {address} is gone with tor."),
+        }
     }
 
     /// The restricted-discovery client set — RFC 4 §5.2.
@@ -1373,6 +1654,9 @@ impl App {
             Some(mut t) => {
                 t.stop();
                 self.onion = None;
+                // Both endpoints go with the daemon. Leaving this set would
+                // make `onion` report a contact address that nothing answers.
+                self.onion_contact = None;
                 self.tor_bootstrap = None;
                 self.node.tor_bootstrap = None;
                 "tor stopped. The onion address is unpublished; it will be the \
@@ -1394,7 +1678,7 @@ impl App {
             .as_ref()
             .and_then(|a| a.rsplit(':').next())
             .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(9001)
+            .unwrap_or(ONION_PORT)
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -1702,6 +1986,8 @@ impl App {
         // Provenance for what the schedule did. Aggregates only, no clock —
         // RFC 3 §12, and `activity_log`'s module note on why.
         self.drain_exchanges();
+        self.drain_shorts();
+        self.tick_cover();
         for peer in &due {
             let short = short_id(peer);
             // Re-key before reconciling. A peering whose ratchet has fallen
@@ -1947,6 +2233,8 @@ impl App {
         let view_store = self.store.clone();
         let carriage = self.roster.carriage;
         let done = self.exchanges.0.clone();
+        let shorts = self.shorts.0.clone();
+        let cover = self.cover.clone();
         let name = peer.to_string();
         self.inbound_ticks = ACTIVITY_GLYPH_TICKS;
         std::thread::spawn(move || {
@@ -1959,7 +2247,10 @@ impl App {
                     scope,
                     retention_now,
                     max_bucket,
-                );
+                )
+                // RFC 1 §8.2: the shape of real traffic, recorded where real
+                // traffic actually arrives.
+                .observing(cover);
             // Cloned, so the totals can be folded back after the drivers
             // return: the view sees only objects it accepted, and RFC 3 §12's
             // novelty ratio needs the ones it declined as duplicates too.
@@ -1995,6 +2286,15 @@ impl App {
             if let (Some(b), Ok(m)) = (&account, &outcome) {
                 let mut a = b.spend.lock().unwrap_or_else(|e| e.into_inner());
                 a.spend.offered = a.spend.offered.saturating_add(m.offered as u64);
+            }
+            // RFC 4 §8's frames, out to the interface. Sent before the event
+            // so that a message survives even if the exchange then failed —
+            // it was already delivered, and dropping it because the sync went
+            // wrong afterwards would be losing something somebody typed.
+            if let Ok(m) = &outcome {
+                if !m.shorts.is_empty() {
+                    let _ = shorts.send((name.clone(), m.shorts.clone()));
+                }
             }
             let event = match outcome {
                 Ok(moved) => activity_log::Event::Reconciled {
@@ -2066,6 +2366,8 @@ impl App {
         // is a decision the operator made, not one the exchange makes.
         let carriage = self.roster.carriage;
         let done = self.exchanges.0.clone();
+        let shorts = self.shorts.0.clone();
+        let cover = self.cover.clone();
         let name = peer.to_string();
         // An exchange is about to put bytes on the link in both directions.
         // Set here rather than on completion: the thread runs for minutes on
@@ -2083,7 +2385,10 @@ impl App {
                     scope,
                     retention_now,
                     max_bucket,
-                );
+                )
+                // RFC 1 §8.2: the shape of real traffic, recorded where real
+                // traffic actually arrives.
+                .observing(cover);
             // Cloned, so the totals can be folded back after the drivers
             // return: the view sees only objects it accepted, and RFC 3 §12's
             // novelty ratio needs the ones it declined as duplicates too.
@@ -2113,6 +2418,11 @@ impl App {
                 let mut a = b.spend.lock().unwrap_or_else(|e| e.into_inner());
                 a.spend.offered = a.spend.offered.saturating_add(m.offered as u64);
             }
+            if let Ok(m) = &outcome {
+                if !m.shorts.is_empty() {
+                    let _ = shorts.send((name.clone(), m.shorts.clone()));
+                }
+            }
             let event = match outcome {
                 Ok(moved) => activity_log::Event::Reconciled {
                     peer: name,
@@ -2128,6 +2438,207 @@ impl App {
             let _ = done.send(event);
         });
         None
+    }
+
+    /// Emit one cover object if the Poisson schedule says so — RFC 1 §5.3.
+    ///
+    /// # It takes `now` and entropy, and nothing else
+    ///
+    /// Exactly like [`krab_node::scheduler::Scheduler`], and for the same
+    /// reason: a dummy emitted *because* the operator did something is not
+    /// cover, it is a second copy of the signal. There is no parameter here
+    /// through which mail, focus, queue depth or lock state could reach the
+    /// decision.
+    ///
+    /// # Nothing is emitted until real traffic has been seen
+    ///
+    /// §8.2 requires cover to match the bucket distribution of real traffic,
+    /// and a node that has observed none has no distribution to match.
+    /// Inventing one — uniform over buckets, say — produces exactly the
+    /// "trivially separable" traffic §8.2 forbids, and separable cover is
+    /// worse than none: an observer who can strip it learns which objects were
+    /// real *and* that this node runs cover at all.
+    fn tick_cover(&mut self) {
+        let Some(mean) = self.cover_mean_s else {
+            return;
+        };
+        let now_s = now_seconds();
+        if self.cover_next_s == 0 {
+            self.cover_next_s = self.draw_cover_next(now_s, mean);
+            return;
+        }
+        if now_s < self.cover_next_s {
+            return;
+        }
+        self.cover_next_s = self.draw_cover_next(now_s, mean);
+
+        let epoch = now_epoch();
+        // Emitted with the expiry a real object of this epoch would carry —
+        // it is in the clear, so a dummy with a distinctive one is a dummy
+        // anyone can pick out.
+        let Some(bytes) = self
+            .cover
+            .emit(epoch.0 as u64, expiry_for(epoch), &mut OsRng)
+        else {
+            return;
+        };
+        let id = krab_crypto::object_id(&bytes);
+        // Into this node's own corpus, where reconciliation will offer it to
+        // peers like anything else. A dummy that never left would hide
+        // nothing.
+        let now_min = epoch.0 * 1440;
+        if self
+            .store
+            .with(|s| s.ingest(id, bytes, now_min, u32::MAX))
+            .is_ok()
+        {
+            self.save_corpus();
+        }
+    }
+
+    fn draw_cover_next(&self, now_s: u64, mean: u64) -> u64 {
+        let mut e = [0u8; 8];
+        OsRng.fill(&mut e);
+        krab_node::scheduler::poisson_next(now_s, mean, u64::from_le_bytes(e))
+    }
+
+    /// `cover [on <seconds> | off]` — RFC 1 §5.3.
+    fn cover_command(&mut self, line: &str) -> String {
+        match arg(line, 1).as_deref() {
+            None => {
+                let seen = self.cover.observations();
+                match self.cover_mean_s {
+                    None => format!(
+                        "cover is OFF.\n\n\
+                         `cover on <seconds>` emits dummy objects on a Poisson \
+                         schedule of that mean, indistinguishable from sealed \
+                         mail to anyone but this node (RFC 1 §5.3).\n\n\
+                         It is off by default because it is not free: RFC 0 §7.3 \
+                         says volume privacy \"requires cover traffic, and cover \
+                         traffic is unaffordable on a constrained link\". On TCP \
+                         or Tor it is affordable; on LoRa it is not, and nothing \
+                         here overrides a link profile that says so.\n\n\
+                         {seen} real object shape(s) observed so far — cover \
+                         cannot start until there is a distribution to match."
+                    ),
+                    Some(mean) => {
+                        let due = self.cover_next_s.saturating_sub(now_seconds());
+                        format!(
+                            "cover is ON, mean {mean}s.\n\n\
+                             {seen} real object shape(s) observed; next dummy in \
+                             about {due}s. The interval is exponential, so that \
+                             is a draw and not a countdown — watching it tells \
+                             you nothing about the next one."
+                        )
+                    }
+                }
+            }
+            Some("off") => {
+                self.cover_mean_s = None;
+                self.cover_next_s = 0;
+                "cover is OFF. Dummies already in the corpus stay there until \
+                 they expire — withdrawing them would be a signal of its own."
+                    .into()
+            }
+            Some("on") => {
+                let mean = arg(line, 2).and_then(|w| w.parse::<u64>().ok());
+                let Some(mean) = mean.filter(|m| (COVER_MIN_S..=COVER_MAX_S).contains(m)) else {
+                    return format!(
+                        "usage: cover on <seconds>\n\n\
+                         Mean seconds between dummies, {COVER_MIN_S}–{COVER_MAX_S}. \
+                         Below the floor the emitter is a bandwidth problem \
+                         rather than a privacy measure; above the ceiling it \
+                         emits so rarely that it hides nothing."
+                    );
+                };
+                self.cover_mean_s = Some(mean);
+                self.cover_next_s = self.draw_cover_next(now_seconds(), mean);
+                let seen = self.cover.observations();
+                let mut out = format!(
+                    "cover is ON, mean {mean}s.\n\n\
+                     Dummies are class 0, not class 2 — RFC 1 §5.3 requires \
+                     them to be indistinguishable from sealed mail, and a \
+                     distinct class byte would make every one of them \
+                     separable by reading one byte."
+                );
+                if seen == 0 {
+                    out.push_str(
+                        "\n\nNothing will be emitted yet: no real traffic has \
+                         been observed, so there is no bucket distribution to \
+                         match (RFC 1 §8.2). Cover that does not match is \
+                         worse than none — an observer who strips it learns \
+                         which objects were real. It will start on its own \
+                         once mail has crossed this node.",
+                    );
+                }
+                out
+            }
+            Some(other) => format!("cover: {other:?} is not `on` or `off`"),
+        }
+    }
+
+    /// Drain `short` frames an exchange carried out, open them, show them.
+    ///
+    /// # Displayed and then gone
+    ///
+    /// RFC 4 §8: a `short` "MUST NOT be stored beyond display". So the
+    /// plaintext goes into the output pane and into nothing else — not the
+    /// inbox, not the corpus, not the activity log, which is where a
+    /// well-meaning "just record that one arrived" would put a message body
+    /// next to a peer name. The log gets a count and no text.
+    ///
+    /// A frame that does not open is not an error worth showing: the key is
+    /// this epoch's chunk, and a peer whose reservoir has drifted produces
+    /// exactly this. It is counted, so a link that can never be read is
+    /// visible as a number rather than as silence.
+    fn drain_shorts(&mut self) {
+        let mut shown: Vec<String> = Vec::new();
+        let mut unreadable = 0usize;
+        while let Ok((peer, frames)) = self.shorts.1.try_recv() {
+            let Some((key, tag, link)) = self.short_keying(&peer) else {
+                unreadable += frames.len();
+                continue;
+            };
+            for frame in frames {
+                match krab_crypto::short::open(key.expose(), &link, &frame) {
+                    // **The tag is checked, not merely carried.** It is four
+                    // bytes of the pairwise tag, so a frame that authenticates
+                    // under this link's key but names another peering is a
+                    // confusion worth refusing rather than displaying.
+                    Ok((head, body)) if head.tag == tag => {
+                        let text = String::from_utf8_lossy(&body).into_owned();
+                        shown.push(format!("{peer} · {text}"));
+                    }
+                    _ => unreadable += 1,
+                }
+            }
+        }
+        if shown.is_empty() && unreadable == 0 {
+            return;
+        }
+        let mut out = String::new();
+        if !shown.is_empty() {
+            out.push_str("short\n\n");
+            for line in &shown {
+                out.push_str(&format!("  {line}\n"));
+            }
+            out.push_str(
+                "\nNot mail. Nothing kept a copy of this — it is gone when \
+                 this pane clears (RFC 4 §8).",
+            );
+        }
+        if unreadable > 0 {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&format!(
+                "{unreadable} short message(s) could not be opened. The link \
+                 key is this epoch's reservoir chunk (RFC 7 §6), so a peering \
+                 that has drifted reads exactly like this — `peer rekey` is \
+                 the repair."
+            ));
+        }
+        self.output = out;
     }
 
     /// Drain finished exchanges. Never blocks.
@@ -6947,6 +7458,7 @@ impl App {
                     self.output = format!(
                         "usage: connect <peer> <transport> [address]\n\n  \
                          tcp      host:port\n  \
+                         tor      <address>.onion — needs `start-tor`\n  \
                          serial   {}\n  \
                          modem    same as serial\n  \
                          courier  no address — use `pack` and `import`\n\n\
@@ -7001,6 +7513,9 @@ impl App {
             Command::Requests => self.output = self.requests(line),
             Command::Message => self.output = self.message(line),
             Command::Send => self.output = self.send(line),
+            Command::Short => self.output = self.short_command(line),
+            Command::Cover => self.output = self.cover_command(line),
+            Command::Onion => self.output = self.onion_command(line),
             Command::Request => self.output = self.peer_request(line),
             Command::Pack => self.output = self.pack(line),
             Command::Import => self.output = self.import(line),
@@ -7382,8 +7897,23 @@ impl App {
             until: Instant::now() + window,
             window,
         });
+        // **RFC 3 §9.2's contact endpoint**, if tor is running: an onion
+        // pointed at *this* socket and nothing else, so what is behind it
+        // genuinely accepts only peer-requests. Rotated on every open, because
+        // two strangers given the same contact address could each confirm the
+        // other had been talking to this node.
+        let contact = self.onion_contact_open(port).map(|a| {
+            format!(
+                "\n\nOver tor: **{a}:{ONION_PORT}** — give them this rather than \
+                 the address above, and it reveals nothing about where this \
+                 node is. It is a *contact* endpoint (RFC 3 §9.2): only \
+                 first contact answers on it, never reconciliation, and it is \
+                 withdrawn when this meeting ends. Your sync address stays \
+                 unpublished."
+            )
+        });
         format!(
-            "waiting on {addr} (port {port}) for {} minutes.\n\n\
+            "waiting on {addr} (port {port}) for {} minutes.{}\n\n\
              **This accepts whoever calls.** There is no peering yet, so there \
              is no key to check them against — that is what the fingerprint \
              comparison afterwards is for.\n\n\
@@ -7392,7 +7922,8 @@ impl App {
              `peer meet status` says whether it is still open.\n\n\
              Do not leave this running. A door left open for somebody who has \
              already arrived is a door nobody is watching.",
-            window.as_secs() / 60
+            window.as_secs() / 60,
+            contact.unwrap_or_default()
         )
     }
 
@@ -7402,7 +7933,14 @@ impl App {
             None => "nothing is waiting.".into(),
             Some(m) => {
                 m.running.store(false, std::sync::atomic::Ordering::Relaxed);
-                format!("closed {}. Nothing was peered.", m.addr)
+                let contact = self.onion_contact.is_some();
+                let _ = self.onion_contact_close();
+                let over_tor = if contact {
+                    " The contact endpoint is withdrawn."
+                } else {
+                    ""
+                };
+                format!("closed {}. Nothing was peered.{over_tor}", m.addr)
             }
         }
     }
@@ -7430,6 +7968,11 @@ impl App {
             let mine = peering::Contribution { r: m.mine.r };
             let m = self.meeting.take().expect("just checked");
             m.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            // The door and the endpoint in front of it close together. An
+            // onion left published after the socket behind it is gone is an
+            // address that answers and then hangs up, which reads to a caller
+            // as a node that is up and broken rather than one that is done.
+            let _ = self.onion_contact_close();
             self.output = match out {
                 Err(e) => meet_failure(e),
                 Ok(outcome) => {
@@ -7448,6 +7991,7 @@ impl App {
         if Instant::now() >= m.until {
             let m = self.meeting.take().expect("just checked");
             m.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.onion_contact_close();
             self.output = format!(
                 "closed {} — nobody called within {} minutes.\n\n\
                  `peer meet listen {}` opens it again.",
@@ -8639,6 +9183,179 @@ impl App {
     /// next scheduled reconciliation, which is what RFC 5 §6.1 requires and
     /// RFC 6 §2.7 reinforces: emitting on send would make transmission timing
     /// a function of composition timing.
+    /// `short <peer> <text>` — RFC 4 §8's link-local one-liner.
+    ///
+    /// # Why this refuses without a live link
+    ///
+    /// A `short` is **link-local by construction** (RFC 1 §5.5): no
+    /// identifier, no relay, no reconciliation. There is no corpus to leave it
+    /// in and no third party to carry it, so "queue it until the peer is
+    /// reachable" is not a smaller version of this feature — it is `send`, and
+    /// `send` already exists. Refusing is the honest answer.
+    ///
+    /// # The counter, and the thing that must never happen
+    ///
+    /// The nonce is `(link_id, ctr)`. A counter that restarted at zero under a
+    /// key that had not changed would repeat a nonce, which breaks
+    /// ChaCha20-Poly1305 outright. So the counter is written to disk
+    /// **before** the frame is sent, not after: a crash between the two costs
+    /// one unused counter value, and the opposite order costs a repeat.
+    fn short_command(&mut self, line: &str) -> String {
+        let Some(peer) = arg(line, 1) else {
+            return "usage: short <peer> <message>\n\n\
+                    A one-line message straight to a peer you are linked to \
+                    right now. It is not mail: nothing stores it, nothing \
+                    relays it, and it is gone when the pane clears (RFC 4 §8)."
+                .into();
+        };
+        let Some(text) = line
+            .splitn(3, char::is_whitespace)
+            .nth(2)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        else {
+            return format!("usage: short {peer} <message>");
+        };
+        if text.len() > krab_crypto::short::MAX_BODY {
+            return format!(
+                "{} bytes — a short carries at most {}. RFC 4 §8's ceiling is \
+                 55 bytes on the wire and 18 of them are framing. Use `send` \
+                 for anything longer.",
+                text.len(),
+                krab_crypto::short::MAX_BODY
+            );
+        }
+
+        let Some(id) = self.identity.as_ref() else {
+            return "locked — `unlock` first.".into();
+        };
+        if self.links.get(&peer).and_then(|l| l.session.as_ref()).is_none() {
+            return format!(
+                "no live link to {peer}. A short is link-local by construction \
+                 (RFC 1 §5.5) — there is nothing to queue it in and nobody to \
+                 relay it. `connect {peer} …` first, or use `send`."
+            );
+        }
+        let Some((key, tag, link)) = self.short_keying(&peer) else {
+            return format!(
+                "no reservoir chunk for {peer} at this epoch. The link key \
+                 comes from the pairwise reservoir (RFC 7 §6); `peer rekey \
+                 {peer}` if the peering has fallen behind."
+            );
+        };
+        let _ = id;
+
+        let epoch = now_epoch();
+        let (stored_epoch, ctr) = self.short_ctr(&peer);
+        let ctr = if stored_epoch == epoch.0 { ctr } else { 0 };
+        // Written first. See the note above on which way round a crash is
+        // allowed to fail.
+        if let Err(e) = self.write_short_ctr(&peer, epoch.0, ctr.saturating_add(1)) {
+            return format!("could not record the short counter: {e} — refusing to send");
+        }
+
+        // Absolute hours, matching the frozen header's absolute minutes.
+        let expiry_h = expiry_for(epoch) / 60;
+        let frame = match krab_crypto::short::seal(
+            key.expose(),
+            &link,
+            ctr,
+            &tag,
+            expiry_h,
+            text.as_bytes(),
+        ) {
+            Ok(f) => f,
+            Err(krab_crypto::short::Error::CounterExhausted) => {
+                return format!(
+                    "this link has used all {} counters this epoch. It rotates \
+                     when the epoch turns; `peer rekey {peer}` rotates it now.",
+                    krab_crypto::short::MAX_CTR
+                )
+            }
+            Err(e) => return format!("could not frame it: {e:?}"),
+        };
+
+        let Some(session) = self.links.get_mut(&peer).and_then(|l| l.session.as_mut()) else {
+            return format!("the link to {peer} went away before it could be sent");
+        };
+        match session.send(&krab_proto::control::Control::Short(frame)) {
+            Ok(()) => format!(
+                "sent to {peer}. Nothing kept a copy — not here, not there \
+                 beyond their pane, and nothing in between (RFC 4 §8)."
+            ),
+            Err(e) => {
+                self.links.failed(&peer);
+                format!("the link to {peer} refused it: {e}")
+            }
+        }
+    }
+
+    /// The message key, the 4-byte tag, and the link identifier for a peering.
+    ///
+    /// All three are derived, never stored: the key from this epoch's
+    /// reservoir chunk under its own domain, the tag from the same pairwise
+    /// tag sealed mail uses, and the identifier from the two node identifiers
+    /// in sorted order so both ends agree.
+    fn short_keying(&self, peer: &str) -> Option<(krab_crypto::Secret<32>, [u8; 4], [u8; 32])> {
+        let id = self.identity.as_ref()?;
+        let w = self.epoch_key?;
+        let card = std::fs::read(self.peer_path(peer, artifact::PeerFile::Link))
+            .ok()
+            .and_then(|b| peering::Card::decode(&b).ok())
+            .filter(|c| c.verify())?;
+
+        let epoch = now_epoch();
+        let chunk = std::fs::read(self.peer_path(peer, artifact::PeerFile::Reservoir))
+            .ok()
+            .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/reservoir", &sealed).ok())
+            .and_then(|raw| persist::decode_reservoir(&raw).ok())
+            .and_then(|(root, stored)| {
+                let mut r = krab_crypto::reservoir::Reservoir::new(root, stored);
+                if stored != epoch && !r.advance_to(epoch) {
+                    return None;
+                }
+                r.chunk(epoch)
+            })?;
+
+        let shared = id.agree_with(&krab_crypto::dh::PublicKey(card.correspondence_pk))?;
+        let full = krab_crypto::pairwise_tag(&shared, epoch);
+        let mut tag = [0u8; 4];
+        tag.copy_from_slice(&full.0[..4]);
+
+        let link = krab_crypto::short::link_id(&id.node_id(), &card.node_id());
+        Some((krab_crypto::short::link_key(&chunk), tag, link))
+    }
+
+    /// This link's `(epoch, next counter)`, or `(0, 0)` if it has never sent.
+    ///
+    /// An unreadable file reads as **exhausted**, not as zero: a counter whose
+    /// previous value cannot be established is one whose safe next value is
+    /// unknown, and guessing zero is the one answer certain to repeat a nonce
+    /// if the file was ever written.
+    fn short_ctr(&self, peer: &str) -> (u32, u16) {
+        let path = self.peer_path(peer, artifact::PeerFile::ShortCtr);
+        match std::fs::read(&path) {
+            Ok(b) if b.len() == 6 => (
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                u16::from_le_bytes([b[4], b[5]]),
+            ),
+            // Never written: nothing has been sent under any key.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0),
+            // Present and unreadable. Refuse by reporting the epoch as one
+            // that cannot match and the counter as spent.
+            _ => (u32::MAX, krab_crypto::short::MAX_CTR),
+        }
+    }
+
+    fn write_short_ctr(&self, peer: &str, epoch: u32, next: u16) -> std::io::Result<()> {
+        let mut out = [0u8; 6];
+        out[..4].copy_from_slice(&epoch.to_le_bytes());
+        out[4..].copy_from_slice(&next.to_le_bytes());
+        self.ensure_peer_dir(peer)
+            .map_err(std::io::Error::other)?;
+        atomic::write(&self.peer_path(peer, artifact::PeerFile::ShortCtr), &out)
+    }
+
     fn send(&mut self, line: &str) -> String {
         let Some(peer) = arg(line, 1) else {
             return "usage: send <peer>                  compose, then Ctrl-D\n\
@@ -9153,6 +9870,46 @@ impl App {
                         .map(Some)
                         .map_err(|e| format!("could not originate on {addr}: {e}"))
                 }
+            }
+            // Spelled as `links::profile_named` spells it, so the profile and
+            // the carrier can never disagree about which kinds are Tor.
+            "tor" | "socks" => {
+                // The onion address goes to tor and never to a resolver.
+                // Before this branch existed, `connect <peer> tor <addr>` fell
+                // through to TCP, where `TcpStream::connect` hands the name to
+                // the system resolver: the dial failed *and* told the local
+                // DNS server which hidden service this node was looking for,
+                // which is the one thing RFC 4 §5.2 exists to prevent.
+                // Outbound only, and checked **before** whether tor is
+                // running: inbound over an onion arrives at the listener the
+                // service forwards to, so answering here is impossible rather
+                // than merely unavailable. Telling an operator to `start-tor`
+                // when starting it would not help is a worse message than the
+                // true one.
+                if answer {
+                    return Err("a tor link cannot answer. Inbound reaches the \
+                                listener your onion service forwards to — run \
+                                `start-tor` and let the peer dial you."
+                        .into());
+                }
+                let Some(tor) = self.tor.as_ref() else {
+                    return Err("no tor is running — `start-tor` first. \
+                                A tor link dials through this node's own \
+                                SOCKS port and there is no other route to an \
+                                .onion address."
+                        .into());
+                };
+                let fabric = krab_fabric::backend::tor::TorFabric::new(
+                    krab_fabric::profile::LinkProfile::tor(),
+                    tor.socks_port(),
+                    addr.trim_end_matches('/'),
+                    id.noise_bytes(),
+                    card.noise_static_pk,
+                );
+                fabric
+                    .connect()
+                    .map(Some)
+                    .map_err(|e| format!("could not reach {addr} over tor: {e}"))
             }
             _ => {
                 let fabric = krab_fabric::backend::tcp::TcpFabric::new(
@@ -9753,6 +10510,8 @@ impl App {
             tor.stop();
         }
         self.onion = None;
+        self.onion_contact = None;
+        self.onion_counters = (0, 0);
         self.tor_bootstrap = None;
         self.node.tor_bootstrap = None;
 
@@ -10944,6 +11703,366 @@ mod tests {
         assert!(a_set[0]
             .chars()
             .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+    }
+
+    /// **Rotation persists.** A counter that advanced only in memory would
+    /// revert at the next start — and the operator would by then have told
+    /// their peers an address this node no longer answers on.
+    #[test]
+    fn rotating_the_onion_counter_survives_a_restart() {
+        let mut a = ready_node("onion-rotate");
+        // No root yet: rotation has nothing to advance and says so rather
+        // than inventing one, because a root created here would not be the
+        // root `start-tor` publishes.
+        type_command(&mut a, "onion rotate");
+        assert!(a.output.contains("no onion root"), "{}", a.output);
+
+        // Seed a root the way `start-tor` does.
+        let key = a.onion_key.expect("unlocked");
+        let root_path = a.path(artifact::Artifact::OnionRoot);
+        let root = krab_crypto::onion::OnionRoot::generate(&mut OsRng);
+        persist::write_onion_root(&root_path, &root, (0, 0), &key, &mut OsRng).unwrap();
+
+        type_command(&mut a, "onion rotate");
+        assert!(a.output.contains("counter 1"), "{}", a.output);
+        assert_eq!(a.onion_counters.0, 1);
+
+        // Read back from disk, as a restart would.
+        let (_, sync, contact) = persist::read_onion_root(&root_path, &key).unwrap();
+        assert_eq!(sync, 1, "the rotation did not reach the disk");
+        assert_eq!(contact, 0, "rotating sync moved the contact counter");
+    }
+
+    /// **The old record format still opens.** Refusing a 32-byte record would
+    /// take an existing node's permanent address away on upgrade — the
+    /// loudest possible failure for the least reason.
+    #[test]
+    fn an_onion_record_without_counters_reads_as_counter_zero() {
+        let a = ready_node("onion-legacy");
+        let key = a.onion_key.expect("unlocked");
+        let root_path = a.path(artifact::Artifact::OnionRoot);
+
+        // Exactly what the first version wrote: the root, sealed, alone.
+        let root = krab_crypto::onion::OnionRoot::generate(&mut OsRng);
+        let sealed = krab_crypto::kek::seal_under(
+            &key,
+            persist::CONTEXT_ONION,
+            root.as_bytes(),
+            &mut OsRng,
+        )
+        .unwrap();
+        std::fs::write(&root_path, &sealed).unwrap();
+
+        let (back, sync, contact) = persist::read_onion_root(&root_path, &key).unwrap();
+        assert_eq!(back.as_bytes(), root.as_bytes(), "the root did not survive");
+        assert_eq!((sync, contact), (0, 0));
+    }
+
+    /// **The two endpoints are reported as two things**, because they are.
+    /// An operator who hands a stranger the sync address has given away the
+    /// reconciliation port, and no amount of restricted discovery helps once
+    /// the address is in their hands.
+    #[test]
+    fn the_onion_report_separates_contact_from_sync() {
+        let mut a = ready_node("onion-report");
+        type_command(&mut a, "onion");
+        assert!(a.output.contains("sync"), "{}", a.output);
+        assert!(a.output.contains("contact"), "{}", a.output);
+        assert!(
+            a.output.contains("start-tor"),
+            "a node with no tor must say why nothing is published: {}",
+            a.output
+        );
+    }
+
+    /// Closing a contact endpoint that was never open is not an error, and
+    /// `peer meet` without tor still works — over a plain address.
+    #[test]
+    fn a_contact_endpoint_without_tor_is_absent_rather_than_a_failure() {
+        let mut a = ready_node("onion-contact-none");
+        assert!(a.onion_contact_open(40_000).is_none());
+        assert_eq!(a.onion_contact_close(), "no contact endpoint is open.");
+    }
+
+    /// **Cover is off unless asked for, and says why.**
+    ///
+    /// RFC 0 §7.3: cover traffic "is unaffordable on a constrained link". A
+    /// node that started emitting on its own would spend an operator's duty
+    /// cycle, metered link or battery to buy a property they may not need.
+    #[test]
+    fn cover_is_off_until_an_operator_turns_it_on() {
+        let mut a = ready_node("cover-off");
+        assert!(a.cover_mean_s.is_none());
+        type_command(&mut a, "cover");
+        assert!(a.output.contains("OFF"), "{}", a.output);
+
+        type_command(&mut a, "cover on 600");
+        assert_eq!(a.cover_mean_s, Some(600));
+        assert!(a.output.contains("class 0"), "{}", a.output);
+
+        type_command(&mut a, "cover off");
+        assert!(a.cover_mean_s.is_none());
+    }
+
+    /// The mean is bounded at both ends, and the refusal says what each bound
+    /// is for.
+    #[test]
+    fn the_cover_interval_is_bounded() {
+        let mut a = ready_node("cover-bounds");
+        for bad in [COVER_MIN_S - 1, COVER_MAX_S + 1, 0] {
+            type_command(&mut a, &format!("cover on {bad}"));
+            assert!(a.cover_mean_s.is_none(), "{bad} was accepted");
+            assert!(a.output.contains("usage"), "{}", a.output);
+        }
+    }
+
+    /// **§8.2's corollary: a node that has observed nothing emits nothing.**
+    ///
+    /// There is no distribution to match yet, and inventing one produces
+    /// exactly the trivially separable traffic §8.2 forbids. Separable cover
+    /// is worse than none — an observer who strips it learns which objects
+    /// were real, and that this node runs cover at all.
+    #[test]
+    fn cover_emits_nothing_until_real_traffic_has_been_seen() {
+        let mut a = ready_node("cover-cold");
+        type_command(&mut a, "cover on 60");
+        assert!(a.output.contains("Nothing will be emitted yet"), "{}", a.output);
+
+        let before = a.store.with(|s| s.len());
+        // Force the schedule past due and tick it repeatedly.
+        for _ in 0..20 {
+            a.cover_next_s = 1;
+            a.tick_cover();
+        }
+        assert_eq!(
+            a.store.with(|s| s.len()),
+            before,
+            "a node with no observed distribution emitted cover anyway"
+        );
+    }
+
+    /// **Once a distribution exists, dummies are emitted — as class 0.**
+    ///
+    /// RFC 1 §5.3 reserves class 2 and forbids using it: a distinct class byte
+    /// would make every cover object separable by reading one byte, which is
+    /// the exact opposite of the point.
+    #[test]
+    fn an_observed_distribution_produces_class_zero_cover() {
+        let mut a = ready_node("cover-warm");
+        type_command(&mut a, "cover on 60");
+
+        // Feed the emitter a real shape, as an exchange would.
+        let (id, bytes) = {
+            let h = krab_core::object::RoutingHeader {
+                version: 1,
+                class: 0,
+                size_bucket: 0,
+                flags: 0,
+                expiry_min: now_epoch().0 * 1440 + 10_000,
+                tag: krab_core::object::Tag([5; 8]),
+            };
+            let body = krab_core::object::example_sealed_body(3);
+            let b = krab_core::object::canonical_bytes(&h, &body).unwrap();
+            (krab_crypto::object_id(&b), b)
+        };
+        let body_len = krab_core::object::validate_body(&bytes).unwrap();
+        a.cover.observe(&bytes[..krab_core::object::ROUTING_HEADER_LEN], body_len);
+        assert_eq!(a.cover.observations(), 1);
+        let _ = id;
+
+        let before = a.store.with(|s| s.len());
+        a.cover_next_s = 1;
+        a.tick_cover();
+        let after = a.store.with(|s| s.len());
+        assert_eq!(after, before + 1, "no cover was emitted");
+
+        // The emitted object is class 0 and its bucket is the one observed.
+        let emitted: Vec<Vec<u8>> = a.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, i)| s.get(&i).map(|b| b.to_vec()))
+                .collect()
+        });
+        let dummy = emitted
+            .iter()
+            .find(|b| krab_crypto::object_id(b) != id)
+            .expect("the dummy is in the corpus");
+        let h = krab_core::object::RoutingHeader::parse(dummy).unwrap();
+        assert_eq!(h.class, 0, "cover must be class 0, never class 2");
+        assert_eq!(h.size_bucket, 0, "cover did not match the observed bucket");
+        assert!(
+            a.cover.is_mine(&krab_crypto::object_id(dummy)),
+            "the emitter did not record its own cover"
+        );
+    }
+
+    /// **Both ends of a peering derive the same `short` keying.**
+    ///
+    /// The analogue of the client-auth agreement test, and for the same
+    /// reason: if the two ends disagree, each computes a *valid* key and every
+    /// message fails to open. Neither end can tell that from the other being
+    /// quiet, and RFC 0 §6 guarantees nobody is told.
+    #[test]
+    fn both_ends_of_a_link_derive_the_same_short_keying() {
+        let (a, b, a_of_b, b_of_a) = peered_pair("short-keying");
+        let (a_key, a_tag, a_link) = a.short_keying(&b_of_a).expect("A has keying for B");
+        let (b_key, b_tag, b_link) = b.short_keying(&a_of_b).expect("B has keying for A");
+        assert_eq!(a_key.expose(), b_key.expose(), "the message keys differ");
+        assert_eq!(a_tag, b_tag, "the tags differ");
+        assert_eq!(a_link, b_link, "the link identifiers differ");
+
+        // And a frame sealed by one opens under the other.
+        let frame =
+            krab_crypto::short::seal(a_key.expose(), &a_link, 0, &a_tag, 400_000, b"on my way")
+                .unwrap();
+        let (head, body) = krab_crypto::short::open(b_key.expose(), &b_link, &frame).unwrap();
+        assert_eq!(body, b"on my way");
+        assert_eq!(head.tag, b_tag);
+    }
+
+    /// **A received short is displayed and stored nowhere.**
+    ///
+    /// RFC 4 §8's "MUST NOT be stored beyond display", checked on the two
+    /// places a message body would plausibly end up: the inbox and the corpus.
+    /// The exchange plumbing that carries the frame this far has its own test
+    /// in `krab_node::exchange`; this is the half that opens it.
+    #[test]
+    fn a_received_short_is_shown_and_kept_nowhere() {
+        let (mut a, b, a_of_b, b_of_a) = peered_pair("short-recv");
+        let (key, tag, link) = b.short_keying(&a_of_b).expect("B has keying for A");
+        let frame =
+            krab_crypto::short::seal(key.expose(), &link, 0, &tag, 400_000, b"running late")
+                .unwrap();
+
+        let before_inbox = a.messages.len();
+        let before_corpus = a.store.with(|s| s.len());
+        a.shorts.0.send((b_of_a.clone(), vec![frame])).unwrap();
+        a.drain_shorts();
+
+        assert!(
+            a.output.contains("running late"),
+            "the message was not displayed: {}",
+            a.output
+        );
+        assert_eq!(a.messages.len(), before_inbox, "a short reached the inbox");
+        assert_eq!(
+            a.store.with(|s| s.len()),
+            before_corpus,
+            "a short reached the corpus"
+        );
+        // And no peer name is paired with a body anywhere that persists.
+        assert!(
+            !a.log.recent(64).iter().any(|l| l.contains("running late")),
+            "the text reached the activity log"
+        );
+    }
+
+    /// A frame from a peering whose reservoir has drifted is counted, not
+    /// silently dropped — a link that can never be read shows as a number.
+    #[test]
+    fn an_unopenable_short_is_counted() {
+        let (mut a, _b, _a_of_b, b_of_a) = peered_pair("short-bad");
+        a.shorts.0.send((b_of_a, vec![vec![0x13; 30]])).unwrap();
+        a.drain_shorts();
+        assert!(
+            a.output.contains("could not be opened"),
+            "an unopenable short vanished: {}",
+            a.output
+        );
+    }
+
+    /// **A short needs a live link, and says so rather than queueing.**
+    ///
+    /// RFC 1 §5.5 makes it link-local by construction: no identifier, no
+    /// relay, no reconciliation. There is nothing to queue it in, so an
+    /// implementation that queued it would have quietly turned it into `send`.
+    #[test]
+    fn a_short_without_a_live_link_is_refused() {
+        let (mut a, _b, _a_of_b, b_of_a) = peered_pair("short-nolink");
+        type_command(&mut a, &format!("short {b_of_a} on my way"));
+        assert!(
+            a.output.contains("no live link"),
+            "a short with no link must refuse: {}",
+            a.output
+        );
+        // And nothing was written: a refused send must not spend a counter.
+        assert!(!a
+            .peer_path(&b_of_a, artifact::PeerFile::ShortCtr)
+            .exists());
+    }
+
+    /// **§8's ceiling is enforced with its own number.** 55 bytes on the wire,
+    /// 18 of them framing.
+    #[test]
+    fn a_short_longer_than_the_ceiling_is_refused() {
+        let (mut a, _b, _a_of_b, b_of_a) = peered_pair("short-long");
+        let long = "x".repeat(krab_crypto::short::MAX_BODY + 1);
+        type_command(&mut a, &format!("short {b_of_a} {long}"));
+        assert!(
+            a.output.contains("at most 37"),
+            "the ceiling must be named: {}",
+            a.output
+        );
+    }
+
+    /// **An unreadable counter reads as exhausted, never as zero.**
+    ///
+    /// The nonce is `(link_id, ctr)`. A counter whose previous value cannot be
+    /// established is one whose safe next value is unknown, and guessing zero
+    /// is the single answer certain to repeat a nonce if the file was ever
+    /// written. Repeating one under ChaCha20-Poly1305 leaks the XOR of two
+    /// plaintexts and the Poly1305 key with it.
+    #[test]
+    fn a_damaged_short_counter_refuses_rather_than_restarting() {
+        let (a, _b, _a_of_b, b_of_a) = peered_pair("short-ctr-bad");
+        assert_eq!(a.short_ctr(&b_of_a), (0, 0), "never written reads as zero");
+
+        a.write_short_ctr(&b_of_a, 12, 7).unwrap();
+        assert_eq!(a.short_ctr(&b_of_a), (12, 7));
+
+        std::fs::write(a.peer_path(&b_of_a, artifact::PeerFile::ShortCtr), b"junk").unwrap();
+        let (epoch, ctr) = a.short_ctr(&b_of_a);
+        assert_eq!(ctr, krab_crypto::short::MAX_CTR, "a damaged counter must read as spent");
+        assert_ne!(epoch, now_epoch().0, "and its epoch must not match this one");
+    }
+
+    /// **`connect <peer> tor <addr>` reaches the Tor carrier, not TCP.**
+    ///
+    /// The branch did not exist, so an onion address fell through to
+    /// `TcpFabric` and `TcpStream::connect` handed the name to the system
+    /// resolver — the dial failed, and the local DNS server was told which
+    /// hidden service this node wanted. Refusing before dialling is what makes
+    /// that impossible; the message says why rather than reporting a timeout.
+    #[test]
+    fn a_tor_connect_without_tor_refuses_before_it_dials() {
+        let (mut a, _b, _a_of_b, b_of_a) = peered_pair("tor-connect");
+        assert!(a.tor.is_none(), "no tor should be running in a test node");
+        let onion = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+        type_command(&mut a, &format!("connect {b_of_a} tor {onion}"));
+        assert!(
+            a.output.contains("start-tor"),
+            "a tor dial without tor must say so: {}",
+            a.output
+        );
+    }
+
+    /// **A tor link cannot answer**, and says so instead of quietly dialling.
+    ///
+    /// `connect <peer> tor <addr> answer` is the only way to express it —
+    /// `listen` infers its carrier from the address shape and never produces
+    /// this kind. Inbound over an onion service arrives at the listener the
+    /// service forwards to, which is a different socket entirely, so a tor
+    /// fabric that accepted would be a second listener racing the first.
+    #[test]
+    fn a_tor_link_refuses_to_answer() {
+        let (mut a, _b, _a_of_b, b_of_a) = peered_pair("tor-answer");
+        let onion = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+        type_command(&mut a, &format!("connect {b_of_a} tor {onion} answer"));
+        assert!(
+            a.output.contains("cannot answer"),
+            "answering over tor must be refused: {}",
+            a.output
+        );
     }
 
     /// **A peer whose card does not verify is skipped and counted**, not

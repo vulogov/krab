@@ -212,6 +212,19 @@ pub enum PeerFile {
     /// there is nothing here about *what* crossed or *when* — but the file
     /// naming a peer is itself the disclosure §8.4 says to purge.
     Quota,
+    /// The `short` counter for this link — RFC 4 §8.
+    ///
+    /// An epoch and a counter, and nothing else. **It must survive a restart**:
+    /// the nonce is `(link_id, ctr)`, so a counter that restarted at zero under
+    /// a key that had not changed would repeat a nonce — which breaks
+    /// ChaCha20-Poly1305 completely, leaking the XOR of two plaintexts and the
+    /// Poly1305 key with it. The epoch is stored alongside precisely so the
+    /// counter *can* safely restart when the key rotates.
+    ///
+    /// Not secret, and deliberately not sealed: it is two integers, it says
+    /// nothing about content, and needing the KEK to read it would mean a
+    /// locked node could not refuse to reuse a nonce.
+    ShortCtr,
     /// The mutually signed `peer-link` credential — RFC 3 §3.
     ///
     /// The most sensitive per-peer file: RFC 3 §15 calls credentials at rest
@@ -253,11 +266,16 @@ impl PeerFile {
             PeerFile::Link | PeerFile::Reservoir | PeerFile::Policy | PeerFile::Terms => false,
             // Spent budget against terms that no longer exist.
             PeerFile::Quota => true,
+            // A nonce counter outlives the credential on purpose. If the
+            // peering is renewed without the reservoir being replaced, a
+            // counter that had been purged would restart under a key that did
+            // not — see the field's own note on what that costs.
+            PeerFile::ShortCtr => false,
         }
     }
 
     /// Every per-peer file.
-    pub const ALL: [PeerFile; 8] = [
+    pub const ALL: [PeerFile; 9] = [
         PeerFile::Link,
         PeerFile::Reservoir,
         PeerFile::Policy,
@@ -266,6 +284,7 @@ impl PeerFile {
         PeerFile::Quota,
         PeerFile::Chain,
         PeerFile::Nodelist,
+        PeerFile::ShortCtr,
     ];
 
     /// The name on disk.
@@ -279,6 +298,7 @@ impl PeerFile {
             PeerFile::Quota => "quota",
             PeerFile::Chain => "chain",
             PeerFile::Nodelist => "nodelist",
+            PeerFile::ShortCtr => "short-ctr",
         }
     }
 }

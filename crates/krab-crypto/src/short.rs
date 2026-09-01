@@ -109,6 +109,45 @@ pub enum Error {
     CounterExhausted,
 }
 
+/// Domain string for the message key derived from the reservoir chunk.
+///
+/// The chunk is **already in use** as the HPKE PSK for sealed mail (RFC 7 §6
+/// as amended by `CRYPTO-REVIEW.md` §1), so handing the same 32 bytes to
+/// ChaCha20-Poly1305 here would key two unrelated constructions with one
+/// secret. Separating them costs one hash and removes a whole class of
+/// cross-protocol argument nobody would enjoy having to make.
+pub const DOMAIN_KEY: &[u8] = b"krab/short-key/v1";
+
+/// Domain string for the link identifier the nonce derives from.
+pub const DOMAIN_LINK: &[u8] = b"krab/short-link/v1";
+
+/// The `short` message key for one epoch of one peering.
+///
+/// `chunk` is that epoch's reservoir chunk (RFC 7 §6), so the key rotates when
+/// the epoch does — which is what makes restarting the counter at zero each
+/// epoch safe, and is why [`MAX_CTR`] is rarely approached in practice.
+///
+/// Built from [`crate::hash::domain_hash`], the series' one hashing
+/// construction, rather than a second one spelled locally.
+pub fn link_key(chunk: &crate::Secret<32>) -> crate::Secret<32> {
+    crate::Secret::new(crate::hash::domain_hash(DOMAIN_KEY, chunk.expose()))
+}
+
+/// The link identifier both ends derive, from the two node identifiers.
+///
+/// **Order-independent**, because the two ends must agree and neither of them
+/// is "first": the identifiers are sorted before hashing. An implementation
+/// that concatenated them in local order would give one link two nonce
+/// streams, which neither end can observe — both would simply open nothing,
+/// and RFC 0 §6 makes that silent.
+pub fn link_id(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut both = [0u8; 64];
+    both[..32].copy_from_slice(lo);
+    both[32..].copy_from_slice(hi);
+    crate::hash::domain_hash(DOMAIN_LINK, &both)
+}
+
 /// A parsed `short` header. The body is returned separately by [`open`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Short {
@@ -270,14 +309,7 @@ pub fn open(key: &[u8; 32], link_id: &[u8], msg: &[u8]) -> Result<(Short, Vec<u8
         return Err(Error::Mac);
     }
 
-    Ok((
-        Short {
-            tag,
-            expiry_h,
-            ctr,
-        },
-        plain,
-    ))
+    Ok((Short { tag, expiry_h, ctr }, plain))
 }
 
 #[cfg(test)]
@@ -442,5 +474,43 @@ mod tests {
         assert_eq!(msg.len(), OVERHEAD);
         let (_, body) = open(&KEY, LINK, &msg).unwrap();
         assert!(body.is_empty());
+    }
+
+    /// **Both ends derive the same link identifier.** They must, or the two
+    /// nonce streams differ and neither end can see why: every message simply
+    /// fails to open, which RFC 0 §6 guarantees nobody is told about.
+    #[test]
+    fn the_link_id_does_not_depend_on_who_computes_it() {
+        let a = [3u8; 32];
+        let b = [200u8; 32];
+        assert_eq!(link_id(&a, &b), link_id(&b, &a));
+        assert_ne!(link_id(&a, &b), link_id(&a, &a));
+    }
+
+    /// **The message key is not the chunk.** The chunk is already the HPKE PSK
+    /// for sealed mail; keying ChaCha20-Poly1305 with the same bytes would put
+    /// one secret under two constructions.
+    #[test]
+    fn the_message_key_is_separated_from_the_chunk_it_comes_from() {
+        let chunk = crate::Secret::new([9u8; 32]);
+        let key = link_key(&chunk);
+        assert_ne!(key.expose(), chunk.expose());
+
+        // And a different chunk gives an unrelated key.
+        let other = link_key(&crate::Secret::new([10u8; 32]));
+        assert_ne!(key.expose(), other.expose());
+    }
+
+    /// One epoch's key seals and opens; the next epoch's does not. This is
+    /// what makes restarting the counter at zero safe when the epoch turns.
+    #[test]
+    fn a_message_opens_only_under_its_own_epoch_key() {
+        let link = link_id(&[1u8; 32], &[2u8; 32]);
+        let this = link_key(&crate::Secret::new([1u8; 32]));
+        let next = link_key(&crate::Secret::new([2u8; 32]));
+
+        let msg = seal(this.expose(), &link, 0, &[7; 4], 100, b"on my way").unwrap();
+        assert!(open(this.expose(), &link, &msg).is_ok());
+        assert_eq!(open(next.expose(), &link, &msg), Err(Error::Mac));
     }
 }

@@ -148,10 +148,24 @@ impl Scheduler {
     /// a loop index or a peer number is a realistic mistake, and it would
     /// present as "sync mysteriously never happens" rather than as an error.
     fn draw(now: u64, mean_s: u64, entropy: u64) -> u64 {
-        let u = ((mix(entropy) >> 11) as f64) / ((1u64 << 53) as f64);
-        let u = if u <= 0.0 { f64::MIN_POSITIVE } else { u };
-        now.saturating_add((-(u.ln()) * mean_s as f64) as u64)
+        poisson_next(now, mean_s, entropy)
     }
+}
+
+/// The next event time in a Poisson process of mean `mean_s`, from `now`.
+///
+/// Public because [`Scheduler`] is not the only Poisson process in the system:
+/// RFC 1 §5.3's cover emitter is another, and it is not per-peer so it cannot
+/// borrow this type. **One draw, two callers** — a second exponential written
+/// out somewhere else is a second thing to get subtly wrong, and the way it
+/// would present is "the schedule looks a bit regular", which nobody notices.
+///
+/// See [`Scheduler::draw`]'s note on why the entropy is mixed before use.
+pub fn poisson_next(now: u64, mean_s: u64, entropy: u64) -> u64 {
+    let mean_s = mean_s.max(1);
+    let u = ((mix(entropy) >> 11) as f64) / ((1u64 << 53) as f64);
+    let u = if u <= 0.0 { f64::MIN_POSITIVE } else { u };
+    now.saturating_add((-(u.ln()) * mean_s as f64) as u64)
 }
 
 /// SplitMix64 finaliser. Spreads a poorly-distributed input across all 64

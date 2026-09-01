@@ -1071,8 +1071,8 @@ available by counting anything.
 | 4.3 | unknown body keys MUST be rejected | met + tested | `decode_envelope`; ingest I4 |
 | 4.3 | unknown *inner plaintext* keys MUST be ignored | vacuous | the inner plaintext is a marker and bytes, not a keyed map |
 | 5.2 | nodes MUST support excluding class 1 via `class_mask` | met | `filter::Filter`, `Policy::class_mask` |
-| 5.3 | cover objects MUST be indistinguishable from `sealed` | **met, unwired** | `krab_node::cover` — same class, header shape, body shape; no production emitter yet (§28) |
-| 5.3 | cover MUST use class 0, not class 2 | **met, unwired** | `Cover::emit` writes class 0; a test fails if it ever writes 2 (§28) |
+| 5.3 | cover objects MUST be indistinguishable from `sealed` | **met** | `krab_node::cover`, emitted on its own Poisson schedule from `App::tick_cover` (§29) |
+| 5.3 | cover MUST use class 0, not class 2 | **met + tested** | `Cover::emit` writes class 0; two tests fail if it ever writes 2 (§29) |
 | 5.4 | the size/timing caveat MUST be restated in security considerations | met | documentation obligation, met by RFC 1 §8.2 and this tree's `SECURE-DELETE.md` |
 | 6.2 | `EPOCH_WINDOW` MUST be ≥ `MAX_TTL / EPOCH` | met | `MAX_TTL_MIN = EPOCH_WINDOW * 1440` derives the other way; conflict #10 |
 | 6.2 | a deployment MUST NOT narrow it | met | not configurable |
@@ -1084,7 +1084,7 @@ available by counting anything.
 | 7 | MUST NOT be a deployment-wide default | met | no setting expresses one |
 | 8.1 | padding MUST be zero | met + tested | `canonical_bytes` |
 | 8.1 | a receiver MUST reject non-zero padding | met + tested | ingest I1, `non_zero_padding_is_refused` |
-| 8.2 | cover MUST match the bucket distribution of real traffic | **met, unwired** | sampled from observed traffic; a node that has observed nothing emits nothing (§28) |
+| 8.2 | cover MUST match the bucket distribution of real traffic | **met + tested** | sampled from what `ExchangeView::put` accepts; a node that has observed nothing emits nothing (§29) |
 | 9.2 | MUST show a fingerprint alongside any display name | met + tested | `alias::Aliases::show` renders both, always |
 | 9.3 | truncated identifiers MUST NOT appear in a routing header, a `WANT` outside a session, or any stored structure | met | the header has no such field; `by_trunc` is derived and unpersisted |
 | 10 | a relay MUST route, filter and expire an unknown `ver` from the header alone, and MUST store and forward it opaquely | **UNMET** | see below |
@@ -1307,9 +1307,9 @@ carry three clauses — §8's `short` rule is one sentence with three prohibitio
 | 5.5 | MUST NOT restrict an archive to objects acquired since a previous one | met | no acquisition time is recorded to restrict by |
 | 7 | classes 0, 2, 3 MUST NOT be carried on amateur bands | vacuous | no amateur-band profile exists — **postponed for want of hardware**, §28 |
 | 7 | amateur and ISM MUST NOT be conflated in configuration | vacuous | as above — **postponed**, §28 |
-| 8 | a `short` message MUST NOT be forwarded | met + tested | `validate_body` refuses class 3 |
-| 8 | MUST NOT be stored beyond display | met + tested | same |
-| 8 | MUST NOT enter reconciliation | met + tested | same |
+| 8 | a `short` message MUST NOT be forwarded | met + tested | `validate_body` refuses class 3; the live path carries frames out of the exchange and into no store (§29) |
+| 8 | MUST NOT be stored beyond display | met + tested | `drain_shorts` writes to the output pane only — asserted against the inbox, the corpus and the activity log (§29) |
+| 8 | MUST NOT enter reconciliation | met + tested | a frame has no identifier, so RBSR and the manifest have nothing to carry (§29) |
 | 8 | the 64-bit MAC caveat MUST be restated in security documentation | **met** | `SECURE-DELETE.md`, final section (§28) |
 | 9 | handshake timeout MUST be enforced | met + tested | `HANDSHAKE_TIMEOUT_S`, Pass 15 |
 | 9 | concurrent in-progress handshakes MUST be capped | met + tested | `MAX_PENDING_HANDSHAKES`, Pass 14 |
@@ -1346,14 +1346,33 @@ That is not a rule broken; it is a configuration that cannot be expressed.
 Recorded as unrepresentable rather than vacuous, because vacuous suggests
 nothing is missing.
 
-### Counts
+### Counts — recounted 2026-09-01, and the old ones were wrong twice
 
-26 requirements. **19 met** (14 with a test that names them), **6 vacuous** —
-Tor's onion service, amateur bands, and `short` framing, none of them built —
-**1 unrepresentable**, and **0 unmet**, after one was fixed by this pass.
+**28 rows in the table above. 25 met** (17 with a test that names them),
+**2 vacuous** — the two amateur-band requirements, postponed for want of
+hardware — **1 unrepresentable**, and **0 unmet**.
 
-Running total across RFCs 1–4: **95 requirements, 15 unmet or partly unmet,
-3 conflicts.** Four of the fifteen were fixed by the pass that found them.
+The numbers this paragraph carried until now said "26 requirements, 19 met,
+6 vacuous", and both halves were wrong:
+
+- **The total never matched the table.** 19 + 6 + 1 = 26, and there are 28
+  rows, and there always were. The paragraph was written from the tally rather
+  than from the table, so the two could not disagree visibly.
+- **§28 flipped five rows from vacuous to met and did not come back here.**
+  Onion key derivation, bootstrap progress and the 64-bit MAC caveat all
+  became met in that pass; the paragraph still described them as "none of them
+  built". A summary that is edited only when it is written is a summary that
+  is wrong from its second day.
+
+This is the third time in this document that a claim of absence turned out to
+be a claim about a set nobody re-read (E-2 records the other two). The lesson
+is the same and it is not "be careful": it is that a count kept beside a table
+must be derived from the table or it will drift, and nothing here derives it.
+
+Running total across RFCs 1–4: **97 requirements, 15 unmet or partly unmet,
+3 conflicts** — the total rises by two because this recount fixed the
+arithmetic, not because anything was added. Four of the fifteen were fixed by
+the pass that found them.
 
 ---
 
@@ -2028,6 +2047,11 @@ until someone can put a packet on a real radio and measure it.
 
 ### What is built but not yet wired
 
+> **Superseded by §29, 2026-09-01.** All four were wired, and the list is left
+> as written because it is the record of what was true on 2026-08-31 — and
+> because writing it is the reason they took one pass to close rather than an
+> audit to rediscover.
+
 Stated here rather than left for an audit to find:
 
 - **`krab_node::cover` has no production caller.** The generator, the
@@ -2067,3 +2091,178 @@ across 28 files, 25 of which predate this pass. A gate would go red on its
 first run for reasons unrelated to any change being tested, and a red check
 people learn to ignore trains them past the Windows job too. Turning it on is
 two commits: `cargo fmt --all` touching nothing else, then the gate.
+
+---
+
+## 29. The four gaps §28 left open, closed — 2026-09-01
+
+§28 ended with a section titled "What is built but not yet wired", listing four
+things that existed, were tested, and nothing called. All four are now called.
+That section was the right thing to write and it is worth saying why: a
+requirement satisfied by a module nobody invokes is the failure mode this
+document has recorded three times under other names, and naming it in advance
+is the only reason it took one pass to close rather than an audit to rediscover.
+
+### What was wired
+
+| gap, as §28 stated it | closed by |
+|---|---|
+| `krab_node::cover` has no production caller | `App::tick_cover` on its own Poisson draw; `ExchangeView::put` feeds the distribution |
+| `krab_crypto::short` has no production caller | `Control::Short` (opcode 12), the `short` verb, `App::drain_shorts` |
+| no `Fabric` implementation over Tor | `backend::tor::TorFabric`; `connect <peer> tor <addr>` reaches it |
+| onion rotation is not a verb | `onion rotate`, with both counters sealed beside the root |
+
+And one requirement §28 did not list, added at the operator's direction:
+
+| RFC 3 §9.2 | contact/sync endpoint separation | two onion services, two domain strings, two listeners |
+
+### The defect the Tor gap was hiding
+
+`connect <peer> tor <addr>` did not merely fail. With no `"tor"` arm in
+`App::establish`, it fell through to the TCP branch, and
+`TcpStream::connect("….onion:9001")` hands the name to the **system resolver**.
+So the dial failed *and* told the operator's DNS server — and anyone watching
+it — which hidden service this node was looking for. That is the precise thing
+RFC 4 §5.2's restricted discovery exists to prevent, undone one layer below it
+by a missing match arm.
+
+It is worth recording how nearly it escaped: a test asserting "connecting over
+tor without tor returns an error" passes on the broken version. The test that
+catches it asserts the **SOCKS request carries `ATYP_DOMAIN` with the literal
+onion name**, which is a statement about where the name went rather than about
+whether the call succeeded. It was probed by reverting `TorFabric::connect` to
+a direct `TcpStream::connect` and confirming it fails.
+
+`TorFabric::accept` always returns `None`, and that is architecture rather than
+omission: inbound over an onion arrives at the listener tor forwards to, so a
+fabric that also accepted would be a second listener racing the first for the
+same connections.
+
+### `short`, and the counter that must survive a restart
+
+RFC 4 §8's nonce is `(link_id, ctr)`. A counter that restarted at zero under a
+key that had not changed would repeat a nonce, and a repeated nonce under
+ChaCha20-Poly1305 leaks the XOR of two plaintexts **and the Poly1305 key**.
+So:
+
+- `PeerFile::ShortCtr` holds an epoch and a counter — two integers, unsealed.
+  Deliberately unsealed: it says nothing about content, and requiring the KEK
+  to read it would mean a **locked node could not refuse to reuse a nonce**.
+- It is written **before** the frame is sent. A crash between the two costs one
+  unused counter value; the other order costs a repeat.
+- An unreadable counter reads as **exhausted**, never as zero. Zero is the one
+  answer certain to repeat if the file was ever written.
+- The epoch is stored alongside so the counter can safely restart when the
+  reservoir chunk rotates, which is what keeps `MAX_CTR` out of reach in
+  practice.
+
+The message key is `domain_hash("krab/short-key/v1", chunk)` rather than the
+chunk itself, which is already the HPKE PSK for sealed mail — one secret under
+two constructions is an argument nobody would enjoy having to make. `link_id`
+sorts the two node identifiers before hashing, with a test, because the failure
+mode is that both ends compute a *valid* key, the keys differ, and every
+message fails to open exactly as if the peer were offline (RFC 0 §6).
+
+Refusing to send without a live link is the honest answer rather than a
+limitation: RFC 1 §5.5 makes `short` link-local by construction, so "queue it
+until they are reachable" is not a smaller version of this feature — it is
+`send`, which already exists.
+
+**Opcode 12 is an extension, and the enum already had four.** RFC 5 §3's table
+lists 0–7; 8 and 9 are RFC 7 §7's re-key, 10 and 11 are RFC 3 §11's first
+contact over a live link. `Control` is `#[non_exhaustive]` and its doc comment
+said "the eight opcodes" while carrying twelve. Both are corrected.
+
+The cost is stated rather than hidden: a CBOR array head, an opcode and a
+byte-string head, four bytes, on top of §8's 18 + N. §8's 55-byte ceiling is
+the *message*, not the frame it travels in.
+
+### Cover traffic, and a bug only the end-to-end test could find
+
+The observer feeds from `ExchangeView::put`, on objects that were **accepted** —
+so a peer flooding rubbish this node refuses cannot steer the distribution its
+cover copies. It skips objects `Cover::is_mine` recognises, which is what RFC 1
+§5.3's "emitters track their own cover objects locally" is *for*: a dummy this
+node emitted can come back from a peer, and observing it would feed the emitter
+its own output.
+
+The emitter draws from `scheduler::poisson_next`, which `Scheduler::draw` now
+also calls. One exponential, two callers — a second one written out separately
+would present as "the schedule looks a bit regular", which nobody notices.
+
+**Off by default.** RFC 0 §7.3: volume privacy "requires cover traffic, and
+cover traffic is unaffordable on a constrained link". A node emitting dummies
+unasked spends an operator's duty cycle, metered link or battery to buy a
+property they may not need. `cover on <60–86400s>` / `cover off`, and bare
+`cover` reports the state and the observation count.
+
+**The bug.** The first version passed the *body* slice to `validate_body`,
+which parses the routing header itself and therefore returned `Malformed` for
+every object. The distribution would have stayed empty for ever — and §8.2's
+corollary is that a node with no distribution emits nothing, so **a broken
+observer and a correctly quiet one are indistinguishable**. Nothing but an
+end-to-end test could have told them apart, and nothing but an end-to-end test
+did. The comment at the call site now says which argument the function takes
+and what it costs to get it wrong.
+
+### Rotation, and endpoint separation
+
+RFC 4 §5.2 asks for "a rotatable epoch counter". A counter that is not stored
+is not rotatable: the address reverts to counter 0 at the next start, which is
+a rotation nobody asked for and nobody is told about. Both counters are now
+sealed beside the root, and a 32-byte record — the old format, root alone —
+still opens as counters `(0, 0)`, because refusing it would take an existing
+node's permanent address away on upgrade.
+
+`onion rotate` writes the counter **before** publishing, adds the new service
+before withdrawing the old one so there is no window in which neither answers,
+and says plainly that every peer holding the old address will find this node
+unreachable and will not be told why. It also names the previous counter, so a
+rotation done by mistake can be undone: the derivation is a pure function of
+root and counter.
+
+**RFC 3 §9.2's two endpoints are two services**, and they differ in three ways
+at once, each load-bearing:
+
+- **different key**, under `DOMAIN_CONTACT` rather than `DOMAIN`, so no counter
+  value can make one equal the other. Separating them by counter alone would
+  mean the contact address at counter *n* is byte-identical to the sync address
+  at counter *n* — so rotating contact onto a counter sync had used would
+  publish the sync address, unrestricted, to a stranger. It would happen
+  silently and at exactly the moment an operator did what §9.2 calls "freely
+  rotatable". There is a test that walks both endpoints across eight counters
+  and asserts sixteen distinct keys.
+- **different discovery**: the sync endpoint carries the `ClientAuthV3` set,
+  the contact endpoint carries none, because a stranger has no peering from
+  which to derive an auth key. Restricted discovery there would make the
+  endpoint unreachable by exactly the people it exists for.
+- **different listener**: the contact endpoint is mapped to the socket
+  `peer meet` opens and nothing else, so what is behind it genuinely accepts
+  only peer-requests — §9.2's phrase, satisfied by what the port reaches rather
+  than by a rule.
+
+The contact endpoint is opened by `peer meet` when tor is running, rotated on
+every open, and withdrawn by `DEL_ONION` on every path out of a meeting —
+completion, timeout, and `peer meet cancel`. Two strangers given the same
+contact address could each confirm the other had been talking to this node,
+which is graph information handed out for nothing.
+
+### What is verified, and how
+
+- **1282 tests**, zero failures, clippy clean under `-D warnings` across
+  `--all-features`. Up from 1254 at §28.
+- The DNS-leak test is bounded rather than blocking. A dial that never reaches
+  the fake proxy would otherwise hang the test binary instead of failing it —
+  the lesson the SOCKS helper learned in §28, applied before it cost anything.
+- `Moved` lost `Copy` deliberately: `shorts` owns its frames, and a `short`
+  must be moved and displayed rather than silently duplicated by an assignment.
+
+### Still open
+
+- **`ADD_ONION` for the contact endpoint has never run against a real tor.**
+  The sync endpoint's has (§28's live test). The contact path is exercised only
+  where tor is absent, which checks that it degrades rather than that it works.
+- **`VirtualLock` has still never executed**, unchanged from §28. The Windows
+  CI job is what closes it.
+- **`del_onion` is untested against a live daemon** for the same reason.
+- **No `cargo fmt` gate**, unchanged from §28 and for the same reason.

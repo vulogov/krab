@@ -189,6 +189,23 @@ pub enum Command {
     Message,
     /// Compose and emit — one line, on the command line.
     Send,
+    /// The onion endpoints — RFC 4 §5.2's rotation and RFC 3 §9.2's
+    /// contact/sync separation.
+    Onion,
+    /// Cover traffic — RFC 1 §5.3's Poisson dummies.
+    ///
+    /// Off by default and discoverable, like the dead-man timer: it costs
+    /// bandwidth an operator may not have, and RFC 8 §4.3 says a setting with
+    /// consequences is stated rather than assumed.
+    Cover,
+    /// One line straight down a live link — RFC 4 §8's `short`.
+    ///
+    /// Not mail. It is not stored, not relayed, and not reconciled, so it
+    /// needs the peer to be linked *now*. Separate from [`Command::Send`]
+    /// because the two differ in what they promise, not in how long the text
+    /// is: `send` will get there eventually, and this either goes now or does
+    /// not go.
+    Short,
     /// Prekey burn rate, reservoir state, identity backup status.
     Keys,
     /// Path admission diagnostic.
@@ -214,7 +231,7 @@ impl Command {
     /// to 19 of 26 without anything noticing. `every_variant_is_in_all` closes
     /// that: it matches on `Command` exhaustively, so a new variant does not
     /// compile until it appears here.
-    pub const ALL: [Command; 37] = [
+    pub const ALL: [Command; 40] = [
         Command::Pin,
         Command::Note,
         Command::Alias,
@@ -248,6 +265,9 @@ impl Command {
         Command::Pack,
         Command::Message,
         Command::Send,
+        Command::Short,
+        Command::Cover,
+        Command::Onion,
         Command::Keys,
         Command::Reach,
         Command::Peers,
@@ -275,6 +295,9 @@ impl Command {
             "import" => Command::Import,
             "pack" => Command::Pack,
             "send" => Command::Send,
+            "short" => Command::Short,
+            "cover" => Command::Cover,
+            "onion" => Command::Onion,
             "message" | "msg" => Command::Message,
             "keys" => Command::Keys,
             "reach" => Command::Reach,
@@ -405,6 +428,15 @@ impl Command {
             "compose to one or more people; Ctrl-D seals and queues",
         ),
         ("send <peer> <text>", "one line to one person"),
+        (
+            "short <peer> <text>",
+            "one line down a live link — not stored, not relayed",
+        ),
+        ("cover on <seconds> | off", "Poisson dummy traffic — RFC 1 §5.3"),
+        (
+            "onion [rotate]",
+            "the two onion endpoints, and rotating the sync one",
+        ),
         ("request", "ask a peer for an object by name"),
         ("pack <file>", "write queued objects out for a courier"),
         ("import <file>", "take in what a courier brought"),
@@ -496,6 +528,8 @@ impl Command {
         matches!(
             self,
             Command::Send
+                | Command::Short
+                | Command::Onion
                 | Command::Peer
                 | Command::Init
                 | Command::Keys
@@ -537,6 +571,9 @@ impl fmt::Display for Command {
             Command::Import => "import",
             Command::Pack => "pack",
             Command::Send => "send",
+            Command::Short => "short",
+            Command::Cover => "cover",
+            Command::Onion => "onion",
             Command::Message => "message",
             Command::Keys => "keys",
             Command::Reach => "reach",
@@ -790,6 +827,9 @@ mod tests {
     fn every_variant_is_in_all() {
         for c in Command::ALL {
             match c {
+                Command::Short => {}
+                Command::Cover => {}
+                Command::Onion => {}
                 Command::Pin => {}
                 Command::Note => {}
                 Command::Alias => {}
@@ -829,7 +869,7 @@ mod tests {
                 Command::Verify => {}
             }
         }
-        assert_eq!(Command::ALL.len(), 37);
+        assert_eq!(Command::ALL.len(), 40);
     }
 
     /// **Every verb round-trips.** RFC 8 §5's ten, and the sixteen it omits.

@@ -68,49 +68,75 @@ pub const CONTEXT_IDENTITY: &[u8] = b"krab/identity/v1";
 /// identity key are not the same secret.
 pub const CONTEXT_ONION: &[u8] = b"krab/onion-root/v1";
 
-/// Seal the onion service root under a **KEK subkey**.
+/// Seal this node's onion state under a KEK subkey.
 ///
-/// # Why a subkey and not the KEK
+/// The root **and both rotation counters** — RFC 4 §5.2's is "a rotatable
+/// epoch counter", and a counter that is not stored is not rotatable: the
+/// address would revert to counter 0 at the next start, which is a rotation
+/// nobody asked for and nobody is told about.
 ///
-/// RFC 7 §4 makes the KEK memory-only and re-derived on unlock, so nothing
-/// holds it between commands — and `start-tor` is a command, typed long after
-/// the passphrase. The codebase's existing answer is a domain-separated
-/// subkey held for the unlocked lifetime, which is what `pin_key` and
-/// `alias_key` already are, and this follows it exactly rather than inventing
-/// a second pattern or retaining the KEK itself.
-///
-/// The root must **not** be sealed under the epoch key: `W_N` rotates and the
-/// onion address must not. That is the same mistake `pin.rs` records — "a pin
-/// whose key is the epoch key is unreadable exactly when it was supposed to be
-/// readable" — with a network address instead of mail.
-///
-/// 32 bytes and no structure: the address is a pure function of these bytes
-/// and the rotation counter, and the counter is what the operator asks for
-/// rather than something stored.
+/// The two counters are separate because the two endpoints rotate for
+/// different reasons and at different rates (RFC 3 §9.2): the contact endpoint
+/// is "freely rotatable" and expected to move often, the sync endpoint is the
+/// address peers have written down.
 pub fn write_onion_root(
     path: &Path,
     root: &krab_crypto::onion::OnionRoot,
+    counters: (krab_crypto::onion::Counter, krab_crypto::onion::Counter),
     key: &[u8; 32],
     rng: &mut impl Rng,
 ) -> Result<(), Error> {
-    let sealed = krab_crypto::kek::seal_under(key, CONTEXT_ONION, root.as_bytes(), rng)
+    let mut plain = [0u8; 40];
+    plain[..32].copy_from_slice(root.as_bytes());
+    plain[32..36].copy_from_slice(&counters.0.to_le_bytes());
+    plain[36..].copy_from_slice(&counters.1.to_le_bytes());
+    let sealed = krab_crypto::kek::seal_under(key, CONTEXT_ONION, &plain, rng)
         .map_err(|_| Error::Malformed)?;
     crate::atomic::write(path, &sealed).map_err(|_| Error::Malformed)
 }
 
-/// Read the onion service root back.
+/// Read the onion service root and its two counters back.
 ///
 /// [`Error::Absent`] means this node has never published an onion service,
 /// which is the ordinary case and not a fault — the caller generates one.
+///
+/// # A 32-byte record is the old format, not a corrupt one
+///
+/// The first version stored the root alone. Refusing those would take an
+/// existing node's permanent address away on upgrade, which is the loudest
+/// possible failure for the least reason: the counters were 0 then, because
+/// there was no way to advance them.
 pub fn read_onion_root(
     path: &Path,
     key: &[u8; 32],
-) -> Result<krab_crypto::onion::OnionRoot, Error> {
+) -> Result<
+    (
+        krab_crypto::onion::OnionRoot,
+        krab_crypto::onion::Counter,
+        krab_crypto::onion::Counter,
+    ),
+    Error,
+> {
     let sealed = std::fs::read(path).map_err(|_| Error::Absent)?;
     let plain =
         krab_crypto::kek::open_under(key, CONTEXT_ONION, &sealed).map_err(|_| Error::Locked)?;
-    let bytes = <[u8; 32]>::try_from(plain.as_slice()).map_err(|_| Error::Malformed)?;
-    Ok(krab_crypto::onion::OnionRoot::from_bytes(bytes))
+    match plain.len() {
+        32 => {
+            let bytes = <[u8; 32]>::try_from(plain.as_slice()).map_err(|_| Error::Malformed)?;
+            Ok((krab_crypto::onion::OnionRoot::from_bytes(bytes), 0, 0))
+        }
+        40 => {
+            let bytes = <[u8; 32]>::try_from(&plain[..32]).map_err(|_| Error::Malformed)?;
+            let sync = u32::from_le_bytes(plain[32..36].try_into().map_err(|_| Error::Malformed)?);
+            let contact = u32::from_le_bytes(plain[36..].try_into().map_err(|_| Error::Malformed)?);
+            Ok((
+                krab_crypto::onion::OnionRoot::from_bytes(bytes),
+                sync,
+                contact,
+            ))
+        }
+        _ => Err(Error::Malformed),
+    }
 }
 
 /// Encode a reservoir for storage: the current root **and its ratchet epoch**.
@@ -591,7 +617,11 @@ mod tests {
                 expiry_min: 29_806_000 + salt as u32,
                 tag: krab_core::object::Tag([salt; 8]),
             };
-            let b = krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(salt)).unwrap();
+            let b = krab_core::object::canonical_bytes(
+                &h,
+                &krab_core::object::example_sealed_body(salt),
+            )
+            .unwrap();
             store
                 .ingest(krab_crypto::object_id(&b), b, 29_766_000, u32::MAX)
                 .unwrap();
@@ -641,7 +671,11 @@ mod tests {
             store.ingest(id, b, 0, u32::MAX).unwrap();
         }
         assert_eq!(write_corpus(&path, &mut store, &mut rng).unwrap(), 4);
-        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 4, "one per bucket");
+        assert_eq!(
+            std::fs::read_dir(&path).unwrap().count(),
+            4,
+            "one per bucket"
+        );
 
         // Nothing changed: nothing is written.
         assert_eq!(write_corpus(&path, &mut store, &mut rng).unwrap(), 0);
@@ -672,8 +706,14 @@ mod tests {
         // And a bucket that goes away takes its file with it.
         store.expire(20_001 * day);
         write_corpus(&path, &mut store, &mut rng).unwrap();
-        assert!(!path.join("20000.krab").exists(), "an expired segment stayed");
-        assert!(path.join("20003.krab").exists(), "a live segment was removed");
+        assert!(
+            !path.join("20000.krab").exists(),
+            "an expired segment stayed"
+        );
+        assert!(
+            path.join("20003.krab").exists(),
+            "a live segment was removed"
+        );
     }
 
     /// A node written by an earlier build has one file. It must not start
@@ -740,7 +780,8 @@ mod tests {
             expiry_min: 29_806_000,
             tag: krab_core::object::Tag([7; 8]),
         };
-        let b = krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(7)).unwrap();
+        let b = krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(7))
+            .unwrap();
         let id = krab_crypto::object_id(&b);
         store.ingest(id, b, 29_766_000, u32::MAX).unwrap();
         let mut rng = NotRandom::seeded(5);

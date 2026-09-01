@@ -68,6 +68,48 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// (RFC 3 §3).
 pub const DOMAIN: &[u8] = b"krab/onion/v1";
 
+/// The distinct domain string for the **contact** endpoint — RFC 3 §9.2.
+///
+/// A separate domain, not merely a separate counter. Sharing `DOMAIN` and
+/// distinguishing the two endpoints by counter alone would mean the contact
+/// address at counter *n* is byte-identical to the sync address at counter
+/// *n* — so rotating the contact endpoint onto a counter the sync endpoint had
+/// used would publish the sync address, unrestricted, to anyone. The
+/// separation §9.2 asks for would collapse silently and at exactly the moment
+/// an operator did the thing §9.2 calls "freely rotatable".
+pub const DOMAIN_CONTACT: &[u8] = b"krab/onion-contact/v1";
+
+/// Which of RFC 3 §9.2's two endpoints a key is for.
+///
+/// > "Where endpoints are exchanged, implementations SHOULD separate a
+/// > **contact endpoint** (accepts only peer-requests, freely rotatable) from
+/// > a **sync endpoint** (never published, protected by Tor restricted
+/// > discovery where applicable — RFC 4)."
+///
+/// The two differ in three ways at once and all three are load-bearing: a
+/// different key, a different discovery regime, and a different thing
+/// listening behind them. This type carries the first; RFC 4 §5.2's
+/// `ClientAuthV3` carries the second; and the port each is mapped to carries
+/// the third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    /// Never published, restricted discovery, reconciliation behind it.
+    Sync,
+    /// Handed out to a stranger for one peering, unrestricted, with only the
+    /// first-contact listener behind it.
+    Contact,
+}
+
+impl Endpoint {
+    /// The domain string this endpoint derives under.
+    pub fn domain(&self) -> &'static [u8] {
+        match self {
+            Endpoint::Sync => DOMAIN,
+            Endpoint::Contact => DOMAIN_CONTACT,
+        }
+    }
+}
+
 /// The rotatable epoch counter of RFC 4 §5.2.
 ///
 /// Not a time epoch. It advances only when an operator rotates the address,
@@ -156,9 +198,20 @@ impl core::fmt::Debug for ExpandedKey {
 /// The counter is little-endian, matching every other counter in this
 /// codebase (RFC 2 §4.1's `u32_le`).
 pub fn service_key(root: &OnionRoot, counter: Counter) -> ExpandedKey {
+    endpoint_key(root, Endpoint::Sync, counter)
+}
+
+/// Derive the onion service key for one endpoint at one counter.
+///
+/// The general form of [`service_key`], which is the `Sync` case. Both
+/// endpoints come from the same [`OnionRoot`] — one secret to back up, as
+/// §5.2 asks — and are separated by domain string rather than by counter, for
+/// the reason [`DOMAIN_CONTACT`] gives.
+pub fn endpoint_key(root: &OnionRoot, endpoint: Endpoint, counter: Counter) -> ExpandedKey {
+    let domain = endpoint.domain();
     // `derive_key` takes the context as `&str`, and both parts are ours.
-    let mut context = Vec::with_capacity(DOMAIN.len() + 4);
-    context.extend_from_slice(DOMAIN);
+    let mut context = Vec::with_capacity(domain.len() + 4);
+    context.extend_from_slice(domain);
     context.extend_from_slice(&counter.to_le_bytes());
     // The context is not required to be UTF-8 by BLAKE3's construction, but
     // the safe API insists, so it is hex-encoded rather than lossily
@@ -573,5 +626,59 @@ mod tests {
             assert!(!seen.contains(k.as_bytes()), "counter {c:#x} collided");
             seen.push(*k.as_bytes());
         }
+    }
+
+    /// **The two endpoints never share an address, at any counter.**
+    ///
+    /// Separating them by counter alone would make the contact address at
+    /// counter *n* identical to the sync address at counter *n* — so rotating
+    /// the contact endpoint onto a counter the sync endpoint had used would
+    /// publish the sync address unrestricted, which is the one thing RFC 3
+    /// §9.2 exists to prevent. It would happen silently, and at exactly the
+    /// moment an operator did what §9.2 calls "freely rotatable".
+    #[test]
+    fn a_contact_key_never_equals_a_sync_key() {
+        let root = OnionRoot::from_bytes([7; 32]);
+        let mut seen = alloc::collections::BTreeSet::new();
+        for counter in 0..8u32 {
+            for endpoint in [Endpoint::Sync, Endpoint::Contact] {
+                let key = endpoint_key(&root, endpoint, counter);
+                assert!(
+                    seen.insert(*key.as_bytes()),
+                    "{endpoint:?} at counter {counter} collided with an earlier key"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 16);
+    }
+
+    /// `service_key` is the sync endpoint, unchanged. Peers hold addresses
+    /// derived by it, so this is the compatibility check: if it ever stops
+    /// meaning `Endpoint::Sync`, every stored `.onion` breaks at once.
+    #[test]
+    fn service_key_is_the_sync_endpoint() {
+        let root = OnionRoot::from_bytes([3; 32]);
+        for counter in [0u32, 1, 4_000_000_000] {
+            assert_eq!(
+                service_key(&root, counter).as_bytes(),
+                endpoint_key(&root, Endpoint::Sync, counter).as_bytes()
+            );
+        }
+    }
+
+    /// Rotation actually rotates: the counter changes the key, and the old
+    /// one is still derivable from the same root — which is what lets an
+    /// operator roll back a rotation they regret.
+    #[test]
+    fn rotating_the_counter_changes_the_address_and_is_reversible() {
+        let root = OnionRoot::from_bytes([11; 32]);
+        let before = *service_key(&root, 4).as_bytes();
+        let after = *service_key(&root, 5).as_bytes();
+        assert_ne!(before, after);
+        assert_eq!(
+            *service_key(&root, 4).as_bytes(),
+            before,
+            "not reproducible"
+        );
     }
 }

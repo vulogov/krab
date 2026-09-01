@@ -50,7 +50,13 @@ pub struct Range {
     pub count: u32,
 }
 
-/// The eight opcodes.
+/// The control opcodes.
+///
+/// RFC 5 §3's table lists 0 through 7. Everything above that is an extension
+/// the series added later and did not renumber the table for: 8 and 9 are RFC
+/// 7 §7's re-key, 10 and 11 are RFC 3 §11's first contact over a live link,
+/// and 12 is RFC 4 §8's `short`. The enum is `#[non_exhaustive]` for the same
+/// reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Control {
@@ -126,6 +132,21 @@ pub enum Control {
     /// adversary recording this session and later breaking X25519 recovers it.
     /// `peer reseal` is how that is repaired without redoing the peering.
     Contribution(Vec<u8>),
+    /// 12 — one `short` message, RFC 4 §8.
+    ///
+    /// **Not an object.** It has no identifier, is never stored, never
+    /// relayed, and never enters reconciliation — RFC 1 §5.5 makes that
+    /// structural rather than a rule, because a `short` frame cannot be turned
+    /// into something the store would accept.
+    ///
+    /// It rides a control message because that is the framing an established
+    /// session already has. The cost is honest and small: a CBOR array head, an
+    /// opcode and a byte-string head, four bytes, on top of §8's 18 + N. §8's
+    /// 55-byte ceiling is the *message*, not the frame it travels in.
+    ///
+    /// The payload is opaque here. Only the two ends hold the reservoir chunk
+    /// it is keyed from, so this layer cannot read it and does not try.
+    Short(Vec<u8>),
     /// 9 — `index` adopted, and here is the confirmation.
     ///
     /// A re-key that half-completes is worse than one that fails: one end
@@ -170,6 +191,7 @@ impl Control {
             Control::RekeyAck { .. } => 9,
             Control::Card(_) => 10,
             Control::Contribution(_) => 11,
+            Control::Short(_) => 12,
         }
     }
 
@@ -249,6 +271,9 @@ impl Control {
             Control::Contribution(b) => {
                 w.array(2).uint(11).bstr(b);
             }
+            Control::Short(b) => {
+                w.array(2).uint(12).bstr(b);
+            }
         }
         w.finish()
     }
@@ -272,6 +297,7 @@ impl Control {
             9 => 3,  // RekeyAck: index, confirmation
             10 => 2, // Card: bytes
             11 => 2, // Contribution: bytes
+            12 => 2, // Short: one RFC 4 §8 frame
             _ => return None,
         })
     }
@@ -434,6 +460,7 @@ impl Control {
             }
             10 => Control::Card(bstr(&mut r)?.to_vec()),
             11 => Control::Contribution(bstr(&mut r)?.to_vec()),
+            12 => Control::Short(bstr(&mut r)?.to_vec()),
             9 => {
                 let index = u32f(uint(&mut r)?)?;
                 let raw = bstr(&mut r)?;
@@ -502,6 +529,22 @@ mod tests {
                 "opcode {}",
                 msg.opcode()
             );
+        }
+    }
+
+    /// **RFC 4 §8's `short`, opcode 12.** `all()` pins RFC 5 §3's eight and
+    /// deliberately does not grow, so the extensions above 7 are covered one
+    /// at a time here.
+    ///
+    /// The frame is opaque at this layer — only the two ends hold the chunk it
+    /// is keyed from — so what is checked is that arbitrary bytes survive
+    /// unaltered, including the empty body §8 permits.
+    #[test]
+    fn a_short_message_round_trips() {
+        for body in [alloc::vec![], alloc::vec![0u8; 18], alloc::vec![0xC3; 55]] {
+            let msg = Control::Short(body);
+            assert_eq!(Control::parse(&msg.write()), Ok(msg.clone()));
+            assert_eq!(msg.opcode(), 12);
         }
     }
 
@@ -732,9 +775,9 @@ mod tests {
     /// entry there would parse loosely, which is the state this replaced.
     #[test]
     fn every_written_opcode_has_an_arity() {
-        for op in 0..=11u64 {
+        for op in 0..=12u64 {
             assert!(Control::arity(op).is_some(), "opcode {op} has no arity");
         }
-        assert_eq!(Control::arity(12), None);
+        assert_eq!(Control::arity(13), None);
     }
 }

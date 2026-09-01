@@ -100,6 +100,60 @@ impl SharedStore {
     }
 }
 
+/// The cover-traffic emitter, shared with the exchange threads.
+///
+/// RFC 1 §5.3 and §8.2. Two things live behind one lock because they are two
+/// halves of one requirement: the record of what real traffic looks like, and
+/// the generator that has to look like it.
+///
+/// Cloneable and `Send`, so the threads that see real objects can record their
+/// shapes without the interface thread being involved.
+#[derive(Clone, Default)]
+pub struct SharedCover(Arc<Mutex<krab_node::cover::Cover>>);
+
+impl SharedCover {
+    /// A fresh emitter, which has observed nothing and will emit nothing.
+    pub fn new() -> SharedCover {
+        SharedCover::default()
+    }
+
+    /// Record one real object's shape — RFC 1 §8.2.
+    pub fn observe(&self, header_and_body: &[u8], body_len: usize) {
+        self.with(|c| c.observe(header_and_body, body_len));
+    }
+
+    /// Emit one dummy, or `None` if no distribution has been observed yet.
+    pub fn emit(
+        &self,
+        epoch: u64,
+        expiry_min: u32,
+        rng: &mut impl krab_crypto::rng::Rng,
+    ) -> Option<Vec<u8>> {
+        self.with(|c| c.emit(epoch, expiry_min, rng))
+    }
+
+    /// Whether this identifier is cover this node emitted.
+    pub fn is_mine(&self, id: &krab_core::object::ObjectId) -> bool {
+        self.with(|c| c.is_mine(id))
+    }
+
+    /// How many real shapes have been observed.
+    pub fn observations(&self) -> usize {
+        self.with(|c| c.observations())
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut krab_node::cover::Cover) -> R) -> R {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g)
+    }
+}
+
+impl std::fmt::Debug for SharedCover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SharedCover({} observations)", self.observations())
+    }
+}
+
 /// The minute a store treats as "now" for ingest.
 ///
 /// Passed rather than read: `krab-store` takes time as an argument and this
@@ -122,6 +176,17 @@ pub struct ExchangeView {
     /// Shared with the interface thread, which persists it once the exchange
     /// reports. A budget the process forgets on restart is not a budget.
     budget: Option<Budget>,
+    /// Where real traffic's shape is recorded — RFC 1 §8.2.
+    ///
+    /// **Fed from here and nowhere else on the receive side**, because this is
+    /// the one point that sees an object the peer actually delivered and this
+    /// node actually accepted. Cover must match the distribution of *real*
+    /// traffic; a node that fed its own dummies back in would drift toward
+    /// matching itself, which is a distribution of nothing.
+    ///
+    /// Optional so an exchange can run without one — a locked node relaying
+    /// for others still reconciles, and nothing there is emitting cover.
+    cover: Option<SharedCover>,
     /// Now, in minutes, for the retention window only.
     ///
     /// **Not `now_min`.** That field is the exchange's lower bound — `now`
@@ -173,6 +238,7 @@ impl ExchangeView {
         ExchangeView {
             store,
             now_min,
+            cover: None,
             carriage,
             filter,
             retention_now_min,
@@ -184,6 +250,12 @@ impl ExchangeView {
     /// Hold this exchange to RFC 3 §6's budget.
     pub fn with_budget(mut self, budget: Budget) -> ExchangeView {
         self.budget = Some(budget);
+        self
+    }
+
+    /// Record the shape of what this exchange accepts — RFC 1 §8.2.
+    pub fn observing(mut self, cover: SharedCover) -> ExchangeView {
+        self.cover = Some(cover);
         self
     }
 
@@ -363,6 +435,25 @@ impl Corpus for ExchangeView {
         // `ingest` is the only path that admits data and it checks regardless
         // of which thread calls it.
         let id = krab_crypto::object_id(&bytes);
+        // Taken **before** `ingest`, which moves the bytes. Sixteen bytes and
+        // a length rather than a copy of the object: the shape is all §8.2
+        // asks for, and holding the whole thing to read two fields would be a
+        // second copy of every object that crosses a link.
+        let shape = self.cover.as_ref().and_then(|_| {
+            let head: [u8; krab_core::object::ROUTING_HEADER_LEN] = bytes
+                .get(..krab_core::object::ROUTING_HEADER_LEN)?
+                .try_into()
+                .ok()?;
+            // **The whole object, not the body slice.** `validate_body`
+            // parses the routing header itself to learn the class — it is
+            // named for what it validates, not for what it is given. Passing
+            // the body alone returns `Malformed` for every object, which would
+            // have left the emitter with an empty distribution for ever and
+            // therefore silent: exactly the failure §8.2's corollary makes
+            // indistinguishable from working correctly.
+            let body_len = krab_core::object::validate_body(&bytes).ok()?;
+            Some((head, body_len))
+        });
         let admitted = self.store.with(|s| {
             // **RFC 1 §11 I2.** `u32::MAX` here meant no upper bound at all,
             // on the one path that takes objects from a peer — so an object
@@ -383,6 +474,23 @@ impl Corpus for ExchangeView {
                 .saturating_add(krab_core::tag::MAX_TTL_MIN);
             s.ingest(id, bytes, self.now_min, ceiling)
         });
+        // **RFC 1 §8.2 — the shape of real traffic, and only of real
+        // traffic.** Recorded on objects that were *accepted*, so a peer
+        // flooding rubbish this node refuses cannot steer the distribution its
+        // cover copies.
+        //
+        // And **§5.3's "emitters track their own cover objects locally", which
+        // is what that is for**: a dummy this node emitted can come back — a
+        // peer takes it and later offers it here again — and observing it
+        // would feed the emitter its own output, letting the distribution
+        // drift toward matching itself, which is a distribution of nothing.
+        // Downstream nodes counting it as real is correct and is the point:
+        // cover is indistinguishable to everyone except its emitter.
+        if let (Ok(_), Some(c), Some((head, body_len))) = (&admitted, &self.cover, shape) {
+            if !c.is_mine(&id) {
+                c.observe(&head, body_len);
+            }
+        }
         // **RFC 1 §11's other half.** "Rejection MUST be silent to the peer
         // beyond ordinary flow control, and MUST be counted per peer as a
         // quota signal (RFC 3)." The silence was implemented and the counting
@@ -417,6 +525,46 @@ mod tests {
     /// partitions the network along version lines and the partition is
     /// permanent, because the nodes that would bridge it are the ones offline
     /// for a month."
+    /// **RFC 1 §8.2: real traffic's shape is recorded where it arrives.**
+    ///
+    /// And only real traffic. The first version of this passed the *body*
+    /// slice to `validate_body`, which parses the routing header itself and so
+    /// returned `Malformed` for every object — leaving the emitter with an
+    /// empty distribution for ever. That failure is silent by construction:
+    /// §8.2's corollary is that a node with no distribution emits nothing, so
+    /// a broken observer and a correctly quiet one look identical.
+    #[test]
+    fn an_accepted_object_is_observed_and_a_refused_one_is_not() {
+        let store = SharedStore::new(Store::new());
+        let cover = SharedCover::new();
+        let mut view = ExchangeView::new(
+            store.clone(),
+            NOW,
+            carry_all(),
+            crate::filter::Filter::unscoped(),
+            NOW,
+            krab_fabric::profile::MaxBucket(5),
+        )
+        .observing(cover.clone());
+
+        let h = RoutingHeader {
+            version: 1,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: NOW + 10_000,
+            tag: Tag([4; 8]),
+        };
+        let bytes = canonical_bytes(&h, &krab_core::object::example_sealed_body(1)).unwrap();
+        view.put(bytes);
+        assert_eq!(cover.observations(), 1, "an accepted object was not observed");
+
+        // Rubbish the store refuses must not steer the distribution: a peer
+        // that could do that would choose the shape this node's cover copies.
+        view.put(vec![0xEE; 64]);
+        assert_eq!(cover.observations(), 1, "a refused object was observed");
+    }
+
     #[test]
     fn an_object_of_an_unknown_version_is_carried_and_never_opened() {
         let store = SharedStore::new(Store::new());

@@ -41,7 +41,11 @@ use krab_proto::recon::{describe, respond, wanted, Corpus, RBSR_MAX_ROUNDS};
 use std::collections::BTreeSet;
 
 /// What an exchange moved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// No longer `Copy`: `shorts` owns its frames. That is deliberate rather than
+/// incidental — a `short` frame must be moved out and displayed, not silently
+/// duplicated by an assignment somewhere.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Moved {
     /// Objects accepted from the peer.
     pub received: usize,
@@ -57,7 +61,29 @@ pub struct Moved {
     /// An aggregate and nothing more. §12 forbids per-object provenance
     /// outright, so there is no record of *which* objects were duplicates.
     pub offered: usize,
+    /// `short` frames the peer sent — RFC 4 §8.
+    ///
+    /// **Carried out, never stored.** These are not objects: they have no
+    /// identifier, so the corpus has nothing to file them under and
+    /// reconciliation has nothing to compare. They are handed to the caller
+    /// still sealed, because only the caller holds the reservoir chunk they
+    /// are keyed from, and §8's "MUST NOT be stored beyond display" is the
+    /// caller's to honour from there.
+    ///
+    /// A frame arrives here rather than being dropped because the alternative
+    /// was the catch-all arm below: an opcode this driver does not speak is
+    /// skipped, which for a `short` would be silent loss of a message somebody
+    /// typed.
+    pub shorts: Vec<Vec<u8>>,
 }
+
+/// How many `short` frames one exchange will carry out.
+///
+/// Bounded because the frames are held in memory until the exchange returns,
+/// and a peer that sends nothing else can send these all session. At 55 bytes
+/// each this is a few kilobytes, and a link that genuinely needs more than 64
+/// one-line messages per reconciliation is not what §8 describes.
+pub const MAX_SHORTS: usize = 64;
 
 /// Cap on messages handled in one exchange.
 ///
@@ -264,6 +290,12 @@ pub fn initiate<C: Corpus + ?Sized>(
             }
             None => break,
             // Anything else belongs to a mode this driver does not speak.
+            // RFC 4 §8. Carried out to the caller, never into the corpus.
+            Some(Control::Short(frame)) => {
+                if moved.shorts.len() < MAX_SHORTS {
+                    moved.shorts.push(frame);
+                }
+            }
             Some(_) => continue,
         }
     }
@@ -337,6 +369,12 @@ pub fn respond_to<C: Corpus + ?Sized>(
                 moved.received += take(corpus, bytes)
             }
             Some(Control::Done) | None => break,
+            // RFC 4 §8. Carried out to the caller, never into the corpus.
+            Some(Control::Short(frame)) => {
+                if moved.shorts.len() < MAX_SHORTS {
+                    moved.shorts.push(frame);
+                }
+            }
             Some(_) => continue,
         }
         if offered && served {
@@ -351,7 +389,13 @@ pub fn respond_to<C: Corpus + ?Sized>(
                         moved.received += take(corpus, bytes)
                     }
                     Some(Control::Done) | None => break,
-                    Some(_) => continue,
+                    // RFC 4 §8. Carried out to the caller, never into the corpus.
+            Some(Control::Short(frame)) => {
+                if moved.shorts.len() < MAX_SHORTS {
+                    moved.shorts.push(frame);
+                }
+            }
+            Some(_) => continue,
                 }
             }
             break;
@@ -658,7 +702,13 @@ fn descend<C: Corpus + ?Sized>(
                                 Some(Control::Want(ids)) => {
                                     moved.sent += serve_wants(session, corpus, &ids, &mut budget)?
                                 }
-                                Some(_) => continue,
+                                // RFC 4 §8. Carried out to the caller, never into the corpus.
+            Some(Control::Short(frame)) => {
+                if moved.shorts.len() < MAX_SHORTS {
+                    moved.shorts.push(frame);
+                }
+            }
+            Some(_) => continue,
                                 None => break,
                             }
                         }
@@ -667,6 +717,12 @@ fn descend<C: Corpus + ?Sized>(
                 }
             }
             None => break,
+            // RFC 4 §8. Carried out to the caller, never into the corpus.
+            Some(Control::Short(frame)) => {
+                if moved.shorts.len() < MAX_SHORTS {
+                    moved.shorts.push(frame);
+                }
+            }
             Some(_) => continue,
         }
     }
@@ -797,6 +853,58 @@ mod tests {
             b.range_fingerprint(0, u32::MAX),
             "counts agree but contents do not"
         );
+    }
+
+    /// **A `short` sent on the session is carried out, and enters nothing.**
+    ///
+    /// This is the arm that did not exist: every driver ended in
+    /// `Some(_) => continue`, so a frame somebody typed was read off the
+    /// socket and dropped, with no error at either end. It is also the check
+    /// that it is not an object — the corpus must be exactly as large after as
+    /// before, because a `short` has no identifier to file it under.
+    #[test]
+    fn a_short_frame_is_carried_out_and_never_stored() {
+        use krab_fabric::backend::tcp::{generate_static, TcpFabric};
+        use krab_fabric::Fabric;
+
+        let frame = alloc_frame();
+        let (a_sk, a_pk) = generate_static().unwrap();
+        let (b_sk, b_pk) = generate_static().unwrap();
+        let responder = TcpFabric::new(LinkProfile::tcp(), "", b_sk, a_pk);
+        let port = responder.listen("127.0.0.1:0").unwrap();
+
+        let handle = std::thread::spawn(move || {
+            for _ in 0..400 {
+                if let Ok(Some(mut s)) = responder.accept() {
+                    let mut store = Store::new();
+                    let mut v = StoreView::new(&mut store, NOW);
+                    let m = respond_to(&mut *s, &mut v, [0; 32], 0, u32::MAX).unwrap_or_default();
+                    return (store.len(), m);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            (0, Moved::default())
+        });
+
+        let initiator = TcpFabric::new(LinkProfile::tcp(), format!("127.0.0.1:{port}"), a_sk, b_pk);
+        let mut session = initiator.connect().expect("handshake");
+        session
+            .send(&krab_proto::control::Control::Short(frame.clone()))
+            .unwrap();
+        let mut store = Store::new();
+        let mut v = StoreView::new(&mut store, NOW);
+        let _ = initiate(&mut *session, &mut v, [0; 32], 0, u32::MAX, 0);
+        let _ = session.close();
+
+        let (their_len, m) = handle.join().unwrap();
+        assert_eq!(m.shorts, vec![frame], "the frame was dropped");
+        assert_eq!(their_len, 0, "a short must not enter the corpus");
+        assert_eq!(m.received, 0);
+    }
+
+    /// A frame's worth of plausible bytes — opaque at this layer.
+    fn alloc_frame() -> Vec<u8> {
+        (0u8..30).collect()
     }
 
     /// A node with nothing catches up from one that has everything.

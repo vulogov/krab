@@ -63,9 +63,9 @@
 //! TCP and Tor and is not affordable on LoRa, and nothing here overrides a
 //! link profile that says so.
 
-use std::collections::{BTreeSet, VecDeque};
 use krab_core::object::{canonical_bytes, Class, Envelope, ObjectId, RoutingHeader, BUCKETS};
 use krab_crypto::rng::Rng;
+use std::collections::{BTreeSet, VecDeque};
 
 /// How many recent real-traffic shapes are remembered — §8.2's distribution.
 ///
@@ -358,8 +358,16 @@ mod tests {
             let cover = c.emit(1, 5_000, &mut rng).expect("no cover");
             seen[RoutingHeader::parse(&cover).unwrap().size_bucket as usize] += 1;
         }
-        assert!(seen[0] > 0 && seen[4] > 0, "one bucket never appeared: {seen:?}");
-        let other: usize = seen.iter().enumerate().filter(|(i, _)| *i != 0 && *i != 4).map(|(_, n)| n).sum();
+        assert!(
+            seen[0] > 0 && seen[4] > 0,
+            "one bucket never appeared: {seen:?}"
+        );
+        let other: usize = seen
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 0 && *i != 4)
+            .map(|(_, n)| n)
+            .sum();
         assert_eq!(other, 0, "a bucket nobody observed was emitted: {seen:?}");
     }
 

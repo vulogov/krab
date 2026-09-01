@@ -395,6 +395,23 @@ impl TorProcess {
         )))
     }
 
+    /// Withdraw a published service — `DEL_ONION`.
+    ///
+    /// The descriptor stops being republished and the service becomes
+    /// unreachable within one descriptor lifetime. This is what makes RFC 3
+    /// §9.2's contact endpoint "freely rotatable" in the operational sense
+    /// rather than only the cryptographic one: a contact address that could be
+    /// derived afresh but never withdrawn would accumulate, and every one of
+    /// them would still be answering.
+    ///
+    /// Idempotent from the caller's side: a service tor has already forgotten
+    /// gives `552`, which is reported and is not a condition worth handling
+    /// differently from success.
+    pub fn del_onion(&mut self, address: &str) -> Result<(), TorError> {
+        let id = address.trim_end_matches(".onion");
+        self.command(&format!("DEL_ONION {id}")).map(|_| ())
+    }
+
     /// Stop tor now.
     ///
     /// **Kill, not a polite shutdown.** This is what the panic wipe calls, and
@@ -642,6 +659,127 @@ pub fn dial(socks_port: u16, host: &str, port: u16) -> Result<TcpStream, crate::
     s.set_write_timeout(Some(Duration::from_secs(CONTROL_TIMEOUT_S)))?;
     socks::connect_through(&mut s, host, port)?;
     Ok(s)
+}
+
+/// A link to one peer's onion service — RFC 4 §5.2's client half.
+///
+/// This is the piece that was missing: [`dial`] existed and returned a
+/// [`TcpStream`], and nothing in the workspace implemented [`crate::Fabric`] over it,
+/// so `connect <peer> tor <addr>` fell through to the TCP branch. That is
+/// worse than an error. `TcpStream::connect("…onion:9001")` hands the name to
+/// the system resolver, which does not know `.onion` — so the dial fails
+/// *after* the operator's DNS server, and anyone watching it, has been told
+/// which hidden service this node was looking for. The whole point of §5.2 is
+/// that nobody learns that.
+///
+/// # Outbound only, and that is the architecture rather than a limitation
+///
+/// [`accept`](crate::Fabric::accept) always yields `None`. Inbound traffic to an
+/// onion service does not arrive here: tor terminates the rendezvous circuit
+/// itself and forwards the stream to the local port named in `ADD_ONION`'s
+/// `Port=` argument, where the ordinary listener is already waiting. There is
+/// nothing for this type to accept, and a variant that pretended otherwise
+/// would be a second listener racing the first for the same connections.
+///
+/// So a node reachable over Tor is running two things: `start-tor`, which
+/// publishes the service and points it at the listen port, and the listener
+/// that port belongs to. `TorFabric` is only how this node *dials out*.
+///
+/// # The static-key check is unchanged, and that is the point
+///
+/// An onion address authenticates the *service*, not the peer behind it, and
+/// those are different claims: the address proves whoever answers holds the
+/// onion key, which is a key this node's own peer may have had stolen. So the
+/// Noise IK handshake runs exactly as it does over TCP, against the static key
+/// from the credential (RFC 4 §4.1), and a mismatch is the same hard failure.
+/// Tor supplies location privacy; it supplies no identity Krab is willing to
+/// use.
+pub struct TorFabric {
+    profile: crate::profile::LinkProfile,
+    /// The local SOCKS port of the tor this node launched.
+    socks_port: u16,
+    /// The peer's `.onion` address, without a port.
+    host: String,
+    /// The virtual port on that service.
+    port: u16,
+    local_static: [u8; 32],
+    /// The peer's expected static public key, **from their credential**.
+    expected_peer: [u8; 32],
+}
+
+/// The virtual port Krab publishes on, and dials by default.
+///
+/// A hidden service's port space is its own — it is not a port on any host, so
+/// there is no conflict to avoid and no registry to consult. A constant is
+/// therefore better than a setting: both ends must agree, and nothing an
+/// operator could usefully vary is expressed by varying it.
+pub const ONION_PORT: u16 = 9001;
+
+impl TorFabric {
+    /// A link toward `host` through the tor listening on `socks_port`.
+    ///
+    /// `host` is an address, not an address and port: the port is
+    /// [`ONION_PORT`]. Accepting `host:port` here would let a caller pass a
+    /// string that parses two ways depending on whether the address contains a
+    /// colon, and `.onion` addresses do not.
+    pub fn new(
+        profile: crate::profile::LinkProfile,
+        socks_port: u16,
+        host: impl Into<String>,
+        local_static: [u8; 32],
+        expected_peer: [u8; 32],
+    ) -> TorFabric {
+        TorFabric {
+            profile,
+            socks_port,
+            host: host.into(),
+            port: ONION_PORT,
+            local_static,
+            expected_peer,
+        }
+    }
+
+    /// Override the virtual port. For a peer publishing on something else.
+    pub fn with_port(mut self, port: u16) -> TorFabric {
+        self.port = port;
+        self
+    }
+
+    /// The address this fabric dials.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+}
+
+impl crate::Fabric for TorFabric {
+    fn profile(&self) -> &crate::profile::LinkProfile {
+        &self.profile
+    }
+
+    fn connect(&self) -> Result<Box<dyn crate::Session>, crate::Error> {
+        // Deadlines are already armed inside `dial` for the SOCKS negotiation,
+        // which is the step that can hang: tor accepts the local connection
+        // immediately and then says nothing for as long as circuit building
+        // takes. They are re-armed below for the handshake and again for the
+        // session, because the three have different right answers and this
+        // runs on the interface thread — the same argument `TcpFabric::connect`
+        // makes at length.
+        let mut stream = dial(self.socks_port, &self.host, self.port)?;
+        crate::backend::listener::arm_handshake(&stream)?;
+        let noise = crate::noise::handshake_initiator(
+            &mut stream,
+            &self.local_static,
+            &self.expected_peer,
+        )?;
+        crate::backend::listener::arm_session_for(&stream, self.profile.session_timeout())?;
+        Ok(Box::new(crate::noise::StreamSession::new(stream, noise)))
+    }
+
+    /// Always `None` — see the type's note. Inbound arrives at the listener
+    /// the onion service forwards to, not here.
+    fn accept(&self) -> Result<Option<Box<dyn crate::Session>>, crate::Error> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -934,5 +1072,117 @@ mod tests {
     fn a_closed_control_port_is_an_error() {
         let mut r = std::io::Cursor::new(Vec::new());
         assert!(matches!(read_reply_from(&mut r), Err(TorError::Control(_))));
+    }
+
+    /// **The onion name goes to tor, not to the resolver.**
+    ///
+    /// This is the defect the type exists to close. Before `TorFabric`,
+    /// `connect <peer> tor <addr>` fell through to the TCP branch, and
+    /// `TcpStream::connect` hands a hostname to the system resolver — so the
+    /// dial failed *and* told the operator's DNS server which hidden service
+    /// this node was looking for. A test that only checked "connect returns an
+    /// error" would have passed on the broken version.
+    #[test]
+    fn an_onion_link_dials_through_socks_and_never_resolves_the_name() {
+        use std::io::Read;
+        let onion = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+
+        // Bounded, because the failure this test is guarding against is a
+        // dial that never reaches the proxy at all — and a blocking `accept`
+        // would turn that into a hung test binary rather than a red one. The
+        // socks helper learned this the same way.
+        l.set_nonblocking(true).unwrap();
+        let h = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut s = loop {
+                match l.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Vec::new();
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return Vec::new(),
+                }
+            };
+            s.set_nonblocking(false).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut greeting = [0u8; 3];
+            s.read_exact(&mut greeting).unwrap();
+            // Version 5, no authentication.
+            s.write_all(&[0x05, 0x00]).unwrap();
+            let mut head = [0u8; 5];
+            s.read_exact(&mut head).unwrap();
+            let mut rest = vec![0u8; head[4] as usize + 2];
+            s.read_exact(&mut rest).unwrap();
+            let mut seen = head.to_vec();
+            seen.extend_from_slice(&rest);
+            // Succeed, then say nothing: the handshake that follows is not
+            // what this test is about.
+            let _ = s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            seen
+        });
+
+        let f = TorFabric::new(
+            crate::profile::LinkProfile::tor(),
+            port,
+            onion,
+            [7u8; 32],
+            [9u8; 32],
+        );
+        // The handshake cannot complete against a socket that says nothing,
+        // so this fails — after the part being measured has already happened.
+        let _ = crate::Fabric::connect(&f);
+
+        let sent = h.join().unwrap();
+        assert!(
+            !sent.is_empty(),
+            "nothing reached the SOCKS port — the dial went somewhere else, \
+             which for a hostname means the system resolver"
+        );
+        assert_eq!(sent[0], 0x05, "SOCKS5");
+        assert_eq!(sent[1], 0x01, "CONNECT");
+        assert_eq!(
+            sent[3], 0x03,
+            "the address type must be DOMAIN — an IP type means the name was resolved here"
+        );
+        assert_eq!(sent[4] as usize, onion.len());
+        assert_eq!(&sent[5..5 + onion.len()], onion.as_bytes());
+        assert_eq!(
+            u16::from_be_bytes([sent[5 + onion.len()], sent[6 + onion.len()]]),
+            ONION_PORT
+        );
+    }
+
+    /// **A tor link never accepts.** Inbound arrives at the listener the onion
+    /// service forwards to. A fabric that also accepted would be a second
+    /// listener racing the first for the same connections.
+    #[test]
+    fn a_tor_link_is_outbound_only() {
+        let f = TorFabric::new(
+            crate::profile::LinkProfile::tor(),
+            1,
+            "x.onion",
+            [1u8; 32],
+            [2u8; 32],
+        );
+        assert!(crate::Fabric::accept(&f).unwrap().is_none());
+    }
+
+    /// No tor running is an ordinary error, not a hang — I-4 again.
+    #[test]
+    fn a_dead_socks_port_is_an_error() {
+        let f = TorFabric::new(
+            crate::profile::LinkProfile::tor(),
+            // Port 1 on loopback: reserved, nothing listening.
+            1,
+            "x.onion",
+            [1u8; 32],
+            [2u8; 32],
+        );
+        assert!(crate::Fabric::connect(&f).is_err());
     }
 }
