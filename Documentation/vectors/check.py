@@ -266,6 +266,70 @@ def check_objects(v: dict, r: Report) -> None:
             r.ok += 1
 
 
+def check_sealed(v: dict, r: Report) -> None:
+    """The sealed objects (§6), as far as the standard library can go.
+
+    These vectors used to be lengths only, on the grounds that HPKE is
+    randomised. They are generated from a fixed generator, so the bytes are
+    stable and are now printed — and printing them makes the *structure*
+    checkable here even though the ciphertext is not.
+
+    What is verified: that the object is header ‖ body ‖ zero padding, that the
+    body's declared `enc` and `ciphertext` are the ones printed separately, and
+    that the AAD is the object's own header followed by the envelope with key 5
+    omitted. That last one matters most — RFC 1 §6.1's AAD "binds expiry, tag,
+    class, epoch, and suite", and an AAD built from anything else produces an
+    object that decrypts nowhere.
+
+    What is NOT verified here: the ciphertext. Opening it needs
+    ChaCha20-Poly1305 and RFC 9180's key schedule, and neither is in the
+    standard library. That is the check a second implementation should run —
+    the file prints `enc`, `ciphertext`, `info`, `aad` and `kx.b.secret`
+    precisely so it can.
+    """
+    for mode in ("mode_auth", "mode_base"):
+        obj = bytes.fromhex(v[f"{mode}.object.bytes"])
+        enc = bytes.fromhex(v[f"{mode}.enc"])
+        ct = bytes.fromhex(v[f"{mode}.ciphertext"])
+        aad = bytes.fromhex(v[f"{mode}.aad"])
+
+        r.check(f"{mode}.object.len", len(obj), int(v[f"{mode}.object.len"]))
+        r.check(f"{mode}.enc.len", len(enc), int(v[f"{mode}.enc.len"]))
+        r.check(f"{mode}.ciphertext.len", len(ct), int(v[f"{mode}.ciphertext.len"]))
+        r.check(
+            f"{mode} object is padded to its bucket",
+            len(obj),
+            int(v[f"bucket.{v[f'{mode}.bucket']}.bytes"]),
+        )
+
+        # The header the AAD must begin with is the object's own first 16 bytes.
+        r.check(f"{mode} aad starts with the object header", aad[:16].hex(), obj[:16].hex())
+        r.check(f"{mode} aad header class", aad[1], 0)
+
+        # `enc` and `ciphertext` appear in the body, in that order, as CBOR
+        # byte strings. Their heads are not decoded here — what is checked is
+        # that the values printed separately are the values inside the object,
+        # which is what makes the separate lines usable at all.
+        body = obj[16:]
+        r.check(f"{mode} body contains enc", enc in body, True)
+        r.check(f"{mode} body contains ciphertext", ct in body, True)
+        r.check(
+            f"{mode} enc precedes ciphertext (§4.2 keys ascend)",
+            body.index(enc) < body.index(ct),
+            True,
+        )
+
+        # And the AAD omits key 5. If the ciphertext appeared in the AAD, the
+        # AAD could not be built before encryption and nothing would ever open.
+        r.check(f"{mode} aad omits the ciphertext", ct in aad, False)
+        r.check(f"{mode} aad contains enc", enc in aad, True)
+
+        # The tag in the header is the destination tag, eight bytes, and the
+        # object's padding is zero like any other.
+        tail = obj[16 + body.rstrip(b"\x00").__len__() :]
+        r.check(f"{mode} padding is zero", set(tail) or {0}, {0})
+
+
 def check_info_strings(v: dict, r: Report) -> None:
     """The HPKE info string: prefix ‖ one byte of class — RFC 1 §6.1."""
     prefix = bytes.fromhex(v["info.prefix.hex"])
@@ -322,6 +386,7 @@ def main() -> int:
         ("HKDF-Expand construction (§6.2)", check_kdf),
         ("tag derivation (§6.2)", check_tags),
         ("HPKE info strings (§6.1)", check_info_strings),
+        ("sealed object structure (§6)", check_sealed),
     ):
         before = r.ok, len(r.bad)
         fn(v, r)
@@ -337,8 +402,11 @@ def main() -> int:
     print()
     print("Not checked here: object identifiers (BLAKE3-256, absent from the")
     print("Python standard library — the file prints the whole preimage so a")
-    print("reader with a BLAKE3 utility can finish the job), and seal/open,")
-    print("which is randomised and has no fixed value to check.")
+    print("reader with a BLAKE3 utility can finish the job), and the sealed")
+    print("ciphertexts themselves, which need ChaCha20-Poly1305 and RFC 9180's")
+    print("key schedule. Their *structure* and AAD are checked above; opening")
+    print("them is the job of a second implementation, and the file prints")
+    print("enc, ciphertext, info, aad and kx.b.secret so that it can.")
     print()
     print("This is not RFC 1 §12's second implementation. It shares an author")
     print("with the first, so a misreading of §6.2 is reproduced here rather")

@@ -54,9 +54,14 @@ fn bucket(cell: &str) -> &'static str {
         || v.contains("now met")
         || v.starts_with("met")
         || v.contains("closed in the body")
-        || v.contains("deployment obligation")
     {
         "met"
+    } else if v.contains("obligation") {
+        // A requirement on somebody other than the code — the document
+        // reaching Final, or a deployment's transport mix. Its own bucket
+        // because counting it as met claims work nobody did, and counting it
+        // as unmet invites a commit that cannot exist.
+        "obligation"
     } else if v.contains("withdrawn") {
         "withdrawn"
     } else if v == "vacuous" {
@@ -117,7 +122,7 @@ fn declared(doc: &str) -> BTreeMap<String, Vec<usize>> {
         }
         let cells: Vec<&str> = line.split('|').map(str::trim).collect();
         let name = cells[1].to_string();
-        let nums: Vec<usize> = cells[2..9]
+        let nums: Vec<usize> = cells[2..10]
             .iter()
             .map(|c| c.replace('*', "").replace('—', "0").parse().unwrap_or(0))
             .collect();
@@ -163,13 +168,15 @@ fn the_recount_matches_the_audit_tables() {
             tally.get("unrepresentable").copied().unwrap_or(0),
             tally.get("partly met").copied().unwrap_or(0),
             tally.get("withdrawn").copied().unwrap_or(0),
+            tally.get("obligation").copied().unwrap_or(0),
             tally.get("unmet").copied().unwrap_or(0),
         ];
         assert_eq!(
             &got[..],
             &want[..],
             "{name}: §30 says {want:?}, the table has {got:?} \
-             (rows, met, vacuous, unrepresentable, partly met, withdrawn, unmet)"
+             (rows, met, vacuous, unrepresentable, partly met, withdrawn, \
+             obligation, unmet)"
         );
     }
 }
@@ -183,7 +190,7 @@ fn the_recount_matches_the_audit_tables() {
 fn the_total_is_the_sum_of_the_documents() {
     let doc = plan();
     let declared = declared(&doc);
-    let mut sum = vec![0usize; 7];
+    let mut sum = vec![0usize; 8];
     for nums in declared.values() {
         for (s, n) in sum.iter_mut().zip(nums) {
             *s += n;
@@ -200,7 +207,7 @@ fn the_total_is_the_sum_of_the_documents() {
     let stated: Vec<usize> = s
         .split('|')
         .skip(2)
-        .take(7)
+        .take(8)
         .map(|c| {
             c.replace('*', "")
                 .trim()

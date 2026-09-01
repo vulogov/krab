@@ -127,6 +127,26 @@ object.class1.bytes 010100006032c6011122334455667788abababababababababababababab
 object.class1.id 5e38550edee16237de93637c05f85a69295856782f878e345a97ad4194208c99
 object.class1.bytes_with_dirty_padding 010100006032c6011122334455667788abababababababababababababababababababababababababababababababababababababababab0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001
 object.class1.id_with_dirty_padding 61d20b9a71bec2a99f1cfe211a0c7187eb33ae4dbcaf124225e44ecf2c543794
+# class 2 and class 3 have no object encoding, and that is the
+# specification rather than a gap in this file:
+#
+#   class 2 `cover` is RESERVED AND NEVER EMITTED. RFC 1 §5.3:
+#   cover objects "MUST use class 0, not class 2", because a
+#   distinct class byte would make every dummy separable by reading
+#   one byte. §5.3 keeps the value in the enumeration "only so that
+#   no future version assigns it a meaning that would make cover
+#   traffic distinguishable". An implementation that emits class 2
+#   is wrong; one that accepts it is carrying an object no conforming
+#   sender produced.
+#
+#   class 3 `short` IS NOT A CORPUS OBJECT. RFC 1 §5.5: it has no
+#   identifier, is never relayed, never stored and never reconciled,
+#   and its framing is RFC 4 §8's, not this document's. There is no
+#   routing header to encode.
+class2.emitted 0
+class2.reason reserved_never_emitted
+class3.is_corpus_object 0
+class3.framing rfc4_section8
 
 ## HKDF-Expand construction, fixed PRK (§6.2)
 # anchor: external — these six outputs were computed outside this
@@ -236,16 +256,31 @@ info.class0 6b7261622f76312f00
 info.class1 6b7261622f76312f01
 
 ## seal and open (§6)
-# anchor: drift — HPKE is randomised, so a ciphertext is not a fixed
-# value and cannot be. What is pinned is the SHAPE: the lengths, the
-# mode, the suite, and that a round trip through the wire form
-# recovers the plaintext.
+# anchor: derivable — by opening, not by reproducing. See below.
+# The lengths, the mode and the suite are pinned too, because a
+# ciphertext that opens under the wrong schedule would not open at
+# all — and a shape mismatch says which of the two went wrong.
 #
-# A second implementation checks these by producing its own sealed
-# object and comparing the numbers, not by reproducing these bytes.
 # mode_auth is used for a known correspondent; mode_base for first
 # contact, where the recipient does not yet hold the sender's static
 # key and so cannot decapsulate in auth mode (RFC 2 §4.2).
+#
+# **The bytes are printed, and they are checkable — by opening
+# them.** They are produced under a fixed generator, so they are
+# stable here; a second implementation still cannot *reproduce* them,
+# because nothing in RFC 1 specifies how many random bytes HPKE draws
+# or in what order. What it can do is the check that actually
+# matters: take `enc`, `ciphertext`, `info` and `aad` below, together
+# with `kx.b.secret` printed earlier, run RFC 9180 Open in the stated
+# mode, and confirm it recovers `plaintext`. That exercises the KEM,
+# the key schedule, the AEAD and the AAD construction against a
+# different implementation of all four.
+#
+# This block was `anchor: drift` and said a ciphertext "is not a
+# fixed value and cannot be". The first half was true of the API and
+# false of these vectors, which were already generated from a seeded
+# generator; the second half confused *reproducing* a ciphertext with
+# *verifying* one, and only the first is impossible.
 mode_auth.object.len 256
 mode_auth.bucket 0
 mode_auth.tag_mode 0
@@ -254,6 +289,12 @@ mode_auth.enc.len 32
 mode_auth.ciphertext.len 32
 mode_auth.plaintext.len 16
 mode_auth.body_size_for 88
+mode_auth.plaintext 766563746f7220706c61696e74657874
+mode_auth.enc c67f30470ca7c070445f7a1ed9cd3882d6faa7e00ea4d80d22f4dbedf3b0d81b
+mode_auth.ciphertext b89b88f66eca25d66edc56c9f211c0549fc6be43695f79cedc29d8eb34791a3b
+mode_auth.info 6b7261622f76312f00
+mode_auth.aad 010000006032c6015060a67e42cb4e02a4001950bf01000201045820c67f30470ca7c070445f7a1ed9cd3882d6faa7e00ea4d80d22f4dbedf3b0d81b
+mode_auth.object.bytes 010000006032c6015060a67e42cb4e02a5001950bf01000201045820c67f30470ca7c070445f7a1ed9cd3882d6faa7e00ea4d80d22f4dbedf3b0d81b055820b89b88f66eca25d66edc56c9f211c0549fc6be43695f79cedc29d8eb34791a3b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 mode_base.object.len 256
 mode_base.bucket 0
 mode_base.tag_mode 1
@@ -262,22 +303,46 @@ mode_base.enc.len 32
 mode_base.ciphertext.len 32
 mode_base.plaintext.len 16
 mode_base.body_size_for 88
+mode_base.plaintext 766563746f7220706c61696e74657874
+mode_base.enc c67f30470ca7c070445f7a1ed9cd3882d6faa7e00ea4d80d22f4dbedf3b0d81b
+mode_base.ciphertext 645c097683f4c25661f6d81f09192bcb470cd4a1787808d6b845cb5cbc4ff24a
+mode_base.info 6b7261622f76312f00
+mode_base.aad 010000006032c601e2d9c85bbe5e4bb1a4001950bf01010201045820c67f30470ca7c070445f7a1ed9cd3882d6faa7e00ea4d80d22f4dbedf3b0d81b
+mode_base.object.bytes 010000006032c601e2d9c85bbe5e4bb1a5001950bf01010201045820c67f30470ca7c070445f7a1ed9cd3882d6faa7e00ea4d80d22f4dbedf3b0d81b055820645c097683f4c25661f6d81f09192bcb470cd4a1787808d6b845cb5cbc4ff24a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 
 ## rejection cases (§11)
 # anchor: drift — each line names the refusal an implementation must
 # produce for that input. The NAMES are the checkable part: two
 # implementations agreeing that a case is rejected, but for different
 # reasons, have not agreed about §11.
+#
+# **Each case carries the §11 identifier it exercises.** §11 gives the
+# six checks stable identifiers and says "a conformance suite SHOULD
+# exercise each by identifier"; the identifiers were in this
+# generator's comments and did not reach the file, so a second
+# implementer had to reconstruct the mapping — which is exactly where
+# two readings diverge. All six are covered, and the coverage is
+# asserted rather than counted by eye.
 reject.id_mismatch IdMismatch
+reject.id_mismatch.check I5
 reject.bad_length BadPadding
+reject.bad_length.check I1
 reject.expired Expired
+reject.expired.check I2
 reject.too_far_future TooFarFuture
+reject.too_far_future.check I2
 reject.duplicate Duplicate
+reject.duplicate.check I6
 reject.bad_class Unrecognised
+reject.bad_class.check I3
 reject.reserved_flag_set Unrecognised
+reject.reserved_flag_set.check I3
 reject.nonzero_padding BadPadding
+reject.nonzero_padding.check I1
 reject.body_not_cbor BadBody
+reject.body_not_cbor.check I4
 reject.reserved_body_key BadBody
+reject.reserved_body_key.check I4
 
 ## forward compatibility (§10)
 # anchor: an unknown `ver` is CARRIED, not refused. §10: "a relay

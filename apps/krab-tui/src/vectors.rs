@@ -244,6 +244,32 @@ pub fn generate() -> String {
             hex(&krab_crypto::object_id(&padded).0)
         ));
     }
+    // **§12 says "each class" and RFC 1 §5 enumerates four.** Two of them have
+    // no canonical object encoding, and a second implementer reading §12 will
+    // look for four and find two — so the absence is stated rather than left
+    // to be reconstructed.
+    out.push_str(
+        "# class 2 and class 3 have no object encoding, and that is the\n\
+         # specification rather than a gap in this file:\n\
+         #\n\
+         #   class 2 `cover` is RESERVED AND NEVER EMITTED. RFC 1 §5.3:\n\
+         #   cover objects \"MUST use class 0, not class 2\", because a\n\
+         #   distinct class byte would make every dummy separable by reading\n\
+         #   one byte. §5.3 keeps the value in the enumeration \"only so that\n\
+         #   no future version assigns it a meaning that would make cover\n\
+         #   traffic distinguishable\". An implementation that emits class 2\n\
+         #   is wrong; one that accepts it is carrying an object no conforming\n\
+         #   sender produced.\n\
+         #\n\
+         #   class 3 `short` IS NOT A CORPUS OBJECT. RFC 1 §5.5: it has no\n\
+         #   identifier, is never relayed, never stored and never reconciled,\n\
+         #   and its framing is RFC 4 §8's, not this document's. There is no\n\
+         #   routing header to encode.\n\
+         class2.emitted 0\n\
+         class2.reason reserved_never_emitted\n\
+         class3.is_corpus_object 0\n\
+         class3.framing rfc4_section8\n",
+    );
     out.push('\n');
 
     // ---- §6.2 tag derivation across an epoch boundary ----
@@ -418,21 +444,37 @@ pub fn generate() -> String {
 
     // ---- §6 seal/open, both modes ----
     //
-    // HPKE is randomised, so a ciphertext is not a fixed vector. What is
-    // pinned is the *shape*: sizes, and that a round trip through the wire
-    // form recovers the plaintext.
+    // Produced under a fixed generator, so the bytes are stable and are
+    // printed. A second implementation verifies them by *opening* them, which
+    // needs no agreement about how HPKE consumes randomness — see the block
+    // comment written into the file below.
     out.push_str("## seal and open (§6)\n");
     out.push_str(
-        "# anchor: drift — HPKE is randomised, so a ciphertext is not a fixed\n\
-         # value and cannot be. What is pinned is the SHAPE: the lengths, the\n\
-         # mode, the suite, and that a round trip through the wire form\n\
-         # recovers the plaintext.\n\
+        "# anchor: derivable — by opening, not by reproducing. See below.\n\
+         # The lengths, the mode and the suite are pinned too, because a\n\
+         # ciphertext that opens under the wrong schedule would not open at\n\
+         # all — and a shape mismatch says which of the two went wrong.\n\
          #\n\
-         # A second implementation checks these by producing its own sealed\n\
-         # object and comparing the numbers, not by reproducing these bytes.\n\
          # mode_auth is used for a known correspondent; mode_base for first\n\
          # contact, where the recipient does not yet hold the sender's static\n\
-         # key and so cannot decapsulate in auth mode (RFC 2 §4.2).\n",
+         # key and so cannot decapsulate in auth mode (RFC 2 §4.2).\n\
+         #\n\
+         # **The bytes are printed, and they are checkable — by opening\n\
+         # them.** They are produced under a fixed generator, so they are\n\
+         # stable here; a second implementation still cannot *reproduce* them,\n\
+         # because nothing in RFC 1 specifies how many random bytes HPKE draws\n\
+         # or in what order. What it can do is the check that actually\n\
+         # matters: take `enc`, `ciphertext`, `info` and `aad` below, together\n\
+         # with `kx.b.secret` printed earlier, run RFC 9180 Open in the stated\n\
+         # mode, and confirm it recovers `plaintext`. That exercises the KEM,\n\
+         # the key schedule, the AEAD and the AAD construction against a\n\
+         # different implementation of all four.\n\
+         #\n\
+         # This block was `anchor: drift` and said a ciphertext \"is not a\n\
+         # fixed value and cannot be\". The first half was true of the API and\n\
+         # false of these vectors, which were already generated from a seeded\n\
+         # generator; the second half confused *reproducing* a ciphertext with\n\
+         # *verifying* one, and only the first is impossible.\n",
     );
     for (name, first_contact) in [("mode_auth", false), ("mode_base", true)] {
         let plaintext = b"vector plaintext";
@@ -476,6 +518,18 @@ pub fn generate() -> String {
             "{name}.body_size_for {}\n",
             body_size_for(plaintext.len())
         ));
+        // Everything a second implementation needs to run Open. The
+        // recipient's private key is `kx.b.secret`, printed above.
+        out.push_str(&format!("{name}.plaintext {}\n", hex(plaintext)));
+        out.push_str(&format!("{name}.enc {}\n", hex(env.enc)));
+        out.push_str(&format!("{name}.ciphertext {}\n", hex(env.ciphertext)));
+        out.push_str(&format!("{name}.info {}\n", hex(&info_for(0))));
+        let composed_header = RoutingHeader::parse(&composed.bytes).unwrap();
+        out.push_str(&format!(
+            "{name}.aad {}\n",
+            hex(&aad_for(&composed_header, &env))
+        ));
+        out.push_str(&format!("{name}.object.bytes {}\n", hex(&composed.bytes)));
     }
     out.push('\n');
 
@@ -485,10 +539,19 @@ pub fn generate() -> String {
         "# anchor: drift — each line names the refusal an implementation must\n\
          # produce for that input. The NAMES are the checkable part: two\n\
          # implementations agreeing that a case is rejected, but for different\n\
-         # reasons, have not agreed about §11.\n",
+         # reasons, have not agreed about §11.\n\
+         #\n\
+         # **Each case carries the §11 identifier it exercises.** §11 gives the\n\
+         # six checks stable identifiers and says \"a conformance suite SHOULD\n\
+         # exercise each by identifier\"; the identifiers were in this\n\
+         # generator's comments and did not reach the file, so a second\n\
+         # implementer had to reconstruct the mapping — which is exactly where\n\
+         # two readings diverge. All six are covered, and the coverage is\n\
+         # asserted rather than counted by eye.\n",
     );
-    for (name, reject) in rejections() {
+    for (name, check, reject) in rejections() {
         out.push_str(&format!("reject.{name} {reject}\n"));
+        out.push_str(&format!("reject.{name}.check {check}\n"));
     }
 
     // ---- §10 acceptance: a version this build cannot read ----
@@ -570,7 +633,7 @@ fn forward_compatibility() -> Vec<(&'static str, &'static str)> {
 }
 
 /// Every §11 rejection, exercised.
-fn rejections() -> Vec<(&'static str, &'static str)> {
+fn rejections() -> Vec<(&'static str, &'static str, &'static str)> {
     let name_of = |r: Result<(), Reject>| -> &'static str {
         match r {
             Ok(()) => "accepted",
@@ -615,6 +678,7 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
     let (other, _) = object(NOW + 50_000);
     out.push((
         "id_mismatch",
+        "I5",
         name_of(s.ingest(other, bytes.clone(), NOW, u32::MAX)),
     ));
 
@@ -622,18 +686,18 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
     let mut short = bytes.clone();
     short.truncate(short.len() - 1);
     let id = krab_crypto::object_id(&short);
-    out.push(("bad_length", name_of(s.ingest(id, short, NOW, u32::MAX))));
+    out.push(("bad_length", "I1", name_of(s.ingest(id, short, NOW, u32::MAX))));
 
     // I2 — expiry in the past, and beyond MAX_TTL.
     let (id, b) = object(NOW - 1);
-    out.push(("expired", name_of(s.ingest(id, b, NOW, u32::MAX))));
+    out.push(("expired", "I2", name_of(s.ingest(id, b, NOW, u32::MAX))));
     let (id, b) = object(NOW + 100_000);
-    out.push(("too_far_future", name_of(s.ingest(id, b, NOW, 1_000))));
+    out.push(("too_far_future", "I2", name_of(s.ingest(id, b, NOW, 1_000))));
 
     // I6 — duplicate.
     let (id, b) = object(NOW + 40_000);
     let _ = s.ingest(id, b.clone(), NOW, u32::MAX);
-    out.push(("duplicate", name_of(s.ingest(id, b, NOW, u32::MAX))));
+    out.push(("duplicate", "I6", name_of(s.ingest(id, b, NOW, u32::MAX))));
 
     // I3 — the class must be recognised **for a known version**. A version
     // this build does not know is not a rejection at all: RFC 1 §10 requires
@@ -642,7 +706,7 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
     let mut junk = bytes.clone();
     junk[1] = 0xFF; // class
     let id = krab_crypto::object_id(&junk);
-    out.push(("bad_class", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+    out.push(("bad_class", "I3", name_of(s.ingest(id, junk, NOW, u32::MAX))));
 
     // I3 — and the reserved flag bits are zero. §4.1 defines bits 0 and 1;
     // 2..7 are MBZ, and they are inside the identifier, so anything put there
@@ -652,7 +716,7 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
     let mut junk = bytes.clone();
     junk[3] = 0b0000_0100;
     let id = krab_crypto::object_id(&junk);
-    out.push(("reserved_flag_set", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+    out.push(("reserved_flag_set", "I3", name_of(s.ingest(id, junk, NOW, u32::MAX))));
 
     // I1 — the padding after the body is zero. The identifier covers it, so a
     // non-zero pad is a covert channel every relay carries believing it
@@ -661,7 +725,7 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
     let last = junk.len() - 1;
     junk[last] = 0xFF;
     let id = krab_crypto::object_id(&junk);
-    out.push(("nonzero_padding", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+    out.push(("nonzero_padding", "I1", name_of(s.ingest(id, junk, NOW, u32::MAX))));
 
     // I4 — the body parses as deterministic CBOR.
     let h = RoutingHeader {
@@ -674,7 +738,7 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
     };
     let junk = canonical_bytes(&h, &[0xFFu8; 40]).unwrap();
     let id = krab_crypto::object_id(&junk);
-    out.push(("body_not_cbor", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+    out.push(("body_not_cbor", "I4", name_of(s.ingest(id, junk, NOW, u32::MAX))));
 
     // I4 — and carries no key that is not defined for this version. Key 3 is
     // `admission`, reserved: §4.2 says reserved means absent, not
@@ -695,7 +759,7 @@ fn rejections() -> Vec<(&'static str, &'static str)> {
         .bstr(&[7u8; 16]);
     let junk = canonical_bytes(&h, &w.finish()).unwrap();
     let id = krab_crypto::object_id(&junk);
-    out.push(("reserved_body_key", name_of(s.ingest(id, junk, NOW, u32::MAX))));
+    out.push(("reserved_body_key", "I4", name_of(s.ingest(id, junk, NOW, u32::MAX))));
 
     out
 }
@@ -786,11 +850,39 @@ mod tests {
     /// Every §11 rejection produces the expected refusal, not an acceptance.
     #[test]
     fn every_rejection_case_actually_rejects() {
-        for (name, outcome) in rejections() {
+        for (name, _check, outcome) in rejections() {
             assert_ne!(outcome, "accepted", "§11 case {name} was accepted");
             assert_ne!(
                 outcome, "other",
                 "§11 case {name} produced an unnamed reject"
+            );
+        }
+    }
+
+    /// **All six of §11's checks are exercised, by identifier.**
+    ///
+    /// §11 gives the checks stable identifiers "so an implementation can be
+    /// audited against this list line by line", and says a conformance suite
+    /// SHOULD exercise each by identifier. Counting them by eye is how a gap
+    /// survives: the identifiers were in this file's comments and reached
+    /// neither the vectors nor any assertion, so nothing would have noticed a
+    /// case being deleted along with its comment.
+    #[test]
+    fn every_check_in_section_eleven_is_exercised_by_identifier() {
+        let covered: std::collections::BTreeSet<&str> =
+            rejections().into_iter().map(|(_, check, _)| check).collect();
+        let want: std::collections::BTreeSet<&str> =
+            ["I1", "I2", "I3", "I4", "I5", "I6"].into_iter().collect();
+        assert_eq!(
+            covered, want,
+            "§11 defines I1-I6 and the vectors exercise {covered:?}"
+        );
+        // And each identifier reaches the published file, not only this test.
+        let v = generate();
+        for check in want {
+            assert!(
+                v.contains(&format!(".check {check}\n")),
+                "no vector line names {check}"
             );
         }
     }

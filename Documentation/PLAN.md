@@ -1095,8 +1095,8 @@ available by counting anything.
 | 11 | I5 MUST run before anything consulting the identifier | met | first check in `ingest` |
 | 11 | rejection MUST be silent to the peer | met | nothing is written back |
 | 11 | and MUST be counted per peer as a quota signal | **was unmet, now met** | `Spend::rejected` |
-| 12 | RFC 1 MUST NOT reach Final without machine-checkable vectors | met | `Documentation/vectors/rfc-1.txt` |
-| 12 | two independent implementations MUST agree on every vector | **unmet, by design** | there is one implementation; recorded in README |
+| 12 | RFC 1 MUST NOT reach Final without machine-checkable vectors | **met + tested** | `Documentation/vectors/rfc-1.txt`, all eight categories asserted present; §11's six checks exercised by identifier (§33) |
+| 12 | two independent implementations MUST agree on every vector | **obligation** | a gate on RFC 1 reaching Final, not on a node. RFC 1 is `Status: Draft`, so nothing is in violation — an implementation cannot break this, only an editor promoting the document can (§33) |
 
 ### The one that matters: §10's opaque relay
 
@@ -1408,7 +1408,7 @@ easiest to check by grep." Reading it line by line found one.
 | 4.4 | implementations MUST cap round trips | met + tested | `RBSR_MAX_ROUNDS = 8` |
 | 4.4 | …**and fall back to manifest mode on exceeding it** | **was unmet, now met** | `descend`, see below |
 | 4.5 | `PushOnly` MUST NOT be used as a link's sync mode | met structurally | the same requirement, stated twice |
-| 5 | deployments MUST NOT rely on LoRa as a majority transport | deployment obligation | the SHOULD-warn at 30 % of links is not implemented |
+| 5 | deployments MUST NOT rely on LoRa as a majority transport | **obligation** | on a deployment, not on the code; the SHOULD-warn at 30 % of links is still unimplemented (§33) |
 | 6.1 | reconciliation MUST run on a Poisson schedule, randomised interval and peer order, independent of user activity | met + tested | `Scheduler::due` takes time and entropy and nothing else — RFC 0 I-5 |
 | 7 | the index MUST be fully rebuildable from the segments by one scan | **was unmet, now met** | `rebuild_index`, closed 2026-08-30 |
 | 8 | a receiver MUST reject any object whose expiry has passed | met + tested | I2 |
@@ -2355,16 +2355,23 @@ exist.
 
 Derived by walking the rows, not by adding up prose:
 
-| document | rows | met | vacuous | unrepresentable | partly met | withdrawn | **unmet** |
-|---|---|---|---|---|---|---|---|
-| RFC 1 | 35 | 32 | 2 | — | — | — | **1** |
-| RFC 2 | 16 | 14 | 1 | — | — | 1 | **0** |
-| RFC 3 | 22 | 22 | — | — | — | — | 0 |
-| RFC 4 | 28 | 25 | 2 | 1 | — | — | 0 |
-| RFC 5 | 17 | 17 | — | — | — | — | 0 |
-| RFC 6 | 24 | 23 | — | — | — | 1 | 0 |
-| RFC 7 | 29 | 28 | — | — | — | 1 | 0 |
-| **total** | **171** | **161** | **5** | **1** | — | **3** | **1** |
+| document | rows | met | vacuous | unrepresentable | partly met | withdrawn | obligation | **unmet** |
+|---|---|---|---|---|---|---|---|---|
+| RFC 1 | 35 | 32 | 2 | — | — | — | 1 | **0** |
+| RFC 2 | 16 | 14 | 1 | — | — | 1 | — | **0** |
+| RFC 3 | 22 | 22 | — | — | — | — | — | 0 |
+| RFC 4 | 28 | 25 | 2 | 1 | — | — | — | 0 |
+| RFC 5 | 17 | 16 | — | — | — | — | 1 | 0 |
+| RFC 6 | 24 | 23 | — | — | — | 1 | — | 0 |
+| RFC 7 | 29 | 28 | — | — | — | 1 | — | 0 |
+| **total** | **171** | **160** | **5** | **1** | — | **3** | **2** | **0** |
+
+**`obligation`** is a requirement on somebody other than the code: RFC 1 §12's
+two-implementation clause gates the *document* reaching Final, and RFC 5 §5's
+"deployments MUST NOT rely on LoRa as a majority transport" gates a
+*deployment*. Neither can be satisfied by a commit and neither is unmet, so
+counting them as either would be wrong in a different direction. They stay
+visible as their own column — see §33.
 
 **171, not 167.** The old figure was the sum of per-document totals that had
 each been written from a tally rather than counted from a table; four of the
@@ -2374,8 +2381,10 @@ done properly for the first time.
 
 ### What is actually unmet, now that the noise is gone
 
-Three rows when this sweep ran; **two after §31 closed the first of them**, and
-only one of those two is code.
+Three rows when this sweep ran. §31 closed one, §32 closed another, and §33
+reclassified the third — it was never an implementation requirement. **Zero
+unmet**, which is a smaller claim than it sounds: see §33 on why "obligation"
+is its own column and not a way of reaching that number.
 
 - ~~**RFC 2 §5.1 — median-of-peers time.**~~ **Closed the same day, in §31.**
   It was unmet when this sweep ran: nothing computed the estimate. The table
@@ -2383,10 +2392,12 @@ only one of those two is code.
   apart again.
 - ~~**RFC 2 §8 — the in-flight-loss warning on correspondence-key rotation.**~~
   **Closed in §32**, which also found the § was wrong: it is RFC 2 §9.
-- **RFC 1 §12 — two independent implementations MUST agree on every conformance
-  vector.** Unmet by design and not by omission: there is one implementation.
-  It is recorded so that "we have vectors" is never mistaken for "the vectors
-  have been checked against someone else's code".
+- ~~**RFC 1 §12 — two independent implementations MUST agree on every
+  conformance vector.**~~ **Reclassified in §33 as an `obligation`**, which is
+  not the same as closed: both of §12's clauses gate RFC 1 *reaching Final*,
+  and RFC 1 is `Status: Draft`, so no implementation is in violation and none
+  can be. Still open, still recorded, so that "we have vectors" is never
+  mistaken for "the vectors have been checked against someone else's code".
 
 ~~And one partly met: **RFC 2 §8's precomputation table as key material**.~~
 **Closed in §32.** The table is now a `krab_lock::Held<TagTable>`.
@@ -2540,6 +2551,9 @@ verdict, and names E-6 for why the resolution is a day.
 
 ### Still unmet after this
 
+> **Superseded: §32 closed the first two, §33 reclassified the third.** Left as
+> the record of what was open on the day.
+
 - **RFC 2 §8** — the in-flight-loss warning on correspondence-key rotation.
   Unmet because there is no correspondence-key rotation verb to warn *from*.
 - **RFC 1 §12** — two independent implementations agreeing on the conformance
@@ -2643,7 +2657,8 @@ correct when written; it now says what is and is not covered.
 
 ### What remains
 
-One row, and it is not code:
+One row, and it is not code — **and §33 found it is not a requirement on the
+code at all**:
 
 - **RFC 1 §12** — "two independent implementations MUST agree on every
   conformance vector." There is one implementation. The vectors exist and are
@@ -2657,3 +2672,118 @@ about features this version does not have.
 And the things that are built but not proven, which are not audit rows and are
 worth keeping visible: the contact endpoint's `ADD_ONION` and `del_onion` have
 never run against a real tor, and `VirtualLock` has still never executed.
+
+---
+
+## 33. RFC 1 §12 is not a requirement on the implementation — 2026-09-01
+
+§32 left one row and called it "not code". Reading §12 again, it is not a
+requirement on the implementation at all, and the audit had it in the wrong
+category rather than merely unmet.
+
+```
+RFC 1 MUST NOT reach Final without machine-checkable vectors covering, at
+minimum: … Two independent implementations MUST agree on every vector before
+the status changes.
+```
+
+**Both clauses gate RFC 1's status transition.** Neither says anything a node
+does. `Documentation/RFC-1.md:5` reads `Status: Draft`, so nothing is in
+violation and nothing can be: an implementation cannot break §12, only an
+editor promoting the document to Final without the agreement can.
+
+That is a reclassification and not a closure, which is why it goes in its own
+column rather than into "met". The series already had one row of this shape —
+RFC 5 §5's "deployments MUST NOT rely on LoRa as a majority transport", which
+gates a *deployment* — and it had been counted as met, which is the same error
+in the generous direction. Both are now **`obligation`**: a requirement on
+somebody other than the code, satisfiable by no commit and unmet by no
+implementation.
+
+**`plan_counts.rs` refused the first attempt at this**, which is the guard §30
+was written for doing its job one section later: the new verdict wording was
+unclassifiable, so the test failed loudly instead of quietly bucketing it as
+met. The bucket had to be added deliberately, in both the table and the parser.
+
+### What was considered and rejected
+
+**Writing the second implementation.** This does not satisfy §12 and would make
+things worse. Two implementations by one author, from one reading, reproduce
+that reading's errors in both — and `check.py` already says exactly this about
+itself, unprompted, in its own docstring: "it was written by the same author,
+from the same reading of §6.2, so a misreading of the specification would be
+reproduced here rather than caught." Producing a second encoder and calling it
+§12's would convert an honest open item into a false closed one, which is the
+worst outcome available.
+
+The only thing that closes §12 is somebody else implementing RFC 1 from the
+prose and agreeing. Not something this repository can do to itself.
+
+### What was done instead: making the agreement worth more when it comes
+
+§12's *first* clause — that the vectors cover eight named categories — is a
+real requirement and had three gaps.
+
+**1. The rejection vectors did not name §11's identifiers.** §11 gives its six
+checks stable identifiers "so an implementation can be audited against this
+list line by line" and says a conformance suite SHOULD exercise each by
+identifier. All six were covered — and the identifiers existed only in the
+generator's Rust comments, so they reached neither the published file nor any
+assertion. A second implementer had to reconstruct the mapping, which is
+precisely where two readings diverge.
+
+Each case now emits `reject.<name>.check I<n>`, and
+`every_check_in_section_eleven_is_exercised_by_identifier` asserts the set is
+exactly I1–I6 *and* that each identifier reaches the file. Counting them by eye
+is how a gap survives a deletion.
+
+**2. §12 says "each class" and the file had two.** Classes 2 and 3 have no
+canonical object encoding — class 2 `cover` is reserved and MUST NOT be emitted
+(RFC 1 §5.3: cover uses class 0, because a distinct class byte would make every
+dummy separable by reading one byte), and class 3 `short` is not a corpus
+object at all (§5.5; its framing is RFC 4 §8's). Both facts are now *in* the
+file. A second implementer reading "each class" looks for four, and previously
+found two with no explanation.
+
+**3. The seal/open block was `anchor: drift`, and it need not have been.** Its
+comment said HPKE "is randomised, so a ciphertext is not a fixed value and
+cannot be". The first half is true of the API and false of these vectors, which
+were already generated from a seeded generator; the second half confused
+*reproducing* a ciphertext with *verifying* one, and only the first is
+impossible.
+
+The bytes are now printed — `enc`, `ciphertext`, `info`, `aad`, and the whole
+object — alongside the recipient's private key that was already there. A second
+implementation cannot reproduce them, because nothing in RFC 1 specifies how
+HPKE consumes randomness; it can **open** them, which exercises the KEM, the
+key schedule, the AEAD and the AAD construction against a different
+implementation of all four. That is the check that matters and it was being
+skipped on the strength of a sentence about a different one.
+
+**`check.py` gained the part of that it can do.** ChaCha20-Poly1305 and RFC
+9180's schedule are not in the Python standard library, so it cannot open the
+ciphertext — but the *structure* is stdlib-checkable, and the AAD especially:
+RFC 1 §6.1's AAD "binds expiry, tag, class, epoch, and suite", and an AAD built
+from anything else produces an object that decrypts nowhere. 67 checks became
+**91**. Probed by flipping one byte of `mode_auth.aad`, which fails with the
+computed and file values side by side.
+
+### The count, and what it does and does not mean
+
+**171 rows: 160 met, 5 vacuous, 1 unrepresentable, 3 withdrawn, 2 obligation,
+0 unmet.**
+
+Zero unmet is a smaller claim than it looks and is worth deflating deliberately:
+
+- **2 obligations** are open and cannot be closed here.
+- **5 vacuous and 1 unrepresentable** are the amateur-band and SF11/SF12
+  requirements — **postponed for want of hardware**, §28 — and three
+  requirements about features this version does not have.
+- **Every "met" is met against this implementation's reading of the prose**,
+  which is exactly the thing §12's second clause exists to check and which
+  remains unchecked. A conformance suite that agrees with itself is a
+  conformance suite that agrees with itself.
+
+And separately from the audit entirely: the contact endpoint's `ADD_ONION` and
+`del_onion` have never run against a real tor, and `VirtualLock` has still
+never executed.
