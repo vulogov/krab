@@ -3352,3 +3352,106 @@ credential decrypt and verify in `purge_expired_peerings`, the AEAD-decrypt of
 the pinned archive in `pinned()` which is also on the render path, and the full
 tombstone walk. Each is a caching question rather than an indexing one, and each
 needs its own answer to "what invalidates this".
+
+---
+
+## 40. `refresh_inbox`, a regression I shipped, and a verification that was lying — 2026-09-01
+
+Three things, and the middle one is the important one.
+
+### My verification command has been wrong all session
+
+Every "N tests, zero failures" in §29 onward came from:
+
+```
+cargo test --workspace | grep '^test result' | awk -F'[ ;]' '{p+=$4; f+=$6} END {...}'
+```
+
+Splitting `test result: ok. 30 passed; 0 failed;` on space *and* semicolon puts
+the failure count in `$7`, not `$6` — `$6` is the empty string between
+`passed;` and ` 0`. **So `f` was never incremented, and "failed: 0" was an
+uninitialised variable printed with confidence.**
+
+It was found because a change made a test fail loudly enough to appear in
+`grep FAILED` output while the summary still said zero. Checking `HEAD` with a
+corrected command found **1 308 passed, 1 failed**: a regression shipped in §38
+and reported as clean.
+
+The corrected form reads the field before each label rather than counting
+positions:
+
+```
+awk '{for(i=1;i<=NF;i++){if($i=="passed;")p+=$(i-1); if($i=="failed;")f+=$(i-1)}}'
+```
+
+This is the failure mode this document keeps recording, turned on the tools:
+**a summary derived from the wrong position, trusted because it was
+convenient.** §30 says a count kept beside a table must be derived from the
+table. A count parsed out of output must be parsed by name.
+
+### The regression: §38's prekey cache was keyed on too little
+
+§38 made `republish_prekeys_if_due` scan once per epoch instead of once per
+tick, on the reasoning that the answer changes daily. **It also changes
+whenever the corpus does** — a store replaced by a load, an import, or an
+eviction that took the batch with it. A node that had lost its prekeys would
+have waited a day before noticing, and prekeys are what forward secrecy rests
+on (RFC 7 §5.2).
+
+`the_schedule_republishes_prekeys_when_due` asserts exactly that, and it failed
+from the moment §38 landed. The import hook added there was a patch on one
+route to the same condition; the condition itself is "the corpus changed".
+
+Now keyed on `(epoch, Store::version)`, which is the exact signal.
+
+### `Store::version`, which is what the fix and the next one need
+
+A monotonic counter bumped wherever the held set changes — ingest, expire,
+evict, rebuild — and on nothing else. It counts *changes*, not objects, because
+`len()` is not a substitute: an ingest and an eviction in one tick leave the
+count equal and the contents different.
+
+`the_version_moves_exactly_when_the_held_set_changes` asserts both directions,
+and the direction that matters is the negative one: **a refused duplicate must
+not move it**, or a peer offering duplicates makes every reader rescan for
+ever — RFC 3 §6's flood arriving by another route.
+
+### `refresh_inbox` was guarded, and the guard was wrong
+
+Measured first, because the audit gave figures for the other symptoms and not
+this one: the per-peer crypto is **29.8 µs** for the Ed25519 verify and
+**22.6 µs** for the X25519 agreement, so 2.6 ms at fifty peers — **1 % of a
+250 ms tick**, not the 22 % the prekey scan was. The cost that matters here is
+`scan_with`, which allocates a vector of *every object in the corpus* and
+fetches and parses each one, every tick.
+
+So a guard on `(Store::version, peer set, epoch, opening-key count)` — the
+inputs of the derivation. It was written, and it broke four tests, and the
+reason is worth keeping:
+
+**`refresh_inbox` does three jobs.** It derives `self.messages`, it computes
+`self.reach` and the pending bases, and it renders `self.list` and the per-tab
+body. Those inputs are the derivation's only. **The list also depends on which
+tab is open**, which is not an input to the derivation at all — so the guard
+skipped the rendering too, and a tab switch showed what was there when the tab
+was last open. `a_channel_can_be_created_posted_to_and_read` said so at once.
+
+**Reverted rather than patched.** Adding the tab to the guard would make it
+pass and leave the same shape: one condition covering three jobs, where the
+next input added to any of them is a fourth chance to get it wrong. The right
+change is to split derivation from rendering so the guard covers the first and
+the second always runs — a refactor of the whole function, not a condition at
+the top of it, and not something to do as the tail of a performance pass in
+the function that renders the operator's inbox. Having already shipped one
+silent regression today, doing it carefully is worth more than doing it now.
+
+The reasoning is left in the code at the point where the guard would go, so the
+next attempt starts from the finding rather than rediscovering it.
+
+### What is verified
+
+**1 316 tests, zero failures** — by a command that can now count them —
+and clippy clean under `-D warnings` across `--all-features`. The number is
+higher than §39's stated 1 308 partly because tests were added and partly
+because the old figure was produced by the same broken pipeline; treat every
+count before this section as approximate.

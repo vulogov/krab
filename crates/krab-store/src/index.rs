@@ -155,12 +155,37 @@ pub struct Store {
     /// [`Store::buckets`] sees a removal without being told about it — one
     /// less thing that can be forgotten on a path that adds a segment.
     dirty: BTreeSet<u32>,
+    /// Bumped whenever the set of held objects changes.
+    ///
+    /// **An exact invalidation signal for readers that derive from the whole
+    /// corpus**, and the cheapest one there is: a caller that scanned the
+    /// store and wants to know whether its conclusion still holds compares one
+    /// integer instead of walking it again.
+    ///
+    /// It counts *changes*, not objects — `len()` is not a substitute, because
+    /// an ingest and an eviction in the same tick leave it unchanged while the
+    /// contents differ. It is monotonic and never reset, including by
+    /// [`Store::rebuild_index`]: a rebuild does not change what is held, but a
+    /// reader that cached across one has no way to know the segments were not
+    /// also reloaded, so it is bumped there too. Erring toward a redundant
+    /// rescan is the safe direction; the unsafe one is an inbox that has
+    /// stopped noticing mail.
+    version: u64,
 }
 
 impl Store {
     /// An empty store.
     pub fn new() -> Store {
         Store::default()
+    }
+
+    /// How many times the held set has changed.
+    ///
+    /// For a reader that derives something from the whole corpus and wants to
+    /// know whether to derive it again — see the field's own note on why this
+    /// is not `len()`.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Objects held.
@@ -318,8 +343,7 @@ impl Store {
         // Both are skipped for a version this build cannot read — see the note
         // on §10 above for why, and for what that costs.
         if readable {
-            let body_len =
-                krab_core::object::validate_body(&bytes).map_err(|_| Reject::BadBody)?;
+            let body_len = krab_core::object::validate_body(&bytes).map_err(|_| Reject::BadBody)?;
             krab_core::object::verify_padding(&bytes, body_len).map_err(|_| Reject::BadPadding)?;
         }
 
@@ -353,6 +377,7 @@ impl Store {
             .append(id, bytes);
         self.by_trunc.insert(id.truncated(), id);
         self.by_id.insert(id, bucket);
+        self.version += 1;
         self.index.insert(
             (expiry, id),
             Location {
@@ -585,6 +610,9 @@ impl Store {
         self.dirty.extend(cut);
         self.index.retain(|(e, _), _| *e > now_min);
         self.min_expiry_min = self.min_expiry_min.max(now_min);
+        // Bumped unconditionally: `index` entries are pruned above even when
+        // no segment was unlinked, so `n == 0` does not mean nothing changed.
+        self.version += 1;
         n
     }
 
@@ -652,6 +680,7 @@ impl Store {
             // Advertising the raised watermark is what stops a peer re-offering
             // what we just chose not to keep -- SIM-1 §4's +68% re-fetch loop.
             self.min_expiry_min = self.min_expiry_min.max(bound);
+            self.version += 1;
         }
         dropped
     }
@@ -678,6 +707,7 @@ impl Store {
         self.index.clear();
         self.by_trunc.clear();
         self.by_id.clear();
+        self.version += 1;
         for (&bucket, seg) in &self.segments {
             for (id, bytes) in seg.entries() {
                 let h = RoutingHeader::parse(bytes).map_err(|_| Error::Corrupt)?;
@@ -757,7 +787,11 @@ impl Store {
 
         // The identifier each map answers with must round-trip.
         for (trunc, id) in &self.by_trunc {
-            assert_eq!(&id.truncated(), trunc, "{when}: by_trunc maps to a different id");
+            assert_eq!(
+                &id.truncated(),
+                trunc,
+                "{when}: by_trunc maps to a different id"
+            );
             assert!(
                 self.by_id.contains_key(id),
                 "{when}: by_trunc knows an id by_id does not"
@@ -915,7 +949,9 @@ mod tests {
     fn fetching_an_object_does_not_depend_on_where_it_sits() {
         // One bucket, so what is measured is the lookup inside a segment and
         // not the walk across segments.
-        let objs: Vec<(u32, u8)> = (1..1_400u32).flat_map(|e| (0..8u8).map(move |s| (e, s))).collect();
+        let objs: Vec<(u32, u8)> = (1..1_400u32)
+            .flat_map(|e| (0..8u8).map(move |s| (e, s)))
+            .collect();
         let s = store_with(0, &objs);
         assert!(s.len() > 10_000, "held {}", s.len());
         let held = s.entries_in_range(0, u32::MAX);
@@ -1241,7 +1277,10 @@ mod tests {
 
         let mut smuggled = bytes.clone();
         let last = smuggled.len() - 1;
-        assert_eq!(smuggled[last], 0, "the fixture must have padding to smuggle in");
+        assert_eq!(
+            smuggled[last], 0,
+            "the fixture must have padding to smuggle in"
+        );
         smuggled[last] = 0x41;
         let id = krab_crypto::object_id(&smuggled);
         assert_eq!(
@@ -1269,9 +1308,15 @@ mod tests {
             // Indefinite-length map: §4.3 rule 2.
             ("indefinite length", alloc_body(&[0xBF, 0x00, 0x00, 0xFF])),
             // {1: 0, 0: 0} — descending keys, §4.3 rule 3.
-            ("descending keys", alloc_body(&[0xA2, 0x01, 0x00, 0x00, 0x00])),
+            (
+                "descending keys",
+                alloc_body(&[0xA2, 0x01, 0x00, 0x00, 0x00]),
+            ),
             // {0: 0, 0: 0} — duplicate keys, same rule.
-            ("duplicate keys", alloc_body(&[0xA2, 0x00, 0x00, 0x00, 0x00])),
+            (
+                "duplicate keys",
+                alloc_body(&[0xA2, 0x00, 0x00, 0x00, 0x00]),
+            ),
             // A bare uint: a body is a map.
             ("not a map", alloc_body(&[0x01])),
             // A map whose declared pairs are not there.
@@ -1476,7 +1521,8 @@ mod tests {
                 expiry_min: DAY,
                 tag: Tag([flags; 8]),
             };
-            let bytes = canonical_bytes(&h, &krab_core::object::example_sealed_body(flags)).unwrap();
+            let bytes =
+                canonical_bytes(&h, &krab_core::object::example_sealed_body(flags)).unwrap();
             let id = krab_crypto::object_id(&bytes);
             assert_eq!(s.ingest(id, bytes, 0, MAX_TTL), Ok(()), "flags {flags}");
         }
@@ -1546,7 +1592,10 @@ mod tests {
         let before = s.len();
         let evicted = s.evict_to(s.bytes() / 2);
         s.assert_indexes_agree("after evict_to");
-        assert!(evicted > 0, "eviction dropped nothing, so it proved nothing");
+        assert!(
+            evicted > 0,
+            "eviction dropped nothing, so it proved nothing"
+        );
         assert!(s.len() < before);
 
         // And a rebuild reconstructs all three from the segments alone.
@@ -1589,6 +1638,68 @@ mod tests {
             assert!(s.get(id).is_some(), "rebuild did not restore get");
             assert!(s.contains(id), "rebuild did not restore contains");
         }
+    }
+
+    /// **The version moves on every path that changes what is held, and on
+    /// no path that does not.**
+    ///
+    /// A reader caches a conclusion about the whole corpus against this
+    /// number. A bump that is missed is an inbox that stops noticing mail —
+    /// silent, and RFC 0 §6 makes it silent at the sender's end too. A bump
+    /// that is spurious costs a rescan.
+    ///
+    /// So the two directions are asserted separately: every mutator moves it,
+    /// and reads do not.
+    #[test]
+    fn the_version_moves_exactly_when_the_held_set_changes() {
+        const NOW: u32 = 29_766_000;
+        let mut s = Store::new();
+        let v0 = s.version();
+
+        let (id, bytes) = object(NOW + 5_000, 1);
+        s.ingest(id, bytes.clone(), NOW, u32::MAX)
+            .expect("ingested");
+        let v1 = s.version();
+        assert!(v1 > v0, "ingest did not move the version");
+
+        // A *refused* ingest changes nothing and must not move it — otherwise
+        // a peer offering duplicates makes every reader rescan for ever, which
+        // is the flood RFC 3 §6 is about, arriving by another route.
+        assert_eq!(
+            s.ingest(id, bytes, NOW, u32::MAX),
+            Err(Reject::Duplicate),
+            "the fixture is wrong"
+        );
+        assert_eq!(s.version(), v1, "a refused duplicate moved the version");
+
+        // Reads never move it.
+        let _ = s.get(&id);
+        let _ = s.contains(&id);
+        let _ = s.entries_in_range(0, u32::MAX);
+        let _ = s.range_fingerprint(0, u32::MAX);
+        let _ = s.watermark();
+        assert_eq!(s.version(), v1, "a read moved the version");
+
+        // Expire, evict and rebuild each move it.
+        s.expire(NOW + 10_000);
+        let v2 = s.version();
+        assert!(v2 > v1, "expire did not move the version");
+
+        for i in 0..20u32 {
+            let (id, b) = object(NOW + 20_000 + i * 700, (i + 40) as u8);
+            let _ = s.ingest(id, b, NOW, u32::MAX);
+        }
+        let v3 = s.version();
+        s.evict_to(s.bytes() / 2);
+        assert!(s.version() > v3, "evict_to did not move the version");
+
+        let v4 = s.version();
+        s.rebuild_index().expect("rebuilds");
+        assert!(
+            s.version() > v4,
+            "rebuild_index did not move the version — a reader that cached \
+             across a reload cannot tell the segments were not replaced"
+        );
     }
 
     /// **A rebuild replaces the maps; it does not merge into them.**

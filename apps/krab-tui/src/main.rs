@@ -890,10 +890,10 @@ struct App {
     confirmed: bool,
     /// Whether the passphrase prompt is for a correspondence-key rotation.
     rotating: bool,
-    /// The epoch in which the prekey corpus scan last ran — see
-    /// `republish_prekeys_if_due`. `None` until the first tick after a start
-    /// or an unlock, so a restarted node checks once and then not again.
-    prekey_scan_epoch: Option<u32>,
+    /// `(epoch, corpus version)` the prekey scan last ran against — see
+    /// `republish_prekeys_if_due`. Both, because the answer changes when the
+    /// day does *or* when the corpus does.
+    prekey_scan: Option<(u32, u64)>,
     /// Where the first-run ceremony has got to, if it is running.
     init_step: Option<InitStep>,
     /// Whether the passphrase prompt is unlocking rather than initialising.
@@ -987,7 +987,7 @@ impl Default for App {
             tag_table_peers: Vec::new(),
             confirmed: false,
             rotating: false,
-            prekey_scan_epoch: None,
+            prekey_scan: None,
             init_step: None,
             unlocking: false,
         }
@@ -3065,6 +3065,32 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
             return;
         };
 
+        // **This function is not yet cacheable, and the reason is structural.**
+        //
+        // It is the most expensive thing on the tick: a card read, an Ed25519
+        // verify (29.8 µs measured) and an X25519 agreement (22.6 µs) per
+        // peer, a reservoir decrypt per peer, and then `scan_with`, which
+        // allocates a vector of **every object in the corpus** and fetches and
+        // parses each one. The crypto is 2.6 ms at fifty peers; the corpus
+        // walk is the part that scales with the thing that grows.
+        //
+        // Guarding it on its inputs — `Store::version`, the peer set, the
+        // epoch, the opening-key count — was tried and reverted, because those
+        // are the inputs of only *one* of the three jobs this function does.
+        // It also rebuilds `self.list`, `self.reach` and the per-tab body, and
+        // **the list depends on which tab is open**, which is not an input to
+        // the derivation at all. A guard on the derivation's inputs skips the
+        // rendering too, and a tab switch then shows what was there when the
+        // tab was last open — caught immediately by
+        // `a_channel_can_be_created_posted_to_and_read`.
+        //
+        // The fix is to split derivation from rendering, so the guard covers
+        // the first and the second always runs. That is a refactor of this
+        // whole function rather than a condition at the top of it, and it is
+        // not being done as a tail of a performance pass — see PLAN.md §40.
+        //
+        // `Store::version` exists and is tested; it is the signal that split
+        // will use.
         // Correspondents come from the peer-links on disk, so the set is
         // exactly who a ceremony was completed with.
         let mut peers = Vec::new();
@@ -3563,16 +3589,28 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         // corpus is replaced wholesale. `REPUBLISH_EPOCHS` is counted in
         // epochs and an epoch is a day, so a scan per epoch is as often as the
         // answer can possibly matter.
+        // **The epoch alone was not enough, and shipping that was a
+        // regression.** §38 cached on the epoch only, reasoning that the
+        // answer changes daily. It also changes whenever the corpus does — a
+        // store replaced by a load, an import, or an eviction that took the
+        // batch with it — and a node that had lost its prekeys would then wait
+        // a day before noticing. `the_schedule_republishes_prekeys_when_due`
+        // said so immediately and a broken verification pipeline reported it
+        // as passing.
+        //
+        // `Store::version` is the exact signal, asserted in `krab-store` to
+        // move on every change to the held set and on no read.
         let now = now_epoch().0;
-        if self.prekey_scan_epoch == Some(now) {
+        let corpus = self.store.with(|s| s.version());
+        if self.prekey_scan == Some((now, corpus)) {
             return;
         }
         // **Set before the scan, not after.** If `publish_prekeys` below
         // fails, the next tick must not scan the whole corpus again — a
         // persistent failure would then be a full scan four times a second,
-        // which is the thing this is fixing. One attempt per epoch, and the
-        // failure is visible in the activity log.
-        self.prekey_scan_epoch = Some(now);
+        // which is the thing this is fixing. One attempt per (epoch, corpus),
+        // and the failure is visible in the activity log.
+        self.prekey_scan = Some((now, corpus));
 
         let me = self.identity.as_ref().map(|i| i.node_id());
         let mut newest = 0u32;
@@ -10073,10 +10111,6 @@ impl App {
                  trying — records before {idx} would import."
             );
         }
-        // An archive can carry this node's own newer prekey batch, so the
-        // cached answer above stops being true here — the one place the corpus
-        // changes without an exchange.
-        self.prekey_scan_epoch = None;
         match self.store.with(|s| courier::import(s, &path, now)) {
             Err(e) => format!("could not read {}: {e}", path.display()),
             Ok(got) => {
