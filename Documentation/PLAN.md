@@ -2894,8 +2894,8 @@ on a routine bump teaches people to edit the test.
 - **The 64-bit spoken fingerprint.** Correct, and spec-level: RFC 3 §11 defines
   it and the implementation is conformant. Changing it is an RFC amendment, not
   a commit.
-- **`cargo audit` was not run.** It is not installed here either. It belongs in
-  CI beside the Windows job, and is recorded rather than done.
+- ~~**`cargo audit` was not run.**~~ **Done in §36**, which found a yanked
+  `chacha20` under the cipher every sealed object uses.
 
 ### What is verified
 
@@ -2980,7 +2980,102 @@ fuzz target ran clean at 3 373 covered blocks.
 
 ### Still not done
 
-`cargo audit` is still not installed here and still belongs in CI beside the
-Windows job. And a clean fuzz run is evidence, not proof: 325 679 executions is
-a few minutes, and the targets that found something in this project found it
-early. This one should run for hours in CI, not for four minutes on a laptop.
+~~`cargo audit` is still not installed here~~ — **§36**. And a clean fuzz run is
+evidence, not proof: 325 679 executions is a few minutes, and the targets that
+found something in this project found it early. §36 puts all five targets on a
+nightly schedule with a carried-forward corpus.
+
+---
+
+## 36. `cargo audit` in CI, and a yanked cipher — 2026-09-01
+
+§34 recorded `cargo audit` as not run and not installed, and put it in CI
+"beside the Windows job". Installing it first was the right order: **it found
+something on its first run**, and a CI job added without running is the thing
+§35 was about.
+
+### What the first run found
+
+Zero vulnerabilities, four warnings, and one of them mattered:
+
+| crate | class | via | acted on |
+|---|---|---|---|
+| `paste 1.0.15` | unmaintained | `ratatui` | no — proc-macro, build-time only |
+| `lru 0.12.5` | unsound ×2 | `ratatui` | no — see below |
+| **`chacha20 0.10.1`** | **yanked** | `chacha20poly1305` → `hpke` → `krab-crypto` | **yes** |
+
+**The yanked one is on the primary crypto path.** Not `snow`'s copy — the
+reviewer in §34 flagged two ChaCha20s and the older is the Noise side, so the
+natural guess was that the yanked release was the old one. It was not:
+`chacha20 0.10.1` is what `chacha20poly1305 0.11.0` pulls in, which is the AEAD
+`krab-crypto` uses for **every sealed object**. Yanked means the authors
+withdrew it, and a lockfile pins regardless. Pinned forward to 0.10.2 in this
+commit; 1 308 tests and the boundary test unchanged.
+
+Nothing else in this tree reads the advisory database, and the crate had been
+yanked for some time. That is the argument for the job, made by the job.
+
+`lru`'s two unsoundness advisories are left, and left visibly: both require a
+panicking `Drop` inside `ratatui`'s internal cache, which this interface does
+not put there. That is a judgement, not a dismissal — it is written down so the
+next person can disagree with it rather than rediscover it.
+
+### Vulnerabilities fail; warnings do not
+
+`cargo audit` exits non-zero on a vulnerability and prints warnings without
+failing, and the job keeps that split. A vulnerability is a defect in this tree
+whoever introduced it. "Unmaintained" is a judgement about a maintainer's
+attention, and a build that goes red because somebody stopped answering issues
+is **the `cargo fmt` argument again** — a check people learn to click past, and
+they click past the Windows job on the way there.
+
+The fuzz crate's lockfile is audited too, and reported rather than enforced: it
+ships nothing, so a vulnerability in `libfuzzer-sys` is worth knowing and is not
+a vulnerability in Krab.
+
+`cargo audit` is installed with `cargo install --locked`, not a marketplace
+action. A third-party action inside the job that checks the supply chain is a
+supply-chain step inside the supply-chain check.
+
+### And the fuzz targets, on a schedule — which answers "run it for hours"
+
+**A GitHub-hosted job is capped at six hours and the cap cannot be raised.** So
+hours are available and indefinite is not — but the cap turns out not to be the
+binding constraint. Thirty minutes a night, five targets, beats one long run,
+because **the corpus carries forward**: the job caches `fuzz/corpus/<target>`
+between runs, so each night starts where the last stopped.
+
+Without that cache the measurement in §35 repeats every night for ever — 972
+covered blocks from an empty corpus against 3 373 from a seeded one — and the
+job would report millions of clean executions against ground it re-walks daily.
+`fuzz/corpus/` is gitignored, so the cache is the only thing that accumulates.
+
+Not on pushes: a fuzz run short enough to block a merge is a fuzz run too short
+to find anything, and it would make every push wait on it.
+
+Two details that are not decoration. `-timeout=25` makes one slow input a
+finding rather than a lost run — the `picture` target decodes and re-encodes,
+so a decompression bomb is a plausible input rather than a hypothetical one.
+And a crash is uploaded as an artifact, because a crashing input nobody kept is
+a crash nobody can reproduce.
+
+### One interaction that would have been invisible
+
+`concurrency.group` was `workflow-ref`, and `cancel-in-progress` is true. A
+scheduled fuzz run on the default branch shares that group with pushes to it —
+so any commit during those thirty minutes would kill the run. It would present
+as a fuzz job that never finishes on an active day and always finishes on a
+quiet one, which is the kind of thing that gets diagnosed as flakiness. The
+event name is now in the group.
+
+### What is verified
+
+**1 308 tests**, zero failures, clippy clean under `-D warnings` across
+`--all-features`. `cargo audit` reports zero vulnerabilities and three
+warnings, all named above. The workflow parses, and both new command forms —
+`cargo audit --file`, and `cargo fuzz run <target> <corpus> <seeds>` — were run
+locally before being written into it.
+
+**The jobs themselves have still never run**, like the Windows job before them.
+That is the honest state on the day they are added, and it is why the local
+runs above are recorded rather than the CI configuration alone.

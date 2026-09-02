@@ -37,6 +37,23 @@ argument for fuzzing over hand-written robustness tests, made concretely.
 
 After the fix, `control` ran 37 668 225 executions clean.
 
+## In CI — 2026-09-01
+
+The `fuzz` job in `.github/workflows/ci.yml` runs all five targets nightly, 30
+minutes each, on the schedule rather than on pushes. A fuzz run short enough to
+block a merge is a fuzz run too short to find anything.
+
+**"Run it for hours" has a ceiling, and it is not the binding constraint.** A
+GitHub-hosted job is capped at six hours and the cap cannot be raised. But
+thirty minutes a night beats one long run, because the corpus carries forward:
+the job caches `fuzz/corpus/<target>` between runs, so each night starts where
+the last one stopped rather than re-deriving the same inputs. Without that
+cache the numbers below would repeat every night for ever.
+
+`-timeout=25` makes a single slow input a finding rather than a lost run, and
+a crash is uploaded as an artifact — a crashing input nobody kept is a crash
+nobody can reproduce.
+
 ## `picture` — 2026-09-01
 
 RFC 8 §6's pipeline: two third-party parsers, on bytes a peer chose, which the

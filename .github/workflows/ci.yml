@@ -21,11 +21,25 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+  # For `audit` and `fuzz`, which are about the world changing rather than the
+  # code changing. An advisory published against a dependency makes this tree
+  # vulnerable without anybody touching it, and a fuzzer finds more in an hour
+  # than in the four minutes a push can justify.
+  schedule:
+    # 04:17 UTC daily. Not on the hour: GitHub queues scheduled runs and the
+    # top of the hour is where everyone else's are.
+    - cron: "17 4 * * *"
 
 # A push that supersedes an in-flight run cancels it. CI that reports on stale
 # commits is CI people learn to ignore.
+#
+# **The event name is in the group** so a push does not cancel a scheduled run.
+# Without it, the nightly fuzz job shares a group with pushes to the same ref,
+# and any commit during those thirty minutes kills it — which would present as
+# a fuzz job that mysteriously never finishes on an active day, and never on a
+# quiet one.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -147,3 +161,132 @@ jobs:
         run: ./smoke.sh
       - name: Three nodes
         run: ./smoke-three-nodes.sh
+
+  # ---------------------------------------------------------------------
+  # Known advisories against the dependency tree.
+  #
+  # **Vulnerabilities fail; warnings do not.** `cargo audit` exits non-zero on
+  # a vulnerability and prints warnings — unmaintained, unsound, yanked —
+  # without failing, and that split is kept deliberately. A vulnerability is a
+  # defect in this tree whoever introduced it. "Unmaintained" is a judgement
+  # about a maintainer's attention, and a build that goes red because somebody
+  # stopped answering issues is the `cargo fmt` problem again: a check people
+  # learn to click past, and they click past the Windows job on the way.
+  #
+  # The warnings are still printed, and they are still read. At the time this
+  # job was added there were four: `paste` and `lru` (both via `ratatui`, and
+  # `lru`'s two unsoundness advisories are in an LRU cache the interface does
+  # not reach with a panicking `Drop`), and a **yanked `chacha20 0.10.1` under
+  # `chacha20poly1305`, which is the cipher every sealed object uses**. That
+  # last one was worth acting on and was: pinned forward to 0.10.2 in the same
+  # commit. Finding it is the argument for this job — nothing else in CI reads
+  # the advisory database, and the crate had been yanked for some time.
+  #
+  # Installed with `cargo install` rather than a marketplace action. A
+  # third-party action in the job that checks the supply chain is a
+  # supply-chain step inside the supply-chain check, and `--locked` means this
+  # builds the versions cargo-audit's own authors tested.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keyed on the tool version, not on the lockfile: the binary does not
+      # change when this repository's dependencies do.
+      - name: Cache cargo-audit
+        id: audit-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-v0.22.2-${{ runner.os }}
+      - name: Install cargo-audit
+        if: steps.audit-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version 0.22.2
+      # The workspace lockfile — what the shipped binary is built from.
+      - name: Audit the workspace
+        run: cargo audit
+      # And the fuzz crate's, which is separate because `fuzz` is excluded from
+      # the workspace. It ships nothing, so this is reported and does not fail
+      # the build: a vulnerability in `libfuzzer-sys` is worth knowing about
+      # and is not a vulnerability in Krab.
+      - name: Audit the fuzz crate
+        continue-on-error: true
+        run: cargo audit --file fuzz/Cargo.lock
+
+  # ---------------------------------------------------------------------
+  # Fuzzing, on the schedule rather than on every push.
+  #
+  # # On "run it for hours"
+  #
+  # A GitHub-hosted job is capped at **six hours** and cannot be raised. So
+  # "hours" is available and "indefinitely" is not, and the cap is not the
+  # binding constraint anyway — thirty minutes a target, nightly, accumulates
+  # more than one long run does, because the corpus carries forward.
+  #
+  # That is what the cache below is for. `fuzz/corpus/` is gitignored, so
+  # without it every run would start from `fuzz/seeds/` and re-discover the
+  # same inputs — and the measurement in `fuzz/README.md` is exactly how much
+  # that costs: 972 covered blocks from an empty corpus against 3 373 from a
+  # seeded one, on the same target. A fuzzer that forgets is a fuzzer that
+  # spends its budget on ground it has already covered.
+  #
+  # `timeout-minutes` is set explicitly and above the sum of the per-target
+  # budgets, so a hang in one target is killed by libFuzzer's own `-timeout`
+  # and a hang in the *job* is killed here rather than burning to the six-hour
+  # cap.
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    # Not on pushes: a fuzz run that must finish before a merge is a fuzz run
+    # too short to find anything, and it would make every push wait on it.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [picture, control, object, ingest, cbor]
+    steps:
+      - uses: actions/checkout@v4
+      # `cargo fuzz` needs nightly, and `rust-toolchain.toml` pins 1.94.1 for
+      # everything else. This is the one job that deliberately steps outside
+      # that pin, and it ships nothing.
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+      - name: Cache cargo-fuzz
+        id: fuzz-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ runner.os }}
+      - name: Install cargo-fuzz
+        if: steps.fuzz-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --locked
+      # Carried between runs, so each night starts where the last one stopped.
+      # `restore-keys` means a run still starts from the most recent corpus
+      # when the exact key misses, which it does every time the seeds change.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # 30 minutes per target. `-timeout=25` makes a single input that hangs a
+      # finding rather than a lost run — the picture target decodes and
+      # re-encodes, so a decompression bomb is a plausible input rather than a
+      # hypothetical one.
+      - name: Fuzz
+        run: |
+          SEEDS=fuzz/seeds/${{ matrix.target }}
+          test -d "$SEEDS" || SEEDS=""
+          cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} $SEEDS \
+            -- -max_total_time=1800 -timeout=25 -rss_limit_mb=4096
+      # A crash is written to `fuzz/artifacts/` and is the entire point of the
+      # run. Uploaded on failure so it survives the runner, because a crashing
+      # input nobody kept is a crash nobody can reproduce.
+      - name: Upload crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
