@@ -3455,3 +3455,79 @@ and clippy clean under `-D warnings` across `--all-features`. The number is
 higher than §39's stated 1 308 partly because tests were added and partly
 because the old figure was produced by the same broken pipeline; treat every
 count before this section as approximate.
+
+---
+
+## 41. `refresh_inbox`, split — 2026-09-01
+
+§40 reverted a guard on this function and left the reason in the code: it does
+three jobs with different inputs, and the guard covered all three. This is the
+split it asked for.
+
+### The seam
+
+**`derive_inbox`** — the expensive half. A card read, an Ed25519 verify and an
+X25519 agreement per peer, a reservoir decrypt per peer, `scan_with` over every
+object in the corpus, RFC 3 §8's nodelist reconstruction, and RFC 3 §11's
+first-contact scan. Guarded on [`InboxInputs`].
+
+**`render_inbox`** — the cheap half. The list, the request rows, the per-tab
+body. Runs on every tick, because **the open tab changes what it produces
+without changing anything the derivation reads.** That sentence is the whole
+argument for the seam being where it is; §40 put the guard above both and a tab
+switch showed what was there when the tab was last open.
+
+The request rows are formatted at derivation time and cached as strings.
+Formatting is cheap, but `scan_requests` is not — it decapsulates inbox-tagged
+objects — so it belongs on the derived side, and once it is there the rows may
+as well come with it.
+
+### The input set was incomplete, again, and a test found it again
+
+The four inputs from §40 — `Store::version`, the peer set, the epoch, the
+opening-key count — were not enough. **`rotate` changes the correspondence
+key, and every pairwise tag derives from it**, while the corpus, the peer set,
+the epoch and the key count all stay exactly as they were. A rotated node would
+have gone on matching tags derived from a key it no longer holds, and RFC 0 §6
+makes that silent.
+
+`rotation_moves_the_correspondence_key_and_nothing_else` caught it. That is the
+second time this input set has been found incomplete by a test rather than by
+reasoning, which is the argument for `each_derivation_input_forces_a_re_derivation`
+existing: it exercises each field on its own, so the next omission fails at the
+field rather than in whichever feature happens to touch it.
+
+The **public** half is stored, deliberately. `InboxInputs` derives `Debug`, and
+the correspondence secret must not be one field rename away from a log line. It
+costs one X25519 scalarmult per tick — 22.6 µs measured, against 250 ms.
+
+### What it saves, and what it does not
+
+On an idle tick the derivation does not run at all: no card reads, no verifies,
+no agreements, no reservoir decrypts, and **no corpus walk** — which was the
+part that scaled with the thing that grows. On a tick where an object arrived
+or a peering changed, everything runs exactly as before.
+
+It does not make the derivation itself cheaper. `scan_with` still allocates a
+vector of every `(expiry, id)` in the store and fetches each one; it just does
+so when something changed rather than four times a second. That is the next
+thing, and it is an incremental-scan question rather than a caching one.
+
+### Probed
+
+Three probes, each confirming the test can see the thing it claims to:
+
+- `corpus: 0` — a new object no longer forces a re-derive: fails.
+- the correspondence key replaced by a constant — rotation no longer forces
+  one: fails, with the message about matching tags from a retired key.
+- `render_inbox` moved inside the guard — the tab switch shows a stale list:
+  fails.
+
+The first attempt at the two input probes printed nothing at all, which is a
+probe that did not run rather than one that passed. Re-run one at a time with
+the patched line counted first.
+
+### What is verified
+
+**1 318 tests, zero failures**, clippy clean under `-D warnings` across
+`--all-features` — counted by the corrected command from §40.

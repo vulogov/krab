@@ -274,6 +274,43 @@ fn create_dir_private(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// Everything `refresh_inbox`'s **derivation** depends on.
+///
+/// Compared as a whole rather than field by field, so adding an input is a
+/// change to this struct and to the one place it is built — not a fifth
+/// condition somebody has to remember to `&&` into a guard.
+///
+/// It deliberately does not contain the open tab. That is a *rendering* input,
+/// and the first attempt at this guard included the rendering, so a tab switch
+/// showed a stale list. The type's contents are the argument for the split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboxInputs {
+    /// `Store::version` — changes to the held set, counted exactly.
+    corpus: u64,
+    /// Tags are epoch-derived.
+    epoch: krab_core::tag::Epoch,
+    /// A new peering is a correspondent whose tags nothing has tried.
+    peers: Vec<String>,
+    /// A new prekey opens mail the old set could not.
+    key_count: usize,
+    /// This node's correspondence **public** key.
+    ///
+    /// Every pairwise tag derives from `X25519(my correspondence, theirs)`, so
+    /// `rotate` changes every tag in the table while the corpus, the peer set,
+    /// the epoch and the key count all stay exactly as they were. Without this
+    /// the inbox would go on matching tags derived from a key this node no
+    /// longer holds — and RFC 0 §6 makes that silent.
+    ///
+    /// Found by `rotation_moves_the_correspondence_key_and_nothing_else`,
+    /// which is the second time an incomplete input set has been caught by a
+    /// test rather than by reasoning. It costs one X25519 scalarmult per tick
+    /// — 22.6 µs measured, against a 250 ms budget.
+    ///
+    /// The **public** half deliberately: this struct derives `Debug`, and the
+    /// secret must not be one field rename away from a log line.
+    correspondence: [u8; 32],
+}
+
 /// Seconds since the Unix epoch, or zero if the clock is before it.
 fn now_seconds() -> u64 {
     std::time::SystemTime::now()
@@ -890,6 +927,12 @@ struct App {
     confirmed: bool,
     /// Whether the passphrase prompt is for a correspondence-key rotation.
     rotating: bool,
+    /// What `refresh_inbox`'s derivation last ran against — see there.
+    inbox_inputs: Option<InboxInputs>,
+    /// Objects the last scan examined, for the empty-inbox line.
+    examined: usize,
+    /// First-contact request rows, formatted when they were derived.
+    request_rows: Vec<String>,
     /// `(epoch, corpus version)` the prekey scan last ran against — see
     /// `republish_prekeys_if_due`. Both, because the answer changes when the
     /// day does *or* when the corpus does.
@@ -987,6 +1030,9 @@ impl Default for App {
             tag_table_peers: Vec::new(),
             confirmed: false,
             rotating: false,
+            inbox_inputs: None,
+            examined: 0,
+            request_rows: Vec::new(),
             prekey_scan: None,
             init_step: None,
             unlocking: false,
@@ -3052,7 +3098,6 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
     /// Called after anything that changes the corpus or the correspondent set.
     /// Returns plaintext into `self.messages`, which `lock` destroys.
     fn refresh_inbox(&mut self) {
-        self.messages.clear();
         // **The cursor is not reset here.** This runs on a tick — every time
         // an exchange drains — so zeroing it meant the operator pressed Down,
         // the cursor moved, and the next tick put it back. It looked like the
@@ -3060,37 +3105,71 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         // list — a tab switch, descending into a channel — the caller resets
         // it deliberately; here it is only clamped, at the end, once the new
         // item count is known.
-        let (Some(id), Some(w)) = (&self.identity, self.epoch_key) else {
+        if self.identity.is_none() || self.epoch_key.is_none() {
+            self.messages.clear();
+            self.inbox_inputs = None;
             self.list = vec!["(locked)".into()];
             return;
-        };
+        }
 
-        // **This function is not yet cacheable, and the reason is structural.**
+        // **Derive only when an input changed; render always.**
         //
-        // It is the most expensive thing on the tick: a card read, an Ed25519
-        // verify (29.8 µs measured) and an X25519 agreement (22.6 µs) per
-        // peer, a reservoir decrypt per peer, and then `scan_with`, which
-        // allocates a vector of **every object in the corpus** and fetches and
-        // parses each one. The crypto is 2.6 ms at fifty peers; the corpus
-        // walk is the part that scales with the thing that grows.
+        // The inputs below are the derivation's, and they are exact rather
+        // than approximate — no timestamps, no "probably fine". A stale answer
+        // here is an inbox that has stopped noticing mail, which RFC 0 §6
+        // makes silent at both ends.
         //
-        // Guarding it on its inputs — `Store::version`, the peer set, the
-        // epoch, the opening-key count — was tried and reverted, because those
-        // are the inputs of only *one* of the three jobs this function does.
-        // It also rebuilds `self.list`, `self.reach` and the per-tab body, and
-        // **the list depends on which tab is open**, which is not an input to
-        // the derivation at all. A guard on the derivation's inputs skips the
-        // rendering too, and a tab switch then shows what was there when the
-        // tab was last open — caught immediately by
-        // `a_channel_can_be_created_posted_to_and_read`.
+        // - `Store::version` counts changes to the held set, and a *refused*
+        //   ingest does not move it, so a peer offering duplicates cannot make
+        //   this rescan for ever.
+        // - The peer set: a new peering is a correspondent whose tags nothing
+        //   has tried. `peer_ids` is a `readdir`, and it is the one piece of
+        //   the old work that still runs unconditionally.
+        // - The epoch: tags are epoch-derived, so the table changes under the
+        //   same objects.
+        // - The opening keys: a new prekey opens mail the old set could not.
         //
-        // The fix is to split derivation from rendering, so the guard covers
-        // the first and the second always runs. That is a refactor of this
-        // whole function rather than a condition at the top of it, and it is
-        // not being done as a tail of a performance pass — see PLAN.md §40.
-        //
-        // `Store::version` exists and is tested; it is the signal that split
-        // will use.
+        // Objects are immutable and content-addressed, so no other input
+        // exists. The rendering's inputs are different — the open tab, chiefly
+        // — which is exactly why it is not behind this guard.
+        let fresh = InboxInputs {
+            corpus: self.store.with(|s| s.version()),
+            epoch: now_epoch(),
+            peers: self.peer_ids(),
+            key_count: self.opening_keys().len(),
+            correspondence: self
+                .identity
+                .as_ref()
+                .map(|i| i.correspondence().public().0)
+                .unwrap_or_default(),
+        };
+        if self.inbox_inputs.as_ref() != Some(&fresh) {
+            self.inbox_inputs = Some(fresh);
+            self.derive_inbox();
+        }
+        self.render_inbox();
+    }
+
+    /// **The expensive half: everything derived from the corpus and the
+    /// peerings.** RFC 3 §11's requests, RFC 3 §8's nodelists, and the mail.
+    ///
+    /// Split from the rendering below because the two have different inputs
+    /// and wildly different costs. This runs a card read, an Ed25519 verify
+    /// (29.8 µs measured) and an X25519 agreement (22.6 µs) per peer, a
+    /// reservoir decrypt per peer, and two full corpus scans. The rendering
+    /// runs a few string formats.
+    ///
+    /// Guarded on [`InboxInputs`] by its caller, so on an idle tick none of
+    /// this happens. **Guarding the whole of `refresh_inbox` was tried first
+    /// and was wrong** — the list it renders depends on which tab is open,
+    /// which is not an input here, so a tab switch showed what was there when
+    /// the tab was last open. That is the reason for the split rather than a
+    /// justification found afterwards.
+    fn derive_inbox(&mut self) {
+        self.messages.clear();
+        let (Some(id), Some(w)) = (&self.identity, self.epoch_key) else {
+            return;
+        };
         // Correspondents come from the peer-links on disk, so the set is
         // exactly who a ceremony was completed with.
         let mut peers = Vec::new();
@@ -3267,21 +3346,9 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         }
         self.reach = reach.into_iter().map(|(w, _, r)| (w, r)).collect();
         self.last_scan_fail = scan.tag_match_decrypt_fail;
+        self.examined = scan.examined;
         self.pending_bases = bases;
-        self.list = if scan.messages.is_empty() {
-            vec![format!(
-                "(no messages — {} objects examined)",
-                scan.examined
-            )]
-        } else {
-            {
-                let names = self.aliases();
-                scan.messages
-                    .iter()
-                    .map(|m| Self::inbox_row(m, &names))
-                    .collect()
-            }
-        };
+        self.messages = scan.messages;
         // Bases recorded now that the scan's borrow has ended. Deferred rather
         // than skipped: without them, a delta arriving next week has nothing
         // to apply against and is dropped, which reads as a peer who stopped
@@ -3305,41 +3372,57 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
                 attempts,
             )
         });
-        for inc in &requests {
-            let receive::Incoming::Request { request: r, .. } = inc else {
-                continue;
-            };
-            let note = self.foreign(&r.note);
-            self.list.insert(
-                0,
-                format!(
-                    "REQUEST from {}  {note}",
+        self.request_rows = requests
+            .iter()
+            .filter_map(|inc| match inc {
+                receive::Incoming::Request { request: r, .. } => Some(format!(
+                    "REQUEST from {}  {}",
                     r.from
                         .fingerprint()
                         .split_whitespace()
                         .take(2)
                         .collect::<Vec<_>>()
-                        .join(" ")
-                ),
-            );
+                        .join(" "),
+                    self.foreign(&r.note)
+                )),
+                _ => None,
+            })
+            .collect();
+    }
+
+    /// **The cheap half: what the operator is looking at.**
+    ///
+    /// Depends on the derived state above *and on the open tab*, and runs on
+    /// every tick because a tab switch changes it without changing anything
+    /// the derivation reads.
+    fn render_inbox(&mut self) {
+        self.list = if self.messages.is_empty() {
+            vec![format!("(no messages — {} objects examined)", self.examined)]
+        } else {
+            let names = self.aliases();
+            self.messages
+                .iter()
+                .map(|m| Self::inbox_row(m, &names))
+                .collect()
+        };
+        for row in self.request_rows.clone() {
+            self.list.insert(0, row);
         }
-        if !requests.is_empty() {
+        if !self.request_rows.is_empty() {
             self.list.push(format!(
                 "! {} first-contact request(s). Compare fingerprints aloud before \
                  peering — the signature proves who signed it, not who they are.",
-                requests.len()
+                self.request_rows.len()
             ));
         }
-
-        if scan.tag_match_decrypt_fail > 0 {
+        if self.last_scan_fail > 0 {
             // RFC 3 §12's ratio. A high rate usually means objects are arriving
             // outside the acceptance window, which is otherwise invisible.
             self.list.push(format!(
                 "! {} matched a tag and did not open",
-                scan.tag_match_decrypt_fail
+                self.last_scan_fail
             ));
         }
-        self.messages = scan.messages;
         // The Channels tab lists channels, not mail. Both are rebuilt here,
         // so switching tabs shows what is there rather than what was there
         // when the tab was last opened.
@@ -12139,6 +12222,94 @@ mod tests {
         assert!(a_set[0]
             .chars()
             .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+    }
+
+    /// **Rendering runs on every tick; derivation runs when an input moved.**
+    ///
+    /// The property the split exists for, and the one the first attempt at
+    /// this guard broke: a tab switch changes the list without changing
+    /// anything the derivation reads, so guarding the whole function showed
+    /// what was there when the tab was last open.
+    #[test]
+    fn a_tab_switch_re_renders_without_re_deriving() {
+        let (mut a, _b, _a_of_b, _b_of_a) = peered_pair("inbox-split");
+        a.refresh_inbox();
+        let derived = a.inbox_inputs.clone().expect("derived once");
+
+        // Mail's placeholder, on the mail tab.
+        assert!(
+            a.list.iter().any(|r| r.contains("objects examined")),
+            "not on the mail list: {:?}",
+            a.list
+        );
+
+        // Switch to Notes and refresh with *nothing else changed*.
+        a.ui.select_tab(layout::Tab::Notes);
+        a.refresh_inbox();
+        assert_eq!(
+            a.inbox_inputs.as_ref(),
+            Some(&derived),
+            "the derivation re-ran for a tab switch"
+        );
+        assert!(
+            !a.list.iter().any(|r| r.contains("objects examined")),
+            "the list still shows the mail tab's placeholder: {:?}",
+            a.list
+        );
+    }
+
+    /// **Every input in `InboxInputs` actually invalidates.**
+    ///
+    /// One at a time, because a guard that compares the struct as a whole is
+    /// only as good as the fields in it — and this input set has now been
+    /// found incomplete twice, both times by a test rather than by reasoning.
+    /// The epoch is not exercised here: it comes from the clock, and a test
+    /// that moved the clock would be testing the harness.
+    #[test]
+    fn each_derivation_input_forces_a_re_derivation() {
+        let (mut a, _b, _a_of_b, _b_of_a) = peered_pair("inbox-inputs");
+        a.refresh_inbox();
+        let base = a.inbox_inputs.clone().expect("derived");
+
+        // The corpus.
+        let h = krab_core::object::RoutingHeader {
+            version: 1,
+            class: 0,
+            size_bucket: 0,
+            flags: 0,
+            expiry_min: now_epoch().0 * 1440 + 10_000,
+            tag: krab_core::object::Tag([3; 8]),
+        };
+        let bytes =
+            krab_core::object::canonical_bytes(&h, &krab_core::object::example_sealed_body(4))
+                .unwrap();
+        let now_min = now_epoch().0 * 1440;
+        a.store
+            .with(|s| s.ingest(krab_crypto::object_id(&bytes), bytes, now_min, u32::MAX))
+            .expect("ingested");
+        a.refresh_inbox();
+        let after_corpus = a.inbox_inputs.clone().expect("derived");
+        assert_ne!(after_corpus, base, "a new object did not force a re-derive");
+
+        // Idempotent: nothing changed, so nothing moves.
+        a.refresh_inbox();
+        assert_eq!(
+            a.inbox_inputs.as_ref(),
+            Some(&after_corpus),
+            "an idle tick re-derived"
+        );
+
+        // The correspondence key — the input that was missing.
+        persist_identity(&a);
+        a.rotate_correspondence(TEST_PASSPHRASE);
+        a.refresh_inbox();
+        assert_ne!(
+            a.inbox_inputs.as_ref(),
+            Some(&after_corpus),
+            "rotating the correspondence key did not force a re-derive, so \
+             the inbox would go on matching tags from a key this node no \
+             longer holds"
+        );
     }
 
     /// **RFC 2 §9: the precomputation table is held as key material.**
