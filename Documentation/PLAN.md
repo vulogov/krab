@@ -3262,3 +3262,93 @@ finds the analysis rather than repeating the measurement.
 **1 305 tests**, zero failures, clippy clean under `-D warnings` across
 `--all-features`. The dribble regression test discriminates in both directions,
 probed.
+
+---
+
+## 39. `Store::by_id`, and a probe that found a gap in its own test — 2026-09-01
+
+§38 named this the right next change and said why it was not a small one: it
+adds state maintained by hand, and **a stale index is a corpus that silently
+cannot find its own objects.** So the invariant came first and the speed after.
+
+### What it replaces
+
+`Store::get` and `Store::contains` walked `segments.values()`, calling
+`Segment::get` on each. The corpus is one segment per expiry bucket across RFC 1
+§6.2's ±45-epoch window, so that is up to ninety segments per lookup — and both
+are under everything: `get_truncated` goes through `get`, every reconciliation
+serve is a `get`, `ingest` calls `contains` on every object a peer offers, and
+the corpus saver walks the store one `get` at a time.
+
+`by_id: BTreeMap<ObjectId, u32>` maps an identifier to its bucket. **The value
+is the bucket, not a `Location`**: `index` is keyed `(expiry, id)` and already
+holds the location, but reaching it needs the expiry — which is exactly what a
+caller holding an identifier does not have. One `u32` per object closes that
+gap without duplicating anything `index` says, so the two cannot disagree.
+
+Measured on one machine, 20 000 objects across 15 segments:
+
+| operation | before | after | |
+|---|---|---|---|
+| `get` | 0.428 µs | **0.101 µs** | 4.2× |
+| `contains` | 0.419 µs | **0.050 µs** | 8.4× |
+
+The factor is bounded by the segment count, which is what the scan was linear
+in — 15 here, and up to 90 for a corpus spread across the whole window. The
+figures are the shape of the win, not its ceiling.
+
+### The invariant, and what it is asserted against
+
+`assert_indexes_agree` checks the derived maps against **the segments**, which
+hold the bytes and are what RFC 5 §7 makes everything reconstructible from. Not
+against each other: three derived maps agreeing while all three are wrong is
+what a rebuild-that-never-cleared looked like, and that has already happened
+once in this file.
+
+`index` is checked in one direction only, and deliberately. `expire` prunes
+`index` entries for objects whose expiry has passed *while their segment
+survives* — a segment is unlinked only when the whole bucket is past — so the
+store legitimately holds bytes for objects `index` no longer lists. Requiring
+`index` to contain everything the segments do would assert something untrue.
+What must hold is that nothing in `index` names an object the segments lack,
+because a manifest row for an object this node cannot produce is an exchange
+that stalls.
+
+`by_id` and `by_trunc` are checked both ways, because they *are* meant to be
+exactly the segments' contents.
+
+### The probe found a gap in the test, not only in the code
+
+Each of the four maintenance sites was removed in turn to confirm the test
+notices. Three did: ingest, the expire/evict removal, and the rebuild insert.
+
+**The fourth did not.** Removing `by_id.clear()` from `rebuild_index` broke
+nothing, because both tests rebuild from a state where `by_id` is already
+right — one because it agrees, the other because it was emptied by hand.
+Neither is the case the clear exists for.
+
+That case is a **stale** entry: a store loaded from disk with an index that no
+longer matches its segments, which is precisely what RFC 5 §7 makes
+`rebuild_index` exist for. A rebuild that merged rather than replaced would keep
+it, and a stale `by_id` names a bucket that does not hold the object — so `get`
+returns nothing for an object the corpus is holding, silently.
+`a_rebuild_discards_stale_entries_rather_than_merging` is that case, and with
+the clear removed it fails.
+
+Three probes passing and one not is the useful outcome. A probe that only ever
+confirms is not a probe.
+
+### What is verified
+
+**1 308 tests**, zero failures, clippy clean under `-D warnings` across
+`--all-features`. All four maintenance sites probed; the fourth is covered by a
+test that exists because the probe of it failed.
+
+### Remaining from §38's list
+
+Four symptoms, all the same shape — the tick recomputing rather than being told:
+the per-peer Ed25519 verify and X25519 agreement in `refresh_inbox`, the
+credential decrypt and verify in `purge_expired_peerings`, the AEAD-decrypt of
+the pinned archive in `pinned()` which is also on the render path, and the full
+tombstone walk. Each is a caching question rather than an indexing one, and each
+needs its own answer to "what invalidates this".

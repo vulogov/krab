@@ -101,6 +101,25 @@ pub enum Reject {
 pub struct Store {
     segments: BTreeMap<u32, Segment>,
     index: BTreeMap<(u32, ObjectId), Location>,
+    /// `id → bucket`, so a lookup by identifier does not walk the segments.
+    ///
+    /// [`Store::get`] and [`Store::contains`] used `segments.values()` and
+    /// scanned up to `EPOCH_WINDOW` × 2 segments per call — 45 either side of
+    /// now (RFC 1 §6.2) — and both are on the hot path of everything:
+    /// `get_truncated` goes through `get`, every reconciliation serve is a
+    /// `get`, and the corpus saver walks the whole store one `get` at a time.
+    ///
+    /// **The value is the bucket, not a `Location`.** `index` is keyed
+    /// `(expiry, id)` and already holds the location, but reaching it needs the
+    /// expiry, and the expiry is what a caller holding only an identifier does
+    /// not have. One `u32` per object is the smallest thing that closes that
+    /// gap, and it cannot disagree with `index` because it does not duplicate
+    /// it.
+    ///
+    /// Maintained at exactly the four points `by_trunc` is — ingest, expire,
+    /// evict, rebuild — and deliberately declared beside it, because the two
+    /// must move together and a reader adding a fifth site should see both.
+    by_id: BTreeMap<ObjectId, u32>,
     /// Truncated identifier → full identifier.
     ///
     /// `recon::wanted` tests every manifest row against this, so a linear scan
@@ -170,8 +189,11 @@ impl Store {
     }
 
     /// Whether the object is held.
+    ///
+    /// One map lookup. This scanned every segment, calling `Segment::get` on
+    /// each — and `ingest` calls it on every object a peer offers.
     pub fn contains(&self, id: &ObjectId) -> bool {
-        self.segments.values().any(|s| s.get(id).is_some())
+        self.by_id.contains_key(id)
     }
 
     /// Ingest an object, applying RFC 1 §11's checks that this layer owns.
@@ -330,6 +352,7 @@ impl Store {
             .or_insert_with(|| Segment::new(bucket))
             .append(id, bytes);
         self.by_trunc.insert(id.truncated(), id);
+        self.by_id.insert(id, bucket);
         self.index.insert(
             (expiry, id),
             Location {
@@ -365,8 +388,14 @@ impl Store {
     }
 
     /// Fetch an object's bytes.
+    ///
+    /// Two lookups rather than a walk of up to ninety segments. The index is
+    /// derived state and [`Store::rebuild_index`] reconstructs it, so a
+    /// `by_id` entry naming a bucket whose segment is gone returns `None`
+    /// rather than panicking — the same answer the scan gave.
     pub fn get(&self, id: &ObjectId) -> Option<&[u8]> {
-        self.segments.values().find_map(|s| s.get(id))
+        let bucket = *self.by_id.get(id)?;
+        self.segments.get(&bucket)?.get(id)
     }
 
     /// `(expiry, id)` pairs within `[lo, hi)`, in order.
@@ -538,6 +567,7 @@ impl Store {
                 let bound = tombstone_bound(b);
                 for id in seg.ids() {
                     self.by_trunc.remove(&id.truncated());
+                    self.by_id.remove(id);
                     self.tombstones.insert(*id, bound);
                     n += 1;
                 }
@@ -610,6 +640,7 @@ impl Store {
             let bound = tombstone_bound(oldest);
             for id in seg.ids() {
                 self.by_trunc.remove(&id.truncated());
+                self.by_id.remove(id);
                 self.tombstones.insert(*id, bound);
                 dropped += 1;
             }
@@ -638,11 +669,15 @@ impl Store {
     /// `get_truncated` and `has_truncated` answer from. Without it a rebuilt
     /// node would serve reconciliation and find nothing it holds.
     ///
-    /// Both maps are cleared first, so the rebuild is tested against an empty
-    /// one rather than against itself.
+    /// All three maps are cleared first, so the rebuild is tested against an
+    /// empty one rather than against itself. `by_id` was added later and is
+    /// cleared here for the same reason `by_trunc` is: the failure it prevents
+    /// is a rebuild that appears to work because nothing had emptied the map
+    /// it was supposed to reconstruct.
     pub fn rebuild_index(&mut self) -> Result<(), Error> {
         self.index.clear();
         self.by_trunc.clear();
+        self.by_id.clear();
         for (&bucket, seg) in &self.segments {
             for (id, bytes) in seg.entries() {
                 let h = RoutingHeader::parse(bytes).map_err(|_| Error::Corrupt)?;
@@ -654,9 +689,80 @@ impl Store {
                     },
                 );
                 self.by_trunc.insert(id.truncated(), *id);
+                self.by_id.insert(*id, bucket);
             }
         }
         Ok(())
+    }
+
+    /// **Every derived map agrees with the segments.** Test-only.
+    ///
+    /// The segments are the truth: they hold the bytes, and RFC 5 §7 makes
+    /// everything else reconstructible from them. `index`, `by_trunc` and
+    /// `by_id` are three answers to three different questions about the same
+    /// set, maintained by hand at four sites each, and a drift between any of
+    /// them and the segments is invisible in the worst way — **a corpus that
+    /// cannot find an object it is holding, or offers one it has dropped.**
+    /// RFC 0 §6 makes both silent.
+    ///
+    /// # `index` is checked in one direction only, and that is not laziness
+    ///
+    /// `expire` prunes `index` entries for objects whose expiry has passed
+    /// *while their segment survives* — a segment is only unlinked once the
+    /// whole bucket is past. So the store can legitimately hold bytes for an
+    /// object that `index` no longer lists, and requiring `index` to contain
+    /// everything in the segments would assert something untrue.
+    ///
+    /// What must hold is the other direction: nothing in `index` may name an
+    /// object the segments do not have. That is the direction a serve depends
+    /// on — a manifest row for an object this node cannot produce is an
+    /// exchange that stalls.
+    ///
+    /// `by_id` and `by_trunc` are checked both ways, because they *are* meant
+    /// to be exactly the segments' contents: both are cleaned when a segment
+    /// is removed and at no other time.
+    #[cfg(test)]
+    pub(crate) fn assert_indexes_agree(&self, when: &str) {
+        let held: BTreeSet<(ObjectId, u32)> = self
+            .segments
+            .iter()
+            .flat_map(|(&b, seg)| seg.ids().map(move |id| (*id, b)))
+            .collect();
+
+        // by_id ⟺ the segments, bucket included.
+        let mapped: BTreeSet<(ObjectId, u32)> =
+            self.by_id.iter().map(|(id, &b)| (*id, b)).collect();
+        assert_eq!(
+            mapped, held,
+            "{when}: by_id disagrees with the segments — an object is \
+             unreachable by `get`, or `get` names a bucket that does not hold it"
+        );
+
+        // by_trunc ⟺ the same set, by truncation.
+        let trunc_held: BTreeSet<[u8; TRUNC_LEN]> =
+            held.iter().map(|(id, _b)| id.truncated()).collect();
+        let trunc_map: BTreeSet<[u8; TRUNC_LEN]> = self.by_trunc.keys().copied().collect();
+        assert_eq!(
+            trunc_map, trunc_held,
+            "{when}: by_trunc disagrees with the segments"
+        );
+
+        // And every index entry names something the segments hold.
+        for (expiry, id) in self.index.keys() {
+            assert!(
+                held.iter().any(|(h, _)| h == id),
+                "{when}: index lists {id:?} at expiry {expiry} and no segment holds it"
+            );
+        }
+
+        // The identifier each map answers with must round-trip.
+        for (trunc, id) in &self.by_trunc {
+            assert_eq!(&id.truncated(), trunc, "{when}: by_trunc maps to a different id");
+            assert!(
+                self.by_id.contains_key(id),
+                "{when}: by_trunc knows an id by_id does not"
+            );
+        }
     }
 
     /// Tombstones held, for RFC 5 §8's resurrection defence.
@@ -1374,5 +1480,150 @@ mod tests {
             let id = krab_crypto::object_id(&bytes);
             assert_eq!(s.ingest(id, bytes, 0, MAX_TTL), Ok(()), "flags {flags}");
         }
+    }
+
+    /// **The invariant, across every path that maintains the index.**
+    ///
+    /// `by_id` is maintained by hand at four sites — ingest, expire, evict,
+    /// rebuild — and this walks all four in one store rather than testing them
+    /// apart, because the failure that matters is the one where a *later*
+    /// operation is wrong about what an earlier one left behind.
+    ///
+    /// It asserts against the segments, which hold the bytes, and not against
+    /// the other maps: three derived maps agreeing with each other while all
+    /// three are wrong is exactly what a rebuild-that-never-cleared looked
+    /// like, and that already happened once here (see `rebuild_index`).
+    #[test]
+    fn every_index_agrees_with_the_segments_through_the_whole_lifecycle() {
+        const NOW: u32 = 29_766_000;
+        let mut s = Store::new();
+        s.assert_indexes_agree("empty");
+
+        // Spread across buckets, so expiry and eviction have whole segments to
+        // remove and partial ones to leave alone.
+        let mut ids = Vec::new();
+        for i in 0..60u32 {
+            let expiry = NOW + 1_000 + i * 700;
+            let (id, bytes) = object(expiry, i as u8);
+            if s.ingest(id, bytes, NOW, u32::MAX).is_ok() {
+                ids.push(id);
+            }
+        }
+        s.assert_indexes_agree("after ingest");
+        assert!(ids.len() > 40, "too few objects to exercise the buckets");
+
+        // Every ingested object is reachable by all three routes.
+        for id in &ids {
+            assert!(s.contains(id), "contains says no to an ingested object");
+            assert!(s.get(id).is_some(), "get cannot find an ingested object");
+            assert!(
+                s.get_truncated(&id.truncated()).is_some(),
+                "get_truncated cannot find an ingested object"
+            );
+        }
+
+        // A duplicate must not disturb anything.
+        let (id, bytes) = object(NOW + 1_000, 0);
+        assert_eq!(s.ingest(id, bytes, NOW, u32::MAX), Err(Reject::Duplicate));
+        s.assert_indexes_agree("after a refused duplicate");
+
+        // Expire part of the corpus.
+        let dropped = s.expire(NOW + 20_000);
+        s.assert_indexes_agree("after expire");
+        assert!(dropped > 0, "expire dropped nothing, so it proved nothing");
+
+        // What expiry removed must be gone from every route, and what survived
+        // must still be reachable by all of them.
+        for id in &ids {
+            assert_eq!(
+                s.contains(id),
+                s.get(id).is_some(),
+                "contains and get disagree after expire"
+            );
+        }
+
+        // Evict under pressure.
+        let before = s.len();
+        let evicted = s.evict_to(s.bytes() / 2);
+        s.assert_indexes_agree("after evict_to");
+        assert!(evicted > 0, "eviction dropped nothing, so it proved nothing");
+        assert!(s.len() < before);
+
+        // And a rebuild reconstructs all three from the segments alone.
+        s.rebuild_index().expect("the index rebuilds");
+        s.assert_indexes_agree("after rebuild_index");
+    }
+
+    /// **A rebuild reconstructs `by_id`, and is tested against an empty map.**
+    ///
+    /// The specific failure `rebuild_index`'s own note records: it once
+    /// rebuilt `index` and left `by_trunc` alone, and passed because nothing
+    /// had emptied `by_trunc` either. Adding a third map is adding a third
+    /// chance to make that mistake, so this asserts the reconstruction from a
+    /// store whose maps have genuinely been cleared.
+    #[test]
+    fn a_rebuild_reconstructs_by_id_from_the_segments_alone() {
+        const NOW: u32 = 29_766_000;
+        let mut s = Store::new();
+        let mut ids = Vec::new();
+        for i in 0..12u32 {
+            let (id, bytes) = object(NOW + 2_000 + i * 900, i as u8);
+            if s.ingest(id, bytes, NOW, u32::MAX).is_ok() {
+                ids.push(id);
+            }
+        }
+
+        // Empty every derived map, the way a lost index is empty.
+        s.by_id.clear();
+        s.by_trunc.clear();
+        s.index.clear();
+        assert!(
+            ids.iter().all(|id| s.get(id).is_none()),
+            "get answered from something other than by_id, so this test is \
+             not exercising what it claims"
+        );
+
+        s.rebuild_index().expect("the index rebuilds");
+        s.assert_indexes_agree("after a rebuild from cleared maps");
+        for id in &ids {
+            assert!(s.get(id).is_some(), "rebuild did not restore get");
+            assert!(s.contains(id), "rebuild did not restore contains");
+        }
+    }
+
+    /// **A rebuild replaces the maps; it does not merge into them.**
+    ///
+    /// Found by probing: removing `by_id.clear()` from `rebuild_index` broke
+    /// nothing in the two tests above, because both rebuild from a state where
+    /// `by_id` is already right — one because it agrees, the other because it
+    /// is empty. Neither is the case the clear exists for.
+    ///
+    /// That case is a **stale** entry: a store loaded from disk with an index
+    /// that no longer matches its segments, which is precisely the situation
+    /// RFC 5 §7 makes `rebuild_index` exist for. A rebuild that merged would
+    /// leave the stale entry, and a stale `by_id` names a bucket that does not
+    /// hold the object — so `get` returns nothing for an object the corpus is
+    /// holding, silently.
+    #[test]
+    fn a_rebuild_discards_stale_entries_rather_than_merging() {
+        const NOW: u32 = 29_766_000;
+        let mut s = Store::new();
+        let (id, bytes) = object(NOW + 5_000, 1);
+        s.ingest(id, bytes, NOW, u32::MAX).expect("ingested");
+
+        // An identifier the segments have never held, pointing at a bucket
+        // that does exist — the shape a stale index has after eviction.
+        let ghost = krab_crypto::object_id(b"never ingested");
+        let real_bucket = *s.by_id.get(&id).expect("the real object is mapped");
+        s.by_id.insert(ghost, real_bucket);
+        s.by_trunc.insert(ghost.truncated(), ghost);
+
+        s.rebuild_index().expect("the index rebuilds");
+        s.assert_indexes_agree("after a rebuild over stale entries");
+        assert!(
+            !s.contains(&ghost),
+            "a rebuild merged a stale entry instead of replacing the map"
+        );
+        assert!(s.get(&id).is_some(), "the real object was lost");
     }
 }
