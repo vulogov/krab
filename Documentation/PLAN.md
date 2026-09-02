@@ -3863,3 +3863,96 @@ seven have now been brought.
 
 **1 327 tests, zero failures**, clippy clean under `-D warnings` across
 `--all-features`.
+
+---
+
+## 46. The client half of restricted discovery, and the key it was derived from — 2026-09-02
+
+Asked whether the tree is ready for a three-node trial — A↔B over TCP, B↔C over
+Tor. It was not, for one reason, and looking for that reason found a second.
+
+### Only the service half existed
+
+`App::onion_client_set` derived the authorised keys and handed the *public*
+halves to `ADD_ONION … ClientAuthV3=`. **Nothing gave a client's own tor the
+private half** — no `ClientOnionAuthDir`, no `ONION_CLIENT_AUTH_ADD`, no
+`.auth_private`.
+
+So a node dialling a peer that had any verified peering could not decrypt that
+peer's descriptor and **could not find the service at all**, which presents
+exactly as the peer being offline. That is the failure errata E-5 was written to
+name, arriving through the half the derivation was for.
+
+It only bites once the *service* has peers — a node with none publishes
+unrestricted — which is why every test that did not first complete a peering
+passed, and why the trial's B, peered with both A and C, would have hit it
+immediately.
+
+`TorProcess::add_client_auth` issues `ONION_CLIENT_AUTH_ADD`, and the TUI
+registers the key in the tor branch of `establish`, before dialling.
+
+**Not `Flags=Permanent`.** Permanent registration writes the key into tor's
+`ClientOnionAuthDir` — a configuration file on disk, which this module exists
+to avoid (`NO-CONFIG.md`), holding a key derived from a peering, which is graph
+information at rest. Registered for the life of this tor; the key is derived, so
+re-deriving it costs one X25519 and leaves nothing behind.
+
+### The trap in the middle: two encodings
+
+`ADD_ONION … ClientAuthV3=` takes the public key in **base32**.
+`ONION_CLIENT_AUTH_ADD` takes the private key in **base64**. Same key type, same
+protocol, two encodings.
+
+`ClientAuth` now spells both, next to each other, so the asymmetry is a property
+of the type rather than something a caller remembers at the point of use. And it
+is checked **against a real tor**, because that is the only thing that defines
+it: `a_real_tor_accepts_a_client_auth_key` registers a correctly encoded key and
+then a base32 one, and asserts tor takes the first and refuses the second.
+Probed by sending base32 as the correct one — tor answers
+`512 Failed to decode x25519 private key`.
+
+A fake proxy would have accepted both. That is the whole argument for testing
+this against the daemon, and it is the same argument that failed to be made when
+`TorFabric` was written against a fake SOCKS server.
+
+### And then the key was the wrong one
+
+Writing the client half meant deriving it independently, and comparing:
+**`onion_client_set` used the Noise static agreement; errata E-5 specifies RFC 1
+§6.2's `S`, the correspondence agreement.**
+
+Both ends used the Noise static, so two Krab nodes agreed and
+`the_onion_client_set_comes_from_verified_peerings` passed — it asserted that
+the two *service* sides matched, which they did, wrongly. Nothing derived the
+client half independently until now, so nothing could see it.
+
+The consequence is E-5's own: a second implementation following the errata
+derives from the correspondence keys, gets a different key, and **cannot see
+this node's service** — silently. The errata is the normative statement of this
+construction, so the code was wrong and now follows it.
+
+It also stops the Noise static carrying a second purpose. RFC 4 §5.2's objection
+to cross-protocol reuse does not depend on which key, and the transport identity
+is not the one the credential is about.
+
+`the_client_key_matches_the_one_the_service_authorised` is the assertion that
+would have caught either fault: it derives the client key the way a client
+would, from the peer's own card, and compares it with what the service
+published. The two halves meet nowhere else in the code — different processes,
+different machines, different encodings — so nothing else checks they are one
+keypair.
+
+### What this says about the trial
+
+A↔B over TCP was ready and is unaffected. B↔C over Tor now has both halves and
+the encoding is verified against a real daemon — but **two live tors have still
+never spoken to each other through this code**. What is proven is that tor
+accepts what krab sends it, one command at a time; what is not is a circuit, a
+descriptor fetch under restricted discovery, and a Noise handshake over it.
+
+That is what the trial is for, and it is now worth running.
+
+### What is verified
+
+**1 330 tests, zero failures**, clippy clean under `-D warnings` across
+`--all-features`; `crypto_boundaries` unchanged by the new dev-dependency.

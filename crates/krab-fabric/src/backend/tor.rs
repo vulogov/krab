@@ -415,6 +415,49 @@ impl TorProcess {
         )))
     }
 
+    /// Register the private half of a restricted-discovery key — RFC 4 §5.2's
+    /// **client** side.
+    ///
+    /// # The half that was missing, and how it fails without this
+    ///
+    /// `add_onion` publishes the *public* halves so only authorised clients
+    /// can decrypt the service descriptor. Until this existed, nothing gave a
+    /// client's own tor the matching private key — so a node dialling a peer
+    /// that had any verified peering could not decrypt its descriptor and
+    /// **could not find it at all**, which presents exactly as the peer being
+    /// offline. Errata E-5 wrote that failure down as the reason to record the
+    /// derivation; it arrived through the half the derivation was for.
+    ///
+    /// It only bites once the service has peers: a node with none publishes
+    /// unrestricted, so every test that did not first complete a peering
+    /// passed.
+    ///
+    /// # Base64 here, base32 there
+    ///
+    /// `ADD_ONION … ClientAuthV3=` takes the public key in **base32**;
+    /// `ONION_CLIENT_AUTH_ADD` takes the private key in **base64**. Same key
+    /// type, same protocol, two encodings — see
+    /// `krab_crypto::onion::ClientAuth`, which spells both so a caller cannot
+    /// reach for the wrong one.
+    ///
+    /// # Not `Flags=Permanent`, deliberately
+    ///
+    /// Permanent registration writes the key into tor's `ClientOnionAuthDir`,
+    /// which is a **configuration file on disk** — the thing this module
+    /// exists to avoid (`Documentation/NO-CONFIG.md`), and a file holding a
+    /// key derived from a peering, which is graph information at rest.
+    /// Registered for the life of this tor instead: the key is derived, so
+    /// re-deriving it next start costs one X25519 and leaves nothing behind.
+    pub fn add_client_auth(&mut self, address: &str, secret_base64: &str) -> Result<(), TorError> {
+        let id = address.trim_end_matches(".onion");
+        let mut cmd = format!("ONION_CLIENT_AUTH_ADD {id} x25519:{secret_base64}");
+        let r = self.command(&cmd);
+        // The command carried a private key — the same reasoning `add_onion`
+        // applies to its own buffer (RFC 7 §9).
+        overwrite(&mut cmd);
+        r.map(|_| ())
+    }
+
     /// Withdraw a published service — `DEL_ONION`.
     ///
     /// The descriptor stops being republished and the service becomes
@@ -1252,5 +1295,69 @@ mod tests {
             [2u8; 32],
         );
         assert!(crate::Fabric::connect(&f).is_err());
+    }
+
+    /// **The client-auth registration, against a real tor.**
+    ///
+    /// The half that was missing, tested the way its absence went unnoticed:
+    /// against the daemon rather than a fake. A control command with the wrong
+    /// *encoding* — base32 where tor wants base64 — is accepted by any mock
+    /// and refused by tor with a 512, and that is precisely the mistake
+    /// available here, since the sibling command `ADD_ONION` takes the other
+    /// one.
+    ///
+    /// Skipped when tor is absent, and deliberately not `#[ignore]`d: an
+    /// ignored test is one nobody runs, and this is the only place the
+    /// encoding is checked against the thing that defines it.
+    #[test]
+    fn a_real_tor_accepts_a_client_auth_key() {
+        let present = Command::new("tor")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        if !present {
+            println!("skipped: no `tor` on PATH");
+            return;
+        }
+
+        let dir = tmp("clientauth");
+        let cfg = TorLaunch::on_path(&dir);
+        let mut tor = match TorProcess::launch(&cfg) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("tor is installed but krab could not drive it: {e}");
+            }
+        };
+
+        // A real derived pair, from the real derivation — not a random 32
+        // bytes, because a random scalar is not clamped and tor's acceptance
+        // of one says nothing about the key krab actually produces.
+        let a = krab_crypto::dh::SecretKey::from_bytes([3u8; 32]);
+        let b = krab_crypto::dh::SecretKey::from_bytes([5u8; 32]);
+        let shared = krab_crypto::dh::agree(&a, &b.public()).expect("agreement");
+        let auth = krab_crypto::onion::client_auth(&shared);
+
+        // A syntactically valid v3 address. Registration does not require the
+        // service to exist — tor stores the key against the address — so this
+        // checks the command and the encoding without needing a live circuit.
+        let address = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+        let accepted = tor.add_client_auth(address, &auth.secret_base64());
+
+        // **And the wrong encoding is refused**, which is what makes the line
+        // above meaningful rather than merely green.
+        let wrong = tor.add_client_auth(address, &auth.secret_base32());
+
+        tor.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        accepted.expect("tor refused a correctly encoded client-auth key");
+        assert!(
+            wrong.is_err(),
+            "tor accepted base32 where the control protocol wants base64, so \
+             this test cannot tell the two apart"
+        );
     }
 }

@@ -62,3 +62,11 @@ socks = ["tcp"]
 serial = ["dep:serialport"]
 courier = []
 sim = []
+
+[dev-dependencies]
+# **Tests only.** `a_real_tor_accepts_a_client_auth_key` needs the *real*
+# derivation — a random 32 bytes is not a clamped scalar, and tor accepting one
+# would say nothing about the key krab actually produces. This adds no version
+# to the tree: `krab-crypto` is already here through `krab-proto`, which is why
+# `crypto_boundaries.rs` still sees the same two copies of each primitive.
+krab-crypto = { workspace = true }

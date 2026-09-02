@@ -1929,7 +1929,26 @@ impl App {
         let Some(identity) = self.identity.as_ref() else {
             return (Vec::new(), 0);
         };
-        let me = krab_crypto::dh::SecretKey::from_bytes(identity.noise_bytes());
+        // **The correspondence key, not the Noise static** — RFC 1 §6.2's `S`,
+        // which is what errata E-5 specifies and what `client_auth` documents
+        // as its input.
+        //
+        // This used the Noise static. Both ends did, so two Krab nodes agreed
+        // and every test passed — but the errata is the normative statement of
+        // this construction, and a second implementation following it would
+        // derive from the correspondence keys, get a different key, and be
+        // unable to decrypt our descriptor. **That is precisely the silent
+        // unreachability E-5 was written to prevent**, reached through the
+        // implementation of the thing it documents.
+        //
+        // Found by `the_client_key_matches_the_one_the_service_authorised`,
+        // which is the first test to derive the client half independently and
+        // compare — the service-side test asserted only that the two *service*
+        // sides agreed, which they did, wrongly.
+        //
+        // It also stops the Noise static carrying a second purpose. §5.2's
+        // objection to cross-protocol reuse does not depend on which key, and
+        // the transport identity is not the one the credential is about.
         let (mut set, mut skipped) = (Vec::new(), 0usize);
         for peer in self.peer_ids() {
             let card = std::fs::read(self.peer_path(&peer, artifact::PeerFile::Link))
@@ -1940,11 +1959,11 @@ impl App {
                 skipped += 1;
                 continue;
             };
-            let pk = krab_crypto::dh::PublicKey(card.noise_static_pk);
+            let pk = krab_crypto::dh::PublicKey(card.correspondence_pk);
             // `agree` rejects a low-order public key, which would produce an
             // all-zero shared secret and therefore the *same* auth key for
             // every peer holding one. Skipping is the only safe answer.
-            match krab_crypto::dh::agree(&me, &pk) {
+            match identity.agree_with(&pk) {
                 Some(shared) => set.push(krab_crypto::onion::client_auth(&shared).public_base32()),
                 None => skipped += 1,
             }
@@ -10500,7 +10519,7 @@ impl App {
     }
 
     fn establish(
-        &self,
+        &mut self,
         peer: &str,
         kind: &str,
         addr: Option<&str>,
@@ -10591,17 +10610,66 @@ impl App {
                                 `start-tor` and let the peer dial you."
                         .into());
                 }
-                let Some(tor) = self.tor.as_ref() else {
+                if self.tor.is_none() {
                     return Err("no tor is running — `start-tor` first. \
                                 A tor link dials through this node's own \
                                 SOCKS port and there is no other route to an \
                                 .onion address."
                         .into());
-                };
+                }
+                let onion = addr.trim_end_matches('/').to_string();
+
+                // **RFC 4 §5.2's client half, registered before the dial.**
+                //
+                // The peer publishes its descriptor encrypted to the
+                // authorised set, and this node's key for that set is derived
+                // — not exchanged — from the same static-static agreement the
+                // peer used (errata E-5). Without handing it to tor, the
+                // descriptor cannot be decrypted and **the service cannot be
+                // found at all**, which presents exactly as the peer being
+                // offline. It only bites once that peer has verified peerings
+                // of its own, which is why every test that did not first
+                // complete one passed.
+                //
+                // Derived here rather than at `start-tor`: an onion address is
+                // something the operator types at connect time, and tor's
+                // registration is keyed on it.
+                let registered = id
+                    .agree_with(&krab_crypto::dh::PublicKey(card.correspondence_pk))
+                    .map(|shared| {
+                        let auth = krab_crypto::onion::client_auth(&shared);
+                        let mut secret = auth.secret_base64();
+                        let r = self
+                            .tor
+                            .as_mut()
+                            .expect("checked above")
+                            .add_client_auth(&onion, &secret);
+                        crate::overwrite(&mut secret);
+                        r
+                    });
+                match registered {
+                    // A low-order key: `agree` refuses it, and without the
+                    // shared secret there is no auth key to derive. The dial
+                    // is still attempted, because the peer may be publishing
+                    // unrestricted — and if it is not, the error below is the
+                    // honest one.
+                    None => {}
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => {
+                        return Err(format!(
+                            "tor refused the client-auth key for {peer}: {e}\n\n\
+                             Without it their descriptor cannot be decrypted, \
+                             so the service would look offline rather than \
+                             refused (RFC 4 §5.2)."
+                        ))
+                    }
+                }
+
+                let socks = self.tor.as_ref().expect("checked above").socks_port();
                 let fabric = krab_fabric::backend::tor::TorFabric::new(
                     krab_fabric::profile::LinkProfile::tor(),
-                    tor.socks_port(),
-                    addr.trim_end_matches('/'),
+                    socks,
+                    &onion,
                     id.noise_bytes(),
                     card.noise_static_pk,
                 );
@@ -13550,6 +13618,54 @@ mod tests {
             "answering over tor must be refused: {}",
             a.output
         );
+    }
+
+    /// **The key the client registers is the one the service published.**
+    ///
+    /// The two halves meet nowhere in the code — the service puts a base32
+    /// public key into `ADD_ONION`, the client puts a base64 private key into
+    /// `ONION_CLIENT_AUTH_ADD`, in different processes on different machines —
+    /// so nothing else checks that they are the same key. If they are not, the
+    /// client cannot decrypt the descriptor and **the service is invisible to
+    /// it**, which is indistinguishable from the peer being offline (RFC 0
+    /// §6). That is the failure errata E-5 exists to name, and this is the
+    /// assertion that would catch it.
+    #[test]
+    fn the_client_key_matches_the_one_the_service_authorised() {
+        let (a, b, a_of_b, b_of_a) = peered_pair("client-auth");
+
+        // A's service side: the authorised set it would publish.
+        let (authorised, skipped) = a.onion_client_set();
+        assert_eq!(skipped, 0);
+        assert_eq!(authorised.len(), 1, "A authorised nobody");
+
+        // B's client side: the key it would register with its own tor, derived
+        // from B's own agreement with A and nothing B was sent.
+        let their_card = std::fs::read(b.peer_path(&a_of_b, artifact::PeerFile::Link))
+            .ok()
+            .and_then(|raw| peering::Card::decode(&raw).ok())
+            .expect("B holds A's peer-link");
+        let shared = b
+            .identity
+            .as_ref()
+            .expect("identity")
+            .agree_with(&krab_crypto::dh::PublicKey(their_card.correspondence_pk))
+            .expect("agreement");
+        let auth = krab_crypto::onion::client_auth(&shared);
+
+        assert_eq!(
+            auth.public_base32(),
+            authorised[0],
+            "the key B would register is not the one A authorised, so A's \
+             service would be invisible to B and look offline"
+        );
+
+        // And the private half B hands tor is the private half of that key —
+        // the encodings differ, so this is the check that they still describe
+        // one keypair.
+        assert_eq!(auth.secret_base64().len(), 44);
+        assert_ne!(auth.secret_base64(), auth.public_base32());
+        let _ = b_of_a;
     }
 
     /// **A peer whose card does not verify is skipped and counted**, not

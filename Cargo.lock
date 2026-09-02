@@ -725,6 +725,7 @@ name = "krab-fabric"
 version = "0.1.0"
 dependencies = [
  "krab-core",
+ "krab-crypto",
  "krab-proto",
  "serialport",
  "snow",

@@ -272,6 +272,24 @@ impl ClientAuth {
         base32(&self.secret)
     }
 
+    /// The x25519 private key, **base64** — what `ONION_CLIENT_AUTH_ADD` wants.
+    ///
+    /// # The two encodings are different, and that is tor's grammar
+    ///
+    /// The service publishes the public half with
+    /// `ADD_ONION … ClientAuthV3=<base32>`, and the client registers the
+    /// private half with `ONION_CLIENT_AUTH_ADD <addr> x25519:<base64>`. Same
+    /// key type, same protocol, two encodings — so a single `to_string` used
+    /// for both halves produces a service nobody can reach and a client tor
+    /// refuses, and the two failures look nothing alike.
+    ///
+    /// Both are spelled out here, next to each other, so the asymmetry is a
+    /// property of the type rather than something a caller has to remember at
+    /// the point of use.
+    pub fn secret_base64(&self) -> String {
+        base64(&self.secret)
+    }
+
     /// The raw public half, for tests and vectors.
     pub fn public_bytes(&self) -> &[u8; 32] {
         &self.public
@@ -680,5 +698,36 @@ mod tests {
             before,
             "not reproducible"
         );
+    }
+
+    /// **The two halves are encoded the way tor asks for each.**
+    ///
+    /// `ClientAuthV3=` takes base32 and `ONION_CLIENT_AUTH_ADD` takes base64,
+    /// for the same key type in the same protocol. Using one encoding for both
+    /// gives a service nobody can reach and a client tor refuses, and neither
+    /// failure names the other.
+    #[test]
+    fn the_client_auth_halves_use_the_encodings_tor_asks_for() {
+        let a = crate::dh::SecretKey::from_bytes([9u8; 32]);
+        let b = crate::dh::SecretKey::from_bytes([21u8; 32]);
+        let shared = crate::dh::agree(&a, &b.public()).expect("agreement");
+        let auth = client_auth(&shared);
+
+        // base32 of 32 bytes: 52 characters, unpadded, RFC 4648 alphabet.
+        let pk = auth.public_base32();
+        assert_eq!(pk.len(), 52);
+        assert!(!pk.contains('='));
+        assert!(pk
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+
+        // base64 of 32 bytes: 44 characters with one pad.
+        let sk = auth.secret_base64();
+        assert_eq!(sk.len(), 44, "not base64: {sk}");
+        assert!(
+            sk.ends_with('='),
+            "base64 of 32 bytes ends in one pad: {sk}"
+        );
+        assert_ne!(sk, auth.secret_base32(), "the two encodings collapsed");
     }
 }

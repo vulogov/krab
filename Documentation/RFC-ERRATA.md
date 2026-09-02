@@ -264,8 +264,25 @@ peers is reported to the operator. Admitting an unverifiable credential would
 widen the set §5.2 exists to narrow; dropping it silently would leave an
 operator wondering why one peer can never reach them.
 
-**In the code:** `krab_crypto::onion::client_auth`, and
-`App::onion_client_set` which walks the peer directory. The domain string is
+**In the code:** `krab_crypto::onion::client_auth`, `App::onion_client_set`
+for the service half, and `App::establish`'s tor branch for the client half —
+which registers the private key with this node's own tor over the control port
+(`TorProcess::add_client_auth`) rather than writing it into tor's
+`ClientOnionAuthDir`, because that directory is a configuration file and
+`Documentation/NO-CONFIG.md` is why this module launches tor on arguments
+alone.
+
+**The client half was missing until 2026-09-02**, and its absence was exactly
+the failure described above: a node dialling a peer that had any verified
+peering could not decrypt the descriptor and could not find the service at all.
+It only bit once the *service* had peers, so every test that did not first
+complete a peering passed. `PLAN.md` §46 records it.
+
+**And `onion_client_set` derived from the wrong key** until the same date — the
+Noise static rather than `S`. Both ends did, so two Krab nodes agreed and the
+service-side test passed; a second implementation following this entry would
+have derived from the correspondence keys and been unable to reach either. The
+entry is normative and the code now follows it. The domain string is
 `krab_crypto::onion::DOMAIN_CLIENT_AUTH`, covered by RFC 3 §3's
 domain-separation test.
 
