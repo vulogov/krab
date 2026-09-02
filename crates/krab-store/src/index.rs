@@ -8,7 +8,7 @@ use crate::segment::{bucket_of, Segment};
 use crate::Error;
 use krab_core::object::{ObjectId, RoutingHeader, TRUNC_LEN};
 use krab_crypto::Fingerprint;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The index keys covering the expiry range `[lo, hi)`.
 ///
@@ -171,7 +171,33 @@ pub struct Store {
     /// rescan is the safe direction; the unsafe one is an inbox that has
     /// stopped noticing mail.
     version: u64,
+    /// `(version, id)` for objects added, newest last — see
+    /// [`Store::added_since`].
+    ///
+    /// Bounded, because it exists to let a reader catch up on a few objects
+    /// rather than to be a second copy of the corpus. A reader that has fallen
+    /// further behind than this is told to rescan, which is correct and is the
+    /// case the bound is chosen to make rare: [`ADDED_LOG`] is far more than a
+    /// tick's worth of arrivals.
+    added: VecDeque<(u64, ObjectId)>,
+    /// The version at which something was last **removed**.
+    ///
+    /// Additions can be replayed; removals cannot, because a reader that
+    /// derived something from an object now gone has no way to learn that from
+    /// a list of what arrived. So a reader older than this is told to rescan.
+    ///
+    /// Kept separate from the log rather than as a marker inside it: a marker
+    /// would be dropped by the ring's own bound, and the one entry that must
+    /// never be silently forgotten is the one that says "your view is wrong".
+    last_removal: u64,
 }
+
+/// Additions remembered for [`Store::added_since`].
+///
+/// Sized against a tick, not against the corpus. A reconciliation that brought
+/// in more than this in one exchange makes its reader rescan — which costs one
+/// full pass on the tick that received a flood, and is the safe direction.
+pub const ADDED_LOG: usize = 4096;
 
 impl Store {
     /// An empty store.
@@ -186,6 +212,45 @@ impl Store {
     /// is not `len()`.
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Identifiers added since `version`, or `None` if the caller must rescan.
+    ///
+    /// **`None` is not a failure; it is the correct answer** in three cases,
+    /// and each one is a case where replaying additions would give a reader a
+    /// view that is wrong rather than merely stale:
+    ///
+    /// - something was **removed** since — expiry, eviction, or a rebuild. A
+    ///   list of arrivals cannot express a departure, and a reader that kept a
+    ///   message for an object the corpus has dropped is showing mail this
+    ///   node can no longer produce.
+    /// - the log does not reach back that far, because more than [`ADDED_LOG`]
+    ///   objects have arrived since.
+    /// - the caller is from the future, which means it is looking at a
+    ///   different store.
+    ///
+    /// The bound is deliberately on the *reader's* side: a caller that ignores
+    /// `None` and replays anyway gets a stale inbox, so the signature makes
+    /// that a decision rather than an oversight.
+    pub fn added_since(&self, version: u64) -> Option<Vec<ObjectId>> {
+        if version > self.version || version < self.last_removal {
+            return None;
+        }
+        if version == self.version {
+            return Some(Vec::new());
+        }
+        // The oldest entry must be the one *immediately* after the caller's
+        // version, or the ring has dropped something between them.
+        match self.added.front() {
+            Some((first, _)) if *first <= version + 1 => Some(
+                self.added
+                    .iter()
+                    .filter(|(v, _)| *v > version)
+                    .map(|(_, id)| *id)
+                    .collect(),
+            ),
+            _ => None,
+        }
     }
 
     /// Objects held.
@@ -378,6 +443,10 @@ impl Store {
         self.by_trunc.insert(id.truncated(), id);
         self.by_id.insert(id, bucket);
         self.version += 1;
+        if self.added.len() == ADDED_LOG {
+            self.added.pop_front();
+        }
+        self.added.push_back((self.version, id));
         self.index.insert(
             (expiry, id),
             Location {
@@ -613,6 +682,7 @@ impl Store {
         // Bumped unconditionally: `index` entries are pruned above even when
         // no segment was unlinked, so `n == 0` does not mean nothing changed.
         self.version += 1;
+        self.last_removal = self.version;
         n
     }
 
@@ -681,6 +751,7 @@ impl Store {
             // what we just chose not to keep -- SIM-1 §4's +68% re-fetch loop.
             self.min_expiry_min = self.min_expiry_min.max(bound);
             self.version += 1;
+            self.last_removal = self.version;
         }
         dropped
     }
@@ -708,6 +779,11 @@ impl Store {
         self.by_trunc.clear();
         self.by_id.clear();
         self.version += 1;
+        // A rebuild does not change what is held, but a reader has no way to
+        // know the segments were not also reloaded from a different disk
+        // state — so it is told to rescan rather than replay.
+        self.last_removal = self.version;
+        self.added.clear();
         for (&bucket, seg) in &self.segments {
             for (id, bytes) in seg.entries() {
                 let h = RoutingHeader::parse(bytes).map_err(|_| Error::Corrupt)?;
@@ -1643,6 +1719,87 @@ mod tests {
     /// **The version moves on every path that changes what is held, and on
     /// no path that does not.**
     ///
+    /// **`added_since` replays additions, and refuses everything else.**
+    ///
+    /// The refusals are the point. A reader that replays across a removal has
+    /// a view containing mail this node can no longer produce, and it would
+    /// look right — which is the failure this whole mechanism exists inside,
+    /// arriving one layer up.
+    #[test]
+    fn added_since_replays_additions_and_refuses_after_a_removal() {
+        const NOW: u32 = 29_766_000;
+        let mut s = Store::new();
+        let v0 = s.version();
+        assert_eq!(s.added_since(v0), Some(Vec::new()), "nothing has happened");
+
+        let mut ids = Vec::new();
+        for i in 0..5u32 {
+            let (id, b) = object(NOW + 5_000 + i * 700, i as u8);
+            s.ingest(id, b, NOW, u32::MAX).expect("ingested");
+            ids.push(id);
+        }
+        assert_eq!(s.added_since(v0), Some(ids.clone()), "the replay is short");
+        assert_eq!(
+            s.added_since(v0 + 2),
+            Some(ids[2..].to_vec()),
+            "the replay does not resume from the caller's version"
+        );
+        assert_eq!(s.added_since(s.version()), Some(Vec::new()));
+
+        // A refused duplicate adds nothing, so nothing is replayed.
+        let (id, b) = object(NOW + 5_000, 0);
+        assert_eq!(s.ingest(id, b, NOW, u32::MAX), Err(Reject::Duplicate));
+        assert_eq!(s.added_since(s.version()), Some(Vec::new()));
+
+        // **A removal refuses every caller older than it.**
+        let v_before = s.version();
+        s.expire(NOW + 6_000);
+        assert_eq!(
+            s.added_since(v_before),
+            None,
+            "a reader was allowed to replay across a removal"
+        );
+        let v_now = s.version();
+        let (id, b) = object(NOW + 40_000, 99);
+        s.ingest(id, b, NOW, u32::MAX).expect("ingested");
+        assert_eq!(s.added_since(v_now), Some(vec![id]));
+    }
+
+    /// A reader that has fallen further behind than the log is told to rescan
+    /// rather than served a partial answer — a silently incomplete inbox.
+    #[test]
+    fn added_since_refuses_a_reader_the_log_no_longer_reaches() {
+        const NOW: u32 = 29_766_000;
+        let mut s = Store::new();
+        let v0 = s.version();
+        for i in 0..(ADDED_LOG as u32 + 10) {
+            let (id, b) = object(NOW + 5_000 + i, (i % 251) as u8);
+            let _ = s.ingest(id, b, NOW, u32::MAX);
+        }
+        assert!(
+            s.added_since(v0).is_none(),
+            "a reader older than the ring was served a partial replay"
+        );
+        assert_eq!(
+            s.added_since(s.version() - 3).map(|v| v.len()),
+            Some(3),
+            "a reader inside the ring was refused"
+        );
+    }
+
+    /// A rebuild refuses replay too. It changes nothing held, but a reader
+    /// cannot know the segments were not reloaded from a different state.
+    #[test]
+    fn a_rebuild_refuses_replay() {
+        const NOW: u32 = 29_766_000;
+        let mut s = Store::new();
+        let (id, b) = object(NOW + 5_000, 1);
+        s.ingest(id, b, NOW, u32::MAX).expect("ingested");
+        let v = s.version();
+        s.rebuild_index().expect("rebuilds");
+        assert_eq!(s.added_since(v), None);
+    }
+
     /// A reader caches a conclusion about the whole corpus against this
     /// number. A bump that is missed is an inbox that stops noticing mail —
     /// silent, and RFC 0 §6 makes it silent at the sender's end too. A bump

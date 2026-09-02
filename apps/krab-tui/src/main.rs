@@ -680,7 +680,14 @@ struct App {
     /// graph", and a graph on disk is what a seizure is for. It is rebuilt
     /// from the corpus each time the inbox is read, so nothing is lost by not
     /// storing it.
-    reach: Vec<(String, Vec<[u8; 32]>)>,
+    /// Nodelists peers have shared — RFC 3 §8, newest per peer.
+    ///
+    /// **The timestamp is kept**, and it is not decoration: "newest per peer"
+    /// cannot be merged without it, and an incremental scan is a merge. It is
+    /// `published_s` from inside the author's own signature, so it orders
+    /// their documents without this node recording an arrival time (RFC 3
+    /// §12) — which is why keeping it discloses nothing.
+    reach: Vec<(String, u64, Vec<[u8; 32]>)>,
     /// Per-link budgets for the current day — RFC 3 §6.
     ///
     /// Shared with the exchange threads so a running reconciliation is held
@@ -931,6 +938,11 @@ struct App {
     inbox_inputs: Option<InboxInputs>,
     /// Objects the last scan examined, for the empty-inbox line.
     examined: usize,
+    /// The `Store::version` the last scan reached, for `added_since`.
+    ///
+    /// `None` forces a full pass, which is what a fresh node, an unlock and a
+    /// rebuilt tag table all want.
+    scanned_at: Option<u64>,
     /// First-contact request rows, formatted when they were derived.
     request_rows: Vec<String>,
     /// `(epoch, corpus version)` the prekey scan last ran against — see
@@ -1032,6 +1044,7 @@ impl Default for App {
             rotating: false,
             inbox_inputs: None,
             examined: 0,
+            scanned_at: None,
             request_rows: Vec::new(),
             prekey_scan: None,
             init_step: None,
@@ -3107,7 +3120,9 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         // item count is known.
         if self.identity.is_none() || self.epoch_key.is_none() {
             self.messages.clear();
+            self.reach.clear();
             self.inbox_inputs = None;
+            self.scanned_at = None;
             self.list = vec!["(locked)".into()];
             return;
         }
@@ -3166,7 +3181,6 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
     /// the tab was last open. That is the reason for the split rather than a
     /// justification found afterwards.
     fn derive_inbox(&mut self) {
-        self.messages.clear();
         let (Some(id), Some(w)) = (&self.identity, self.epoch_key) else {
             return;
         };
@@ -3249,6 +3263,7 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
             .as_ref()
             .is_some_and(|t| t.is_current(epoch))
             && self.tag_table_peers == built_from;
+        let table_rebuilt = !current;
         if !current {
             self.tag_table = Some(krab_lock::Held::new(receive::TagTable::build(&peers, epoch)));
             self.tag_table_peers = built_from;
@@ -3263,20 +3278,48 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         // yet retired. RFC 1 §6.3 requires the full set be attempted, and a
         // message encapsulated to a prekey opens under none of the others.
         let opening_keys = self.opening_keys();
-        let scan = self
-            .store
-            .with(|st| {
-                // The budget refills per scan; the cache does not.
-                self.attempts.refresh();
-                receive::Inbox::scan_with(
+        // **Incremental when it can be, and a full pass when it cannot.**
+        //
+        // `added_since` replays the objects that arrived since the last
+        // derivation, and returns `None` whenever a replay would be *wrong*
+        // rather than merely stale — after any removal, or when this reader
+        // has fallen further behind than the store's log. Ignoring that
+        // `None` would produce an inbox silently missing mail, so it is
+        // matched rather than defaulted.
+        //
+        // The table also has to be the same one. A rebuilt table means every
+        // tag changed, so objects examined under the old one have not been
+        // examined at all — `table_rebuilt` is set above, in the branch that
+        // rebuilds it and clears `attempts` for the same reason.
+        let since = if table_rebuilt {
+            None
+        } else {
+            self.scanned_at
+                .and_then(|v| self.store.with(|st| st.added_since(v)))
+        };
+        let scan = self.store.with(|st| {
+            // The budget refills per scan; the cache does not.
+            self.attempts.refresh();
+            match &since {
+                Some(ids) => receive::Inbox::scan_added(
+                    st,
+                    table,
+                    &peers,
+                    &opening_keys,
+                    ids,
+                    &mut self.attempts,
+                ),
+                None => receive::Inbox::scan_with(
                     st,
                     table,
                     &peers,
                     &opening_keys,
                     (0, u32::MAX),
                     &mut self.attempts,
-                )
-            });
+                ),
+            }
+        });
+        self.scanned_at = Some(self.store.with(|st| st.version()));
 
         // **Nodelists arriving from peers** — RFC 3 §8. A fragment is sealed
         // pairwise like any other message, so it opens here; it is separated
@@ -3287,7 +3330,11 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         // attributable, not true. `Fragment::verify` refuses a link the author
         // is not party to, and one whose counterparty never agreed to be
         // listed.
-        self.reach.clear();
+        // **Seeded rather than cleared, because an incremental pass is a
+        // merge.** Clearing would drop every nodelist whose object arrived
+        // before this pass — a peer's onward reach vanishing from the panel
+        // because nothing new came from them, which reads as a peer who
+        // stopped sharing.
         let now_s = self.now_s();
         // Collected first, because recording a base needs `&mut self` and the
         // scan borrows the messages.
@@ -3302,7 +3349,7 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         //
         // `published_s` is inside the author's signature, so it orders their
         // own documents without this node recording an arrival time (§12).
-        let mut reach: Vec<(String, u64, Vec<[u8; 32]>)> = Vec::new();
+        let mut reach: Vec<(String, u64, Vec<[u8; 32]>)> = std::mem::take(&mut self.reach);
         let mut note = |who: &str, at: u64, r: Vec<[u8; 32]>| match reach
             .iter_mut()
             .find(|(w, _, _)| w == who)
@@ -3344,11 +3391,28 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
                 }
             }
         }
-        self.reach = reach.into_iter().map(|(w, _, r)| (w, r)).collect();
-        self.last_scan_fail = scan.tag_match_decrypt_fail;
-        self.examined = scan.examined;
+        self.reach = reach;
+        // **Replace on a full pass, accumulate on an incremental one.**
+        //
+        // `examined` is what an operator reads as "objects examined", and it
+        // must not fall when nothing arrived — so an incremental pass adds to
+        // it rather than reporting its own small number. `last_scan_fail` is
+        // RFC 3 §12's ratio and follows the same rule.
+        if since.is_some() {
+            self.last_scan_fail += scan.tag_match_decrypt_fail;
+            self.examined += scan.examined;
+            self.messages.extend(scan.messages);
+            // Two sorted lists concatenated are not one sorted list — and the
+            // tiebreak must match `receive`'s, or a merge reorders what a full
+            // pass would not.
+            self.messages
+                .sort_by(|a, b| b.epoch.cmp(&a.epoch).then(a.id.0.cmp(&b.id.0)));
+        } else {
+            self.last_scan_fail = scan.tag_match_decrypt_fail;
+            self.examined = scan.examined;
+            self.messages = scan.messages;
+        }
         self.pending_bases = bases;
-        self.messages = scan.messages;
         // Bases recorded now that the scan's borrow has ended. Deferred rather
         // than skipped: without them, a delta arriving next week has nothing
         // to apply against and is dropped, which reads as a peer who stopped
@@ -5724,7 +5788,7 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         // just destroyed, which fails in a way nothing explains.
         self.links.disconnect(peer);
         self.spends.remove(peer);
-        self.reach.retain(|(who, _)| who != peer);
+        self.reach.retain(|(who, _, _)| who != peer);
         if let Some(card) = self.peer_card(peer) {
             self.scheduler
                 .remove(&sync::peer_id_from_node(&card.node_id()));
@@ -5838,7 +5902,7 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
             }
             if gone > 0 {
                 self.spends.remove(&peer);
-                self.reach.retain(|(who, _)| who != &peer);
+                self.reach.retain(|(who, _, _)| who != &peer);
                 self.log.push(activity_log::Event::Failed {
                     peer: peer.clone(),
                     why: "expired and not renewed — record purged (§8.4)",
@@ -10675,8 +10739,8 @@ impl App {
             let onward = self
                 .reach
                 .iter()
-                .find(|(who, _)| who == id)
-                .map(|(_, r)| r.len())
+                .find(|(who, _, _)| who == id)
+                .map(|(_, _, r)| r.len())
                 .unwrap_or(0);
             let nodelist = if onward > 0 {
                 format!("\n    lists {onward} peer(s) onward — two hops, no more (RFC 3 §8)")
@@ -12222,6 +12286,99 @@ mod tests {
         assert!(a_set[0]
             .chars()
             .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+    }
+
+    /// **An incremental derive agrees with a full one.**
+    ///
+    /// The failure this guards is two scanners that agree until they do not:
+    /// a message that opens on a rescan and not on a tick looks like the
+    /// network rather than like a bug, so nobody reports it. Both paths share
+    /// `Inbox::scan_ids`, and this checks the *plumbing* around it — the
+    /// merge, the accumulation, and `added_since`'s refusals.
+    #[test]
+    fn an_incremental_derive_agrees_with_a_full_one() {
+        let (mut a, mut b, a_of_b, b_of_a) = peered_pair("inbox-incr");
+
+        // Two messages, delivered one at a time, so the second derive is
+        // incremental.
+        type_command(&mut b, &format!("send {a_of_b} first"));
+        carry_corpus(&b, &mut a);
+        a.refresh_inbox();
+        assert_eq!(a.messages.len(), 1, "the first message did not arrive");
+        let after_one = a.scanned_at;
+        assert!(after_one.is_some());
+
+        type_command(&mut b, &format!("send {a_of_b} second"));
+        carry_corpus(&b, &mut a);
+        a.refresh_inbox();
+        assert_eq!(
+            a.messages.len(),
+            2,
+            "the incremental pass lost or missed a message"
+        );
+        assert_ne!(a.scanned_at, after_one, "the scan did not advance");
+
+        // The same node, forced to rescan from nothing, must agree.
+        let incremental: Vec<String> = a.messages.iter().map(|m| m.body.clone()).collect();
+        let examined_incremental = a.examined;
+        a.scanned_at = None;
+        a.inbox_inputs = None;
+        a.messages.clear();
+        a.refresh_inbox();
+        let full: Vec<String> = a.messages.iter().map(|m| m.body.clone()).collect();
+        assert_eq!(
+            incremental, full,
+            "the incremental result differs from a full scan"
+        );
+        assert_eq!(
+            a.examined, examined_incremental,
+            "the running `examined` total does not match a full pass"
+        );
+
+        // An idle tick neither rescans nor loses anything.
+        let before = a.scanned_at;
+        a.refresh_inbox();
+        assert_eq!(a.scanned_at, before, "an idle tick advanced the scan");
+        assert_eq!(a.messages.len(), 2, "an idle tick lost messages");
+        let _ = b_of_a;
+    }
+
+    /// **A removal forces a full pass**, because a replay of arrivals cannot
+    /// express a departure — so an incremental reader would keep showing mail
+    /// the corpus has dropped.
+    #[test]
+    fn an_expiry_forces_a_full_rescan_rather_than_a_replay() {
+        let (mut a, mut b, a_of_b, _b_of_a) = peered_pair("inbox-expire");
+        type_command(&mut b, &format!("send {a_of_b} keep me"));
+        carry_corpus(&b, &mut a);
+        a.refresh_inbox();
+        assert_eq!(a.messages.len(), 1);
+
+        // Expire everything, then derive again.
+        let far = u32::MAX - 1;
+        a.store.with(|s| s.expire(far));
+        a.refresh_inbox();
+        assert!(
+            a.messages.is_empty(),
+            "a message survived the expiry of its object, so the inbox is \
+             showing mail this node can no longer produce"
+        );
+    }
+
+    /// Copy `from`'s corpus into `to`, as reconciliation would.
+    fn carry_corpus(from: &App, to: &mut App) {
+        let now_min = now_epoch().0 * 1440;
+        let objects: Vec<Vec<u8>> = from.store.with(|s| {
+            s.entries_in_range(0, u32::MAX)
+                .into_iter()
+                .filter_map(|(_, id)| s.get(&id).map(|b| b.to_vec()))
+                .collect()
+        });
+        to.store.with(|s| {
+            for b in objects {
+                let _ = s.ingest(krab_crypto::object_id(&b), b, now_min, u32::MAX);
+            }
+        });
     }
 
     /// **Rendering runs on every tick; derivation runs when an input moved.**
@@ -16250,7 +16407,7 @@ mod tests {
         // No longer acted on, either.
         assert!(!x.spends.contains_key(&short_y));
         assert!(x.credential_with(&short_y).is_none());
-        assert!(x.reach.iter().all(|(w, _)| w != &short_y));
+        assert!(x.reach.iter().all(|(w, _, _)| w != &short_y));
     }
 
     /// **§8.4 says "termination *or* expiry"**, and an expiry has no
@@ -16575,8 +16732,8 @@ mod tests {
         assert_eq!(
             y.reach
                 .iter()
-                .find(|(w, _)| *w == short_x)
-                .map(|(_, r)| r.len()),
+                .find(|(w, _, _)| *w == short_x)
+                .map(|(_, _, r)| r.len()),
             Some(1)
         );
 
@@ -16592,8 +16749,8 @@ mod tests {
         assert_eq!(
             y.reach
                 .iter()
-                .find(|(w, _)| *w == short_x)
-                .map(|(_, r)| r.len()),
+                .find(|(w, _, _)| *w == short_x)
+                .map(|(_, _, r)| r.len()),
             Some(2),
             "the delta was not applied to the stored base"
         );
@@ -16619,8 +16776,8 @@ mod tests {
         std::fs::remove_file(y.peer_path(&short_x, artifact::PeerFile::Nodelist)).ok();
         y.refresh_inbox();
         assert!(
-            y.reach.iter().all(|(w, _)| *w != short_x)
-                || y.reach.iter().any(|(w, r)| *w == short_x && r.len() == 1),
+            y.reach.iter().all(|(w, _, _)| *w != short_x)
+                || y.reach.iter().any(|(w, _, r)| *w == short_x && r.len() == 1),
             "a delta was applied without its base"
         );
     }

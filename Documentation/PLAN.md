@@ -3531,3 +3531,98 @@ the patched line counted first.
 
 **1 318 tests, zero failures**, clippy clean under `-D warnings` across
 `--all-features` — counted by the corrected command from §40.
+
+---
+
+## 42. An incremental scan, and an ordering divergence it exposed — 2026-09-01
+
+§41 split derivation from rendering, and said the derivation itself was still a
+full corpus walk whenever it ran. This makes it incremental — and the useful
+part of the pass is what that surfaced.
+
+### The store tells the reader what changed
+
+The wrong shape is "scan everything and skip what was seen": it is still O(corpus)
+per derive, and it needs a set of examined identifiers as large as the corpus.
+The right one is for the store to say what moved.
+
+`Store::added_since(version) -> Option<Vec<ObjectId>>`, backed by a bounded ring
+of `(version, id)`. **`None` is not a failure; it is the correct answer** in
+three cases, and each is one where replaying would give a *wrong* view rather
+than a stale one:
+
+- **something was removed** — expiry, eviction, or a rebuild. A list of arrivals
+  cannot express a departure, so a reader that replayed would keep showing mail
+  the corpus has dropped.
+- the log no longer reaches that far, so the replay would be silently partial.
+- the caller is from the future, which means a different store.
+
+`last_removal` is kept as its own field rather than as a marker inside the ring,
+because the ring's bound would eventually drop it — and the one entry that must
+never be silently forgotten is the one saying "your view is wrong".
+
+The bound is deliberately on the reader's side. A caller that ignores `None` and
+replays anyway gets a stale inbox, so the signature makes that a decision. Probed
+by making `derive_inbox` do exactly that: the expiry test then fails with *"a
+message survived the expiry of its object"*.
+
+### One scanner, two entry points
+
+`scan_with` and `scan_added` share `scan_ids`. Two scanners would agree until
+they did not, and **a message that opens on a rescan and not on a tick looks
+like the network rather than like a bug**, so nobody reports it.
+
+Every derived output needed a merge rule, and one of them was not obvious:
+
+- `messages`: extend and re-sort on an incremental pass, replace on a full one.
+- `examined` and `last_scan_fail`: accumulate. `examined` is what an operator
+  reads as "objects examined" and must not fall when nothing arrived.
+- **`reach` is seeded, not cleared** — and this is why `reach` now keeps the
+  timestamp it used to discard. It is "newest per peer", which cannot be merged
+  without one, and clearing it would drop every nodelist whose object arrived
+  before this pass: a peer's onward reach vanishing from the panel because
+  nothing new came from them, which reads as a peer who stopped sharing. The
+  timestamp is `published_s` from inside the author's own signature, so keeping
+  it records nothing about arrival and RFC 3 §12 is untouched.
+
+### The divergence the test found
+
+`an_incremental_derive_agrees_with_a_full_one` passed on its own and failed in
+the full suite. Not flakiness — **a real disagreement, exposed by timing**:
+
+```
+left:  ["first", "second"]     incremental
+right: ["second", "first"]     full scan
+```
+
+Mail sent on one day shares an epoch, and `sort_by(epoch)` is stable — so it
+left the messages in *input* order, which is `(expiry, id)` for a full pass and
+arrival order for an incremental one. The two paths ordered the same inbox
+differently, and an operator would see the list reshuffle when nothing had
+happened.
+
+Ties now break on the identifier, in both paths and in the merge. It is a
+content hash, so the order is deterministic; it is public, so it discloses
+nothing; and there is no better key, because RFC 3 §12 forbids recording the
+arrival order that would otherwise be the natural one.
+
+**This is the failure that test was written to catch, caught on its first
+outing.** It is also the second time this session a test has passed alone and
+failed in company, and both times the full-suite run was the honest signal.
+
+### What it costs and what it buys
+
+On a tick where nothing arrived: no scan at all — §41 already had that. On a
+tick where one object arrived: one object examined instead of the whole corpus.
+On a tick after an expiry or an eviction: a full pass, as before, which is
+correct rather than a regression.
+
+`scan_requests` — RFC 3 §11's first-contact path — is still a full walk on every
+derive. It is a different scan with a different key and it is not addressed
+here; recorded rather than left to be found.
+
+### What is verified
+
+**1 323 tests, zero failures**, clippy clean under `-D warnings` across
+`--all-features`. The removal fallback is probed; the incremental and full paths
+are asserted to agree on both content and order.

@@ -601,7 +601,56 @@ impl Inbox {
             examined: 0,
         };
 
-        for (_, id) in store.entries_in_range(window.0, window.1) {
+        Self::scan_ids(
+            store
+                .entries_in_range(window.0, window.1)
+                .into_iter()
+                .map(|(_, id)| id),
+            store,
+            table,
+            correspondents,
+            ours,
+            attempts,
+            &mut out,
+        );
+        // Newest first. Ordering by epoch, not by arrival — this node does not
+        // record arrival times (RFC 3 §12), and could not sort by them.
+        //
+        // **Ties break on the identifier, and that is not cosmetic.** Mail
+        // sent on one day shares an epoch, so the epoch alone leaves a stable
+        // sort in *input* order — which is `(expiry, id)` for a full pass and
+        // arrival order for an incremental one. The two paths then disagree
+        // about the order of the same inbox, and an operator sees the list
+        // reshuffle when nothing happened.
+        //
+        // Found by `an_incremental_derive_agrees_with_a_full_one`, which is
+        // the failure that test exists for: two scanners that agree until they
+        // do not. The identifier is a content hash, so the tiebreak is
+        // deterministic, and it is public, so it discloses nothing.
+        out.messages
+            .sort_by(|a, b| b.epoch.cmp(&a.epoch).then(a.id.0.cmp(&b.id.0)));
+        out
+    }
+
+    /// **The same pass, over identifiers the caller names.**
+    ///
+    /// `scan_with` hands it every object in the window; `scan_added` hands it
+    /// only what has arrived since the caller last looked. One body, so an
+    /// object examined incrementally is examined by exactly the code that
+    /// would have examined it in a full pass — the alternative is two scanners
+    /// that agree until they do not, and a message that opens on a rescan and
+    /// not on a tick is the kind of bug nobody reports because it looks like
+    /// the network.
+    fn scan_ids(
+        ids: impl Iterator<Item = ObjectId>,
+        store: &Store,
+        table: &TagTable,
+        correspondents: &[Correspondent],
+        ours: &[SecretKey],
+        attempts: &mut Attempts,
+        out: &mut Scan,
+    ) {
+        for id in ids {
             let Some(bytes) = store.get(&id) else {
                 continue;
             };
@@ -652,10 +701,63 @@ impl Inbox {
                 }
             }
         }
+    }
 
+    /// Examine only the objects that arrived since the caller last scanned.
+    ///
+    /// The identifiers come from `Store::added_since`, which refuses — with
+    /// `None` — whenever a replay would give a wrong answer rather than a
+    /// stale one: after any removal, and when the caller has fallen further
+    /// behind than the store's log. **The caller must fall back to
+    /// [`Inbox::scan_with`] on `None`**, and the signature makes that a
+    /// decision rather than an oversight, because ignoring it produces an
+    /// inbox that is silently missing mail.
+    ///
+    /// `examined` counts what this pass looked at, not the corpus. The caller
+    /// carries the running total, because the number an operator reads is
+    /// "objects examined" and it should not fall when nothing arrived.
+    pub fn scan_added(
+        store: &Store,
+        table: &TagTable,
+        correspondents: &[Correspondent],
+        ours: &[SecretKey],
+        ids: &[ObjectId],
+        attempts: &mut Attempts,
+    ) -> Scan {
+        let mut out = Scan {
+            messages: Vec::new(),
+            tag_match_decrypt_fail: 0,
+            examined: 0,
+        };
+        Self::scan_ids(
+            ids.iter().copied(),
+            store,
+            table,
+            correspondents,
+            ours,
+            attempts,
+            &mut out,
+        );
         // Newest first. Ordering by epoch, not by arrival — this node does not
         // record arrival times (RFC 3 §12), and could not sort by them.
-        out.messages.sort_by(|a, b| b.epoch.cmp(&a.epoch));
+        //
+        // **Ties break on the identifier, and that is not cosmetic.** Mail
+        // sent on one day shares an epoch, so the epoch alone leaves a stable
+        // sort in *input* order — which is `(expiry, id)` for a full pass and
+        // arrival order for an incremental one. The two paths then disagree
+        // about the order of the same inbox, and an operator sees the list
+        // reshuffle when nothing happened.
+        //
+        // Found by `an_incremental_derive_agrees_with_a_full_one`, which is
+        // the failure that test exists for: two scanners that agree until they
+        // do not. The identifier is a content hash, so the tiebreak is
+        // deterministic, and it is public, so it discloses nothing.
+        //
+        // Sorted here too, so an incremental result is ordered on its own. The
+        // caller merges it with what it already had and sorts again, because
+        // two sorted lists concatenated are not one sorted list.
+        out.messages
+            .sort_by(|a, b| b.epoch.cmp(&a.epoch).then(a.id.0.cmp(&b.id.0)));
         out
     }
 
