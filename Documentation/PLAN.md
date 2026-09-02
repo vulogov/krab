@@ -3685,3 +3685,95 @@ rather than tick rate.
 
 **1 324 tests, zero failures**, clippy clean under `-D warnings` across
 `--all-features`.
+
+---
+
+## 44. `pinned()`, held rather than re-decrypted — 2026-09-02
+
+The last of §38's per-tick symptoms that is worth fixing, and the smallest —
+which is worth saying first, because the reason to do it is not the number.
+
+### What it was
+
+`pinned()` read a file, ran an AEAD decrypt and a CBOR decode, and returned a
+fresh archive. It is called from nine places, and one of them is
+`selectable_len`, which bounds the Notes tab's cursor — **on the render path**,
+so this ran at frame rate to answer a question about a list that changes when
+the operator pins something.
+
+Measured: **12.1 µs** for a 4 KB archive, so 0.73 ms per second of frame budget
+at 60 fps. That is not much, and the honest reason to fix it is not the
+microseconds:
+
+- it is a **syscall per frame**, so it is a per-frame opportunity to fail on a
+  disk that is busy, full, or gone;
+- it **scales with the archive**, which grows as an operator keeps things, so
+  the cost lands on the node that has been used most.
+
+### The invalidation is exact, and unusually easy
+
+`save_pinned` is the **only writer of this file**, and it is in this process.
+Nothing else can change the answer — no peer, no exchange thread, no clock. So
+this is a plain cache rather than a versioned one: filled on read, replaced on
+write, cleared on lock.
+
+Replaced *after* the write succeeds, not before. A failed write must not leave
+memory claiming something is on disk that is not, because the next unlock would
+then disagree with what the operator was just shown.
+
+### The part that is not about speed
+
+**The cache holds plaintext.** Pinned notes are message bodies an operator chose
+to keep, so RFC 7 §8's rule applies to them exactly as it does to `messages`:
+they exist while displayed and not after. A cache that survived a lock would
+keep decrypted mail in memory on a node the operator believes is locked, and
+nothing in the interface would show that it had.
+
+So it is cleared in `lock()` — beside `messages`, one line apart, so the two
+are read together — and again on unlock, which is belt and braces: `lock` gets
+there first every time today, and the failure if that ever stops being true is
+an archive decrypted under one identity shown under another.
+
+`RefCell`, because `pinned()` is a read. Making it `&mut self` would push the
+mutation into a dozen callers that are otherwise pure — a worse trade than one
+cell, in a type that is single-threaded by construction (the store is what
+crosses threads, and it is behind its own lock).
+
+### Probed
+
+Both halves, each failing with the thing it broke:
+
+- the write not updating the cache — *"the cache did not follow the write"*,
+  with the command's own success message beside it;
+- the lock not clearing it — *"the decrypted archive survived a lock, so pinned
+  message bodies are still in memory on a node an operator believes is
+  locked"*.
+
+The test also caught its own fixture first: `pin 0` is not the verb's grammar —
+it takes a peer — and the failure said so rather than passing on an empty
+archive.
+
+### §38's list, closed
+
+| symptom | outcome |
+|---|---|
+| `republish_prekeys_if_due` scanning the corpus per tick | §38, and its cache re-keyed in §40 after a regression |
+| `save_spends` per tick | §38 |
+| `Store::get` walking segments | §39 |
+| `refresh_inbox` per-peer crypto and corpus walk | §41 guard, §42 incremental |
+| `scan_requests` corpus walk | §43 |
+| `pinned()` on the render path | here |
+| tombstone-map walk | **not done** — see below |
+| `purge_expired_peerings` credential decrypt per peer | **not done** |
+
+The two left are per-peer rather than per-corpus, so they are bounded by how
+many friends someone has — the bound RFC 3 §6.1 already assumes — and neither
+grows with the thing that grows. They are worth doing and they are not urgent,
+and the invalidation for `purge_expired_peerings` is the harder one: it depends
+on the credential files *and* on the clock crossing an expiry, so it wants an
+explicit generation rather than the mtime that first suggests itself.
+
+### What is verified
+
+**1 325 tests, zero failures**, clippy clean under `-D warnings` across
+`--all-features`.

@@ -938,6 +938,29 @@ struct App {
     inbox_inputs: Option<InboxInputs>,
     /// Objects the last scan examined, for the empty-inbox line.
     examined: usize,
+    /// The decrypted pinned archive, held rather than re-decrypted.
+    ///
+    /// **`pinned()` is on the render path.** `selectable_len` calls it to
+    /// bound the Notes tab's cursor, and that runs on every frame — so a file
+    /// read, an AEAD decrypt and a CBOR decode were happening at frame rate to
+    /// answer a question about a list that changes when the operator pins
+    /// something.
+    ///
+    /// The invalidation is exact and unusually easy, which is why this is a
+    /// plain cache and not a versioned one: **`save_pinned` is the only writer
+    /// of this file**, and it is in this process. Nothing else can change the
+    /// answer, so the cache is filled on read, replaced on write, and cleared
+    /// on lock.
+    ///
+    /// Cleared on lock because it is **plaintext** — pinned notes are message
+    /// bodies an operator chose to keep, and RFC 7 §8 says plaintext exists
+    /// only while displayed. It is the same class as `messages` and is cleared
+    /// in the same places.
+    ///
+    /// `RefCell` because `pinned()` is a read: making it `&mut self` would
+    /// push the mutation into a dozen callers that are otherwise pure, which
+    /// is a worse trade than one cell.
+    pinned_cache: std::cell::RefCell<Option<pin::Pinned>>,
     /// The `Store::version` the last scan reached, for `added_since`.
     ///
     /// `None` forces a full pass, which is what a fresh node, an unlock and a
@@ -1044,6 +1067,7 @@ impl Default for App {
             rotating: false,
             inbox_inputs: None,
             examined: 0,
+            pinned_cache: std::cell::RefCell::new(None),
             scanned_at: None,
             request_rows: Vec::new(),
             prekey_scan: None,
@@ -5405,22 +5429,43 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
     }
 
     /// The pinned archive, or an empty one.
+    ///
+    /// Decrypted once and held — see [`App::pinned_cache`] on why that is safe
+    /// here and on why it is cleared with the plaintext rather than kept.
     fn pinned(&self) -> pin::Pinned {
         let Some(key) = self.pin_key else {
+            // Locked: no key, no archive, and the cache must not answer from a
+            // previous session.
             return pin::Pinned::default();
         };
-        std::fs::read(self.path(artifact::Artifact::Pinned))
+        if let Some(cached) = self.pinned_cache.borrow().as_ref() {
+            return cached.clone();
+        }
+        let loaded = std::fs::read(self.path(artifact::Artifact::Pinned))
             .ok()
             .and_then(|s| krab_crypto::kek::open_under(&key, pin::DOMAIN, &s).ok())
             .and_then(|raw| pin::Pinned::decode(&raw))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // An absent file caches as an empty archive, deliberately: "nothing is
+        // pinned" is an answer, and re-deriving it every frame costs a failed
+        // `open` per frame for the life of a node that never pins anything.
+        *self.pinned_cache.borrow_mut() = Some(loaded.clone());
+        loaded
     }
 
     /// Store it, sealed under the long-lived key.
+    ///
+    /// **The only writer of this file**, which is what makes `pinned`'s cache
+    /// exact rather than a guess. The cache is replaced *after* the write
+    /// succeeds: a failed write must not leave memory claiming something is
+    /// on disk that is not, because the next unlock would then disagree with
+    /// what the operator was just shown.
     fn save_pinned(&self, key: &[u8; 32], archive: &pin::Pinned) -> Option<()> {
         let sealed =
             krab_crypto::kek::seal_under(key, pin::DOMAIN, &archive.encode(), &mut OsRng).ok()?;
-        atomic::write(&self.path(artifact::Artifact::Pinned), &sealed).ok()
+        atomic::write(&self.path(artifact::Artifact::Pinned), &sealed).ok()?;
+        *self.pinned_cache.borrow_mut() = Some(archive.clone());
+        Some(())
     }
 
     /// `force-send [peer]` — reconcile now, rather than when the schedule says.
@@ -11432,6 +11477,11 @@ impl App {
         self.identity = Some(krab_lock::Held::new(id));
         self.epoch_key = Some(w);
         self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
+        // Belt and braces: `lock` already clears it, and every unlock follows
+        // a lock or a fresh start. Cleared here too because the failure if
+        // that ever stops being true is an archive decrypted under one
+        // identity being shown under another.
+        *self.pinned_cache.borrow_mut() = None;
         self.onion_key = Some(kek.subkey(persist::CONTEXT_ONION));
         // RFC 7 §10: an unlock is what resets the dead-man window.
         self.deadman_rearm();
@@ -11598,6 +11648,11 @@ impl App {
         // RFC 7 §8.1's long-lived key. From the KEK, so it survives every
         // epoch shred — which is the only reason a pin is worth anything.
         self.pin_key = Some(pin::Pinned::key_from_kek(&kek));
+        // Belt and braces: `lock` already clears it, and every unlock follows
+        // a lock or a fresh start. Cleared here too because the failure if
+        // that ever stops being true is an archive decrypted under one
+        // identity being shown under another.
+        *self.pinned_cache.borrow_mut() = None;
         self.onion_key = Some(kek.subkey(persist::CONTEXT_ONION));
         // RFC 7 §10: an unlock is what resets the dead-man window.
         self.deadman_rearm();
@@ -11881,6 +11936,10 @@ impl App {
             overwrite(&mut m.body);
         }
         self.messages.clear();
+        // Pinned notes are message bodies the operator chose to keep, so the
+        // decrypted archive is plaintext and dies with the lock (RFC 7 §8) —
+        // the same rule `messages` follows, one line above.
+        *self.pinned_cache.borrow_mut() = None;
         // The table derives from static-static shared secrets, so it is
         // content-key material. A locked node is a relay and must not hold it.
         self.tag_table = None;
@@ -12366,6 +12425,60 @@ mod tests {
         assert_eq!(a.scanned_at, before, "an idle tick advanced the scan");
         assert_eq!(a.messages.len(), 2, "an idle tick lost messages");
         let _ = b_of_a;
+    }
+
+    /// **The pinned cache follows the write, and dies with the lock.**
+    ///
+    /// Three properties, and the third is the one that matters most: the cache
+    /// holds decrypted message bodies, so a lock that left it behind would
+    /// keep plaintext past the moment RFC 7 §8 says it stops existing — and
+    /// nothing in the interface would show that it had.
+    #[test]
+    fn the_pinned_cache_follows_writes_and_dies_with_the_lock() {
+        let (mut a, mut b, a_of_b, _b_of_a) = peered_pair("pin-cache");
+        type_command(&mut b, &format!("send {a_of_b} keep this one"));
+        carry_corpus(&b, &mut a);
+        a.refresh_inbox();
+        assert_eq!(a.messages.len(), 1, "no mail to pin");
+
+        // Nothing pinned yet, and the empty answer is cached rather than
+        // re-derived — an absent file must not cost a failed open per frame.
+        assert!(a.pinned().kept.is_empty());
+        assert!(a.pinned_cache.borrow().is_some(), "the empty answer was not cached");
+
+        // Pin it — by peer, which is what `pin` takes. The cache must follow
+        // the write and not lag it: the operator is shown the result
+        // immediately after.
+        let from = a.messages[0].from.clone();
+        type_command(&mut a, &format!("pin {from}"));
+        assert_eq!(
+            a.pinned().kept.len(),
+            1,
+            "the cache did not follow the write: {}",
+            a.output
+        );
+        assert_eq!(a.pinned().kept[0].body, "keep this one");
+
+        // A fresh read from disk agrees — the cache is not the only copy.
+        let key = a.pin_key.expect("unlocked");
+        let from_disk = std::fs::read(a.path(artifact::Artifact::Pinned))
+            .ok()
+            .and_then(|s| krab_crypto::kek::open_under(&key, pin::DOMAIN, &s).ok())
+            .and_then(|raw| pin::Pinned::decode(&raw))
+            .expect("the archive is on disk");
+        assert_eq!(from_disk.kept.len(), 1, "the write did not reach the disk");
+
+        // **And it dies with the lock.** Plaintext, RFC 7 §8.
+        a.lock();
+        assert!(
+            a.pinned_cache.borrow().is_none(),
+            "the decrypted archive survived a lock, so pinned message bodies \
+             are still in memory on a node an operator believes is locked"
+        );
+        assert!(
+            a.pinned().kept.is_empty(),
+            "a locked node answered from the archive"
+        );
     }
 
     /// **A first-contact request found incrementally, and one found earlier
