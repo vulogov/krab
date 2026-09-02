@@ -3154,3 +3154,111 @@ only *compiled*.
 x86_64-pc-windows-gnu --all-targets` clean — which covers the `#[cfg(windows)]`
 test block added above, since `--all-targets` includes tests. Compiling is not
 running, and this section is careful to say which is which.
+
+---
+
+## 38. A dribbling handshake, and two ticks that recomputed — 2026-09-01
+
+An audit with a working proof of concept. One confirmed denial of service, and
+a design finding with eight symptoms. The DoS is fixed here; two of the eight
+are fixed here; the rest are assessed at the end.
+
+### S1 — every deadline bounded a read, and none bounded a conversation
+
+`arm_handshake` sets `set_read_timeout` and `set_write_timeout`. Those bound
+**one read**. `frame::read_len` and `read_exact` both loop while `read` returns
+`Ok(n)`, so **every byte that arrives re-arms the clock** — and a peer sending
+one byte every nine seconds never trips a ten-second timeout.
+
+On the handshake path that is a denial of service with a very small cost to the
+attacker. `MAX_PENDING_HANDSHAKES` is 16 *in total*, deliberately, because
+accepting is cheap and handshaking is not — so sixteen dribbling sockets hold
+every slot and no real peer connects. It is silent at the defender's end by
+design: a failed handshake is `Ok(None)` and nothing is logged, because logging
+strangers is the provenance RFC 3 §12 forbids.
+
+**`slowloris.rs` and `deadlines.rs` missed it because all of them test
+silence**, and silence is the one case a per-read timeout does bound. The
+attack is not saying nothing; it is saying almost nothing.
+
+**The fix is a total wall-clock budget**, in `crate::deadline`. No per-read
+timeout can substitute: shortening it to a second makes the attacker send a
+byte every 0.9 s and refuses honest peers on slow links, where one 144-byte
+handshake is minutes of airtime (RFC 4 §5.4). The two are different
+quantities — how long one read may block, and how long the whole exchange may
+take — and only the second bounds someone willing to keep talking.
+
+**The budget lives inside `handshake_*`, not at the call sites.** There are six
+call sites across four backends and a rule they must each remember is a rule
+one of them will not. Making it a parameter meant the compiler named every
+caller, which is how each carrier came to state its own: 30 s for sockets and
+Tor, and **600 s for serial**, because RFC 4 §5.4's SF10 figure of 0.83 B/s
+makes 144 bytes roughly three minutes of airtime before framing. One constant
+for both would have refused every honest radio.
+
+**The regression test passed for the wrong reason first.** Its dribble wrote
+zero bytes throughout, and four leading zeroes declare a zero-length frame,
+which `read_bytes` refuses instantly — so it passed in a second, before the
+fix, for a reason unrelated to it. What holds a slot is a *well-formed* header
+promising a body that then arrives a byte at a time. Corrected, it takes 30.6 s
+and, with the deadline removed, runs 90 seconds and 297 bytes still connected.
+
+That probe also failed silently the first time: the patch did not apply and the
+run looked like a pass. The second attempt printed the patched line before
+running. A probe that cannot be seen to have been applied has not been run.
+
+### P1 and P2 — two ticks that recomputed what nothing had changed
+
+**`republish_prekeys_if_due` scanned the entire corpus every tick.** It
+computes one number — the epoch of the newest prekey batch this node
+published — and it computed it by fetching and parsing every object in the
+store, four times a second, while holding the mutex the exchange threads need.
+Measured by the audit at 56 ms with 50 000 objects, 22 % of a 250 ms tick, and
+superlinear.
+
+`REPUBLISH_EPOCHS` is counted in epochs and an epoch is a day, so the scan now
+runs **once per epoch**: as often as the answer can possibly matter. The cache
+is set *before* the scan, so a persistent publish failure is one attempt per
+epoch rather than a full scan four times a second — and it is cleared on
+`import`, the one place the corpus changes without an exchange.
+
+**`drain_exchanges` called `save_spends` on every tick**, outside the
+`arrived > 0` guard: a seal and an `atomic::write` — with its `fsync`, and the
+directory's — per peer, four times a second, writing numbers identical to those
+already on disk. The audit measured `atomic::write` at 3.53 ms, so 35 ms/tick
+at ten peers and over 100 ms at thirty.
+
+**The guard is `reported`, not `arrived`**, and the difference matters. Spends
+change in `ExchangeView::put` when an object is *refused* or *rejected* as well
+as when one is accepted, so guarding on objects received would have quietly
+stopped persisting the quota signal for exactly the peer RFC 3 §6.2 wants it
+for — the one sending things this node will not take. An exchange reporting at
+all is the condition; nothing else touches those counters.
+
+### The rest of P1–P8, assessed and not yet done
+
+The audit's diagnosis is one design decision with eight symptoms: **the tick
+recomputes state rather than being told when it changed.** That is right, and
+the remaining six are the same shape — a per-peer Ed25519 verify and X25519
+agreement in `refresh_inbox`, a credential decrypt and verify in
+`purge_expired_peerings`, an AEAD-decrypt of the pinned archive in `pinned()`
+which is also on the render path, and a full tombstone walk.
+
+The multiplier under several of them is `Store::get`, which has no store-level
+identifier index and walks up to 45 segments per lookup. One
+`by_id: BTreeMap<ObjectId, u32>` fixes `get`, `contains`, `get_truncated` and
+`persist::write_corpus` together.
+
+That is the right next change and it is not a small one: it adds state that
+must be maintained on ingest, eviction, expiry and load, and a stale index is a
+corpus that silently cannot find its own objects — RFC 0 §6 again. It wants its
+own pass, with the invariant asserted rather than assumed.
+
+**Not done, and deliberately not rushed.** Recorded here so the next reader
+finds the analysis rather than repeating the measurement.
+
+### What is verified
+
+**1 305 tests**, zero failures, clippy clean under `-D warnings` across
+`--all-features`. The dribble regression test discriminates in both directions,
+probed.

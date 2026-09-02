@@ -1,4 +1,16 @@
-//! One silent socket must not deny inbound peering — RFC 4 §9.
+//! Slow callers must not deny inbound peering — RFC 4 §9.
+//!
+//! **Two attacks, and only one of them was covered here.** Silence is bounded
+//! by a per-read socket timeout, which is what this file originally tested.
+//! *Almost* silence is not: `frame::read_len` and `read_exact` loop while
+//! `read` returns `Ok(n)`, so every byte re-arms the clock and a caller
+//! sending one byte every nine seconds never trips a ten-second timeout. Six
+//! bytes held a slot for forty-eight seconds; filling a declared frame at that
+//! rate holds it for days.
+//!
+//! `crate::deadline` is the fix and `a_dribbling_caller_is_cut_off` is the
+//! case. It is here rather than beside the unit tests because what it proves
+//! is about the *listener* — that a slot comes back.
 //!
 //! "Handshake slowloris is the cheapest attack against a reachable node."
 //! The accept loop completed the handshake inline, so a caller that connected
@@ -99,4 +111,92 @@ fn in_progress_handshakes_are_capped() {
         listener.pending_handshakes()
     );
     drop(held);
+}
+
+/// **A caller that dribbles is cut off, and its slot comes back.**
+///
+/// The attack the per-read timeout does not bound. This client sends one byte
+/// every 300 ms for as long as it is allowed to — under a per-read deadline it
+/// would be allowed to for ever, because every byte restarts the clock.
+///
+/// The budget under test is `HANDSHAKE_TOTAL_S`, so the assertion is that the
+/// connection is closed on this side within a margin of it rather than at some
+/// exact instant: the deadline is checked before each read, so the overshoot is
+/// bounded by one per-read timeout and no tighter.
+#[test]
+fn a_dribbling_caller_is_cut_off() {
+    use krab_fabric::backend::listener::HANDSHAKE_TOTAL_S;
+    use std::io::Write;
+
+    let (peer_sk, peer_pk) = generate_static().unwrap();
+    let (node_sk, _node_pk) = generate_static().unwrap();
+    let _ = peer_sk;
+
+    let (listener, port) =
+        Listener::bind("127.0.0.1:0", node_sk, Allowed::new(vec![peer_pk])).unwrap();
+
+    let mut attacker = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    // Let the listener take the connection and spend a slot on it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while listener.pending_handshakes() == 0 && Instant::now() < deadline {
+        let _ = listener.accept();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        listener.pending_handshakes(),
+        1,
+        "the listener never took the connection, so this proves nothing"
+    );
+
+    // **A plausible length prefix first, then dribble the body.**
+    //
+    // The first version of this test wrote zero bytes throughout, and the four
+    // leading zeroes declare a zero-length frame — which `read_bytes` refuses
+    // instantly. It passed in a second, before the fix, for a reason that had
+    // nothing to do with the fix. What holds a slot is a *well-formed* header
+    // promising a body that then arrives one byte at a time.
+    attacker.write_all(&4096u32.to_le_bytes()).unwrap();
+    attacker.flush().unwrap();
+
+    // Dribble the body. The write fails once the far end gives up, which is
+    // the observable this test is after — and it must happen, rather than the
+    // loop running to its own bound.
+    let started = Instant::now();
+    let mut wrote = 0usize;
+    let cut_off = loop {
+        if attacker.write_all(&[0u8]).is_err() || attacker.flush().is_err() {
+            break true;
+        }
+        wrote += 1;
+        // Comfortably inside the per-read timeout, so a per-read deadline
+        // would never fire.
+        std::thread::sleep(Duration::from_millis(300));
+        if started.elapsed() > Duration::from_secs(HANDSHAKE_TOTAL_S * 3) {
+            break false;
+        }
+    };
+    let took = started.elapsed();
+
+    assert!(
+        cut_off,
+        "still dribbling after {took:?} and {wrote} bytes — the handshake has \
+         no total deadline, and {} slots of this hold the door shut",
+        MAX_PENDING_HANDSHAKES
+    );
+    assert!(
+        wrote > 3,
+        "the connection died immediately, so the dribble was never exercised"
+    );
+
+    // And the slot comes back, which is the property that matters: a bounded
+    // handshake that leaked its counter would deny peering just as thoroughly.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while listener.pending_handshakes() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        listener.pending_handshakes(),
+        0,
+        "the slot was never released"
+    );
 }

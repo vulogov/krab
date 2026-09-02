@@ -91,6 +91,19 @@ pub enum Role {
 /// is discovered rather than hung on.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The **total** wall-clock budget for a handshake on a serial line.
+///
+/// Deliberately not the socket backends' thirty seconds. RFC 4 §4.1 puts the
+/// handshake at 144 bytes, and RFC 4 §5.4's SF10 LoRa figure is 0.83 B/s
+/// sustained — so those 144 bytes are **roughly three minutes of airtime**
+/// before any framing overhead, on a line that is also half-duplex.
+///
+/// Ten minutes gives that a wide margin. The bound still matters here: a line
+/// is a physical resource one caller occupies entirely, so a peer that
+/// dribbles holds the modem rather than one of sixteen slots. It just cannot
+/// be the same number as TCP's without refusing every honest radio.
+pub const HANDSHAKE_TOTAL: Duration = Duration::from_secs(600);
+
 /// A serial link to one peer.
 pub struct SerialFabric {
     profile: LinkProfile,
@@ -243,7 +256,12 @@ impl Fabric for SerialFabric {
             return Err(Error::Unreachable);
         }
         let mut port = Port(self.open(ANSWER_TIMEOUT)?);
-        let noise = handshake_initiator(&mut port, &self.local_static, &self.expected_peer)?;
+        let noise = handshake_initiator(
+            &mut port,
+            &self.local_static,
+            &self.expected_peer,
+            HANDSHAKE_TOTAL,
+        )?;
         port.arm_session(self.profile.session_timeout())?;
         Ok(Box::new(StreamSession::new(port, noise)))
     }
@@ -257,7 +275,12 @@ impl Fabric for SerialFabric {
             return Ok(None);
         }
         let mut port = Port(self.open(ANSWER_TIMEOUT)?);
-        match handshake_responder(&mut port, &self.local_static, &self.expected_peer) {
+        match handshake_responder(
+            &mut port,
+            &self.local_static,
+            &self.expected_peer,
+            HANDSHAKE_TOTAL,
+        ) {
             Ok(noise) => {
                 port.arm_session(self.profile.session_timeout())?;
                 Ok(Some(Box::new(StreamSession::new(port, noise))))

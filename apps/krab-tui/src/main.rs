@@ -890,6 +890,10 @@ struct App {
     confirmed: bool,
     /// Whether the passphrase prompt is for a correspondence-key rotation.
     rotating: bool,
+    /// The epoch in which the prekey corpus scan last ran — see
+    /// `republish_prekeys_if_due`. `None` until the first tick after a start
+    /// or an unlock, so a restarted node checks once and then not again.
+    prekey_scan_epoch: Option<u32>,
     /// Where the first-run ceremony has got to, if it is running.
     init_step: Option<InitStep>,
     /// Whether the passphrase prompt is unlocking rather than initialising.
@@ -983,6 +987,7 @@ impl Default for App {
             tag_table_peers: Vec::new(),
             confirmed: false,
             rotating: false,
+            prekey_scan_epoch: None,
             init_step: None,
             unlocking: false,
         }
@@ -2960,7 +2965,9 @@ impl App {
     /// Drain finished exchanges. Never blocks.
     fn drain_exchanges(&mut self) {
         let mut arrived = 0usize;
+        let mut reported = 0usize;
         while let Ok(event) = self.exchanges.1.try_recv() {
+            reported += 1;
             if matches!(event, activity_log::Event::Failed { .. }) {
                 self.links.failed(event.peer());
             }
@@ -2986,8 +2993,25 @@ impl App {
         if arrived > 0 {
             self.save_corpus();
         }
-        // RFC 3 §6's counters, which an exchange may have just moved.
-        self.save_spends();
+        // **RFC 3 §6's counters, saved when an exchange reported and not on
+        // every tick.**
+        //
+        // This ran unconditionally: a seal and an `atomic::write` — with its
+        // `fsync`, and the directory's — per peer, four times a second,
+        // whether or not anything had changed. At ten peers that is tens of
+        // milliseconds of a 250 ms tick spent writing numbers that are
+        // identical to the ones already on disk.
+        //
+        // **The guard is `reported`, not `arrived`.** Spends change inside
+        // `ExchangeView::put`, and they change when an object is *refused* or
+        // *rejected* as well as when one is accepted — so guarding on objects
+        // received would have quietly stopped persisting the quota signal for
+        // exactly the peer RFC 3 §6.2 wants it for: the one sending things
+        // this node will not take. An exchange reporting at all is the
+        // condition; nothing else touches the counters.
+        if reported > 0 {
+            self.save_spends();
+        }
         // Mail may have arrived while the interface was doing nothing.
         if self.identity.is_some() && self.epoch_key.is_some() {
             self.refresh_inbox();
@@ -3526,6 +3550,30 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         if self.identity.is_none() || self.epoch_key.is_none() {
             return;
         }
+        // **The corpus scan runs once an epoch, not four times a second.**
+        //
+        // This function computes one number — the epoch of the newest prekey
+        // batch this node published — and it computed it by fetching and
+        // parsing *every object in the corpus*, on every tick, while holding
+        // the store mutex the exchange threads need. Measured at 56 ms with
+        // 50 000 objects, which is 22 % of a 250 ms tick, and superlinear.
+        //
+        // The number it is looking for changes when this node publishes, which
+        // is what the tail of this function does, and otherwise only when the
+        // corpus is replaced wholesale. `REPUBLISH_EPOCHS` is counted in
+        // epochs and an epoch is a day, so a scan per epoch is as often as the
+        // answer can possibly matter.
+        let now = now_epoch().0;
+        if self.prekey_scan_epoch == Some(now) {
+            return;
+        }
+        // **Set before the scan, not after.** If `publish_prekeys` below
+        // fails, the next tick must not scan the whole corpus again — a
+        // persistent failure would then be a full scan four times a second,
+        // which is the thing this is fixing. One attempt per epoch, and the
+        // failure is visible in the activity log.
+        self.prekey_scan_epoch = Some(now);
+
         let me = self.identity.as_ref().map(|i| i.node_id());
         let mut newest = 0u32;
         self.store.with(|s| {
@@ -3537,7 +3585,6 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
                 }
             }
         });
-        let now = now_epoch().0;
         if newest != 0 && now.saturating_sub(newest) < REPUBLISH_EPOCHS {
             return;
         }
@@ -10026,6 +10073,10 @@ impl App {
                  trying — records before {idx} would import."
             );
         }
+        // An archive can carry this node's own newer prekey batch, so the
+        // cached answer above stops being true here — the one place the corpus
+        // changes without an exchange.
+        self.prekey_scan_epoch = None;
         match self.store.with(|s| courier::import(s, &path, now)) {
             Err(e) => format!("could not read {}: {e}", path.display()),
             Ok(got) => {

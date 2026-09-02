@@ -38,6 +38,7 @@
 #![deny(missing_docs)]
 
 pub mod backend;
+pub mod deadline;
 pub mod frame;
 pub mod noise;
 pub mod profile;

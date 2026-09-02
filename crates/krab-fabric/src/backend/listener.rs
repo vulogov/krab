@@ -158,7 +158,12 @@ impl Listener {
                 // the resource RFC 4 §9 caps.
                 arm_handshake(&stream)?;
                 let (noise, peer) =
-                    handshake_responder_any(&mut stream, &local_static, &allowed)?;
+                    handshake_responder_any(
+                        &mut stream,
+                        &local_static,
+                        &allowed,
+                        std::time::Duration::from_secs(HANDSHAKE_TOTAL_S),
+                    )?;
                 arm_session(&stream)?;
                 Ok((
                     Box::new(StreamSession::new(stream, noise)) as Box<dyn Session>,
@@ -198,7 +203,11 @@ pub fn bootstrap_connect(addr: &str, local_static: [u8; 32]) -> Result<Accepted,
         std::time::Duration::from_secs(CONNECT_TIMEOUT_S),
     )?;
     arm_handshake(&stream)?;
-    let (noise, peer) = crate::noise::handshake_initiator_xx(&mut stream, &local_static)?;
+    let (noise, peer) = crate::noise::handshake_initiator_xx(
+        &mut stream,
+        &local_static,
+        std::time::Duration::from_secs(HANDSHAKE_TOTAL_S),
+    )?;
     arm_session(&stream)?;
     Ok((Box::new(StreamSession::new(stream, noise)), peer))
 }
@@ -279,7 +288,11 @@ impl Bootstrap {
             let finish = || -> Result<Accepted, Error> {
                 arm_handshake(&stream)?;
                 let (noise, peer) =
-                    crate::noise::handshake_responder_xx(&mut stream, &local_static)?;
+                    crate::noise::handshake_responder_xx(
+                        &mut stream,
+                        &local_static,
+                        std::time::Duration::from_secs(HANDSHAKE_TOTAL_S),
+                    )?;
                 arm_session(&stream)?;
                 Ok((
                     Box::new(StreamSession::new(stream, noise)) as Box<dyn Session>,
@@ -355,6 +368,24 @@ pub const CONNECT_TIMEOUT_S: u64 = 10;
 /// to answer a manifest, and cutting it off would turn a slow exchange into a
 /// failed one. It bounds a stall, not a delay.
 pub const SESSION_TIMEOUT_S: u64 = crate::profile::SESSION_TIMEOUT_FLOOR_S;
+
+/// The **total** wall-clock budget for one handshake, on a socket carrier.
+///
+/// [`HANDSHAKE_TIMEOUT_S`] bounds a single read; this bounds the conversation.
+/// The two are different quantities and only the second stops a peer that
+/// keeps talking — see `crate::deadline` for the attack, which held a
+/// `MAX_PENDING_HANDSHAKES` slot for days using six bytes.
+///
+/// Thirty seconds against a 144-byte exchange that is one round trip (RFC 4
+/// §4.1). That is enormously generous for TCP and for a Tor circuit, whose
+/// ~3 s RTT §5.2 already calls irrelevant here — and generosity is right,
+/// because the cost of being wrong is refusing an honest peer on a bad
+/// connection, while the benefit of being tighter is only that an attacker
+/// must hold a socket for twenty seconds less.
+///
+/// **Not used by the serial backend**, whose carrier makes 144 bytes minutes
+/// of airtime; it names its own.
+pub const HANDSHAKE_TOTAL_S: u64 = 30;
 
 /// Put the handshake's deadline on a stream.
 ///

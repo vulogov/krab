@@ -24,7 +24,9 @@
 
 use crate::Error;
 use snow::{Builder, TransportState};
+use crate::deadline::Deadline;
 use std::io::{Read, Write};
+use std::time::Duration;
 
 /// RFC 4 §4.1's pattern, with RFC 1 §6.1's primitives.
 pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
@@ -59,7 +61,9 @@ pub const NOISE_PARAMS_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 pub fn handshake_initiator_xx<S: Read + Write>(
     stream: &mut S,
     local_static: &[u8; 32],
+    budget: Duration,
 ) -> Result<(TransportState, [u8; 32]), Error> {
+    let stream = &mut Deadline::new(stream, budget);
     let mut hs = Builder::new(NOISE_PARAMS_XX.parse().map_err(|_| Error::Frame)?)
         .local_private_key(local_static)
         .map_err(|_| Error::Frame)?
@@ -84,7 +88,9 @@ pub fn handshake_initiator_xx<S: Read + Write>(
 pub fn handshake_responder_xx<S: Read + Write>(
     stream: &mut S,
     local_static: &[u8; 32],
+    budget: Duration,
 ) -> Result<(TransportState, [u8; 32]), Error> {
+    let stream = &mut Deadline::new(stream, budget);
     let mut hs = Builder::new(NOISE_PARAMS_XX.parse().map_err(|_| Error::Frame)?)
         .local_private_key(local_static)
         .map_err(|_| Error::Frame)?
@@ -147,7 +153,9 @@ pub fn handshake_initiator<S: Read + Write>(
     stream: &mut S,
     local_static: &[u8; 32],
     expected_peer: &[u8; 32],
+    budget: Duration,
 ) -> Result<TransportState, Error> {
+    let stream = &mut Deadline::new(stream, budget);
     let mut hs = Builder::new(NOISE_PARAMS.parse().map_err(|_| Error::Frame)?)
         .local_private_key(local_static)
         .map_err(|_| Error::Frame)?
@@ -179,7 +187,9 @@ pub fn handshake_responder<S: Read + Write>(
     stream: &mut S,
     local_static: &[u8; 32],
     expected_peer: &[u8; 32],
+    budget: Duration,
 ) -> Result<TransportState, Error> {
+    let stream = &mut Deadline::new(stream, budget);
     let mut hs = Builder::new(NOISE_PARAMS.parse().map_err(|_| Error::Frame)?)
         .local_private_key(local_static)
         .map_err(|_| Error::Frame)?
@@ -221,7 +231,9 @@ pub fn handshake_responder_any<S: Read + Write>(
     stream: &mut S,
     local_static: &[u8; 32],
     allowed: &[[u8; 32]],
+    budget: Duration,
 ) -> Result<(TransportState, [u8; 32]), Error> {
+    let stream = &mut Deadline::new(stream, budget);
     let mut hs = Builder::new(NOISE_PARAMS.parse().map_err(|_| Error::Frame)?)
         .local_private_key(local_static)
         .map_err(|_| Error::Frame)?
@@ -436,6 +448,11 @@ impl<S: Read + Write + Send> crate::Session for StreamSession<S> {
 mod tests {
     use super::*;
 
+    /// Generous, because these tests are about the handshake and not about
+    /// the deadline — `crate::deadline` owns that, and
+    /// `a_dribbling_caller_does_not_hold_a_slot` below owns the integration.
+    const TEST_BUDGET: Duration = Duration::from_secs(30);
+
     /// A bidirectional in-memory pipe, so the handshake is testable without a
     /// socket or a serial port.
     struct Pipe {
@@ -501,14 +518,14 @@ mod tests {
         let (mut a_pipe, mut b_pipe) = pipe_pair();
 
         let responder = std::thread::spawn(move || {
-            let noise = handshake_responder(&mut b_pipe, &b_sk, &a_pk).expect("responder");
+            let noise = handshake_responder(&mut b_pipe, &b_sk, &a_pk, TEST_BUDGET).expect("responder");
             let mut s = StreamSession::new(b_pipe, noise);
             let got = s.recv().unwrap();
             s.send(&krab_proto::control::Control::Done).unwrap();
             got
         });
 
-        let noise = handshake_initiator(&mut a_pipe, &a_sk, &b_pk).expect("initiator");
+        let noise = handshake_initiator(&mut a_pipe, &a_sk, &b_pk, TEST_BUDGET).expect("initiator");
         let mut s = StreamSession::new(a_pipe, noise);
         assert_eq!(
             s.peer_static(),
@@ -546,12 +563,12 @@ mod tests {
         let (mut a_pipe, mut b_pipe) = pipe_pair();
 
         let responder = std::thread::spawn(move || {
-            let noise = handshake_responder(&mut b_pipe, &b_sk, &a_pk).expect("responder");
+            let noise = handshake_responder(&mut b_pipe, &b_sk, &a_pk, TEST_BUDGET).expect("responder");
             let mut s = StreamSession::new(b_pipe, noise);
             s.recv()
         });
 
-        let noise = handshake_initiator(&mut a_pipe, &a_sk, &b_pk).expect("initiator");
+        let noise = handshake_initiator(&mut a_pipe, &a_sk, &b_pk, TEST_BUDGET).expect("initiator");
         let mut s = StreamSession::new(a_pipe, noise);
         s.write_chunk(MORE, &[]).expect("the chunk goes out");
         // Anything after it may fail on a broken pipe, and that is the point:
@@ -577,10 +594,10 @@ mod tests {
         let (mut a_pipe, mut b_pipe) = pipe_pair();
 
         std::thread::spawn(move || {
-            let _ = handshake_responder(&mut b_pipe, &b_sk, &a_pk);
+            let _ = handshake_responder(&mut b_pipe, &b_sk, &a_pk, TEST_BUDGET);
         });
         // Expecting C, talking to B.
-        assert!(handshake_initiator(&mut a_pipe, &a_sk, &c_pk).is_err());
+        assert!(handshake_initiator(&mut a_pipe, &a_sk, &c_pk, TEST_BUDGET).is_err());
     }
 
     /// And the responder's, which is the one likelier to be omitted.
@@ -593,9 +610,9 @@ mod tests {
 
         let responder = std::thread::spawn(move || {
             // Expecting C; A calls.
-            handshake_responder(&mut b_pipe, &b_sk, &c_pk).is_err()
+            handshake_responder(&mut b_pipe, &b_sk, &c_pk, TEST_BUDGET).is_err()
         });
-        let _ = handshake_initiator(&mut a_pipe, &a_sk, &b_pk);
+        let _ = handshake_initiator(&mut a_pipe, &a_sk, &b_pk, TEST_BUDGET);
         assert!(responder.join().unwrap(), "the responder must refuse A");
     }
 

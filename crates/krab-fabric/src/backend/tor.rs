@@ -797,6 +797,7 @@ impl crate::Fabric for TorFabric {
             &mut stream,
             &self.local_static,
             &self.expected_peer,
+            std::time::Duration::from_secs(crate::backend::listener::HANDSHAKE_TOTAL_S),
         )?;
         crate::backend::listener::arm_session_for(&stream, self.profile.session_timeout())?;
         Ok(Box::new(crate::noise::StreamSession::new(stream, noise)))
