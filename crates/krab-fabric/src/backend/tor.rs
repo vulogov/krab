@@ -146,10 +146,30 @@ impl TorLaunch {
     ) -> Result<TorLaunch, TorError> {
         let binary = binary.into();
         if !binary.is_absolute() {
+            // **The reason differs by platform, and so does the message.**
+            //
+            // On Windows a path like `\tor` or `/tor` has a root and no drive
+            // letter, so it is *drive-relative*: it resolves against whichever
+            // drive the process is on. `Path::is_absolute` is false for it,
+            // which is correct and is exactly the ambiguity this argument
+            // exists to refuse — but telling an operator that `\tor` is
+            // "relative" reads as a bug to them, because it does not look
+            // relative and on unix it would not be.
+            //
+            // Found by the first Windows CI run, which failed a test asserting
+            // `/nonexistent/tor` was absent-not-relative. It is absent on
+            // unix and relative on Windows, and the check was more right than
+            // the test.
+            let why = if cfg!(windows) {
+                "must name a drive — a path beginning with a slash or backslash \
+                 resolves against whichever drive this process happens to be \
+                 on, which is not something you or krab control"
+            } else {
+                "must be absolute, or it resolves against a working directory \
+                 neither you nor krab controls"
+            };
             return Err(TorError::Path(format!(
-                "{} is relative — an explicit tor path must be absolute, or it \
-                 resolves against a working directory neither you nor krab \
-                 controls",
+                "{} will not do: an explicit tor path {why}",
                 binary.display()
             )));
         }
@@ -865,6 +885,24 @@ mod tests {
     /// A relative tor path is refused — it would resolve against a working
     /// directory nobody controls, which is the attack the argument exists to
     /// prevent.
+    ///
+    /// # `/nonexistent/tor` is not absolute on Windows, and that is the point
+    ///
+    /// This test asserted that path gave `Binary` — absolute but absent — and
+    /// it does on unix. **On Windows it gives `Path`**, because a leading
+    /// slash with no drive letter is *drive-relative*: it resolves against
+    /// whatever drive the process happens to be on, so
+    /// `Path::is_absolute` is false for it and `at` refuses it as relative.
+    ///
+    /// That is the check being *more* right than this test assumed, not less.
+    /// The argument exists so an operator's explicit tor path cannot be
+    /// resolved against something they do not control, and on Windows the
+    /// current drive is exactly such a thing. The first Windows CI run found
+    /// it; nothing on a developer's Mac could have.
+    ///
+    /// So the fixture is per-platform and the drive-relative case is asserted
+    /// on its own, rather than the assertion being loosened to accept either
+    /// error — which would have hidden the difference instead of naming it.
     #[test]
     fn a_relative_binary_path_is_refused() {
         let dir = tmp("relative");
@@ -873,11 +911,33 @@ mod tests {
             TorLaunch::at("./tor", &dir),
             Err(TorError::Path(_))
         ));
+
         // Absolute but absent is a different complaint, and says so.
-        assert!(matches!(
-            TorLaunch::at("/nonexistent/tor", &dir),
-            Err(TorError::Binary(_))
-        ));
+        let absent = if cfg!(windows) {
+            r"C:\nonexistent\tor"
+        } else {
+            "/nonexistent/tor"
+        };
+        assert!(
+            matches!(TorLaunch::at(absent, &dir), Err(TorError::Binary(_))),
+            "{absent} should be absent-not-relative on this platform"
+        );
+
+        // **Drive-relative, which exists only on Windows.** `\tor` and
+        // `/tor` name a path on the *current* drive, so they are exactly the
+        // ambiguity this argument refuses — and they are ordinary-looking
+        // absolute paths to anyone reading a unix shell history.
+        #[cfg(windows)]
+        {
+            assert!(matches!(
+                TorLaunch::at(r"\nonexistent\tor", &dir),
+                Err(TorError::Path(_))
+            ));
+            assert!(matches!(
+                TorLaunch::at("/nonexistent/tor", &dir),
+                Err(TorError::Path(_))
+            ));
+        }
     }
 
     /// The daemon is tied to this process's lifetime, and the argument

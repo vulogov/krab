@@ -3079,3 +3079,78 @@ locally before being written into it.
 **The jobs themselves have still never run**, like the Windows job before them.
 That is the honest state on the day they are added, and it is why the local
 runs above are recorded rather than the CI configuration alone.
+
+---
+
+## 37. The first Windows CI run, and what it caught — 2026-09-01
+
+§28 added the workflow for one reason: `krab-lock`'s Windows arm had never
+executed. §36 added two more jobs and closed with "the jobs themselves have
+still never run, like the Windows job before them." They have now, and the
+Windows run failed — which is what a first run on a platform nobody develops on
+is for.
+
+### The failure was a Unix-ism in a test fixture, not a defect
+
+`backend::tor::tests::a_relative_binary_path_is_refused` asserted that
+`TorLaunch::at("/nonexistent/tor", …)` gives `Binary` — absolute but absent.
+On Windows it gives `Path` — relative — and **the code is right**:
+
+> On Windows, a path with a root and no drive letter is *drive-relative*. `/tor`
+> and `\tor` resolve against whichever drive the process happens to be on, so
+> `Path::is_absolute` is false for them.
+
+That is precisely the ambiguity the argument exists to refuse. `start-tor`
+takes an explicit binary path so an operator is not at the mercy of `PATH`, and
+a path resolved against an uncontrolled *drive* is the same hazard as one
+resolved against an uncontrolled *working directory*. **The check was more
+right than the test**, and nothing on a developer's Mac could have shown it.
+
+Fixed by making the fixture per-platform and asserting the drive-relative cases
+separately on Windows — rather than by loosening the assertion to accept either
+error, which would have hidden the difference instead of naming it.
+
+### And a message that was wrong on the platform it was refusing
+
+The refusal said the path "is relative", which on Windows reads as a bug to the
+operator: `\tor` does not look relative, and on unix it would not be. The
+message now names the actual reason per platform — on Windows, that the path
+must name a drive because otherwise it resolves against the one this process
+happens to be on.
+
+A finding about a test that turned into a finding about an error message, which
+is the ordinary shape of these: the test failed because the *world* differs
+there, and anything the code says about the world differs with it.
+
+### The other Unix-isms in the tree, checked
+
+Sixteen other tests use `/`-rooted literals. They are fine, and for a reason
+worth stating rather than assuming: **every one of them only needs "this path
+does not exist"**, which holds on Windows whether the path is absolute or
+drive-relative. `courier`'s missing archive, `atomic`'s unwritable directory,
+`--home`'s default — all still err.
+
+The tor test was the only one where **absoluteness itself carried meaning**,
+because it is the only one distinguishing two error variants by it. That is the
+predicate to look for, not the leading slash.
+
+### What is still not answered
+
+The output above is `krab-fabric`'s. **The job this workflow was written for is
+`krab-lock on Windows`, and its output is what closes `UNSAFE-AUDIT.md`'s open
+question** — whether `VirtualLock` has ever executed, and whether it succeeded
+or was refused. The crate's tests all tolerate a refusal, because a container
+that cannot lock is a real machine, so a green tick does not answer it.
+`report_what_this_platform_granted` prints the answer and the job runs with
+`--nocapture` for exactly that reason.
+
+Until that print is read, the audit's question is open and the arm is still
+only *compiled*.
+
+### What is verified here
+
+**1 308 tests**, zero failures, clippy clean under `-D warnings` across
+`--all-features`, and `cargo clippy -p krab-fabric --target
+x86_64-pc-windows-gnu --all-targets` clean — which covers the `#[cfg(windows)]`
+test block added above, since `--all-targets` includes tests. Compiling is not
+running, and this section is careful to say which is which.
