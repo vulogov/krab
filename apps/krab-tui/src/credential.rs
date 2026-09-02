@@ -297,9 +297,7 @@ pub struct Credential {
 /// document — the same relationship `markdown` has to a message body, and for
 /// the same reason.
 pub fn to_hjson(c: &Credential, now_s: u64) -> String {
-    let hex = |b: &[u8]| -> String {
-        b.iter().map(|x| alloc_hex(*x)).collect::<Vec<_>>().join("")
-    };
+    let hex = |b: &[u8]| -> String { b.iter().map(|x| alloc_hex(*x)).collect::<Vec<_>>().join("") };
     let party = |label: &str, p: &Party| -> String {
         format!(
             "  {label}:\n  {{\n                 # short id, as it appears everywhere else in the interface\n                 id: {}\n                 sig_pk: {}   # Ed25519 identity\n                 kx_pk:  {}   # X25519 correspondence\n  }}\n",
@@ -324,9 +322,9 @@ pub fn to_hjson(c: &Credential, now_s: u64) -> String {
             Some(v) => format!("  {label}: {}\n", hex(v)),
             // Stated, not omitted. RFC 3 §3: "a singly-signed document lets one
             // party assert a relationship the other never agreed to."
-            None => format!(
-                "  {label}: null   # NOT SIGNED — this is a proposal, not a contract\n"
-            ),
+            None => {
+                format!("  {label}: null   # NOT SIGNED — this is a proposal, not a contract\n")
+            }
         }
     };
 
@@ -569,6 +567,28 @@ impl Credential {
     /// "partially valid" here and no accessor that returns the parties without
     /// having checked.
     pub fn verify(&self, now_s: u64) -> Result<(), Invalid> {
+        self.verify_static()?;
+        // Expiry last, so a forged document reports as forged rather than as
+        // merely out of date. That ordering is also what lets a caller cache
+        // the expensive half — see [`Credential::verify_static`].
+        if now_s >= self.expires_s {
+            return Err(Invalid::Expired);
+        }
+        Ok(())
+    }
+
+    /// Everything `verify` checks **except the clock**.
+    ///
+    /// The two Ed25519 verifications are here, and they are the cost: about
+    /// 60 µs for a credential, against everything else in the function being
+    /// integer comparisons. **Nothing here depends on `now_s`**, which is what
+    /// makes the answer cacheable for as long as the document itself is
+    /// unchanged — the caller re-applies the expiry each time, for free.
+    ///
+    /// That separation is not new; `verify` already checked expiry last, on
+    /// purpose, so that "forged" beats "out of date" in a report. This names
+    /// the boundary that ordering had already drawn.
+    pub fn verify_static(&self) -> Result<(), Invalid> {
         // Canonical order first: out of order, the body bytes are not the ones
         // the other end would have built, so a signature check would answer a
         // question about the wrong document.
@@ -596,11 +616,6 @@ impl Credential {
             return Err(Invalid::BadSignature);
         }
 
-        // Expiry last, so a forged document reports as forged rather than as
-        // merely out of date.
-        if now_s >= self.expires_s {
-            return Err(Invalid::Expired);
-        }
         Ok(())
     }
 
@@ -952,7 +967,10 @@ mod tests {
         // **HJSON, not JSON** — the comments are most of why §3 asks for it,
         // and they carry §3's own meanings so an operator need not have the
         // document open beside the terminal.
-        assert!(out.contains('#'), "no annotation; plain JSON would do:\n{out}");
+        assert!(
+            out.contains('#'),
+            "no annotation; plain JSON would do:\n{out}"
+        );
         assert!(out.starts_with('{') && out.trim_end().ends_with('}'));
 
         // **An unsigned side is stated, not omitted.** §3: "a singly-signed

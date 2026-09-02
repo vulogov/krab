@@ -3777,3 +3777,89 @@ explicit generation rather than the mtime that first suggests itself.
 
 **1 325 tests, zero failures**, clippy clean under `-D warnings` across
 `--all-features`.
+
+---
+
+## 45. `purge_expired_peerings`, and a test that enumerated more than it checked — 2026-09-02
+
+The last of §38's eight. Two findings, and the second is about my own test.
+
+### The clock is not a cache-invalidation problem, because it is not cached
+
+`purge_expired_peerings` runs every tick and asks every peer. Each answer was a
+file read, an AEAD decrypt, a decode and **two Ed25519 verifications** — about
+47 µs of signature checking per peer per tick (measured: 23.6 µs a verify) to
+compute a comparison against the clock.
+
+The obvious cache is the *standing*, and it is the wrong one: a standing depends
+on `now_s`, so it would have to be invalidated when the clock crosses the term —
+and **a credential that stayed "live" past its expiry is one this node keeps
+honouring after RFC 3 §4 says it stopped.** A threshold that must be noticed is
+a threshold that will eventually be missed.
+
+`Credential::verify` already checked expiry **last**, deliberately, so that a
+forgery reports as forged rather than as out of date. `verify_static` names the
+boundary that ordering had already drawn: everything expensive is there, nothing
+in it reads the clock, and the caller re-applies the expiry each tick for the
+price of one integer comparison. **The threshold cannot be missed because
+nothing about it is remembered.**
+
+`the_credential_cache_does_not_outlive_the_term` pins that: the same cached
+document verifies now and is `Expired` a second past its term, with no reload
+and no invalidation.
+
+### Three destroyers, and I found two
+
+Same one-writer argument as §44's `pinned_cache` — but a credential file is also
+*destroyed*, and that is where it went wrong. There are three paths:
+
+1. `purge_expired_peerings` — found
+2. **`peer forget`** — missed
+3. `wipe`, which reaches it through `lock` — found
+
+`forget` is the command whose entire job is to destroy the record, and a decoded
+credential left in memory is RFC 3 §15's non-repudiable document with the
+sealing removed: a mutually signed statement that these two agreed to peer. It
+was caught by an existing test rather than by my enumerating the paths, which is
+why the enumeration is now a test.
+
+### The test enumerated three paths and checked two
+
+`every_path_that_destroys_a_credential_forgets_it` was written to close exactly
+that gap. Probing each site found `forget` and `lock` caught — **and the purge
+not**, because the test never exercised it.
+
+So the test named three paths in its own doc comment and its body covered two of
+them. That is a more comfortable failure than the original bug and the same
+kind: *a claim of coverage over a set that was not the whole set*, which this
+document has now recorded five times. It is easy to write a test whose name
+claims more than its body does, and the only thing that found it was neutering
+each site in turn and noticing one probe stayed green.
+
+All four blocks are probed now.
+
+### The assumption, written down where it bites
+
+The cache is exact **while one process owns the home directory**. Something
+editing `peers/<id>/credential` from outside — a restore, a second instance on
+the same `--home` — would not be seen.
+
+That assumption is not introduced here: the corpus is already held in memory and
+written out wholesale, so a second process on one home loses objects with or
+without this. It is stated because a test that writes the file directly has to
+invalidate by hand, and the next person to do that should find the reason rather
+than the symptom. Two such tests now say so at the line where they do it.
+
+### §38's list is closed
+
+Eight symptoms, eight outcomes. The two "not done" entries in §44's table are
+this one and the tombstone walk — and the tombstone walk turns out not to need
+doing: `prune_tombstones` is a `retain` over a map that RFC 5 §8 already bounds
+by `MAX_TTL`, it runs once a tick rather than once per peer, and nothing in it
+decrypts or verifies. It is linear in a bounded set, which is where the other
+seven have now been brought.
+
+### What is verified
+
+**1 327 tests, zero failures**, clippy clean under `-D warnings` across
+`--all-features`.

@@ -938,6 +938,43 @@ struct App {
     inbox_inputs: Option<InboxInputs>,
     /// Objects the last scan examined, for the empty-inbox line.
     examined: usize,
+    /// Decoded, signature-checked credentials, by peer — the expensive half
+    /// of `credential_standing`.
+    ///
+    /// **`purge_expired_peerings` runs every tick and asks every peer.** Each
+    /// answer was a file read, an AEAD decrypt, a decode and **two Ed25519
+    /// verifications** — about 60 µs of signature checking per peer per tick,
+    /// to compute a comparison against the clock.
+    ///
+    /// What is cached is the part that does not depend on the clock.
+    /// `Credential::verify` already checked expiry last, deliberately, so that
+    /// a forgery reports as forged rather than as out of date;
+    /// `verify_static` names the boundary that ordering had drawn, and the
+    /// caller re-applies the expiry each tick for the price of one integer
+    /// comparison. **A threshold crossing is therefore not a cache-invalidation
+    /// problem here** — which is the trap this design exists to avoid, because
+    /// a credential that stayed "live" past its term would be one this node
+    /// keeps honouring after RFC 3 §4 says it stopped.
+    ///
+    /// Exact, for the same reason `pinned_cache` is: **this process is the
+    /// only thing that writes or deletes a credential file**, at one write
+    /// site and one shred site, and both invalidate here.
+    ///
+    /// `None` for a peer means "there is no readable credential", which is an
+    /// answer worth caching too — otherwise a node with an incomplete peering
+    /// pays a failed open per tick for ever.
+    ///
+    /// # The assumption, stated
+    ///
+    /// This is exact **while one process owns the home directory**. Something
+    /// editing `peers/<id>/credential` from outside — a restore, a second
+    /// instance on the same `--home` — would not be seen. That assumption is
+    /// not introduced here: the corpus is already held in memory and written
+    /// out wholesale, so a second process on one home loses objects with or
+    /// without this cache. It is written down because a test that writes the
+    /// file directly has to invalidate by hand, and the next person to do that
+    /// should find the reason rather than the symptom.
+    credentials: std::cell::RefCell<std::collections::BTreeMap<String, Option<credential::Credential>>>,
     /// The decrypted pinned archive, held rather than re-decrypted.
     ///
     /// **`pinned()` is on the render path.** `selectable_len` calls it to
@@ -1067,6 +1104,7 @@ impl Default for App {
             rotating: false,
             inbox_inputs: None,
             examined: 0,
+            credentials: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             pinned_cache: std::cell::RefCell::new(None),
             scanned_at: None,
             request_rows: Vec::new(),
@@ -4580,6 +4618,10 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         ) {
             return format!("could not store it: {e}");
         }
+        // The one write site. Forgotten after the write succeeds, so a failed
+        // write leaves the cache agreeing with what is still on disk rather
+        // than with what was attempted.
+        self.forget_credential(&short);
         // **Whoever completed it still owes the other end a copy.**
         //
         // The first version shredded the loose file unconditionally, so the
@@ -5894,6 +5936,18 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
             &mut OsRng,
         );
 
+        // **The decoded copy goes with the sealed one.** `forget`'s whole job
+        // is to destroy the record, and a cache still holding the plaintext of
+        // a mutually signed, per RFC 3 §15 non-repudiable, statement that
+        // these two agreed to peer is that record surviving the command named
+        // after ending it.
+        //
+        // This is the third destroyer of a credential file — the other two are
+        // `purge_expired_peerings` and `wipe`, which reaches it through
+        // `lock`. It was missed, and
+        // `every_path_that_destroys_a_credential_forgets_it` is the test that
+        // now walks all three rather than trusting the count.
+        self.forget_credential(peer);
         // The allowed set is rebuilt from what is on disk, so it drops them.
         self.refresh_allowed();
 
@@ -5971,6 +6025,11 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
                 }
             }
             if gone > 0 {
+                // The credential is one of the files just shredded, so the
+                // cached copy is a decoded record of a peering this node has
+                // deliberately destroyed — RFC 3 §8.4's purge is not a purge
+                // if it leaves that in memory.
+                self.forget_credential(&peer);
                 self.spends.remove(&peer);
                 self.reach.retain(|(who, _, _)| who != &peer);
                 self.log.push(activity_log::Event::Failed {
@@ -6439,18 +6498,19 @@ impl App {
     /// built on it, so enforcement and reporting cannot disagree about what a
     /// credential is.
     fn credential_standing(&self, peer: &str) -> Standing {
-        let Some(w) = self.epoch_key else {
+        if self.epoch_key.is_none() {
             return Standing::None;
-        };
-        let Some(cred) = std::fs::read(self.peer_path(peer, artifact::PeerFile::Credential))
-            .ok()
-            .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/credential", &sealed).ok())
-            .and_then(|raw| credential::Credential::decode(&raw))
-        else {
+        }
+        let Some(cred) = self.credential_cached(peer) else {
             return Standing::None;
         };
         let now_s = self.now_s();
-        match cred.verify(now_s) {
+        let verdict: Result<(), credential::Invalid> = match cred.verify_static() {
+            Err(why) => Err(why),
+            Ok(()) if now_s >= cred.expires_s => Err(credential::Invalid::Expired),
+            Ok(()) => Ok(()),
+        };
+        match verdict {
             Ok(()) => Standing::Live(cred.life(now_s), cred.expires_s),
             // Expiry is reported as what it is. `verify` refuses it, which is
             // correct enforcement; reporting it as a defect is what §4 forbids.
@@ -6463,6 +6523,36 @@ impl App {
 }
 
 impl App {
+    /// The decoded credential for `peer`, from the cache or from disk.
+    ///
+    /// The read, the AEAD open and the decode happen once per credential
+    /// rather than once per tick per peer. Signature verification is *not*
+    /// done here — the caller does it with `verify_static`, whose result is
+    /// also stable, so that a caller wanting only the document's fields is not
+    /// made to pay for two Ed25519 checks it will not read.
+    fn credential_cached(&self, peer: &str) -> Option<credential::Credential> {
+        if let Some(hit) = self.credentials.borrow().get(peer) {
+            return hit.clone();
+        }
+        let w = self.epoch_key?;
+        let loaded = std::fs::read(self.peer_path(peer, artifact::PeerFile::Credential))
+            .ok()
+            .and_then(|sealed| krab_crypto::kek::open_under(&w, b"krab/credential", &sealed).ok())
+            .and_then(|raw| credential::Credential::decode(&raw));
+        self.credentials
+            .borrow_mut()
+            .insert(peer.to_string(), loaded.clone());
+        loaded
+    }
+
+    /// Forget what is cached for `peer` — after a write, or after a purge.
+    ///
+    /// Named rather than inlined so the two call sites read as the same act,
+    /// and so a third writer added later has something to call.
+    fn forget_credential(&self, peer: &str) {
+        self.credentials.borrow_mut().remove(peer);
+    }
+
     /// This node's completed credential with `peer`, if there is one.
     ///
     /// Sealed at rest under `W_N` — RFC 3 §15 makes that a MUST, so a locked
@@ -6470,10 +6560,8 @@ impl App {
     /// That is the intended behaviour and not a limitation: §15 calls a
     /// running node holding them in memory "mitigation, not a fix".
     fn credential_with(&self, peer: &str) -> Option<credential::Credential> {
-        let w = self.epoch_key?;
-        let sealed = std::fs::read(self.peer_path(peer, artifact::PeerFile::Credential)).ok()?;
-        let raw = krab_crypto::kek::open_under(&w, b"krab/credential", &sealed).ok()?;
-        let cred = credential::Credential::decode(&raw)?;
+        self.epoch_key?;
+        let cred = self.credential_cached(peer)?;
         cred.verify(self.now_s()).ok().map(|()| cred)
     }
 
@@ -11940,6 +12028,13 @@ impl App {
         // decrypted archive is plaintext and dies with the lock (RFC 7 §8) —
         // the same rule `messages` follows, one line above.
         *self.pinned_cache.borrow_mut() = None;
+        // **Decoded credentials go too.** RFC 3 §15 calls a credential at rest
+        // "non-repudiable" — seizing one yields the peer list with
+        // cryptographic proof — and a decoded copy in memory is that document
+        // with the sealing removed. A locked node is a relay and holds the
+        // *sealed* files because it still carries for those peers; it has no
+        // reason to hold the plaintext.
+        self.credentials.borrow_mut().clear();
         // The table derives from static-static shared secrets, so it is
         // content-key material. A locked node is a relay and must not hold it.
         self.tag_table = None;
@@ -12425,6 +12520,152 @@ mod tests {
         assert_eq!(a.scanned_at, before, "an idle tick advanced the scan");
         assert_eq!(a.messages.len(), 2, "an idle tick lost messages");
         let _ = b_of_a;
+    }
+
+    /// Two nodes with a **completed credential**, not merely a peer-link.
+    ///
+    /// `peered_pair` stops at the peer-link; a credential needs RFC 3 §3's
+    /// countersigning ceremony on top, and the cache under test is keyed on
+    /// the credential file. Modelled on
+    /// `countersigning_completes_a_credential_and_refuses_a_strangers`.
+    fn credentialled_pair(tag: &str) -> (App, App, String) {
+        let mut x = ready_node(&format!("{tag}-x"));
+        let mut y = ready_node(&format!("{tag}-y"));
+        let short_y = peer_up(&mut x, &mut y);
+        let _ = peer_up(&mut y, &mut x);
+
+        let proposal = x.propose_credential(&y.identity.as_ref().unwrap().card(Policy::default()));
+        let xpath = x.home.join("proposal.credential");
+        std::fs::write(&xpath, &proposal).unwrap();
+        let ypath = y.home.join("proposal.credential");
+        std::fs::write(&ypath, &proposal).unwrap();
+        assert!(y
+            .peer_countersign(Some(ypath.to_str().unwrap()))
+            .contains("is complete"));
+
+        let short_x = short_id(&x.identity.as_ref().unwrap().node_id());
+        let done = std::fs::read(y.home.join(format!("{short_x}.credential"))).unwrap();
+        std::fs::write(&xpath, &done).unwrap();
+        assert!(x
+            .peer_countersign(Some(xpath.to_str().unwrap()))
+            .contains("is complete"));
+        assert!(x.credential_with(&short_y).is_some(), "no credential built");
+        (x, y, short_y)
+    }
+
+    /// **Every path that destroys a credential forgets the decoded copy.**
+    ///
+    /// There are three, and I found two. `peer forget` was the one missed —
+    /// the command whose entire job is to destroy the record — and it was
+    /// caught by an existing test rather than by enumerating the paths, which
+    /// is why this enumerates them.
+    ///
+    /// A decoded credential in memory is RFC 3 §15's non-repudiable document
+    /// with the sealing removed: a mutually signed statement that these two
+    /// agreed to peer. Leaving one behind after the file is gone is the record
+    /// surviving the act named after ending it.
+    #[test]
+    fn every_path_that_destroys_a_credential_forgets_it() {
+        // 1. `peer forget`.
+        {
+            let (mut x, _y, y_of_x) = credentialled_pair("cred-forget");
+            type_command(&mut x, &format!("peer forget {y_of_x}"));
+            assert!(
+                x.credential_with(&y_of_x).is_none(),
+                "`peer forget` left the decoded credential in memory"
+            );
+        }
+
+        // 2. `wipe`, which reaches it through `lock`.
+        {
+            let (mut x, _y, y_of_x) = credentialled_pair("cred-wipe");
+            assert!(x.credential_with(&y_of_x).is_some());
+            let _ = x.panic_wipe();
+            assert!(
+                x.credentials.borrow().is_empty(),
+                "a wipe left decoded credentials in memory"
+            );
+        }
+
+        // 3. `purge_expired_peerings` — RFC 3 §8.4, the path that shreds a
+        //    credential the operator never asked about.
+        //
+        //    Not covered by the two above, and that omission is why this test
+        //    exists: probing found `forget` and `lock` caught by it and the
+        //    purge not, so an "enumeration" that listed three paths tested
+        //    two. It is easy to write a test whose name claims more than its
+        //    body does.
+        {
+            let (mut x, y, y_of_x) = credentialled_pair("cred-purge");
+            let w = x.epoch_key.expect("unlocked");
+            // A term that ended well past the grace, so §8.4 takes it.
+            let long_ago = x.now_s() - credential::DEFAULT_TERM_DAYS * 86_400
+                - GRACE_AFTER_EXPIRY_S
+                - 86_400;
+            let stale = completed_credential(&x, &y, long_ago);
+            let sealed =
+                krab_crypto::kek::seal_under(&w, b"krab/credential", &stale.encode(), &mut OsRng)
+                    .unwrap();
+            std::fs::write(x.peer_path(&y_of_x, artifact::PeerFile::Credential), sealed).unwrap();
+            // Written behind the app's back, so invalidated by hand — see
+            // `App::credentials`. From here the purge must do it itself.
+            x.forget_credential(&y_of_x);
+            assert!(
+                x.credential_cached(&y_of_x).is_some(),
+                "the stale credential did not load, so the purge has nothing to do"
+            );
+
+            x.purge_expired_peerings();
+            assert!(
+                !x.peer_path(&y_of_x, artifact::PeerFile::Credential).exists(),
+                "the purge did not run"
+            );
+            assert!(
+                !x.credentials.borrow().contains_key(&y_of_x),
+                "the purge shredded the file and left the decoded credential \
+                 in memory — RFC 3 §8.4's purge is not a purge if it does"
+            );
+        }
+
+        // 4. `lock` on its own — a relay holds the sealed files and has no
+        //    reason to hold their plaintext.
+        {
+            let (mut x, _y, y_of_x) = credentialled_pair("cred-lock");
+            assert!(x.credential_with(&y_of_x).is_some());
+            assert!(!x.credentials.borrow().is_empty(), "nothing was cached");
+            x.lock();
+            assert!(
+                x.credentials.borrow().is_empty(),
+                "a lock left decoded credentials in memory"
+            );
+        }
+    }
+
+    /// **The expensive half is cached and the clock half is not.**
+    ///
+    /// The trap this design avoids: a cached *standing* would have to be
+    /// invalidated when the clock crosses the term, and a credential that
+    /// stayed "live" past its expiry is one this node keeps honouring after
+    /// RFC 3 §4 says it stopped. Caching only what does not depend on `now_s`
+    /// makes that impossible rather than handled.
+    #[test]
+    fn the_credential_cache_does_not_outlive_the_term() {
+        let (x, _y, y_of_x) = credentialled_pair("cred-clock");
+        let cred = x.credential_cached(&y_of_x).expect("a credential");
+        assert!(cred.verify_static().is_ok(), "the fixture does not verify");
+
+        // Valid now.
+        assert!(cred.verify(x.now_s()).is_ok());
+        // And refused a second past its term, from the very same cached
+        // document — no reload, no invalidation, no threshold to miss.
+        assert_eq!(
+            cred.verify(cred.expires_s),
+            Err(credential::Invalid::Expired)
+        );
+        assert_eq!(
+            cred.verify(cred.expires_s + 86_400),
+            Err(credential::Invalid::Expired)
+        );
     }
 
     /// **The pinned cache follows the write, and dies with the lock.**
@@ -14380,7 +14621,13 @@ mod tests {
         let path = a.peer_path(&sb, artifact::PeerFile::Credential);
 
         // Inside the grace: the reason survives and renewal is still named.
+        //
+        // **Written behind the app's back**, which no production path does —
+        // `peer seal` is the one writer, and it invalidates. The fixture has to
+        // do it by hand, so it has to invalidate by hand; see `App::credentials`
+        // on the single-process assumption this rests on.
         std::fs::write(&path, &lapsed_yesterday).unwrap();
+        a.forget_credential(&sb);
         a.purge_expired_peerings();
         let line = a.credential_standing(&sb).line(&sb, a.now_s());
         assert!(line.contains("EXPIRED"), "the reason was erased: {line}");
@@ -14389,6 +14636,7 @@ mod tests {
 
         // Past it: §8.4 takes the record of an agreement nobody renewed.
         std::fs::write(&path, &lapsed_a_month_ago).unwrap();
+        a.forget_credential(&sb);
         a.purge_expired_peerings();
         assert!(
             !path.exists(),
