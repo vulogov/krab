@@ -3425,18 +3425,38 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
         // request needs a human decision (RFC 3 §11's ceremony is a deliberate
         // act), and burying it under mail would mean it is never made.
         // Disjoint field borrows: `store` is read, `attempts` is spent.
+        // **Incremental on the same terms as the mail scan.**
+        //
+        // An inbox tag is derived from the epoch (RFC 2 §4.2), so a rollover
+        // changes every tag this is looking for — but `since` is already
+        // `None` whenever the tag table was rebuilt, and the table is rebuilt
+        // on rollover. Reusing it is therefore conservative in the safe
+        // direction: a peer-set change also forces a full request scan, which
+        // costs one pass and cannot miss a ceremony.
         let attempts = &mut self.attempts;
-        let requests = self.store.with(|st| {
-            receive::scan_requests(
+        let requests = self.store.with(|st| match &since {
+            Some(ids) => receive::scan_requests_in(
+                st,
+                id.correspondence(),
+                &id.node_id(),
+                epoch,
+                ids,
+                attempts,
+            ),
+            None => receive::scan_requests(
                 st,
                 id.correspondence(),
                 &id.node_id(),
                 epoch,
                 (0, u32::MAX),
                 attempts,
-            )
+            ),
         });
-        self.request_rows = requests
+        // Appended on an incremental pass, replaced on a full one — the same
+        // rule the messages follow, and for the same reason: an incremental
+        // pass saw only what arrived, so replacing would drop every request
+        // still waiting for a decision.
+        let rows: Vec<String> = requests
             .iter()
             .filter_map(|inc| match inc {
                 receive::Incoming::Request { request: r, .. } => Some(format!(
@@ -3452,6 +3472,11 @@ fn inbox_row(m: &receive::Message, names: &alias::Aliases) -> String {
                 _ => None,
             })
             .collect();
+        if since.is_some() {
+            self.request_rows.extend(rows);
+        } else {
+            self.request_rows = rows;
+        }
     }
 
     /// **The cheap half: what the operator is looking at.**
@@ -12341,6 +12366,63 @@ mod tests {
         assert_eq!(a.scanned_at, before, "an idle tick advanced the scan");
         assert_eq!(a.messages.len(), 2, "an idle tick lost messages");
         let _ = b_of_a;
+    }
+
+    /// **A first-contact request found incrementally, and one found earlier
+    /// that must not be dropped.**
+    ///
+    /// RFC 3 §11's ceremony is a deliberate act, and the request row is how an
+    /// operator learns there is one waiting. An incremental pass sees only
+    /// what arrived, so replacing the rows rather than appending would make a
+    /// request vanish from the list the moment any other object turned up —
+    /// which is worse than never showing it, because nothing else in the
+    /// interface says a stranger is waiting.
+    #[test]
+    fn a_request_survives_an_incremental_pass_and_a_new_one_is_found() {
+        let mut a = ready_node("req-incr-a");
+        let mut b = ready_node("req-incr-b");
+        let mut c = ready_node("req-incr-c");
+        type_command(&mut a, "peer offer");
+        type_command(&mut b, "peer offer");
+        type_command(&mut c, "peer offer");
+
+        // A and C each request contact with B.
+        let carry = |from: &App, to: &App, as_name: &str| {
+            std::fs::copy(from.path(artifact::Artifact::PeerCard), to.at(as_name)).unwrap();
+            to.at(as_name).display().to_string()
+        };
+        let b_card_for_a = carry(&b, &a, "b.card");
+        type_command(&mut a, &format!("request {b_card_for_a} from a"));
+        let b_card_for_c = carry(&b, &c, "b.card");
+        type_command(&mut c, &format!("request {b_card_for_c} from c"));
+
+        // B receives A's first, and derives.
+        carry_corpus(&a, &mut b);
+        b.refresh_inbox();
+        assert_eq!(
+            b.request_rows.len(),
+            1,
+            "the first request was not recognised: {:?}",
+            b.list
+        );
+
+        // Then C's arrives, and the pass is incremental.
+        let before = b.scanned_at;
+        carry_corpus(&c, &mut b);
+        b.refresh_inbox();
+        assert_ne!(b.scanned_at, before, "the scan did not advance");
+        assert_eq!(
+            b.request_rows.len(),
+            2,
+            "the incremental pass dropped the earlier request or missed the \
+             new one: {:?}",
+            b.request_rows
+        );
+        assert!(
+            b.list.iter().filter(|l| l.starts_with("REQUEST from")).count() == 2,
+            "both requests must be at the top of the list: {:?}",
+            b.list
+        );
     }
 
     /// **A removal forces a full pass**, because a replay of arrivals cannot

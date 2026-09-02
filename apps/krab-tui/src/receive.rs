@@ -301,8 +301,32 @@ pub fn scan_requests(
         tags.insert(krab_crypto::inbox_tag(&ours.public(), epoch).0, epoch);
     }
 
+    let ids = store
+        .entries_in_range(window.0, window.1)
+        .into_iter()
+        .map(|(_, id)| id);
+    scan_request_ids(store, ours, our_node_id, now, ids, attempts, &tags)
+}
+
+/// **The same pass, over identifiers the caller names.**
+///
+/// [`scan_requests`] hands it every object in the window; [`scan_requests_in`]
+/// hands it only what has arrived since the caller last looked. One body, for
+/// the reason `Inbox::scan_ids` has one: two scanners agree until they do not,
+/// and a first-contact request that appears on a rescan and not on a tick is a
+/// ceremony an operator never learns is waiting.
+#[allow(clippy::too_many_arguments)]
+fn scan_request_ids(
+    store: &Store,
+    ours: &SecretKey,
+    our_node_id: &[u8; 32],
+    now: Epoch,
+    ids: impl Iterator<Item = krab_core::object::ObjectId>,
+    attempts: &mut Attempts,
+    tags: &std::collections::HashMap<[u8; 8], Epoch>,
+) -> Vec<Incoming> {
     let mut out = Vec::new();
-    for (_, id) in store.entries_in_range(window.0, window.1) {
+    for id in ids {
         let Some(bytes) = store.get(&id) else {
             continue;
         };
@@ -388,6 +412,38 @@ pub fn scan_requests(
         }
     }
     out
+}
+
+/// Examine only the objects that arrived since the caller last scanned.
+///
+/// The identifiers come from `Store::added_since`, which refuses — with
+/// `None` — whenever a replay would give a wrong answer rather than a stale
+/// one. **The caller must fall back to [`scan_requests`] on `None`**, and must
+/// also fall back whenever the epoch window has moved: an inbox tag is derived
+/// from the epoch (RFC 2 §4.2), so a rollover changes every tag this scan is
+/// looking for and objects examined under the old ones have not been examined
+/// at all.
+pub fn scan_requests_in(
+    store: &Store,
+    ours: &SecretKey,
+    our_node_id: &[u8; 32],
+    now: Epoch,
+    ids: &[krab_core::object::ObjectId],
+    attempts: &mut Attempts,
+) -> Vec<Incoming> {
+    let mut tags = std::collections::HashMap::new();
+    for epoch in Epoch::window(now) {
+        tags.insert(krab_crypto::inbox_tag(&ours.public(), epoch).0, epoch);
+    }
+    scan_request_ids(
+        store,
+        ours,
+        our_node_id,
+        now,
+        ids.iter().copied(),
+        attempts,
+        &tags,
+    )
 }
 
 /// The recognition and decryption path.

@@ -3626,3 +3626,62 @@ here; recorded rather than left to be found.
 **1 323 tests, zero failures**, clippy clean under `-D warnings` across
 `--all-features`. The removal fallback is probed; the incremental and full paths
 are asserted to agree on both content and order.
+
+---
+
+## 43. `scan_requests`, incremental — 2026-09-02
+
+§42 closed with `scan_requests` still walking the whole corpus on every derive,
+recorded rather than left to be found. This is that, and it needed one thing
+§42's did not.
+
+### The same shape, and the extra condition
+
+`scan_requests` and `scan_requests_in` share `scan_request_ids`, for the reason
+`Inbox::scan_ids` has one body: **a first-contact request that appears on a
+rescan and not on a tick is a ceremony an operator never learns is waiting.**
+RFC 3 §11 makes that ceremony a deliberate act, and the request row is the only
+thing in the interface that says a stranger is there.
+
+The extra condition is the epoch. An inbox tag is derived from it (RFC 2 §4.2),
+so a rollover changes every tag this scan is looking for and objects examined
+under the old ones have not been examined at all. `since` is already `None`
+whenever the tag table was rebuilt, and the table is rebuilt on rollover — so
+reusing it is correct, and conservative in the safe direction: a peer-set change
+also forces a full request pass, which costs one walk and cannot miss a
+ceremony.
+
+### The merge rule that matters
+
+`request_rows` is **appended** on an incremental pass and replaced on a full
+one. Replacing would make a waiting request vanish the moment any other object
+arrived — worse than never having shown it, because nothing else in the
+interface says a stranger is waiting and the operator would have no reason to
+look again.
+
+Probed both halves separately, each failing with the specific thing it broke:
+replacing instead of appending loses the earlier request; a `scan_requests_in`
+that returns nothing loses the new one.
+
+### What is now incremental, and what is not
+
+Per derive, on a tick where objects arrived: the mail scan and the request scan
+both examine only what arrived. On a tick where nothing arrived: neither runs at
+all — §41's guard. After a removal, or a rollover, or a peer-set change: both do
+a full pass, which is correct rather than a regression.
+
+Still per-derive and still linear in the peer count, not the corpus: the card
+read, Ed25519 verify and X25519 agreement per peer, and the reservoir decrypt
+per peer. Those are 52 µs each and bounded by how many friends someone has,
+which is the bound RFC 3 §6.1 already assumes. They are not the next thing.
+
+The next things are the two remaining symptoms from §38's list, both caching
+questions with their own invalidation: `purge_expired_peerings`' credential
+decrypt and verify per peer per tick, and `pinned()`'s AEAD decrypt of the
+pinned archive — which is also on the render path, so it runs at frame rate
+rather than tick rate.
+
+### What is verified
+
+**1 324 tests, zero failures**, clippy clean under `-D warnings` across
+`--all-features`.
